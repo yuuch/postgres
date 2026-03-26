@@ -71,9 +71,15 @@ pg_vec_try_build_query_state(QueryDesc *queryDesc, int eflags)
 	MemoryContext oldcxt;
 	PgVecQueryState *state;
 	PgVecPlan	plan;
+	const char *failure_reason = NULL;
 
-	if (!pg_vec_try_translate_plan(queryDesc, eflags, &plan))
+	if (!pg_vec_try_translate_plan(queryDesc, eflags, &plan, &failure_reason))
+	{
+		elog(WARNING, "pg_vec: fallback to standard executor: %s",
+			 failure_reason != NULL ? failure_reason :
+			 "query could not be translated into pg_vec IR");
 		return NULL;
+	}
 
 	oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
 	state = palloc0(sizeof(PgVecQueryState));
@@ -93,6 +99,8 @@ pg_vec_try_build_query_state(QueryDesc *queryDesc, int eflags)
 
 		case PG_VEC_PLAN_UNSUPPORTED:
 		default:
+			elog(WARNING, "pg_vec: fallback to standard executor: unsupported translated plan kind %d",
+				 (int) state->plan.kind);
 			pfree(state);
 			return NULL;
 	}

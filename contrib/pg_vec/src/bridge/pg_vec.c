@@ -15,6 +15,7 @@ static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static bool pg_vec_enabled = true;
+static bool pg_vec_trace_hooks = false;
 
 static void pg_vec_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_vec_ExecutorRun(QueryDesc *queryDesc,
@@ -22,6 +23,8 @@ static void pg_vec_ExecutorRun(QueryDesc *queryDesc,
 							   uint64 count);
 static void pg_vec_ExecutorFinish(QueryDesc *queryDesc);
 static void pg_vec_ExecutorEnd(QueryDesc *queryDesc);
+static void pg_vec_trace_hook_warning(const char *hook_name,
+										  const char *detail);
 
 void		_PG_init(void);
 void		_PG_fini(void);
@@ -34,6 +37,17 @@ _PG_init(void)
 							 NULL,
 							 &pg_vec_enabled,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("pg_vec.trace_hooks",
+							 "Emit WARNING messages whenever pg_vec executor hooks run.",
+							 NULL,
+							 &pg_vec_trace_hooks,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL,
@@ -65,9 +79,23 @@ _PG_fini(void)
 }
 
 static void
+pg_vec_trace_hook_warning(const char *hook_name, const char *detail)
+{
+	if (!pg_vec_trace_hooks)
+		return;
+
+	if (detail != NULL)
+		elog(WARNING, "pg_vec: %s hook active: %s", hook_name, detail);
+	else
+		elog(WARNING, "pg_vec: %s hook active", hook_name);
+}
+
+static void
 pg_vec_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	PgVecQueryState *state;
+
+	pg_vec_trace_hook_warning("ExecutorStart", NULL);
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
@@ -75,12 +103,18 @@ pg_vec_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		standard_ExecutorStart(queryDesc, eflags);
 
 	if (!pg_vec_enabled)
+	{
+		pg_vec_trace_hook_warning("ExecutorStart", "pg_vec.enabled=off");
 		return;
+	}
 
 	state = pg_vec_try_build_query_state(queryDesc, eflags);
 	if (state != NULL)
 	{
 		pg_vec_register_state(queryDesc, state);
+		pg_vec_trace_hook_warning("ExecutorStart",
+								  psprintf("registered %s plan",
+										   pg_vec_plan_kind_name(state->plan.kind)));
 		elog(LOG, "pg_vec: registered %s execution path",
 			 pg_vec_plan_kind_name(state->plan.kind));
 	}
@@ -91,8 +125,26 @@ pg_vec_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
 	PgVecQueryState *state = pg_vec_lookup_state(queryDesc);
 
-	if (state != NULL && pg_vec_execute_query(queryDesc, state, direction, count))
-		return;
+	pg_vec_trace_hook_warning("ExecutorRun", NULL);
+
+	if (state != NULL)
+	{
+		pg_vec_trace_hook_warning("ExecutorRun",
+								  psprintf("taking over %s plan",
+										   pg_vec_plan_kind_name(state->plan.kind)));
+		if (pg_vec_execute_query(queryDesc, state, direction, count))
+		{
+			pg_vec_trace_hook_warning("ExecutorRun",
+									  psprintf("completed %s plan in pg_vec",
+											   pg_vec_plan_kind_name(state->plan.kind)));
+			return;
+		}
+
+		elog(WARNING, "pg_vec: fallback to standard executor during ExecutorRun for %s plan",
+			 pg_vec_plan_kind_name(state->plan.kind));
+	}
+	else
+		pg_vec_trace_hook_warning("ExecutorRun", "no pg_vec state registered");
 
 	if (prev_ExecutorRun)
 		prev_ExecutorRun(queryDesc, direction, count);
@@ -103,6 +155,11 @@ pg_vec_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 static void
 pg_vec_ExecutorFinish(QueryDesc *queryDesc)
 {
+	pg_vec_trace_hook_warning("ExecutorFinish",
+							  pg_vec_lookup_state(queryDesc) != NULL ?
+							  "query has pg_vec state" :
+							  "query has no pg_vec state");
+
 	if (prev_ExecutorFinish)
 		prev_ExecutorFinish(queryDesc);
 	else
@@ -113,6 +170,11 @@ static void
 pg_vec_ExecutorEnd(QueryDesc *queryDesc)
 {
 	PgVecQueryState *state = pg_vec_lookup_state(queryDesc);
+
+	pg_vec_trace_hook_warning("ExecutorEnd",
+							  state != NULL ?
+							  "query has pg_vec state" :
+							  "query has no pg_vec state");
 
 	if (state != NULL)
 		pg_vec_close_query_state(state);

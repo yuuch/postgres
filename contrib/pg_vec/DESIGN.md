@@ -113,6 +113,39 @@ The crucial design choice is that PostgreSQL's physical plan nodes are not
 executed directly. They are translated into a much smaller internal operator
 set.
 
+## Current Implementation Snapshot
+
+The codebase already follows the intended four-way split:
+
+- `src/bridge/`
+  - thin PostgreSQL-facing C glue
+  - executor hooks, query state, and row sink materialization
+- `src/ir/`
+  - compact `pg_vec` execution IR shared between translator and engine
+- `src/translate/`
+  - PostgreSQL `Plan` / `Expr` / `Aggref` to IR translation
+- `src/engine/`
+  - `DataChunk`, deform, scan, filter, aggregate, and join execution
+
+The current implementation is intentionally narrower than the final design:
+
+- the top-level IR is still a composite `scan + optional join + filter + agg`
+  descriptor rather than a full independent operator tree
+- the engine is chunk-at-a-time and pipeline-style, but not yet a full
+  morsel-driven scheduler
+- input filters now have a typed fast path for conjunctive
+  `column-vs-constant` comparisons, with interpreter fallback for more complex
+  boolean shapes
+
+As of the current implementation:
+
+- `Q1` runs on the generic single-table `SeqScan -> Filter -> Agg` path
+- `Q6` runs on the same generic path and is the first stable fully columnar
+  hot path
+- a minimal two-input inner-join plus aggregate path exists and is sufficient
+  for the current `q14` regression shape
+- more general TPCH join/lowering coverage is still in progress
+
 ## Why C + C++ Is The Right Split
 
 The C layer should stay small and unambitious. It exists to interact with the
@@ -255,6 +288,14 @@ For the production path, deforming should target `DataChunk` directly. It
 should not depend on PostgreSQL's `ExprState` / `TupleTableSlot` JIT deform
 pipeline, because that machinery is optimized for the core row executor rather
 than a columnar destination format.
+
+The current production scanner already follows this direction:
+
+- it uses `HeapScanDesc` with `SO_ALLOW_PAGEMODE`
+- it reuses PostgreSQL's `rs_read_stream` sequential read path for buffer
+  prefetch behavior close to core `SeqScan`
+- it collects visible tuples page-by-page and deforms them directly into
+  `DataChunk` column arrays
 
 The recommended progression is:
 
@@ -446,8 +487,8 @@ This keeps the engine small and stable.
 
 ## Q6 As The First Fully Vectorized Path
 
-Q6 should be the first query that runs without row-at-a-time execution in the
-hot path.
+Q6 is the first query that runs without row-at-a-time execution in the hot
+path.
 
 The query shape is:
 
@@ -483,9 +524,9 @@ survive inside the C++ hot loop.
 
 ### Q6 scan path
 
-The fully vectorized Q6 scan path should be:
+The implemented Q6 scan path is:
 
-1. `HeapPageDataChunkScanner` reads visible tuples from heap pages.
+1. `HeapDataChunkScanner` reads visible tuples from heap pages.
 2. For each visible tuple, it deforms only the four required attributes.
 3. It converts PostgreSQL values immediately into engine-native physical types.
 4. It appends them into the current `DataChunk`.
@@ -496,6 +537,10 @@ For Q6, "fully vectorized" means:
 - no `TupleTableSlot` in the steady-state hot loop
 - no `Numeric` arithmetic in the hot loop
 - no row materialization between scan, filter, projection, and aggregation
+
+In the current code, the scanner also reuses PostgreSQL's sequential
+`read_stream` path instead of manually walking relation blocks. That closed a
+major gap with core `SeqScan` on 10GB TPC-H runs.
 
 ### Q6 filter kernel
 
@@ -524,6 +569,20 @@ sel = filter(
 A single fused filter kernel is better than five separate filter operators for
 Q6, because it avoids intermediate selections and matches the final benchmark
 shape exactly.
+
+The current implementation does not hardcode a Q6-specific filter function.
+Instead, the engine now:
+
+- binds a supported input filter into a `BoundFilterProgram`
+- recognizes conjunctive `column-vs-constant` comparisons
+- executes them as typed selection-vector kernels over the current
+  `DataChunk`
+- falls back to the generic recursive `eval_qual()` interpreter for unsupported
+  shapes such as `OR` or richer expression trees
+
+This is intentionally TPCH-oriented rather than PostgreSQL-generic. It gives
+Q6 and Q1 a fast path without introducing query-specific execution entry
+points.
 
 ### Q6 projection kernel
 
@@ -574,6 +633,11 @@ At the end of all chunks:
 So the only `columnar -> row` conversion for Q6 happens at the very end, for a
 single scalar result.
 
+One important implementation detail is that `DECIMAL(15,2)` values now leave
+PostgreSQL packed `Numeric` form through a dedicated scale-2 fast path during
+deform. That fast path handles the common TPC-H finite numeric layout directly
+and falls back to the generic decoder when needed.
+
 ### Q6 operator graph
 
 The intended Q6 execution graph is:
@@ -607,6 +671,26 @@ If Q6 is implemented this way, we prove five important things early:
 Once these are stable, Q1 becomes mostly "Q6 plus grouped aggregation and more
 projection expressions", which is a much better next step than starting with a
 generic grouped engine first.
+
+### Current performance notes
+
+On the current local 10GB TPC-H environment:
+
+- `Q6` is now effectively at parity with core PostgreSQL
+  - median `pg_vec=off`: `4739.627 ms`
+  - median `pg_vec=on`: `4739.942 ms`
+- `Q1` shows a material win on the same engine path
+  - median `pg_vec=off`: `21622.518 ms`
+  - median `pg_vec=on`: `10542.608 ms`
+
+The most recent improvements that moved Q6 from a regression to parity were:
+
+- switching the scanner to PostgreSQL's `read_stream` sequential scan path
+- adding the `DECIMAL(15,2)` deform fast path
+- adding typed selection-vector filter kernels for simple conjunctive filters
+
+The next likely hotspot for Q6-style queries is aggregate input expression
+evaluation, which still uses the generic expression interpreter.
 
 ### Aggregation strategy
 
@@ -717,7 +801,7 @@ The following support matrix is the target lowering behavior:
 
 ## Suggested File Layout
 
-The final implementation should likely grow into something like this:
+The implementation is currently organized like this:
 
 ```text
 contrib/pg_vec/
@@ -728,10 +812,41 @@ contrib/pg_vec/
       pg_vec.c
       state.h
       state.c
-      lower.h
-      lower.c
-      scan.h
-      scan.c
+      execute.h
+      execute.c
+    ir/
+      vec_ir.h
+    translate/
+      pg_translate.h
+      pg_translate.c
+    engine/
+      data_chunk.hpp
+      data_chunk_deform.hpp
+      scan_filter_agg_exec.cpp
+      vec_exec_api.h
+```
+
+The likely next refinement is to split `scan_filter_agg_exec.cpp` into more
+focused engine modules once the scan/filter/agg/join kernels stabilize.
+
+The final implementation should likely grow further into something like this:
+
+```text
+contrib/pg_vec/
+  src/
+    bridge/
+      pg_vec.c
+      state.c
+      execute.c
+    ir/
+      vec_ir.h
+      vec_plan_ir.h
+      vec_expr_ir.h
+    translate/
+      pg_plan_translate.c
+      pg_expr_translate.c
+      pg_agg_translate.c
+    bridge/
       result_sink.h
       result_sink.c
     engine/
@@ -750,7 +865,7 @@ Exact filenames are flexible, but the layering should stay stable.
 
 ## Implementation Priorities
 
-The shortest path to a useful executor is:
+The original shortest path was:
 
 1. Bring up the bridge and lifecycle state.
 2. Implement `DataChunk` scan/filter/global agg for Q6.
@@ -759,6 +874,24 @@ The shortest path to a useful executor is:
 5. Add semi/anti join lowering for Q4/Q16/Q18/Q21/Q22.
 6. Add scalar and correlated aggregate subquery rewriting for Q2/Q11/Q15/Q17/Q20/Q22.
 7. Add left join and `COUNT(DISTINCT ...)` for Q13/Q16.
+
+The current status against that plan is:
+
+- steps 1 through 3 are done
+- step 4 is in progress
+  - a minimal two-input inner join plus aggregate path exists
+  - the current regression `q14` shape is covered
+  - broader live TPCH join/lowering coverage still needs work
+- steps 5 through 7 have not started yet as full features
+
+The current near-term priority is:
+
+1. widen the generic join/lowering path so live TPCH `Q12`, `Q14`, and `Q19`
+   all use the same engine path
+2. keep reducing interpreter work in hot loops, especially aggregate input
+   expression evaluation
+3. extend filter fast paths from simple conjunctive comparisons to `OR`,
+   `IN (...)`, and aggregate-local filters
 
 This sequence gets to "TPC-H runs end-to-end" much faster than chasing generic
 executor parity.

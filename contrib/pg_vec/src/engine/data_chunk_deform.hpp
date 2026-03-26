@@ -26,8 +26,11 @@ static constexpr uint16 kNumericNeg = 0x4000;
 static constexpr uint16 kNumericShort = 0x8000;
 static constexpr uint16 kNumericSpecial = 0xC000;
 static constexpr uint16 kNumericShortSignMask = 0x2000;
+static constexpr uint16 kNumericShortDscaleMask = 0x1F80;
+static constexpr uint16 kNumericShortDscaleShift = 7;
 static constexpr uint16 kNumericShortWeightSignMask = 0x0040;
 static constexpr uint16 kNumericShortWeightMask = 0x003F;
+static constexpr uint16 kNumericDscaleMask = 0x3FFF;
 
 enum class DeformDecodeKind : uint8_t
 {
@@ -100,6 +103,15 @@ struct DeformBindings
 	int			ncolumns;
 };
 
+struct NumericDecodeInfo
+{
+	const char *digits_ptr;
+	int			sign;
+	int			weight;
+	int			dscale;
+	int			ndigits;
+};
+
 static inline uint16
 load_u16_unaligned(const void *ptr)
 {
@@ -139,17 +151,12 @@ scale_numeric_accumulator(__int128 *value, int exponent)
 }
 
 static inline bool
-numeric_varlena_to_scaled_int64_inline(const void *ptr, int scale, int64 *out)
+parse_numeric_varlena_inline(const void *ptr, NumericDecodeInfo *out)
 {
 	const char *payload;
-	const char *digits_ptr;
 	Size		payload_size;
 	Size		header_size;
 	uint16		header;
-	int			sign;
-	int			weight;
-	int			ndigits;
-	__int128	accum = 0;
 
 	payload = VARDATA_ANY(ptr);
 	payload_size = VARSIZE_ANY_EXHDR(ptr);
@@ -162,8 +169,9 @@ numeric_varlena_to_scaled_int64_inline(const void *ptr, int scale, int64 *out)
 
 	if ((header & kNumericSignMask) == kNumericShort)
 	{
-		sign = (header & kNumericShortSignMask) ? kNumericNeg : 0;
-		weight = ((header & kNumericShortWeightSignMask) ?
+		out->sign = (header & kNumericShortSignMask) ? kNumericNeg : 0;
+		out->dscale = (header & kNumericShortDscaleMask) >> kNumericShortDscaleShift;
+		out->weight = ((header & kNumericShortWeightSignMask) ?
 				  ~kNumericShortWeightMask : 0) |
 			(header & kNumericShortWeightMask);
 		header_size = sizeof(uint16);
@@ -173,32 +181,146 @@ numeric_varlena_to_scaled_int64_inline(const void *ptr, int scale, int64 *out)
 		if (payload_size < sizeof(uint16) + sizeof(int16))
 			return false;
 
-		sign = header & kNumericSignMask;
-		weight = load_i16_unaligned(payload + sizeof(uint16));
+		out->sign = header & kNumericSignMask;
+		out->dscale = header & kNumericDscaleMask;
+		out->weight = load_i16_unaligned(payload + sizeof(uint16));
 		header_size = sizeof(uint16) + sizeof(int16);
 	}
 
 	if ((payload_size - header_size) % sizeof(int16) != 0)
 		return false;
 
-	digits_ptr = payload + header_size;
-	ndigits = (payload_size - header_size) / sizeof(int16);
+	out->digits_ptr = payload + header_size;
+	out->ndigits = (payload_size - header_size) / sizeof(int16);
+	return true;
+}
 
-	for (int i = 0; i < ndigits; i++)
+static inline bool
+load_numeric_digit(const NumericDecodeInfo &info, int idx, int16 *digit)
+{
+	if (idx < 0 || idx >= info.ndigits)
+		return false;
+
+	*digit = load_i16_unaligned(info.digits_ptr + idx * sizeof(int16));
+	return *digit >= 0 && *digit < kNumericBase;
+}
+
+static inline bool
+accumulate_base10000_int64(int64 *value, int16 digit)
+{
+	__int128	next = static_cast<__int128>(*value) * kNumericBase + digit;
+
+	if (next > PG_INT64_MAX)
+		return false;
+
+	*value = static_cast<int64>(next);
+	return true;
+}
+
+static inline bool
+multiply_int64_small(int64 *value, int factor)
+{
+	__int128	next = static_cast<__int128>(*value) * factor;
+
+	if (next > PG_INT64_MAX)
+		return false;
+
+	*value = static_cast<int64>(next);
+	return true;
+}
+
+static inline bool
+numeric_varlena_to_decimal64_scale2_fast_inline(const void *ptr, int64 *out)
+{
+	NumericDecodeInfo info;
+	int			integer_groups;
+	int			groups_from_digits;
+	int			fractional_idx;
+	int64		scaled = 0;
+	int16		digit;
+
+	if (!parse_numeric_varlena_inline(ptr, &info))
+		return false;
+
+	if (info.dscale > kDecimalScale2)
+		return false;
+
+	if (info.ndigits == 0)
 	{
-		int16		digit = load_i16_unaligned(digits_ptr + i * sizeof(int16));
+		*out = 0;
+		return true;
+	}
 
-		if (digit < 0 || digit >= kNumericBase)
+	if (info.weight < -1)
+		return false;
+
+	if (info.ndigits > info.weight + 2)
+		return false;
+
+	integer_groups = info.weight + 1;
+	if (integer_groups > 0)
+	{
+		groups_from_digits = (info.ndigits < integer_groups) ? info.ndigits : integer_groups;
+
+		for (int i = 0; i < groups_from_digits; i++)
+		{
+			if (!load_numeric_digit(info, i, &digit) ||
+				!accumulate_base10000_int64(&scaled, digit))
+				return false;
+		}
+
+		for (int i = groups_from_digits; i < integer_groups; i++)
+		{
+			if (!multiply_int64_small(&scaled, kNumericBase))
+				return false;
+		}
+	}
+
+	if (!multiply_int64_small(&scaled, 100))
+		return false;
+
+	fractional_idx = info.weight + 1;
+	if (fractional_idx >= 0 && fractional_idx < info.ndigits)
+	{
+		if (!load_numeric_digit(info, fractional_idx, &digit) || (digit % 100) != 0)
+			return false;
+		scaled += digit / 100;
+	}
+
+	if (info.sign == kNumericNeg)
+		scaled = -scaled;
+
+	*out = scaled;
+	return true;
+}
+
+static inline bool
+numeric_varlena_to_scaled_int64_inline(const void *ptr, int scale, int64 *out)
+{
+	NumericDecodeInfo info;
+	__int128	accum = 0;
+	int16		digit;
+
+	if (scale == kDecimalScale2 &&
+		numeric_varlena_to_decimal64_scale2_fast_inline(ptr, out))
+		return true;
+
+	if (!parse_numeric_varlena_inline(ptr, &info))
+		return false;
+
+	for (int i = 0; i < info.ndigits; i++)
+	{
+		if (!load_numeric_digit(info, i, &digit))
 			return false;
 
 		accum = accum * kNumericBase + digit;
 	}
 
 	if (!scale_numeric_accumulator(&accum,
-								   kNumericDecDigits * (weight - ndigits + 1) + scale))
+								   kNumericDecDigits * (info.weight - info.ndigits + 1) + scale))
 		return false;
 
-	if (sign == kNumericNeg)
+	if (info.sign == kNumericNeg)
 		accum = -accum;
 
 	if (accum < PG_INT64_MIN || accum > PG_INT64_MAX)

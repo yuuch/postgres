@@ -112,6 +112,29 @@ struct EvalContext
 	ExecInputCursor inputs[PG_VEC_MAX_INPUTS];
 };
 
+struct BoundFilterClause
+{
+	int			column_idx;
+	PgVecScalarKind scalar_kind;
+	PgVecFilterOp op;
+	PgVecConstValue constant;
+};
+
+struct BoundFilterProgram
+{
+	bool		valid;
+	int			nclauses;
+	BoundFilterClause clauses[PG_VEC_MAX_FILTER_NODES];
+
+	void
+	reset()
+	{
+		valid = false;
+		nclauses = 0;
+	}
+};
+
+static ExecDataChunk *allocate_exec_chunk(const PgVecInputSpec *spec);
 static bool string_equals(const PgVecStringConst &lhs, const PgVecStringConst &rhs);
 static int compare_string(const PgVecStringConst &lhs, const PgVecStringConst &rhs);
 static bool compare_string_value(const PgVecStringConst &lhs,
@@ -237,6 +260,19 @@ MaterializedInput::append_row(const ExecDataChunk &chunk, std::uint16_t row)
 	row_count++;
 }
 
+static ExecDataChunk *
+allocate_exec_chunk(const PgVecInputSpec *spec)
+{
+	ExecDataChunk *chunk;
+
+	chunk = reinterpret_cast<ExecDataChunk *>(palloc0(sizeof(ExecDataChunk)));
+	chunk->ncolumns = spec->ncolumns;
+	for (int i = 0; i < chunk->ncolumns; i++)
+		chunk->column_kinds[i] = spec->columns[i].scalar_kind;
+
+	return chunk;
+}
+
 static DeformDecodeKind
 decode_kind_for_scalar(PgVecScalarKind scalar_kind)
 {
@@ -292,6 +328,184 @@ build_deform_program(const PgVecInputSpec *input)
 	return program;
 }
 
+static PgVecFilterOp
+reverse_filter_op(PgVecFilterOp op)
+{
+	switch (op)
+	{
+		case PG_VEC_OP_EQ:
+			return PG_VEC_OP_EQ;
+		case PG_VEC_OP_LT:
+			return PG_VEC_OP_GT;
+		case PG_VEC_OP_LE:
+			return PG_VEC_OP_GE;
+		case PG_VEC_OP_GT:
+			return PG_VEC_OP_LT;
+		case PG_VEC_OP_GE:
+			return PG_VEC_OP_LE;
+		case PG_VEC_OP_PREFIX_LIKE:
+		case PG_VEC_OP_INVALID:
+		default:
+			return PG_VEC_OP_INVALID;
+	}
+}
+
+static bool
+bound_filter_supports_scalar(PgVecScalarKind scalar_kind)
+{
+	switch (scalar_kind)
+	{
+		case PG_VEC_SCALAR_INT32:
+		case PG_VEC_SCALAR_DATE32:
+		case PG_VEC_SCALAR_DECIMAL64_S2:
+		case PG_VEC_SCALAR_CHAR1:
+		case PG_VEC_SCALAR_STRING128:
+			return true;
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+		case PG_VEC_SCALAR_INVALID:
+		default:
+			return false;
+	}
+}
+
+static bool
+append_bound_filter_clause(BoundFilterProgram *program,
+						   int column_idx,
+						   PgVecScalarKind scalar_kind,
+						   PgVecFilterOp op,
+						   const PgVecConstValue &constant)
+{
+	if (program->nclauses >= PG_VEC_MAX_FILTER_NODES)
+		return false;
+
+	program->clauses[program->nclauses].column_idx = column_idx;
+	program->clauses[program->nclauses].scalar_kind = scalar_kind;
+	program->clauses[program->nclauses].op = op;
+	program->clauses[program->nclauses].constant = constant;
+	program->nclauses++;
+	return true;
+}
+
+static bool
+bind_compare_clause(const PgVecInputSpec *input,
+					uint8 input_id,
+					const PgVecFilterSpec &filter,
+					int qual_idx,
+					BoundFilterProgram *program)
+{
+	const PgVecExprNode *column_expr;
+	const PgVecExprNode *const_expr;
+	PgVecFilterOp op;
+	int			column_idx;
+
+	if (qual_idx < 0 || qual_idx >= filter.nnodes)
+		return false;
+
+	const PgVecQualNode &qual = filter.nodes[qual_idx];
+
+	if (qual.kind != PG_VEC_QUAL_COMPARE ||
+		qual.lhs_expr < 0 || qual.lhs_expr >= filter.exprs.nnodes ||
+		qual.rhs_expr < 0 || qual.rhs_expr >= filter.exprs.nnodes)
+		return false;
+
+	const PgVecExprNode &lhs_expr = filter.exprs.nodes[qual.lhs_expr];
+	const PgVecExprNode &rhs_expr = filter.exprs.nodes[qual.rhs_expr];
+
+	op = qual.op;
+	if (lhs_expr.kind == PG_VEC_EXPR_COLUMN && rhs_expr.kind == PG_VEC_EXPR_CONST)
+	{
+		column_expr = &lhs_expr;
+		const_expr = &rhs_expr;
+	}
+	else if (lhs_expr.kind == PG_VEC_EXPR_CONST &&
+			 rhs_expr.kind == PG_VEC_EXPR_COLUMN &&
+			 qual.op != PG_VEC_OP_PREFIX_LIKE)
+	{
+		op = reverse_filter_op(qual.op);
+		if (op == PG_VEC_OP_INVALID)
+			return false;
+		column_expr = &rhs_expr;
+		const_expr = &lhs_expr;
+	}
+	else
+	{
+		return false;
+	}
+
+	if (column_expr->column.input_id != input_id ||
+		column_expr->column.scalar_kind != const_expr->scalar_kind ||
+		!bound_filter_supports_scalar(column_expr->column.scalar_kind))
+		return false;
+
+	if (op == PG_VEC_OP_PREFIX_LIKE &&
+		column_expr->column.scalar_kind != PG_VEC_SCALAR_STRING128)
+		return false;
+
+	column_idx = scan_column_index(input, column_expr->column.attno);
+	if (column_idx < 0)
+		return false;
+
+	return append_bound_filter_clause(program,
+									  column_idx,
+									  column_expr->column.scalar_kind,
+									  op,
+									  const_expr->constant);
+}
+
+static bool
+bind_filter_clauses(const PgVecInputSpec *input,
+					uint8 input_id,
+					const PgVecFilterSpec &filter,
+					int qual_idx,
+					BoundFilterProgram *program)
+{
+	if (qual_idx < 0 || qual_idx >= filter.nnodes)
+		return false;
+
+	const PgVecQualNode &qual = filter.nodes[qual_idx];
+
+	switch (qual.kind)
+	{
+		case PG_VEC_QUAL_COMPARE:
+			return bind_compare_clause(input, input_id, filter, qual_idx, program);
+		case PG_VEC_QUAL_AND:
+			return bind_filter_clauses(input, input_id, filter, qual.left, program) &&
+				bind_filter_clauses(input, input_id, filter, qual.right, program);
+		case PG_VEC_QUAL_OR:
+		case PG_VEC_QUAL_INVALID:
+		default:
+			return false;
+	}
+}
+
+static BoundFilterProgram
+build_bound_input_filter(const PgVecInputSpec *input, uint8 input_id)
+{
+	BoundFilterProgram program;
+
+	program.reset();
+
+	if (input->filter.nnodes == 0)
+	{
+		program.valid = true;
+		return program;
+	}
+
+	if (input->filter.root < 0)
+		return program;
+
+	program.valid = bind_filter_clauses(input,
+										 input_id,
+										 input->filter,
+										 input->filter.root,
+										 &program);
+	if (!program.valid)
+		program.nclauses = 0;
+
+	return program;
+}
+
 struct ExecChunkBindings
 {
 	DeformColumnBinding columns[PG_VEC_MAX_SCAN_COLUMNS];
@@ -344,23 +558,20 @@ public:
 		desc_(RelationGetDescr(rel)),
 		program_(build_deform_program(input_)),
 		deformer_(desc_, &program_)
-	{
-		uint32		flags = SO_TYPE_SEQSCAN |
-			SO_ALLOW_STRAT |
-			SO_ALLOW_SYNC |
-			SO_ALLOW_PAGEMODE;
+		{
+			uint32		flags = SO_TYPE_SEQSCAN |
+				SO_ALLOW_STRAT |
+				SO_ALLOW_SYNC |
+				SO_ALLOW_PAGEMODE;
 
-		scan_ = (HeapScanDesc) heap_beginscan(rel_,
-												 snapshot_,
-												 0,
-												 NULL,
-												 NULL,
-												 flags);
-		total_blocks_ = scan_->rs_nblocks;
-		blocks_scanned_ = 0;
-		next_block_ = (total_blocks_ == 0) ? InvalidBlockNumber : scan_->rs_startblock;
-		page_visible_index_ = 0;
-	}
+			scan_ = (HeapScanDesc) heap_beginscan(rel_,
+													 snapshot_,
+													 0,
+													 NULL,
+													 NULL,
+													 flags);
+			page_visible_index_ = 0;
+		}
 
 	~HeapDataChunkScanner()
 	{
@@ -395,56 +606,63 @@ private:
 	{
 		while (true)
 		{
-			if (BufferIsValid(scan_->rs_cbuf) &&
-				page_visible_index_ < scan_->rs_ntuples)
-				return true;
+				if (BufferIsValid(scan_->rs_cbuf) &&
+					page_visible_index_ < scan_->rs_ntuples)
+					return true;
 
-			release_current_page();
-
-			if (blocks_scanned_ >= total_blocks_ || next_block_ == InvalidBlockNumber)
-				return false;
-
-			load_next_page();
-			if (scan_->rs_ntuples > 0)
-				return true;
+				release_current_page();
+				load_next_page();
+				if (!BufferIsValid(scan_->rs_cbuf))
+					return false;
+				if (scan_->rs_ntuples > 0)
+					return true;
+			}
 		}
-	}
 
 	void
-	load_next_page()
-	{
-		Buffer		buffer;
+		load_next_page()
+		{
+			if (BufferIsValid(scan_->rs_cbuf))
+			{
+				ReleaseBuffer(scan_->rs_cbuf);
+				scan_->rs_cbuf = InvalidBuffer;
+			}
 
-		CHECK_FOR_INTERRUPTS();
+			CHECK_FOR_INTERRUPTS();
 
-		buffer = ReadBufferExtended(scan_->rs_base.rs_rd,
-									MAIN_FORKNUM,
-									next_block_,
-									RBM_NORMAL,
-									scan_->rs_strategy);
-		scan_->rs_cbuf = buffer;
-		scan_->rs_cblock = next_block_;
-		heap_prepare_pagescan((TableScanDesc) scan_);
-		page_visible_index_ = 0;
+			if (unlikely(scan_->rs_dir != ForwardScanDirection))
+			{
+				scan_->rs_prefetch_block = scan_->rs_cblock;
+				read_stream_reset(scan_->rs_read_stream);
+			}
 
-		blocks_scanned_++;
-		if (blocks_scanned_ >= total_blocks_)
-			next_block_ = InvalidBlockNumber;
-		else
-			next_block_ = (next_block_ + 1) % total_blocks_;
-	}
+			scan_->rs_dir = ForwardScanDirection;
+			scan_->rs_cbuf = read_stream_next_buffer(scan_->rs_read_stream, NULL);
+			if (!BufferIsValid(scan_->rs_cbuf))
+			{
+				scan_->rs_cblock = InvalidBlockNumber;
+				scan_->rs_ntuples = 0;
+				page_visible_index_ = 0;
+				return;
+			}
+
+			scan_->rs_cblock = BufferGetBlockNumber(scan_->rs_cbuf);
+			heap_prepare_pagescan((TableScanDesc) scan_);
+			page_visible_index_ = 0;
+		}
 
 	void
 	release_current_page()
 	{
-		if (BufferIsValid(scan_->rs_cbuf))
-		{
-			ReleaseBuffer(scan_->rs_cbuf);
-			scan_->rs_cbuf = InvalidBuffer;
+			if (BufferIsValid(scan_->rs_cbuf))
+			{
+				ReleaseBuffer(scan_->rs_cbuf);
+				scan_->rs_cbuf = InvalidBuffer;
+			}
+			scan_->rs_cblock = InvalidBlockNumber;
+			scan_->rs_ntuples = 0;
+			page_visible_index_ = 0;
 		}
-		scan_->rs_ntuples = 0;
-		page_visible_index_ = 0;
-	}
 
 	bool
 	append_visible_tuple(ExecDataChunk &chunk, const DeformBindings &bindings)
@@ -467,13 +685,10 @@ private:
 	const PgVecInputSpec *input_;
 	HeapScanDesc scan_;
 	TupleDesc	desc_;
-	DeformProgram program_;
-	DataChunkDeformer deformer_;
-	BlockNumber next_block_;
-	BlockNumber total_blocks_;
-	BlockNumber blocks_scanned_;
-	uint32		page_visible_index_;
-};
+		DeformProgram program_;
+		DataChunkDeformer deformer_;
+		uint32		page_visible_index_;
+	};
 
 static bool
 string_equals(const PgVecStringConst &lhs, const PgVecStringConst &rhs)
@@ -905,9 +1120,130 @@ eval_qual(const PgVecFilterSpec &filter,
 }
 
 static void
-filter_chunk(uint8 input_id, const PgVecInputSpec *input, ExecDataChunk &chunk)
+select_all_rows(ExecDataChunk &chunk)
+{
+	chunk.sel.count = chunk.count;
+	for (std::uint16_t row = 0; row < chunk.count; row++)
+		chunk.sel.row_ids[row] = row;
+}
+
+template <typename T>
+static void
+apply_bound_compare_clause(SelectionVector<kExecChunkCapacity> *sel,
+						   const T *values,
+						   T constant,
+						   PgVecFilterOp op)
+{
+	std::uint16_t next_count = 0;
+
+	for (std::uint16_t i = 0; i < sel->count; i++)
+	{
+		std::uint16_t row = sel->row_ids[i];
+
+		if (compare_value(values[row], constant, op))
+			sel->row_ids[next_count++] = row;
+	}
+
+	sel->count = next_count;
+}
+
+static void
+apply_bound_string_clause(SelectionVector<kExecChunkCapacity> *sel,
+						  const PgVecStringConst *values,
+						  const PgVecStringConst &constant,
+						  PgVecFilterOp op)
+{
+	std::uint16_t next_count = 0;
+
+	for (std::uint16_t i = 0; i < sel->count; i++)
+	{
+		std::uint16_t row = sel->row_ids[i];
+		bool		match;
+
+		if (op == PG_VEC_OP_PREFIX_LIKE)
+			match = string_starts_with(values[row], constant);
+		else
+			match = compare_string_value(values[row], constant, op);
+
+		if (match)
+			sel->row_ids[next_count++] = row;
+	}
+
+	sel->count = next_count;
+}
+
+static bool
+filter_chunk_fast(const BoundFilterProgram &program, ExecDataChunk &chunk)
+{
+	select_all_rows(chunk);
+
+	for (int clause_idx = 0; clause_idx < program.nclauses; clause_idx++)
+	{
+		const BoundFilterClause &clause = program.clauses[clause_idx];
+
+		switch (clause.scalar_kind)
+		{
+			case PG_VEC_SCALAR_INT32:
+				apply_bound_compare_clause(&chunk.sel,
+										   chunk.int32_values[clause.column_idx],
+										   clause.constant.int32_value,
+										   clause.op);
+				break;
+			case PG_VEC_SCALAR_DATE32:
+				apply_bound_compare_clause(&chunk.sel,
+										   chunk.date32_values[clause.column_idx],
+										   clause.constant.date32,
+										   clause.op);
+				break;
+			case PG_VEC_SCALAR_DECIMAL64_S2:
+				apply_bound_compare_clause(&chunk.sel,
+										   chunk.decimal64_values[clause.column_idx],
+										   clause.constant.decimal64_s2,
+										   clause.op);
+				break;
+			case PG_VEC_SCALAR_CHAR1:
+				apply_bound_compare_clause(&chunk.sel,
+										   chunk.char1_values[clause.column_idx],
+										   clause.constant.char1,
+										   clause.op);
+				break;
+			case PG_VEC_SCALAR_STRING128:
+				apply_bound_string_clause(&chunk.sel,
+										  chunk.string128_values[clause.column_idx],
+										  clause.constant.string128,
+										  clause.op);
+				break;
+			case PG_VEC_SCALAR_DECIMAL128_S6:
+			case PG_VEC_SCALAR_DECIMAL128_S4:
+			case PG_VEC_SCALAR_INVALID:
+			default:
+				return false;
+		}
+
+		if (chunk.sel.count == 0)
+			break;
+	}
+
+	return true;
+}
+
+static void
+filter_chunk(uint8 input_id,
+			 const PgVecInputSpec *input,
+			 const BoundFilterProgram *bound_filter,
+			 ExecDataChunk &chunk)
 {
 	EvalContext eval_ctx{};
+
+	if (input->filter.nnodes == 0)
+	{
+		select_all_rows(chunk);
+		return;
+	}
+
+	if (bound_filter != nullptr && bound_filter->valid &&
+		filter_chunk_fast(*bound_filter, chunk))
+		return;
 
 	chunk.sel.clear();
 	eval_ctx.inputs[input_id].spec = input;
@@ -1196,23 +1532,20 @@ materialize_filtered_input(uint8 input_id,
 							MaterializedInput *materialized,
 							PgVecScanFilterAggExecResult *result)
 {
+	BoundFilterProgram bound_filter = build_bound_input_filter(&params->inputs[input_id],
+																  input_id);
 	HeapDataChunkScanner scanner(params->rels[input_id],
 								 params->snapshot,
 								 &params->inputs[input_id]);
-	ExecDataChunk chunk;
+	ExecDataChunk *chunk = allocate_exec_chunk(&params->inputs[input_id]);
 
-	std::memset(&chunk, 0, sizeof(chunk));
-	chunk.ncolumns = params->inputs[input_id].ncolumns;
-	for (int i = 0; i < chunk.ncolumns; i++)
-		chunk.column_kinds[i] = params->inputs[input_id].columns[i].scalar_kind;
-
-	while (scanner.next_chunk(chunk))
+	while (scanner.next_chunk(*chunk))
 	{
-		filter_chunk(input_id, &params->inputs[input_id], chunk);
-		result->rows_scanned += chunk.count;
-		result->rows_selected += chunk.sel.count;
-		for (std::uint16_t i = 0; i < chunk.sel.count; i++)
-			materialized->append_row(chunk, chunk.sel[i]);
+		filter_chunk(input_id, &params->inputs[input_id], &bound_filter, *chunk);
+		result->rows_scanned += chunk->count;
+		result->rows_selected += chunk->sel.count;
+		for (std::uint16_t i = 0; i < chunk->sel.count; i++)
+			materialized->append_row(*chunk, (*chunk).sel[i]);
 		result->chunks_scanned++;
 	}
 }
@@ -1225,29 +1558,26 @@ accumulate_single_input(const PgVecScanFilterAggExecParams *params,
 						std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index,
 						PgVecScanFilterAggExecResult *result)
 {
+	BoundFilterProgram bound_filter = build_bound_input_filter(&params->inputs[input_id],
+																  input_id);
 	HeapDataChunkScanner scanner(params->rels[input_id],
 								 params->snapshot,
 								 &params->inputs[input_id]);
-	ExecDataChunk chunk;
+	ExecDataChunk *chunk = allocate_exec_chunk(&params->inputs[input_id]);
 	EvalContext eval_ctx{};
 
-	std::memset(&chunk, 0, sizeof(chunk));
-	chunk.ncolumns = params->inputs[input_id].ncolumns;
-	for (int i = 0; i < chunk.ncolumns; i++)
-		chunk.column_kinds[i] = params->inputs[input_id].columns[i].scalar_kind;
-
 	eval_ctx.inputs[input_id].spec = &params->inputs[input_id];
-	eval_ctx.inputs[input_id].chunk = &chunk;
+	eval_ctx.inputs[input_id].chunk = chunk;
 	eval_ctx.inputs[input_id].materialized = nullptr;
 
-	while (scanner.next_chunk(chunk))
+	while (scanner.next_chunk(*chunk))
 	{
-		filter_chunk(input_id, &params->inputs[input_id], chunk);
-		result->rows_scanned += chunk.count;
-		result->rows_selected += chunk.sel.count;
-		for (std::uint16_t i = 0; i < chunk.sel.count; i++)
+		filter_chunk(input_id, &params->inputs[input_id], &bound_filter, *chunk);
+		result->rows_scanned += chunk->count;
+		result->rows_selected += chunk->sel.count;
+		for (std::uint16_t i = 0; i < chunk->sel.count; i++)
 		{
-			eval_ctx.inputs[input_id].chunk_row = chunk.sel[i];
+			eval_ctx.inputs[input_id].chunk_row = (*chunk).sel[i];
 			if (params->agg.grouped)
 				accumulate_grouped_eval(params, eval_ctx, groups, group_index);
 			else
@@ -1266,10 +1596,13 @@ accumulate_joined(const PgVecScanFilterAggExecParams *params,
 {
 	MaterializedInput right_input(&params->inputs[params->join.right_input]);
 	std::unordered_map<JoinKey, std::vector<std::size_t>, JoinKeyHash> right_hash;
+	BoundFilterProgram left_filter = build_bound_input_filter(
+		&params->inputs[params->join.left_input],
+		params->join.left_input);
 	HeapDataChunkScanner left_scanner(params->rels[params->join.left_input],
 									  params->snapshot,
 									  &params->inputs[params->join.left_input]);
-	ExecDataChunk left_chunk;
+	ExecDataChunk *left_chunk = allocate_exec_chunk(&params->inputs[params->join.left_input]);
 	EvalContext eval_ctx{};
 
 	materialize_filtered_input(params->join.right_input, params, &right_input, result);
@@ -1287,31 +1620,27 @@ accumulate_joined(const PgVecScanFilterAggExecParams *params,
 		right_hash[key].push_back(row_idx);
 	}
 
-	std::memset(&left_chunk, 0, sizeof(left_chunk));
-	left_chunk.ncolumns = params->inputs[params->join.left_input].ncolumns;
-	for (int i = 0; i < left_chunk.ncolumns; i++)
-		left_chunk.column_kinds[i] = params->inputs[params->join.left_input].columns[i].scalar_kind;
-
 	eval_ctx.inputs[params->join.left_input].spec = &params->inputs[params->join.left_input];
-	eval_ctx.inputs[params->join.left_input].chunk = &left_chunk;
+	eval_ctx.inputs[params->join.left_input].chunk = left_chunk;
 	eval_ctx.inputs[params->join.left_input].materialized = nullptr;
 	eval_ctx.inputs[params->join.right_input].spec = &params->inputs[params->join.right_input];
 	eval_ctx.inputs[params->join.right_input].materialized = &right_input;
 
-	while (left_scanner.next_chunk(left_chunk))
+	while (left_scanner.next_chunk(*left_chunk))
 	{
 		filter_chunk(params->join.left_input,
 					 &params->inputs[params->join.left_input],
-					 left_chunk);
-		result->rows_scanned += left_chunk.count;
-		result->rows_selected += left_chunk.sel.count;
+					 &left_filter,
+					 *left_chunk);
+		result->rows_scanned += left_chunk->count;
+		result->rows_selected += left_chunk->sel.count;
 
-		for (std::uint16_t i = 0; i < left_chunk.sel.count; i++)
+		for (std::uint16_t i = 0; i < left_chunk->sel.count; i++)
 		{
 			JoinKey		key{};
 			auto		it = right_hash.end();
 
-			eval_ctx.inputs[params->join.left_input].chunk_row = left_chunk.sel[i];
+			eval_ctx.inputs[params->join.left_input].chunk_row = (*left_chunk).sel[i];
 			if (!extract_join_key(eval_ctx, params->join, true, &key))
 				elog(ERROR, "pg_vec: failed to extract join probe key");
 

@@ -4,23 +4,34 @@
 
 - `Q1` is supported on the generic single-table `SeqScan -> Filter -> Agg`
   path.
-- `Q6` and `plain_expr` regressions are green.
-- The current engine is still missing the first generic join stage.
+- `Q6` uses the same generic single-table path and is now stable on the
+  columnar hot path.
+- The minimal inner-join plus aggregate path exists and the `q14` regression is
+  green.
+- `q1`, `q6`, `q14`, and `plain_expr` regressions are green.
+- The scan path now uses PostgreSQL's `read_stream` sequential path rather than
+  manual block walking.
+- `DECIMAL(15,2)` deform now has a common-case scale-2 fast path with generic
+  fallback.
+- Input filters now have a typed `AND + column-vs-constant` fast path over the
+  selection vector, with interpreter fallback for richer boolean shapes.
+- The next hot interpreter work is aggregate input expression evaluation and
+  broader join/lowering coverage for live TPC-H shapes.
 
 ## Rollout Order
 
 ### Stage 1: First Generic Join Path
 
-1. `Q14`
-   - first practical inner join target
-   - requires `INTEGER` join keys, `VARCHAR` prefix `LIKE`, conditional
-     aggregate, and final scalar arithmetic over aggregate results
-2. `Q12`
+1. `Q12`
    - reuses join
    - adds grouped aggregate with conditional sums
-3. `Q19`
+2. `Q19`
    - reuses join
    - stresses large DNF predicates on top of the same global aggregate shape
+3. widen `Q14`
+   - keep `Q14` on the same generic join path in live 10GB runs
+   - close remaining lowering gaps between the regression shape and the live
+     planner shape
 
 ### Stage 2: Join + Group + TopN
 
@@ -73,27 +84,28 @@
 
 ## Immediate Implementation Work
 
-### Q14
+### Performance Follow-up
 
-- Extend the IR with:
-  - multiple scan inputs
-  - one generic inner equi-join stage
+- Add a fast path for aggregate input expressions on selected rows.
+- Extend filter fast paths beyond simple conjunctive comparisons:
+  - `OR`
+  - `IN (...)`
   - aggregate-level filter predicates
-  - output expressions over aggregate results
-- Extend physical types with:
-  - `INTEGER -> int32`
-  - bounded inline strings for TPC-H `VARCHAR/CHAR(n)`
-- Extend the translator with:
-  - `Agg <- Join <- SeqScan/SeqScan` lowering
-  - join key extraction from PG join nodes
-  - conditional aggregate rewrite from `SUM(CASE WHEN ... THEN x ELSE 0 END)`
-  - prefix `LIKE` lowering
-- Extend the engine with:
+- Keep `Q6` at or above parity while preserving the `Q1` win on the same
+  engine path.
+
+### Join Coverage Follow-up
+
+- Broaden `Agg <- Join <- SeqScan/SeqScan` lowering to cover live TPCH `Q14`
+  planner shapes, not just the current regression shape.
+- Reuse that path for `Q12` grouped conditional aggregation.
+- Reuse the same path again for `Q19` once large DNF filter support is widened.
+- Keep the engine generic:
   - two-input scan + hash join
-  - aggregate filter evaluation on joined rows
+  - grouped/plain aggregate on joined rows
   - final output expression evaluation in the bridge sink
 
 ## Guardrails
 
-- Keep `q1`, `q6`, and `plain_expr` green after every stage.
+- Keep `q1`, `q6`, `q14`, and `plain_expr` green after every stage.
 - Add one regression per newly supported TPC-H query shape before moving on.
