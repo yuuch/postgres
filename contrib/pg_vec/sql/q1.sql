@@ -1,0 +1,52 @@
+SET client_min_messages = warning;
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = on;
+
+CREATE TABLE lineitem (
+	l_returnflag char(1) NOT NULL,
+	l_linestatus char(1) NOT NULL,
+	l_quantity numeric(15,2) NOT NULL,
+	l_extendedprice numeric(15,2) NOT NULL,
+	l_discount numeric(15,2) NOT NULL,
+	l_tax numeric(15,2) NOT NULL,
+	l_shipdate date NOT NULL
+);
+
+INSERT INTO lineitem (
+	l_returnflag,
+	l_linestatus,
+	l_quantity,
+	l_extendedprice,
+	l_discount,
+	l_tax,
+	l_shipdate
+)
+VALUES
+	('A', 'F', 10.00, 100.00, 0.05, 0.10, date '1998-08-31'),
+	('A', 'F', 20.00, 50.00, 0.00, 0.05, date '1998-09-02'),
+	('N', 'O', 5.00, 80.00, 0.10, 0.00, date '1998-07-15'),
+	('N', 'O', 15.00, 120.00, 0.20, 0.02, date '1998-10-01'),
+	('R', 'F', 7.00, 60.00, 0.05, 0.03, date '1998-01-01');
+
+SELECT
+	l_returnflag,
+	l_linestatus,
+	sum(l_quantity) AS sum_qty,
+	sum(l_extendedprice) AS sum_base_price,
+	sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+	sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+	avg(l_quantity) AS avg_qty,
+	avg(l_extendedprice) AS avg_price,
+	avg(l_discount) AS avg_disc,
+	count(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= date '1998-12-01' - interval '90' day
+GROUP BY
+	l_returnflag,
+	l_linestatus
+ORDER BY
+	l_returnflag,
+	l_linestatus;
+
+DROP TABLE lineitem;
+DROP EXTENSION pg_vec;
