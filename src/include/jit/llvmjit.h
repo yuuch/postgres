@@ -107,6 +107,7 @@ extern void llvm_reset_after_error(void);
 extern void llvm_assert_in_fatal_section(void);
 
 extern LLVMJitContext *llvm_create_context(int jitFlags);
+extern void llvm_release_context_direct(LLVMJitContext *context);
 extern LLVMModuleRef llvm_mutable_module(LLVMJitContext *context);
 extern char *llvm_expand_funcname(LLVMJitContext *context, const char *basename);
 extern void *llvm_get_function(LLVMJitContext *context, const char *funcname);

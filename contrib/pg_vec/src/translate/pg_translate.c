@@ -2,10 +2,16 @@
 
 #include <ctype.h>
 
+#include "executor/executor.h"
+#include "executor/nodeSubplan.h"
+#include "access/stratnum.h"
 #include "catalog/pg_type_d.h"
+#include "nodes/makefuncs.h"
+#include "nodes/params.h"
 #include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
 #include "parser/parsetree.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
@@ -14,6 +20,8 @@
 
 #include "pg_translate.h"
 
+extern Datum numeric_scale(PG_FUNCTION_ARGS);
+
 typedef struct PgVecInputContext {
   Index rtindex;
   Oid relid;
@@ -21,9 +29,17 @@ typedef struct PgVecInputContext {
 } PgVecInputContext;
 
 typedef struct PgVecLowerContext {
+  QueryDesc *queryDesc;
   int ninputs;
   PgVecInputContext inputs[PG_VEC_MAX_INPUTS];
 } PgVecLowerContext;
+
+typedef struct PgVecJoinTreeInfo {
+  int first_input;
+  int ninputs;
+  int njoins;
+  PgVecJoinSpec joins[PG_VEC_MAX_JOINS];
+} PgVecJoinTreeInfo;
 
 static bool
 pg_vec_try_translate_scan_filter_agg_plan(QueryDesc *queryDesc, PgVecPlan *plan,
@@ -50,13 +66,23 @@ static bool pg_vec_add_output_expr_node(PgVecOutputExprProgram *program,
                                         int *node_idx);
 static bool pg_vec_add_agg_call(PgVecAggSpec *agg, const PgVecAggCall *agg_call,
                                 int *agg_idx);
-static bool pg_vec_add_group_key(PgVecAggSpec *agg, PgVecColumnRef group_key,
+static bool pg_vec_add_group_key(PgVecAggSpec *agg,
+                                 const PgVecExprProgram *group_expr,
+                                 PgVecScalarKind scalar_kind,
                                  int *group_idx);
 static bool pg_vec_scalar_kind_from_pg_type(Oid type_oid, int32 typmod,
                                             PgVecScalarKind *scalar_kind);
 static bool pg_vec_lower_const_value(Const *constnode,
                                      PgVecScalarKind scalar_kind,
                                      PgVecConstValue *constant);
+static bool pg_vec_scalar_kind_from_const(Const *constnode,
+                                          bool has_expected_kind,
+                                          PgVecScalarKind expected_kind,
+                                          PgVecScalarKind *scalar_kind);
+static bool pg_vec_resolve_constlike_node(Node *node,
+                                          const PgVecLowerContext *ctx,
+                                          Const *runtime_const,
+                                          Const **constnode);
 static bool pg_vec_resolve_binary_expr_kind(PgVecExprKind expr_kind,
                                             PgVecScalarKind left_kind,
                                             PgVecScalarKind right_kind,
@@ -68,6 +94,8 @@ static bool pg_vec_resolve_binary_output_kind(PgVecOutputExprKind expr_kind,
 static Node *pg_vec_strip_implicit_casts(Node *node);
 static TargetEntry *pg_vec_find_tle_by_resno(List *targetlist,
                                              AttrNumber resno);
+static Node *pg_vec_resolve_var_through_plan_with_source(Node *node, Plan *plan,
+                                                         Plan **resolved_plan);
 static Node *pg_vec_resolve_var_through_plan(Node *node, Plan *plan);
 static bool pg_vec_lower_var(Var *var, const PgVecLowerContext *ctx,
                              PgVecPlan *plan, PgVecColumnRef *column_ref);
@@ -76,6 +104,12 @@ pg_vec_lower_expr_internal(Node *node, Plan *source_plan,
                            const PgVecLowerContext *ctx, PgVecPlan *plan,
                            PgVecExprProgram *program, bool has_expected_kind,
                            PgVecScalarKind expected_kind, int *expr_root);
+static bool pg_vec_try_lower_extract_year_expr(FuncExpr *func,
+                                               Plan *source_plan,
+                                               const PgVecLowerContext *ctx,
+                                               PgVecPlan *plan,
+                                               PgVecExprProgram *program,
+                                               int *expr_root);
 static bool pg_vec_lower_expr(Node *node, Plan *source_plan,
                               const PgVecLowerContext *ctx, PgVecPlan *plan,
                               PgVecExprProgram *program, int *expr_root);
@@ -84,14 +118,29 @@ static bool pg_vec_lower_compare_operands(
     PgVecPlan *plan, PgVecFilterSpec *filter, int *left_root, int *right_root);
 static bool pg_vec_try_parse_prefix_like(Const *constnode,
                                          PgVecStringConst *prefix);
+static bool pg_vec_try_parse_contains_like(Const *constnode,
+                                           PgVecStringConst *needle);
+static bool pg_vec_filter_op_from_name(const char *op_name,
+                                       PgVecFilterOp *filter_op);
+static bool pg_vec_lower_scalar_array_qual(ScalarArrayOpExpr *scalar_array,
+                                           Plan *source_plan,
+                                           const PgVecLowerContext *ctx,
+                                           PgVecPlan *plan,
+                                           PgVecFilterSpec *filter,
+                                           int *qual_root);
 static bool pg_vec_lower_qual(Node *node, Plan *source_plan,
                               const PgVecLowerContext *ctx, PgVecPlan *plan,
                               PgVecFilterSpec *filter, int *qual_root);
+static bool pg_vec_append_filter_quals(List *quals, Plan *source_plan,
+                                       const PgVecLowerContext *ctx,
+                                       PgVecPlan *plan, PgVecFilterSpec *filter);
 static bool pg_vec_lower_filter_quals(List *quals, Plan *source_plan,
                                       const PgVecLowerContext *ctx,
                                       PgVecPlan *plan, PgVecFilterSpec *filter);
 static bool pg_vec_agg_kind_from_aggref(Aggref *aggref, PgVecAggKind *agg_kind);
 static bool pg_vec_const_is_zero(Node *node);
+static Aggref *pg_vec_resolve_logical_aggref(Aggref *aggref, Plan *source_plan,
+                                             Plan **logical_source_plan);
 static bool pg_vec_try_lower_conditional_agg(Aggref *aggref, Plan *source_plan,
                                              const PgVecLowerContext *ctx,
                                              PgVecPlan *plan,
@@ -99,11 +148,43 @@ static bool pg_vec_try_lower_conditional_agg(Aggref *aggref, Plan *source_plan,
 static bool pg_vec_lower_agg_call(Aggref *aggref, Plan *source_plan,
                                   const PgVecLowerContext *ctx, PgVecPlan *plan,
                                   int *agg_idx);
+static void pg_vec_post_agg_filter_init(PgVecPostAggFilterSpec *filter);
+static bool pg_vec_add_post_agg_qual_node(PgVecPostAggFilterSpec *filter,
+                                          const PgVecQualNode *node,
+                                          int *node_idx);
+static bool pg_vec_add_post_agg_binary_qual(PgVecPostAggFilterSpec *filter,
+                                            PgVecQualKind kind,
+                                            int left_idx,
+                                            int right_idx,
+                                            int *node_idx);
+static bool pg_vec_lower_output_expr_internal(Node *node, Plan *source_plan,
+                                              const PgVecLowerContext *ctx,
+                                              PgVecPlan *plan,
+                                              PgVecOutputExprProgram *program,
+                                              bool has_expected_kind,
+                                              PgVecScalarKind expected_kind,
+                                              int *expr_root);
 static bool pg_vec_lower_output_expr(Node *node, Plan *source_plan,
                                      const PgVecLowerContext *ctx,
                                      PgVecPlan *plan,
                                      PgVecOutputExprProgram *program,
                                      int *expr_root);
+static bool pg_vec_lower_post_agg_compare_operands(Node *left, Node *right,
+                                                   Plan *source_plan,
+                                                   const PgVecLowerContext *ctx,
+                                                   PgVecPlan *plan,
+                                                   PgVecPostAggFilterSpec *filter,
+                                                   int *left_root,
+                                                   int *right_root);
+static bool pg_vec_lower_post_agg_qual(Node *node, Plan *source_plan,
+                                       const PgVecLowerContext *ctx,
+                                       PgVecPlan *plan,
+                                       PgVecPostAggFilterSpec *filter,
+                                       int *qual_root);
+static bool pg_vec_append_post_agg_filter_quals(List *quals, Plan *source_plan,
+                                                const PgVecLowerContext *ctx,
+                                                PgVecPlan *plan,
+                                                PgVecPostAggFilterSpec *filter);
 static bool pg_vec_lower_agg_targetlist(QueryDesc *queryDesc, List *targetlist,
                                         Plan *source_plan,
                                         const PgVecLowerContext *ctx,
@@ -111,20 +192,39 @@ static bool pg_vec_lower_agg_targetlist(QueryDesc *queryDesc, List *targetlist,
 static bool pg_vec_make_single_input_context(SeqScan *seqscan,
                                              PlannedStmt *plannedstmt,
                                              PgVecLowerContext *ctx);
-static bool pg_vec_make_join_input_context(SeqScan *left_scan,
-                                           SeqScan *right_scan,
-                                           PlannedStmt *plannedstmt,
-                                           PgVecLowerContext *ctx);
+static bool pg_vec_add_input_context(SeqScan *seqscan,
+                                     PlannedStmt *plannedstmt,
+                                     PgVecLowerContext *ctx,
+                                     PgVecPlan *plan,
+                                     int *input_id);
 static bool pg_vec_lower_join_key_expr(Node *node, Plan *join_plan,
                                        const PgVecLowerContext *ctx,
                                        PgVecPlan *plan,
                                        PgVecColumnRef *column_ref);
 static bool pg_vec_lower_join_keys_from_list(List *clauses, Plan *join_plan,
                                              const PgVecLowerContext *ctx,
-                                             PgVecPlan *plan);
+                                             PgVecPlan *plan,
+                                             PgVecJoinSpec *join_spec);
 static bool pg_vec_lower_join_spec(Plan *join_plan,
+                                   PgVecJoinKind join_kind,
                                    const PgVecLowerContext *ctx,
+                                   PgVecPlan *plan,
+                                   PgVecJoinSpec *join_spec);
+static List *pg_vec_join_quals(Plan *join_plan);
+static Plan *pg_vec_strip_plan_wrappers(Plan *plan);
+static bool pg_vec_top_agg_split_supported(const Agg *agg);
+static bool pg_vec_join_tree_agg_elidable(const Agg *agg);
+static bool pg_vec_output_index_for_resno(List *targetlist, AttrNumber resno,
+                                          int *output_idx);
+static bool pg_vec_sort_key_descending(Oid sort_operator, bool *descending);
+static bool pg_vec_lower_topn_spec(Limit *limit, Sort *sort, List *targetlist,
                                    PgVecPlan *plan);
+static bool pg_vec_lower_grouped_input_sort_spec(const Agg *agg, Sort *sort,
+                                                 PgVecPlan *plan);
+static bool pg_vec_lower_join_tree(Plan *subplan, PlannedStmt *plannedstmt,
+                                   PgVecLowerContext *ctx, PgVecPlan *plan,
+                                   PgVecJoinTreeInfo *info,
+                                   const char **failure_reason);
 static bool pg_vec_numeric_to_scaled_int64(Datum value, int scale, int64 *out);
 static bool pg_vec_parse_scaled_int64(const char *str, int scale, int64 *out);
 static void pg_vec_set_failure_reason(const char **failure_reason,
@@ -199,6 +299,7 @@ static void pg_vec_set_failure_reason(const char **failure_reason,
 static void pg_vec_plan_init(PgVecPlan *plan) {
   MemSet(plan, 0, sizeof(*plan));
   plan->kind = PG_VEC_PLAN_UNSUPPORTED;
+  pg_vec_post_agg_filter_init(&plan->agg.having);
   for (int input_id = 0; input_id < PG_VEC_MAX_INPUTS; input_id++)
     pg_vec_input_spec_init(&plan->inputs[input_id]);
 }
@@ -222,6 +323,13 @@ static void pg_vec_filter_spec_init(PgVecFilterSpec *filter) {
 static void pg_vec_output_expr_program_init(PgVecOutputExprProgram *program) {
   MemSet(program, 0, sizeof(*program));
   program->root = -1;
+}
+
+static void
+pg_vec_post_agg_filter_init(PgVecPostAggFilterSpec *filter) {
+  MemSet(filter, 0, sizeof(*filter));
+  filter->root = -1;
+  pg_vec_output_expr_program_init(&filter->exprs);
 }
 
 static bool pg_vec_add_scan_column(PgVecInputSpec *input, uint8 input_id,
@@ -304,15 +412,28 @@ static bool pg_vec_add_agg_call(PgVecAggSpec *agg, const PgVecAggCall *agg_call,
   return true;
 }
 
-static bool pg_vec_add_group_key(PgVecAggSpec *agg, PgVecColumnRef group_key,
+static bool
+pg_vec_expr_program_equal(const PgVecExprProgram *lhs,
+                          const PgVecExprProgram *rhs)
+{
+  if (lhs->root != rhs->root || lhs->nnodes != rhs->nnodes)
+    return false;
+  if (lhs->nnodes == 0)
+    return true;
+  return memcmp(lhs->nodes,
+                rhs->nodes,
+                sizeof(PgVecExprNode) * lhs->nnodes) == 0;
+}
+
+static bool pg_vec_add_group_key(PgVecAggSpec *agg,
+                                 const PgVecExprProgram *group_expr,
+                                 PgVecScalarKind scalar_kind,
                                  int *group_idx) {
   for (int i = 0; i < agg->ngroup_keys; i++) {
-    if (agg->group_keys[i].input_id != group_key.input_id ||
-        agg->group_keys[i].attno != group_key.attno)
+    if (agg->group_keys[i].scalar_kind != scalar_kind)
       continue;
-
-    if (agg->group_keys[i].scalar_kind != group_key.scalar_kind)
-      return false;
+    if (!pg_vec_expr_program_equal(&agg->group_keys[i].expr, group_expr))
+      continue;
 
     *group_idx = i;
     return true;
@@ -321,7 +442,8 @@ static bool pg_vec_add_group_key(PgVecAggSpec *agg, PgVecColumnRef group_key,
   if (agg->ngroup_keys >= PG_VEC_MAX_GROUP_KEYS)
     return false;
 
-  agg->group_keys[agg->ngroup_keys] = group_key;
+  agg->group_keys[agg->ngroup_keys].scalar_kind = scalar_kind;
+  agg->group_keys[agg->ngroup_keys].expr = *group_expr;
   *group_idx = agg->ngroup_keys;
   agg->ngroup_keys++;
   return true;
@@ -354,6 +476,37 @@ static bool pg_vec_scalar_kind_from_pg_type(Oid type_oid, int32 typmod,
   }
 }
 
+static bool
+pg_vec_scalar_kind_from_const(Const *constnode, bool has_expected_kind,
+                              PgVecScalarKind expected_kind,
+                              PgVecScalarKind *scalar_kind) {
+  int32 dscale;
+
+  if (constnode == NULL || scalar_kind == NULL || constnode->constisnull)
+    return false;
+  if (has_expected_kind) {
+    *scalar_kind = expected_kind;
+    return true;
+  }
+  if (constnode->consttype != NUMERICOID)
+    return pg_vec_scalar_kind_from_pg_type(constnode->consttype,
+                                           constnode->consttypmod,
+                                           scalar_kind);
+
+  dscale = DatumGetInt32(DirectFunctionCall1(numeric_scale,
+                                             constnode->constvalue));
+  if (dscale <= 2)
+    *scalar_kind = PG_VEC_SCALAR_DECIMAL128_S2;
+  else if (dscale <= 4)
+    *scalar_kind = PG_VEC_SCALAR_DECIMAL128_S4;
+  else if (dscale <= 6)
+    *scalar_kind = PG_VEC_SCALAR_DECIMAL128_S6;
+  else
+    return false;
+
+  return true;
+}
+
 static bool pg_vec_lower_const_value(Const *constnode,
                                      PgVecScalarKind scalar_kind,
                                      PgVecConstValue *constant) {
@@ -383,9 +536,20 @@ static bool pg_vec_lower_const_value(Const *constnode,
     return false;
 
   case PG_VEC_SCALAR_DECIMAL64_S2:
+  case PG_VEC_SCALAR_DECIMAL128_S2:
     if (constnode->consttype != NUMERICOID)
       return false;
     return pg_vec_numeric_to_scaled_int64(constnode->constvalue, 2,
+                                          &constant->decimal64_s2);
+  case PG_VEC_SCALAR_DECIMAL128_S4:
+    if (constnode->consttype != NUMERICOID)
+      return false;
+    return pg_vec_numeric_to_scaled_int64(constnode->constvalue, 4,
+                                          &constant->decimal64_s2);
+  case PG_VEC_SCALAR_DECIMAL128_S6:
+    if (constnode->consttype != NUMERICOID)
+      return false;
+    return pg_vec_numeric_to_scaled_int64(constnode->constvalue, 6,
                                           &constant->decimal64_s2);
 
   case PG_VEC_SCALAR_CHAR1:
@@ -414,12 +578,61 @@ static bool pg_vec_lower_const_value(Const *constnode,
            PG_VEC_INLINE_STRING_MAX - strlen);
     return true;
 
-  case PG_VEC_SCALAR_DECIMAL128_S6:
-  case PG_VEC_SCALAR_DECIMAL128_S4:
   case PG_VEC_SCALAR_INVALID:
   default:
     return false;
   }
+}
+
+static bool
+pg_vec_resolve_constlike_node(Node *node,
+                              const PgVecLowerContext *ctx,
+                              Const *runtime_const,
+                              Const **constnode)
+{
+  Param *param;
+  EState *estate;
+  ExprContext *econtext;
+  ParamExecData *prm;
+
+  if (constnode != NULL)
+    *constnode = NULL;
+  if (node == NULL)
+    return false;
+  if (IsA(node, Const)) {
+    if (constnode != NULL)
+      *constnode = castNode(Const, node);
+    return true;
+  }
+  if (!IsA(node, Param))
+    return false;
+
+  param = castNode(Param, node);
+  if (param->paramkind != PARAM_EXEC || ctx == NULL || ctx->queryDesc == NULL ||
+      ctx->queryDesc->estate == NULL || runtime_const == NULL)
+    return false;
+  if (param->paramid < 0 ||
+      param->paramid >= list_length(ctx->queryDesc->plannedstmt->paramExecTypes))
+    return false;
+
+  estate = ctx->queryDesc->estate;
+  econtext = GetPerTupleExprContext(estate);
+  prm = &estate->es_param_exec_vals[param->paramid];
+  if (prm->execPlan != NULL)
+    ExecSetParamPlan((SubPlanState *)prm->execPlan, econtext);
+
+  MemSet(runtime_const, 0, sizeof(*runtime_const));
+  runtime_const->xpr.type = T_Const;
+  runtime_const->consttype = param->paramtype;
+  runtime_const->consttypmod = param->paramtypmod;
+  runtime_const->constcollid = param->paramcollid;
+  runtime_const->constisnull = prm->isnull;
+  runtime_const->constvalue = prm->value;
+  runtime_const->location = -1;
+
+  if (constnode != NULL)
+    *constnode = runtime_const;
+  return true;
 }
 
 static bool pg_vec_resolve_binary_expr_kind(PgVecExprKind expr_kind,
@@ -434,6 +647,7 @@ static bool pg_vec_resolve_binary_expr_kind(PgVecExprKind expr_kind,
     switch (left_kind) {
     case PG_VEC_SCALAR_INT32:
     case PG_VEC_SCALAR_DECIMAL64_S2:
+    case PG_VEC_SCALAR_DECIMAL128_S2:
     case PG_VEC_SCALAR_DECIMAL128_S4:
     case PG_VEC_SCALAR_DECIMAL128_S6:
       *result_kind = left_kind;
@@ -447,6 +661,13 @@ static bool pg_vec_resolve_binary_expr_kind(PgVecExprKind expr_kind,
     }
 
   case PG_VEC_EXPR_MUL:
+    if ((left_kind == PG_VEC_SCALAR_DECIMAL64_S2 &&
+         right_kind == PG_VEC_SCALAR_INT32) ||
+        (left_kind == PG_VEC_SCALAR_INT32 &&
+         right_kind == PG_VEC_SCALAR_DECIMAL64_S2)) {
+      *result_kind = PG_VEC_SCALAR_DECIMAL128_S2;
+      return true;
+    }
     if (left_kind == PG_VEC_SCALAR_DECIMAL64_S2 &&
         right_kind == PG_VEC_SCALAR_DECIMAL64_S2) {
       *result_kind = PG_VEC_SCALAR_DECIMAL128_S4;
@@ -474,17 +695,36 @@ static bool pg_vec_resolve_binary_output_kind(PgVecOutputExprKind expr_kind,
                                               PgVecScalarKind right_kind,
                                               PgVecScalarKind *result_kind) {
   if (left_kind != right_kind &&
+      !(left_kind == PG_VEC_SCALAR_DECIMAL128_S2 &&
+        right_kind == PG_VEC_SCALAR_DECIMAL128_S4) &&
+      !(left_kind == PG_VEC_SCALAR_DECIMAL128_S4 &&
+        right_kind == PG_VEC_SCALAR_DECIMAL128_S2) &&
+      !(left_kind == PG_VEC_SCALAR_DECIMAL128_S2 &&
+        right_kind == PG_VEC_SCALAR_DECIMAL128_S6) &&
+      !(left_kind == PG_VEC_SCALAR_DECIMAL128_S6 &&
+        right_kind == PG_VEC_SCALAR_DECIMAL128_S2) &&
       !(left_kind == PG_VEC_SCALAR_DECIMAL64_S2 &&
         right_kind == PG_VEC_SCALAR_DECIMAL128_S4) &&
       !(left_kind == PG_VEC_SCALAR_DECIMAL128_S4 &&
-        right_kind == PG_VEC_SCALAR_DECIMAL64_S2))
+        right_kind == PG_VEC_SCALAR_DECIMAL64_S2) &&
+      !(left_kind == PG_VEC_SCALAR_DECIMAL128_S6 &&
+        right_kind == PG_VEC_SCALAR_DECIMAL128_S4) &&
+      !(left_kind == PG_VEC_SCALAR_DECIMAL128_S4 &&
+        right_kind == PG_VEC_SCALAR_DECIMAL128_S6))
     return false;
 
   switch (expr_kind) {
   case PG_VEC_OUTPUT_EXPR_ADD:
   case PG_VEC_OUTPUT_EXPR_SUB:
-    *result_kind =
-        (left_kind == right_kind) ? left_kind : PG_VEC_SCALAR_DECIMAL128_S6;
+    if (left_kind == right_kind)
+      *result_kind = left_kind;
+    else if ((left_kind == PG_VEC_SCALAR_DECIMAL128_S2 &&
+              right_kind == PG_VEC_SCALAR_DECIMAL128_S4) ||
+             (left_kind == PG_VEC_SCALAR_DECIMAL128_S4 &&
+              right_kind == PG_VEC_SCALAR_DECIMAL128_S2))
+      *result_kind = PG_VEC_SCALAR_DECIMAL128_S4;
+    else
+      *result_kind = PG_VEC_SCALAR_DECIMAL128_S6;
     return true;
   case PG_VEC_OUTPUT_EXPR_MUL:
   case PG_VEC_OUTPUT_EXPR_DIV:
@@ -503,9 +743,17 @@ static Node *pg_vec_strip_implicit_casts(Node *node) {
   while (node != NULL) {
     if (IsA(node, FuncExpr)) {
       FuncExpr *func = castNode(FuncExpr, node);
+      const char *func_name = get_func_name(func->funcid);
 
       if (func->funcformat == COERCE_IMPLICIT_CAST &&
           list_length(func->args) == 1)
+        node = linitial(func->args);
+      else if (list_length(func->args) == 1 &&
+               func->funcresulttype == NUMERICOID &&
+               func_name != NULL &&
+               (strcmp(func_name, "int2_numeric") == 0 ||
+                strcmp(func_name, "int4_numeric") == 0 ||
+                strcmp(func_name, "int8_numeric") == 0))
         node = linitial(func->args);
       else
         break;
@@ -538,35 +786,64 @@ static TargetEntry *pg_vec_find_tle_by_resno(List *targetlist,
   return NULL;
 }
 
-static Node *pg_vec_resolve_var_through_plan(Node *node, Plan *plan) {
+static Node *pg_vec_resolve_var_through_plan_with_source(Node *node, Plan *plan,
+                                                         Plan **resolved_plan) {
   Var *var;
   Plan *source_plan;
   TargetEntry *tle;
 
   node = pg_vec_strip_implicit_casts(node);
-  if (node == NULL || !IsA(node, Var))
+  if (node == NULL || !IsA(node, Var)) {
+    if (resolved_plan != NULL)
+      *resolved_plan = plan;
     return node;
+  }
 
   var = castNode(Var, node);
-  if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
+  if (var->varno != OUTER_VAR && var->varno != INNER_VAR) {
+    if (resolved_plan != NULL)
+      *resolved_plan = plan;
     return node;
+  }
 
-  if (plan == NULL)
+  if (plan == NULL) {
+    if (resolved_plan != NULL)
+      *resolved_plan = NULL;
     return node;
+  }
 
   if (var->varno == OUTER_VAR)
     source_plan = plan->lefttree;
   else
     source_plan = plan->righttree;
 
-  if (source_plan == NULL)
+  if (source_plan == NULL) {
+    if (resolved_plan != NULL)
+      *resolved_plan = NULL;
     return node;
+  }
+
+  while (source_plan != NULL &&
+         source_plan->targetlist == NIL &&
+         source_plan->lefttree != NULL)
+    source_plan = source_plan->lefttree;
 
   tle = pg_vec_find_tle_by_resno(source_plan->targetlist, var->varattno);
-  if (tle == NULL)
+  if (tle == NULL) {
+    if (resolved_plan != NULL)
+      *resolved_plan = source_plan;
     return node;
+  }
 
-  return pg_vec_resolve_var_through_plan((Node *)tle->expr, source_plan);
+  return pg_vec_resolve_var_through_plan_with_source((Node *) tle->expr,
+                                                     source_plan,
+                                                     resolved_plan);
+}
+
+static Node *
+pg_vec_resolve_var_through_plan(Node *node, Plan *plan)
+{
+  return pg_vec_resolve_var_through_plan_with_source(node, plan, NULL);
 }
 
 static bool pg_vec_lower_var(Var *var, const PgVecLowerContext *ctx,
@@ -602,23 +879,74 @@ static bool pg_vec_lower_var(Var *var, const PgVecLowerContext *ctx,
 }
 
 static bool
+pg_vec_try_lower_extract_year_expr(FuncExpr *func,
+                                   Plan *source_plan,
+                                   const PgVecLowerContext *ctx,
+                                   PgVecPlan *plan,
+                                   PgVecExprProgram *program,
+                                   int *expr_root)
+{
+  const char *func_name;
+  Node *field_node;
+  Const *field_const;
+  char *field_name;
+  PgVecExprNode expr_node;
+  int arg_root;
+
+  if (func == NULL || list_length(func->args) != 2)
+    return false;
+
+  func_name = get_func_name(func->funcid);
+  if (func_name == NULL || strcmp(func_name, "extract") != 0)
+    return false;
+
+  field_node = pg_vec_strip_implicit_casts(linitial(func->args));
+  if (!IsA(field_node, Const))
+    return false;
+  field_const = castNode(Const, field_node);
+  if (field_const->constisnull || field_const->consttype != TEXTOID)
+    return false;
+
+  field_name = TextDatumGetCString(field_const->constvalue);
+  if (pg_strcasecmp(field_name, "year") != 0)
+    return false;
+
+  if (!pg_vec_lower_expr(lsecond(func->args), source_plan, ctx, plan, program,
+                         &arg_root))
+    return false;
+  if (program->nodes[arg_root].scalar_kind != PG_VEC_SCALAR_DATE32)
+    return false;
+
+  MemSet(&expr_node, 0, sizeof(expr_node));
+  expr_node.kind = PG_VEC_EXPR_EXTRACT_YEAR;
+  expr_node.scalar_kind = PG_VEC_SCALAR_INT32;
+  expr_node.left = arg_root;
+  expr_node.right = -1;
+  return pg_vec_add_expr_node(program, &expr_node, expr_root);
+}
+
+static bool
 pg_vec_lower_expr_internal(Node *node, Plan *source_plan,
                            const PgVecLowerContext *ctx, PgVecPlan *plan,
                            PgVecExprProgram *program, bool has_expected_kind,
                            PgVecScalarKind expected_kind, int *expr_root) {
   PgVecExprNode expr_node;
+  FuncExpr *funcexpr;
   OpExpr *opexpr;
   char *op_name;
   Node *left;
   Node *right;
+  Plan *expr_source_plan = source_plan;
   int left_root;
   int right_root;
   PgVecScalarKind left_kind;
   PgVecScalarKind right_kind;
   PgVecScalarKind result_kind;
+  Const runtime_const;
   Const *constnode;
 
-  node = pg_vec_resolve_var_through_plan(node, source_plan);
+  node = pg_vec_resolve_var_through_plan_with_source(node, source_plan,
+                                                     &expr_source_plan);
   node = pg_vec_strip_implicit_casts(node);
   if (node == NULL)
     return false;
@@ -634,12 +962,9 @@ pg_vec_lower_expr_internal(Node *node, Plan *source_plan,
     return pg_vec_add_expr_node(program, &expr_node, expr_root);
   }
 
-  if (IsA(node, Const)) {
-    constnode = castNode(Const, node);
-    if (has_expected_kind)
-      result_kind = expected_kind;
-    else if (!pg_vec_scalar_kind_from_pg_type(
-                 constnode->consttype, constnode->consttypmod, &result_kind))
+  if (pg_vec_resolve_constlike_node(node, ctx, &runtime_const, &constnode)) {
+    if (!pg_vec_scalar_kind_from_const(constnode, has_expected_kind,
+                                       expected_kind, &result_kind))
       return false;
 
     MemSet(&expr_node, 0, sizeof(expr_node));
@@ -650,6 +975,14 @@ pg_vec_lower_expr_internal(Node *node, Plan *source_plan,
     if (!pg_vec_lower_const_value(constnode, result_kind, &expr_node.constant))
       return false;
     return pg_vec_add_expr_node(program, &expr_node, expr_root);
+  }
+
+  if (IsA(node, FuncExpr)) {
+    funcexpr = castNode(FuncExpr, node);
+    if (pg_vec_try_lower_extract_year_expr(funcexpr, expr_source_plan, ctx, plan,
+                                           program, expr_root))
+      return true;
+    return false;
   }
 
   if (!IsA(node, OpExpr))
@@ -665,8 +998,8 @@ pg_vec_lower_expr_internal(Node *node, Plan *source_plan,
 
   left = linitial(opexpr->args);
   right = lsecond(opexpr->args);
-  if (!pg_vec_lower_expr(left, source_plan, ctx, plan, program, &left_root) ||
-      !pg_vec_lower_expr(right, source_plan, ctx, plan, program, &right_root))
+  if (!pg_vec_lower_expr(left, expr_source_plan, ctx, plan, program, &left_root) ||
+      !pg_vec_lower_expr(right, expr_source_plan, ctx, plan, program, &right_root))
     return false;
 
   left_kind = program->nodes[left_root].scalar_kind;
@@ -702,19 +1035,26 @@ static bool pg_vec_lower_expr(Node *node, Plan *source_plan,
 static bool pg_vec_lower_compare_operands(
     Node *left, Node *right, Plan *source_plan, const PgVecLowerContext *ctx,
     PgVecPlan *plan, PgVecFilterSpec *filter, int *left_root, int *right_root) {
+  Const left_runtime_const;
+  Const right_runtime_const;
+  Const *left_const = NULL;
+  Const *right_const = NULL;
+
   left = pg_vec_resolve_var_through_plan(left, source_plan);
   right = pg_vec_resolve_var_through_plan(right, source_plan);
   left = pg_vec_strip_implicit_casts(left);
   right = pg_vec_strip_implicit_casts(right);
 
-  if (IsA(left, Const) && !IsA(right, Const)) {
+  if (pg_vec_resolve_constlike_node(left, ctx, &left_runtime_const, &left_const) &&
+      !pg_vec_resolve_constlike_node(right, ctx, &right_runtime_const,
+                                     &right_const)) {
     PgVecExprProgram tmp_program = filter->exprs;
 
     if (!pg_vec_lower_expr(right, source_plan, ctx, plan, &filter->exprs,
                            right_root))
       return false;
     if (!pg_vec_lower_expr_internal(
-            left, source_plan, ctx, plan, &filter->exprs, true,
+            (Node *) left_const, source_plan, ctx, plan, &filter->exprs, true,
             filter->exprs.nodes[*right_root].scalar_kind, left_root)) {
       filter->exprs = tmp_program;
       return false;
@@ -726,9 +1066,9 @@ static bool pg_vec_lower_compare_operands(
                          left_root))
     return false;
 
-  if (IsA(right, Const)) {
+  if (pg_vec_resolve_constlike_node(right, ctx, &right_runtime_const, &right_const)) {
     if (!pg_vec_lower_expr_internal(
-            right, source_plan, ctx, plan, &filter->exprs, true,
+            (Node *) right_const, source_plan, ctx, plan, &filter->exprs, true,
             filter->exprs.nodes[*left_root].scalar_kind, right_root))
       return false;
   } else if (!pg_vec_lower_expr(right, source_plan, ctx, plan, &filter->exprs,
@@ -767,6 +1107,177 @@ static bool pg_vec_try_parse_prefix_like(Const *constnode,
     memcpy(prefix->bytes, payload, prefix->len);
   memset(prefix->bytes + prefix->len, 0,
          PG_VEC_INLINE_STRING_MAX - prefix->len);
+  return true;
+}
+
+static bool
+pg_vec_try_parse_contains_like(Const *constnode,
+                               PgVecStringConst *needle)
+{
+  const char *payload;
+  Size payload_size;
+
+  if (constnode == NULL || constnode->constisnull)
+    return false;
+  if (constnode->consttype != TEXTOID && constnode->consttype != VARCHAROID &&
+      constnode->consttype != BPCHAROID)
+    return false;
+
+  payload = VARDATA_ANY(DatumGetPointer(constnode->constvalue));
+  payload_size = VARSIZE_ANY_EXHDR(DatumGetPointer(constnode->constvalue));
+  if (payload_size < 3)
+    return false;
+  if (payload[0] != '%' || payload[payload_size - 1] != '%')
+    return false;
+  for (Size i = 1; i + 1 < payload_size; i++) {
+    if (payload[i] == '%' || payload[i] == '_')
+      return false;
+  }
+  if (payload_size - 2 >= PG_VEC_INLINE_STRING_MAX)
+    return false;
+
+  needle->len = (uint16) (payload_size - 2);
+  if (needle->len > 0)
+    memcpy(needle->bytes, payload + 1, needle->len);
+  memset(needle->bytes + needle->len, 0,
+         PG_VEC_INLINE_STRING_MAX - needle->len);
+  return true;
+}
+
+static bool
+pg_vec_filter_op_from_name(const char *op_name, PgVecFilterOp *filter_op)
+{
+  if (op_name == NULL)
+    return false;
+
+  if (strcmp(op_name, "=") == 0)
+    *filter_op = PG_VEC_OP_EQ;
+  else if (strcmp(op_name, "<>") == 0 || strcmp(op_name, "!=") == 0)
+    *filter_op = PG_VEC_OP_NE;
+  else if (strcmp(op_name, "<") == 0)
+    *filter_op = PG_VEC_OP_LT;
+  else if (strcmp(op_name, "<=") == 0)
+    *filter_op = PG_VEC_OP_LE;
+  else if (strcmp(op_name, ">") == 0)
+    *filter_op = PG_VEC_OP_GT;
+  else if (strcmp(op_name, ">=") == 0)
+    *filter_op = PG_VEC_OP_GE;
+  else
+    return false;
+
+  return true;
+}
+
+static bool
+pg_vec_lower_scalar_array_qual(ScalarArrayOpExpr *scalar_array,
+                               Plan *source_plan,
+                               const PgVecLowerContext *ctx,
+                               PgVecPlan *plan,
+                               PgVecFilterSpec *filter,
+                               int *qual_root)
+{
+  const char *op_name;
+  PgVecFilterOp filter_op;
+  Node *left;
+  Node *right;
+  Const *array_const;
+  ArrayType *array_value;
+  Oid element_type;
+  int16 typlen;
+  bool typbyval;
+  char typalign;
+  Datum *elements = NULL;
+  bool *nulls = NULL;
+  int nelems = 0;
+  int current_root = -1;
+
+  if (scalar_array == NULL || list_length(scalar_array->args) != 2)
+    return false;
+
+  op_name = get_opname(scalar_array->opno);
+  if (!pg_vec_filter_op_from_name(op_name, &filter_op))
+    return false;
+
+  left = linitial(scalar_array->args);
+  right = pg_vec_strip_implicit_casts(lsecond(scalar_array->args));
+  if (!IsA(right, Const))
+    return false;
+
+  array_const = castNode(Const, right);
+  if (array_const->constisnull)
+    return false;
+
+  array_value = DatumGetArrayTypeP(array_const->constvalue);
+  if (ARR_NDIM(array_value) != 1 || ARR_HASNULL(array_value))
+    return false;
+
+  element_type = ARR_ELEMTYPE(array_value);
+  get_typlenbyvalalign(element_type, &typlen, &typbyval, &typalign);
+  deconstruct_array(array_value,
+                    element_type,
+                    typlen,
+                    typbyval,
+                    typalign,
+                    &elements,
+                    &nulls,
+                    &nelems);
+  if (nelems <= 0)
+    return false;
+
+  for (int i = 0; i < nelems; i++)
+  {
+    Const *element_const;
+    PgVecQualNode qual_node;
+    int left_root;
+    int right_root;
+    int compare_root;
+
+    if (nulls != NULL && nulls[i])
+      return false;
+
+    element_const = makeConst(element_type,
+                              -1,
+                              InvalidOid,
+                              typlen,
+                              elements[i],
+                              false,
+                              typbyval);
+
+    if (!pg_vec_lower_compare_operands(left,
+                                       (Node *) element_const,
+                                       source_plan,
+                                       ctx,
+                                       plan,
+                                       filter,
+                                       &left_root,
+                                       &right_root))
+      return false;
+    if (filter->exprs.nodes[left_root].scalar_kind !=
+        filter->exprs.nodes[right_root].scalar_kind)
+      return false;
+
+    MemSet(&qual_node, 0, sizeof(qual_node));
+    qual_node.kind = PG_VEC_QUAL_COMPARE;
+    qual_node.left = -1;
+    qual_node.right = -1;
+    qual_node.lhs_expr = left_root;
+    qual_node.rhs_expr = right_root;
+    qual_node.op = filter_op;
+    if (!pg_vec_add_qual_node(filter, &qual_node, &compare_root))
+      return false;
+
+    if (current_root < 0)
+      current_root = compare_root;
+    else if (!pg_vec_add_binary_qual(filter,
+                                     scalar_array->useOr ? PG_VEC_QUAL_OR
+                                                         : PG_VEC_QUAL_AND,
+                                     current_root,
+                                     compare_root,
+                                     &current_root))
+      return false;
+  }
+
+  *qual_root = current_root;
   return true;
 }
 
@@ -821,6 +1332,14 @@ static bool pg_vec_lower_qual(Node *node, Plan *source_plan,
     return true;
   }
 
+  if (IsA(node, ScalarArrayOpExpr))
+    return pg_vec_lower_scalar_array_qual(castNode(ScalarArrayOpExpr, node),
+                                          source_plan,
+                                          ctx,
+                                          plan,
+                                          filter,
+                                          qual_root);
+
   if (!IsA(node, OpExpr))
     return false;
 
@@ -837,10 +1356,17 @@ static bool pg_vec_lower_qual(Node *node, Plan *source_plan,
 
   if (strcmp(op_name, "~~") == 0) {
     PgVecExprNode rhs_node;
+    PgVecFilterOp like_op;
 
     prefix_const = castNode(Const, pg_vec_strip_implicit_casts(right));
-    if (!IsA(pg_vec_strip_implicit_casts(right), Const) ||
-        !pg_vec_try_parse_prefix_like(prefix_const, &prefix_value))
+    if (!IsA(pg_vec_strip_implicit_casts(right), Const))
+      return false;
+
+    if (pg_vec_try_parse_prefix_like(prefix_const, &prefix_value))
+      like_op = PG_VEC_OP_PREFIX_LIKE;
+    else if (pg_vec_try_parse_contains_like(prefix_const, &prefix_value))
+      like_op = PG_VEC_OP_CONTAINS_LIKE;
+    else
       return false;
 
     if (!pg_vec_lower_expr(left, source_plan, ctx, plan, &filter->exprs,
@@ -865,21 +1391,11 @@ static bool pg_vec_lower_qual(Node *node, Plan *source_plan,
     qual_node.right = -1;
     qual_node.lhs_expr = left_root;
     qual_node.rhs_expr = right_root;
-    qual_node.op = PG_VEC_OP_PREFIX_LIKE;
+    qual_node.op = like_op;
     return pg_vec_add_qual_node(filter, &qual_node, qual_root);
   }
 
-  if (strcmp(op_name, "=") == 0)
-    filter_op = PG_VEC_OP_EQ;
-  else if (strcmp(op_name, "<") == 0)
-    filter_op = PG_VEC_OP_LT;
-  else if (strcmp(op_name, "<=") == 0)
-    filter_op = PG_VEC_OP_LE;
-  else if (strcmp(op_name, ">") == 0)
-    filter_op = PG_VEC_OP_GT;
-  else if (strcmp(op_name, ">=") == 0)
-    filter_op = PG_VEC_OP_GE;
-  else
+  if (!pg_vec_filter_op_from_name(op_name, &filter_op))
     return false;
 
   if (!pg_vec_lower_compare_operands(left, right, source_plan, ctx, plan,
@@ -904,10 +1420,16 @@ static bool pg_vec_lower_filter_quals(List *quals, Plan *source_plan,
                                       const PgVecLowerContext *ctx,
                                       PgVecPlan *plan,
                                       PgVecFilterSpec *filter) {
-  ListCell *lc;
-  int root = -1;
-
   pg_vec_filter_spec_init(filter);
+  return pg_vec_append_filter_quals(quals, source_plan, ctx, plan, filter);
+}
+
+static bool pg_vec_append_filter_quals(List *quals, Plan *source_plan,
+                                       const PgVecLowerContext *ctx,
+                                       PgVecPlan *plan,
+                                       PgVecFilterSpec *filter) {
+  ListCell *lc;
+  int root = filter->root;
 
   foreach (lc, quals) {
     int qual_root;
@@ -971,6 +1493,41 @@ static bool pg_vec_const_is_zero(Node *node) {
   return false;
 }
 
+static Aggref *
+pg_vec_resolve_logical_aggref(Aggref *aggref, Plan *source_plan,
+                              Plan **logical_source_plan)
+{
+  TargetEntry *arg_tle;
+  Node *resolved_arg;
+
+  if (aggref == NULL)
+    return NULL;
+
+  if (logical_source_plan != NULL)
+    *logical_source_plan = source_plan;
+
+  if (aggref->aggsplit != AGGSPLIT_FINAL_DESERIAL)
+    return aggref;
+  if (list_length(aggref->args) != 1)
+    return aggref;
+
+  arg_tle = linitial_node(TargetEntry, aggref->args);
+  if (arg_tle->resjunk)
+    return aggref;
+
+  resolved_arg = pg_vec_resolve_var_through_plan_with_source((Node *) arg_tle->expr,
+                                                             source_plan,
+                                                             logical_source_plan);
+  resolved_arg = pg_vec_strip_implicit_casts(resolved_arg);
+  if (resolved_arg != NULL && IsA(resolved_arg, Aggref))
+    return castNode(Aggref, resolved_arg);
+
+  if (logical_source_plan != NULL)
+    *logical_source_plan = source_plan;
+
+  return aggref;
+}
+
 static bool pg_vec_try_lower_conditional_agg(Aggref *aggref, Plan *source_plan,
                                              const PgVecLowerContext *ctx,
                                              PgVecPlan *plan,
@@ -988,17 +1545,17 @@ static bool pg_vec_try_lower_conditional_agg(Aggref *aggref, Plan *source_plan,
   if (arg_tle->resjunk)
     return false;
 
-  if (!IsA(pg_vec_strip_implicit_casts(arg_tle->expr), CaseExpr))
+  if (!IsA(pg_vec_strip_implicit_casts((Node *)arg_tle->expr), CaseExpr))
     return false;
 
-  case_expr = castNode(CaseExpr, pg_vec_strip_implicit_casts(arg_tle->expr));
+  case_expr = castNode(CaseExpr, pg_vec_strip_implicit_casts((Node *)arg_tle->expr));
   if (list_length(case_expr->args) != 1)
     return false;
-  if (!pg_vec_const_is_zero(case_expr->defresult))
+  if (!pg_vec_const_is_zero((Node *)case_expr->defresult))
     return false;
 
   case_when = linitial_node(CaseWhen, case_expr->args);
-  if (!pg_vec_lower_expr(case_when->result, source_plan, ctx, plan,
+  if (!pg_vec_lower_expr((Node *)case_when->result, source_plan, ctx, plan,
                          &agg_call->expr, &agg_call->expr.root))
     return false;
   if (!pg_vec_lower_filter_quals(list_make1(case_when->expr), source_plan, ctx,
@@ -1014,33 +1571,43 @@ static bool pg_vec_lower_agg_call(Aggref *aggref, Plan *source_plan,
                                   const PgVecLowerContext *ctx, PgVecPlan *plan,
                                   int *agg_idx) {
   PgVecAggCall agg_call;
+  Aggref *logical_aggref;
+  Plan *logical_source_plan;
   TargetEntry *arg_tle;
 
-  if (aggref->aggdistinct != NIL || aggref->aggorder != NIL ||
-      aggref->aggfilter != NULL)
+  logical_aggref =
+      pg_vec_resolve_logical_aggref(aggref, source_plan, &logical_source_plan);
+  if (logical_aggref == NULL)
+    return false;
+
+  if (logical_aggref->aggdistinct != NIL || logical_aggref->aggorder != NIL ||
+      logical_aggref->aggfilter != NULL)
     return false;
 
   MemSet(&agg_call, 0, sizeof(agg_call));
   pg_vec_expr_program_init(&agg_call.expr);
   pg_vec_filter_spec_init(&agg_call.filter);
-  if (!pg_vec_agg_kind_from_aggref(aggref, &agg_call.kind))
+  if (!pg_vec_agg_kind_from_aggref(logical_aggref, &agg_call.kind))
     return false;
 
-  if (aggref->aggstar) {
+  if (logical_aggref->aggstar) {
     if (agg_call.kind != PG_VEC_AGG_COUNT)
       return false;
     agg_call.star_arg = true;
     agg_call.expr.root = -1;
-  } else if (!pg_vec_try_lower_conditional_agg(aggref, source_plan, ctx, plan,
+  } else if (!pg_vec_try_lower_conditional_agg(logical_aggref,
+                                               logical_source_plan,
+                                               ctx,
+                                               plan,
                                                &agg_call)) {
-    if (list_length(aggref->args) != 1)
+    if (list_length(logical_aggref->args) != 1)
       return false;
 
-    arg_tle = linitial_node(TargetEntry, aggref->args);
+    arg_tle = linitial_node(TargetEntry, logical_aggref->args);
     if (arg_tle->resjunk)
       return false;
 
-    if (!pg_vec_lower_expr(arg_tle->expr, source_plan, ctx, plan,
+    if (!pg_vec_lower_expr((Node *)arg_tle->expr, logical_source_plan, ctx, plan,
                            &agg_call.expr, &agg_call.expr.root))
       return false;
   }
@@ -1048,11 +1615,13 @@ static bool pg_vec_lower_agg_call(Aggref *aggref, Plan *source_plan,
   return pg_vec_add_agg_call(&plan->agg, &agg_call, agg_idx);
 }
 
-static bool pg_vec_lower_output_expr(Node *node, Plan *source_plan,
-                                     const PgVecLowerContext *ctx,
-                                     PgVecPlan *plan,
-                                     PgVecOutputExprProgram *program,
-                                     int *expr_root) {
+static bool pg_vec_lower_output_expr_internal(Node *node, Plan *source_plan,
+                                              const PgVecLowerContext *ctx,
+                                              PgVecPlan *plan,
+                                              PgVecOutputExprProgram *program,
+                                              bool has_expected_kind,
+                                              PgVecScalarKind expected_kind,
+                                              int *expr_root) {
   PgVecOutputExprNode expr_node;
   Node *resolved_node;
   OpExpr *opexpr;
@@ -1062,34 +1631,42 @@ static bool pg_vec_lower_output_expr(Node *node, Plan *source_plan,
   PgVecScalarKind left_kind;
   PgVecScalarKind right_kind;
   PgVecScalarKind result_kind;
-  PgVecColumnRef group_key;
   Aggref *aggref;
   int ref_idx;
+  Const runtime_const;
   Const *constnode;
+  PgVecExprProgram group_key_expr;
+  Plan *resolved_source_plan = source_plan;
 
-  resolved_node = pg_vec_resolve_var_through_plan(node, source_plan);
+  resolved_node = pg_vec_resolve_var_through_plan_with_source(node, source_plan,
+                                                              &resolved_source_plan);
   resolved_node = pg_vec_strip_implicit_casts(resolved_node);
   if (resolved_node == NULL)
     return false;
 
-  if (IsA(resolved_node, Var)) {
-    if (!pg_vec_lower_var(castNode(Var, resolved_node), ctx, plan, &group_key))
-      return false;
-    if (!pg_vec_add_group_key(&plan->agg, group_key, &ref_idx))
-      return false;
+  if (!IsA(resolved_node, Aggref) &&
+      !pg_vec_resolve_constlike_node(resolved_node, ctx, &runtime_const, &constnode)) {
+    pg_vec_expr_program_init(&group_key_expr);
+    if (pg_vec_lower_expr(resolved_node, resolved_source_plan, ctx, plan,
+                          &group_key_expr, &group_key_expr.root)) {
+      result_kind = group_key_expr.nodes[group_key_expr.root].scalar_kind;
+      if (!pg_vec_add_group_key(&plan->agg, &group_key_expr, result_kind,
+                                &ref_idx))
+        return false;
 
-    MemSet(&expr_node, 0, sizeof(expr_node));
-    expr_node.kind = PG_VEC_OUTPUT_EXPR_GROUP_KEY;
-    expr_node.scalar_kind = group_key.scalar_kind;
-    expr_node.index = ref_idx;
-    expr_node.left = -1;
-    expr_node.right = -1;
-    return pg_vec_add_output_expr_node(program, &expr_node, expr_root);
+      MemSet(&expr_node, 0, sizeof(expr_node));
+      expr_node.kind = PG_VEC_OUTPUT_EXPR_GROUP_KEY;
+      expr_node.scalar_kind = result_kind;
+      expr_node.index = ref_idx;
+      expr_node.left = -1;
+      expr_node.right = -1;
+      return pg_vec_add_output_expr_node(program, &expr_node, expr_root);
+    }
   }
 
   if (IsA(resolved_node, Aggref)) {
     aggref = castNode(Aggref, resolved_node);
-    if (!pg_vec_lower_agg_call(aggref, source_plan, ctx, plan, &ref_idx))
+    if (!pg_vec_lower_agg_call(aggref, resolved_source_plan, ctx, plan, &ref_idx))
       return false;
 
     MemSet(&expr_node, 0, sizeof(expr_node));
@@ -1106,12 +1683,10 @@ static bool pg_vec_lower_output_expr(Node *node, Plan *source_plan,
     return pg_vec_add_output_expr_node(program, &expr_node, expr_root);
   }
 
-  if (IsA(resolved_node, Const)) {
-    constnode = castNode(Const, resolved_node);
-    if (!pg_vec_scalar_kind_from_pg_type(constnode->consttype,
-                                         constnode->consttypmod, &result_kind))
+  if (pg_vec_resolve_constlike_node(resolved_node, ctx, &runtime_const, &constnode)) {
+    if (!pg_vec_scalar_kind_from_const(constnode, has_expected_kind,
+                                       expected_kind, &result_kind))
       return false;
-
     MemSet(&expr_node, 0, sizeof(expr_node));
     expr_node.kind = PG_VEC_OUTPUT_EXPR_CONST;
     expr_node.scalar_kind = result_kind;
@@ -1133,9 +1708,9 @@ static bool pg_vec_lower_output_expr(Node *node, Plan *source_plan,
   if (op_name == NULL)
     return false;
 
-  if (!pg_vec_lower_output_expr(linitial(opexpr->args), source_plan, ctx, plan,
+  if (!pg_vec_lower_output_expr(linitial(opexpr->args), resolved_source_plan, ctx, plan,
                                 program, &left_root) ||
-      !pg_vec_lower_output_expr(lsecond(opexpr->args), source_plan, ctx, plan,
+      !pg_vec_lower_output_expr(lsecond(opexpr->args), resolved_source_plan, ctx, plan,
                                 program, &right_root))
     return false;
 
@@ -1164,6 +1739,276 @@ static bool pg_vec_lower_output_expr(Node *node, Plan *source_plan,
   return pg_vec_add_output_expr_node(program, &expr_node, expr_root);
 }
 
+static bool
+pg_vec_lower_output_expr(Node *node, Plan *source_plan,
+                         const PgVecLowerContext *ctx,
+                         PgVecPlan *plan,
+                         PgVecOutputExprProgram *program,
+                         int *expr_root) {
+  return pg_vec_lower_output_expr_internal(node, source_plan, ctx, plan,
+                                           program, false,
+                                           PG_VEC_SCALAR_INVALID, expr_root);
+}
+
+static bool
+pg_vec_add_post_agg_qual_node(PgVecPostAggFilterSpec *filter,
+                              const PgVecQualNode *node, int *node_idx)
+{
+  if (filter->nnodes >= PG_VEC_MAX_FILTER_NODES)
+    return false;
+
+  filter->nodes[filter->nnodes] = *node;
+  *node_idx = filter->nnodes++;
+  return true;
+}
+
+static bool
+pg_vec_add_post_agg_binary_qual(PgVecPostAggFilterSpec *filter,
+                                PgVecQualKind kind,
+                                int left_idx,
+                                int right_idx,
+                                int *node_idx)
+{
+  PgVecQualNode qual_node;
+
+  MemSet(&qual_node, 0, sizeof(qual_node));
+  qual_node.kind = kind;
+  qual_node.left = left_idx;
+  qual_node.right = right_idx;
+  qual_node.lhs_expr = -1;
+  qual_node.rhs_expr = -1;
+  qual_node.op = PG_VEC_OP_INVALID;
+  return pg_vec_add_post_agg_qual_node(filter, &qual_node, node_idx);
+}
+
+static bool
+pg_vec_scalar_kinds_numeric_compatible(PgVecScalarKind left_kind,
+                                       PgVecScalarKind right_kind)
+{
+  switch (left_kind) {
+    case PG_VEC_SCALAR_DECIMAL64_S2:
+    case PG_VEC_SCALAR_DECIMAL128_S2:
+    case PG_VEC_SCALAR_DECIMAL128_S4:
+    case PG_VEC_SCALAR_DECIMAL128_S6:
+      switch (right_kind) {
+        case PG_VEC_SCALAR_DECIMAL64_S2:
+        case PG_VEC_SCALAR_DECIMAL128_S2:
+        case PG_VEC_SCALAR_DECIMAL128_S4:
+        case PG_VEC_SCALAR_DECIMAL128_S6:
+          return true;
+        default:
+          return false;
+      }
+    default:
+      return false;
+  }
+}
+
+static bool
+pg_vec_lower_post_agg_compare_operands(Node *left, Node *right,
+                                       Plan *source_plan,
+                                       const PgVecLowerContext *ctx,
+                                       PgVecPlan *plan,
+                                       PgVecPostAggFilterSpec *filter,
+                                       int *left_root,
+                                       int *right_root)
+{
+  Node *left_resolved = pg_vec_resolve_var_through_plan(left, source_plan);
+  Node *right_resolved = pg_vec_resolve_var_through_plan(right, source_plan);
+  Const left_runtime_const;
+  Const right_runtime_const;
+  Const *left_const = NULL;
+  Const *right_const = NULL;
+
+  left_resolved = pg_vec_strip_implicit_casts(left_resolved);
+  right_resolved = pg_vec_strip_implicit_casts(right_resolved);
+
+  if (pg_vec_resolve_constlike_node(left_resolved, ctx, &left_runtime_const,
+                                    &left_const) &&
+      !pg_vec_resolve_constlike_node(right_resolved, ctx, &right_runtime_const,
+                                     &right_const)) {
+    PgVecOutputExprProgram tmp_program = filter->exprs;
+
+    if (!pg_vec_lower_output_expr(right_resolved, source_plan, ctx, plan,
+                                  &filter->exprs, right_root))
+      return false;
+    if (!pg_vec_lower_output_expr_internal((Node *) left_const,
+                                           source_plan,
+                                           ctx,
+                                           plan,
+                                           &filter->exprs,
+                                           true,
+                                           filter->exprs.nodes[*right_root].scalar_kind,
+                                           left_root)) {
+      filter->exprs = tmp_program;
+      if (!pg_vec_lower_output_expr_internal((Node *) left_const,
+                                             source_plan,
+                                             ctx,
+                                             plan,
+                                             &filter->exprs,
+                                             false,
+                                             PG_VEC_SCALAR_INVALID,
+                                             left_root))
+        return false;
+    }
+    return filter->exprs.nodes[*left_root].scalar_kind ==
+               filter->exprs.nodes[*right_root].scalar_kind ||
+           pg_vec_scalar_kinds_numeric_compatible(
+               filter->exprs.nodes[*left_root].scalar_kind,
+               filter->exprs.nodes[*right_root].scalar_kind);
+  }
+
+  if (!pg_vec_lower_output_expr(left_resolved, source_plan, ctx, plan,
+                                &filter->exprs, left_root))
+    return false;
+
+  if (pg_vec_resolve_constlike_node(right_resolved, ctx, &right_runtime_const,
+                                    &right_const)) {
+    if (!pg_vec_lower_output_expr_internal((Node *) right_const,
+                                           source_plan,
+                                           ctx,
+                                           plan,
+                                           &filter->exprs,
+                                           true,
+                                           filter->exprs.nodes[*left_root].scalar_kind,
+                                           right_root))
+    {
+      if (!pg_vec_lower_output_expr_internal((Node *) right_const,
+                                             source_plan,
+                                             ctx,
+                                             plan,
+                                             &filter->exprs,
+                                             false,
+                                             PG_VEC_SCALAR_INVALID,
+                                             right_root))
+        return false;
+    }
+  } else if (!pg_vec_lower_output_expr(right_resolved, source_plan, ctx, plan,
+                                       &filter->exprs, right_root))
+    return false;
+
+  return filter->exprs.nodes[*left_root].scalar_kind ==
+             filter->exprs.nodes[*right_root].scalar_kind ||
+         pg_vec_scalar_kinds_numeric_compatible(
+             filter->exprs.nodes[*left_root].scalar_kind,
+             filter->exprs.nodes[*right_root].scalar_kind);
+}
+
+static bool
+pg_vec_lower_post_agg_qual(Node *node, Plan *source_plan,
+                           const PgVecLowerContext *ctx,
+                           PgVecPlan *plan,
+                           PgVecPostAggFilterSpec *filter,
+                           int *qual_root)
+{
+  PgVecQualNode qual_node;
+  BoolExpr *bool_expr;
+  OpExpr *opexpr;
+  char *op_name;
+  int left_root;
+  int right_root;
+
+  if (node == NULL)
+    return false;
+
+  node = pg_vec_strip_implicit_casts(node);
+  if (IsA(node, BoolExpr)) {
+    ListCell *lc;
+    int combined_root = -1;
+
+    bool_expr = castNode(BoolExpr, node);
+    if (bool_expr->boolop != AND_EXPR && bool_expr->boolop != OR_EXPR)
+      return false;
+
+    foreach (lc, bool_expr->args) {
+      int child_root;
+
+      if (!pg_vec_lower_post_agg_qual((Node *) lfirst(lc),
+                                      source_plan,
+                                      ctx,
+                                      plan,
+                                      filter,
+                                      &child_root))
+        return false;
+      if (combined_root < 0)
+        combined_root = child_root;
+      else if (!pg_vec_add_post_agg_binary_qual(filter,
+                                                bool_expr->boolop == AND_EXPR
+                                                    ? PG_VEC_QUAL_AND
+                                                    : PG_VEC_QUAL_OR,
+                                                combined_root,
+                                                child_root,
+                                                &combined_root))
+        return false;
+    }
+
+    *qual_root = combined_root;
+    return combined_root >= 0;
+  }
+
+  if (!IsA(node, OpExpr))
+    return false;
+
+  opexpr = castNode(OpExpr, node);
+  if (list_length(opexpr->args) != 2)
+    return false;
+  op_name = get_opname(opexpr->opno);
+  if (op_name == NULL || !pg_vec_filter_op_from_name(op_name, &qual_node.op))
+    return false;
+
+  if (!pg_vec_lower_post_agg_compare_operands(linitial(opexpr->args),
+                                              lsecond(opexpr->args),
+                                              source_plan,
+                                              ctx,
+                                              plan,
+                                              filter,
+                                              &left_root,
+                                              &right_root))
+    return false;
+
+  MemSet(&qual_node, 0, sizeof(qual_node));
+  qual_node.kind = PG_VEC_QUAL_COMPARE;
+  qual_node.left = -1;
+  qual_node.right = -1;
+  qual_node.lhs_expr = left_root;
+  qual_node.rhs_expr = right_root;
+  if (!pg_vec_filter_op_from_name(op_name, &qual_node.op))
+    return false;
+
+  return pg_vec_add_post_agg_qual_node(filter, &qual_node, qual_root);
+}
+
+static bool
+pg_vec_append_post_agg_filter_quals(List *quals, Plan *source_plan,
+                                    const PgVecLowerContext *ctx,
+                                    PgVecPlan *plan,
+                                    PgVecPostAggFilterSpec *filter)
+{
+  ListCell *lc;
+
+  foreach (lc, quals) {
+    int qual_root;
+
+    if (!pg_vec_lower_post_agg_qual((Node *) lfirst(lc),
+                                    source_plan,
+                                    ctx,
+                                    plan,
+                                    filter,
+                                    &qual_root))
+      return false;
+    if (filter->root < 0)
+      filter->root = qual_root;
+    else if (!pg_vec_add_post_agg_binary_qual(filter,
+                                              PG_VEC_QUAL_AND,
+                                              filter->root,
+                                              qual_root,
+                                              &filter->root))
+      return false;
+  }
+
+  return true;
+}
+
 static bool pg_vec_lower_agg_targetlist(QueryDesc *queryDesc, List *targetlist,
                                         Plan *source_plan,
                                         const PgVecLowerContext *ctx,
@@ -1184,9 +2029,14 @@ static bool pg_vec_lower_agg_targetlist(QueryDesc *queryDesc, List *targetlist,
 
     output_expr = &plan->agg.outputs[plan->agg.noutputs];
     pg_vec_output_expr_program_init(output_expr);
-    if (!pg_vec_lower_output_expr(tle->expr, source_plan, ctx, plan,
+    if (!pg_vec_lower_output_expr((Node *)tle->expr, source_plan, ctx, plan,
                                   output_expr, &output_expr->root))
+    {
+      ereport(WARNING,
+              errmsg("pg_vec debug: failed to lower agg output expr: %s",
+                     nodeToString(tle->expr)));
       return false;
+    }
 
     plan->agg.noutputs++;
   }
@@ -1205,21 +2055,26 @@ static bool pg_vec_make_single_input_context(SeqScan *seqscan,
   return true;
 }
 
-static bool pg_vec_make_join_input_context(SeqScan *left_scan,
-                                           SeqScan *right_scan,
-                                           PlannedStmt *plannedstmt,
-                                           PgVecLowerContext *ctx) {
-  ctx->ninputs = 2;
+static bool pg_vec_add_input_context(SeqScan *seqscan,
+                                     PlannedStmt *plannedstmt,
+                                     PgVecLowerContext *ctx, PgVecPlan *plan,
+                                     int *input_id) {
+  RangeTblEntry *rte;
 
-  ctx->inputs[0].rtindex = left_scan->scan.scanrelid;
-  ctx->inputs[0].input_id = 0;
-  ctx->inputs[0].relid =
-      rt_fetch(left_scan->scan.scanrelid, plannedstmt->rtable)->relid;
+  if (seqscan == NULL || ctx->ninputs >= PG_VEC_MAX_INPUTS)
+    return false;
 
-  ctx->inputs[1].rtindex = right_scan->scan.scanrelid;
-  ctx->inputs[1].input_id = 1;
-  ctx->inputs[1].relid =
-      rt_fetch(right_scan->scan.scanrelid, plannedstmt->rtable)->relid;
+  rte = rt_fetch(seqscan->scan.scanrelid, plannedstmt->rtable);
+  if (rte == NULL || rte->rtekind != RTE_RELATION)
+    return false;
+
+  *input_id = ctx->ninputs;
+  ctx->inputs[*input_id].rtindex = seqscan->scan.scanrelid;
+  ctx->inputs[*input_id].input_id = *input_id;
+  ctx->inputs[*input_id].relid = rte->relid;
+  plan->inputs[*input_id].relid = rte->relid;
+  ctx->ninputs++;
+  plan->ninputs = ctx->ninputs;
   return true;
 }
 
@@ -1238,7 +2093,8 @@ static bool pg_vec_lower_join_key_expr(Node *node, Plan *join_plan,
 
 static bool pg_vec_lower_join_keys_from_list(List *clauses, Plan *join_plan,
                                              const PgVecLowerContext *ctx,
-                                             PgVecPlan *plan) {
+                                             PgVecPlan *plan,
+                                             PgVecJoinSpec *join_spec) {
   ListCell *lc;
 
   foreach (lc, clauses) {
@@ -1271,45 +2127,433 @@ static bool pg_vec_lower_join_keys_from_list(List *clauses, Plan *join_plan,
         right_ref.scalar_kind != PG_VEC_SCALAR_INT32)
       return false;
 
-    if (left_ref.input_id != plan->join.left_input) {
+    if (left_ref.input_id == join_spec->right_input) {
       PgVecColumnRef tmp = left_ref;
 
       left_ref = right_ref;
       right_ref = tmp;
     }
 
-    if (plan->join.nkeys >= PG_VEC_MAX_JOIN_KEYS)
+    if (right_ref.input_id != join_spec->right_input ||
+        left_ref.input_id == join_spec->right_input)
+      return false;
+
+    if (join_spec->nkeys >= PG_VEC_MAX_JOIN_KEYS)
       return false;
 
     key.left = left_ref;
     key.right = right_ref;
-    plan->join.keys[plan->join.nkeys++] = key;
+    join_spec->keys[join_spec->nkeys++] = key;
   }
 
-  return plan->join.nkeys > 0;
+  return join_spec->nkeys > 0;
 }
 
 static bool pg_vec_lower_join_spec(Plan *join_plan,
+                                   PgVecJoinKind join_kind,
                                    const PgVecLowerContext *ctx,
-                                   PgVecPlan *plan) {
+                                   PgVecPlan *plan,
+                                   PgVecJoinSpec *join_spec) {
   List *clauses = NIL;
+  int left_input = join_spec->left_input;
+  int right_input = join_spec->right_input;
 
-  plan->join.enabled = true;
-  plan->join.kind = PG_VEC_JOIN_INNER;
-  plan->join.left_input = 0;
-  plan->join.right_input = 1;
-  plan->join.nkeys = 0;
+  MemSet(join_spec, 0, sizeof(*join_spec));
+  join_spec->kind = join_kind;
+  join_spec->left_input = left_input;
+  join_spec->right_input = right_input;
+  pg_vec_filter_spec_init(&join_spec->filter);
 
   if (IsA(join_plan, HashJoin))
     clauses = castNode(HashJoin, join_plan)->hashclauses;
   else if (IsA(join_plan, MergeJoin))
     clauses = castNode(MergeJoin, join_plan)->mergeclauses;
   else if (IsA(join_plan, NestLoop))
-    clauses = join_plan->qual;
+    clauses = pg_vec_join_quals(join_plan);
   else
     return false;
 
-  return pg_vec_lower_join_keys_from_list(clauses, join_plan, ctx, plan);
+  return pg_vec_lower_join_keys_from_list(clauses, join_plan, ctx, plan,
+                                          join_spec);
+}
+
+static List *
+pg_vec_join_quals(Plan *join_plan)
+{
+  if (join_plan == NULL)
+    return NIL;
+
+  if (IsA(join_plan, HashJoin))
+    return castNode(HashJoin, join_plan)->join.joinqual;
+  if (IsA(join_plan, MergeJoin))
+    return castNode(MergeJoin, join_plan)->join.joinqual;
+  if (IsA(join_plan, NestLoop))
+    return castNode(NestLoop, join_plan)->join.joinqual;
+
+  return NIL;
+}
+
+static Plan *
+pg_vec_strip_plan_wrappers(Plan *plan)
+{
+  while (plan != NULL) {
+    if (IsA(plan, Hash) || IsA(plan, Material) || IsA(plan, Sort)) {
+      plan = plan->lefttree;
+      continue;
+    }
+
+    if (IsA(plan, Agg) && pg_vec_join_tree_agg_elidable(castNode(Agg, plan))) {
+      plan = plan->lefttree;
+      continue;
+    }
+
+    break;
+  }
+
+  return plan;
+}
+
+static bool
+pg_vec_top_agg_split_supported(const Agg *agg)
+{
+  if (agg == NULL)
+    return false;
+
+  return (agg->aggsplit == AGGSPLIT_SIMPLE ||
+          agg->aggsplit == AGGSPLIT_FINAL_DESERIAL);
+}
+
+static bool
+pg_vec_join_tree_agg_elidable(const Agg *agg)
+{
+  if (agg == NULL)
+    return false;
+
+  if (agg->plan.righttree != NULL || agg->plan.qual != NIL)
+    return false;
+  if (agg->groupingSets != NIL)
+    return false;
+
+  return (agg->aggsplit == AGGSPLIT_SIMPLE ||
+          agg->aggsplit == AGGSPLIT_INITIAL_SERIAL);
+}
+
+static bool
+pg_vec_output_index_for_resno(List *targetlist, AttrNumber resno,
+                              int *output_idx)
+{
+  int current_idx = 0;
+  ListCell *lc;
+
+  foreach (lc, targetlist) {
+    TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+    if (tle->resjunk)
+      continue;
+    if (tle->resno == resno) {
+      *output_idx = current_idx;
+      return true;
+    }
+    current_idx++;
+  }
+
+  return false;
+}
+
+static bool
+pg_vec_output_index_for_group_key(const PgVecPlan *plan, int group_key_idx,
+                                  int *output_idx)
+{
+  for (int idx = 0; idx < plan->agg.noutputs; idx++) {
+    const PgVecOutputExprProgram *program = &plan->agg.outputs[idx];
+    const PgVecOutputExprNode *root;
+
+    if (program->root < 0 || program->root >= program->nnodes)
+      continue;
+    root = &program->nodes[program->root];
+    if (root->kind == PG_VEC_OUTPUT_EXPR_GROUP_KEY && root->index == group_key_idx) {
+      *output_idx = idx;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool
+pg_vec_sort_key_descending(Oid sort_operator, bool *descending)
+{
+  Oid opfamily;
+  Oid opcintype;
+  CompareType strategy;
+
+  if (!get_ordering_op_properties(sort_operator, &opfamily, &opcintype,
+                                  &strategy))
+    return false;
+  if (strategy == BTLessStrategyNumber) {
+    *descending = false;
+    return true;
+  }
+  if (strategy == BTGreaterStrategyNumber) {
+    *descending = true;
+    return true;
+  }
+
+  return false;
+}
+
+static bool
+pg_vec_lower_topn_spec(Limit *limit, Sort *sort, List *targetlist,
+                       PgVecPlan *plan)
+{
+  plan->topn.enabled = false;
+  plan->topn.has_limit = false;
+  plan->topn.limit_count = 0;
+  plan->topn.nsortkeys = 0;
+
+  if (sort != NULL) {
+    for (int key_idx = 0; key_idx < sort->numCols; key_idx++) {
+      int output_idx;
+      bool descending;
+      PgVecSortKey *sort_key;
+      PgVecOutputExprProgram *program;
+
+      if (plan->topn.nsortkeys >= PG_VEC_MAX_SORT_KEYS)
+        return false;
+      if (!pg_vec_output_index_for_resno(targetlist,
+                                         sort->sortColIdx[key_idx],
+                                         &output_idx))
+        return false;
+      if (!pg_vec_sort_key_descending(sort->sortOperators[key_idx],
+                                      &descending))
+        return false;
+
+      program = &plan->agg.outputs[output_idx];
+      if (program->root < 0 || program->root >= program->nnodes)
+        return false;
+      if (program->nodes[program->root].kind != PG_VEC_OUTPUT_EXPR_GROUP_KEY &&
+          program->nodes[program->root].kind != PG_VEC_OUTPUT_EXPR_AGGREF)
+        return false;
+
+      sort_key = &plan->topn.sort_keys[plan->topn.nsortkeys++];
+      sort_key->output_idx = output_idx;
+      sort_key->descending = descending;
+      sort_key->nulls_first = sort->nullsFirst[key_idx];
+    }
+  }
+
+  if (limit != NULL) {
+    Const *limit_const =
+        castNode(Const, pg_vec_strip_implicit_casts(limit->limitCount));
+
+    if (limit->limitOffset != NULL && !pg_vec_const_is_zero(limit->limitOffset))
+      return false;
+    if (limit->limitCount == NULL || !IsA(limit_const, Const) ||
+        limit_const->constisnull)
+      return false;
+
+    if (limit_const->consttype == INT8OID)
+      plan->topn.limit_count = DatumGetInt64(limit_const->constvalue);
+    else if (limit_const->consttype == INT4OID)
+      plan->topn.limit_count = DatumGetInt32(limit_const->constvalue);
+    else
+      return false;
+
+    if (plan->topn.limit_count < 0)
+      return false;
+    plan->topn.has_limit = true;
+  }
+
+  plan->topn.enabled = (plan->topn.nsortkeys > 0 || plan->topn.has_limit);
+  return true;
+}
+
+static bool
+pg_vec_lower_grouped_input_sort_spec(const Agg *agg, Sort *sort, PgVecPlan *plan)
+{
+  if (agg == NULL || sort == NULL)
+    return true;
+  if (!plan->agg.grouped)
+    return true;
+  if (plan->topn.enabled)
+    return true;
+
+  plan->topn.enabled = false;
+  plan->topn.has_limit = false;
+  plan->topn.limit_count = 0;
+  plan->topn.nsortkeys = 0;
+
+  for (int key_idx = 0; key_idx < sort->numCols; key_idx++) {
+    int group_key_idx = -1;
+    int output_idx;
+    bool descending;
+    PgVecSortKey *sort_key;
+
+    for (int grp_idx = 0; grp_idx < agg->numCols; grp_idx++) {
+      if (agg->grpColIdx[grp_idx] == sort->sortColIdx[key_idx]) {
+        group_key_idx = grp_idx;
+        break;
+      }
+    }
+
+    if (group_key_idx < 0)
+      return false;
+    if (!pg_vec_output_index_for_group_key(plan, group_key_idx, &output_idx))
+      return false;
+    if (!pg_vec_sort_key_descending(sort->sortOperators[key_idx], &descending))
+      return false;
+    if (plan->topn.nsortkeys >= PG_VEC_MAX_SORT_KEYS)
+      return false;
+
+    sort_key = &plan->topn.sort_keys[plan->topn.nsortkeys++];
+    sort_key->output_idx = output_idx;
+    sort_key->descending = descending;
+    sort_key->nulls_first = sort->nullsFirst[key_idx];
+  }
+
+  plan->topn.enabled = (plan->topn.nsortkeys > 0);
+  return true;
+}
+
+static bool
+pg_vec_lower_join_tree(Plan *subplan, PlannedStmt *plannedstmt,
+                       PgVecLowerContext *ctx, PgVecPlan *plan,
+                       PgVecJoinTreeInfo *info,
+                       const char **failure_reason)
+{
+  Join *join_node;
+  Plan *stripped = pg_vec_strip_plan_wrappers(subplan);
+
+  if (stripped == NULL) {
+    pg_vec_set_failure_reason(failure_reason, "missing join subplan");
+    return false;
+  }
+
+  if (IsA(stripped, SeqScan)) {
+    SeqScan *seqscan = castNode(SeqScan, stripped);
+    int input_id;
+
+    if (!pg_vec_add_input_context(seqscan, plannedstmt, ctx, plan, &input_id) ||
+        !pg_vec_lower_filter_quals(seqscan->scan.plan.qual,
+                                   &seqscan->scan.plan,
+                                   ctx,
+                                   plan,
+                                   &plan->inputs[input_id].filter)) {
+      pg_vec_set_failure_reason(failure_reason,
+                                "failed to lower SeqScan input in join tree");
+      return false;
+    }
+
+    info->first_input = input_id;
+    info->ninputs = 1;
+    info->njoins = 0;
+    return true;
+  }
+
+  if (!IsA(stripped, HashJoin) && !IsA(stripped, MergeJoin) &&
+      !IsA(stripped, NestLoop)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "join path currently requires a left-deep tree of base-relation joins");
+    return false;
+  }
+
+  join_node = (Join *) stripped;
+
+  {
+    PgVecJoinTreeInfo phys_left_info;
+    PgVecJoinTreeInfo phys_right_info;
+    const PgVecJoinTreeInfo *ordered_left_info[2];
+    const PgVecJoinTreeInfo *ordered_right_info[2];
+    const char *lower_failure = NULL;
+
+    if (!pg_vec_lower_join_tree(join_node->plan.lefttree,
+                                plannedstmt,
+                                ctx,
+                                plan,
+                                &phys_left_info,
+                                failure_reason))
+      return false;
+    if (!pg_vec_lower_join_tree(join_node->plan.righttree,
+                                plannedstmt,
+                                ctx,
+                                plan,
+                                &phys_right_info,
+                                failure_reason))
+      return false;
+    ordered_left_info[0] = &phys_left_info;
+    ordered_right_info[0] = &phys_right_info;
+    ordered_left_info[1] = &phys_right_info;
+    ordered_right_info[1] = &phys_left_info;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+      const PgVecJoinTreeInfo *left_info = ordered_left_info[attempt];
+      const PgVecJoinTreeInfo *right_info = ordered_right_info[attempt];
+      PgVecJoinSpec join_spec;
+      PgVecJoinKind join_kind = PG_VEC_JOIN_INVALID;
+      int total_joins = left_info->njoins + 1 + right_info->njoins;
+
+      if (total_joins > PG_VEC_MAX_JOINS) {
+        lower_failure = "too many joins for current pg_vec IR";
+        continue;
+      }
+
+      switch (join_node->jointype) {
+        case JOIN_INNER:
+          join_kind = PG_VEC_JOIN_INNER;
+          break;
+        case JOIN_SEMI:
+          if (left_info != &phys_left_info || right_info != &phys_right_info)
+            continue;
+          join_kind = PG_VEC_JOIN_SEMI;
+          break;
+        case JOIN_RIGHT_SEMI:
+          if (left_info != &phys_right_info || right_info != &phys_left_info)
+            continue;
+          join_kind = PG_VEC_JOIN_SEMI;
+          break;
+        default:
+          lower_failure = "join tree currently supports only inner and semi joins";
+          continue;
+      }
+
+      MemSet(&join_spec, 0, sizeof(join_spec));
+      join_spec.left_input = left_info->first_input;
+      join_spec.right_input = right_info->first_input;
+      if (!pg_vec_lower_join_spec(stripped, join_kind, ctx, plan, &join_spec) ||
+          !pg_vec_lower_filter_quals(pg_vec_join_quals(stripped),
+                                     stripped,
+                                     ctx,
+                                     plan,
+                                     &join_spec.filter) ||
+          !pg_vec_append_filter_quals(stripped->qual,
+                                      stripped,
+                                      ctx,
+                                      plan,
+                                      &join_spec.filter)) {
+        lower_failure = "failed to lower join keys or residual join filter";
+        continue;
+      }
+
+      info->first_input = left_info->first_input;
+      info->ninputs = left_info->ninputs + right_info->ninputs;
+      info->njoins = 0;
+
+      for (int join_idx = 0; join_idx < left_info->njoins; join_idx++)
+        info->joins[info->njoins++] = left_info->joins[join_idx];
+      info->joins[info->njoins++] = join_spec;
+      for (int join_idx = 0; join_idx < right_info->njoins; join_idx++)
+        info->joins[info->njoins++] = right_info->joins[join_idx];
+
+      return true;
+    }
+
+    pg_vec_set_failure_reason(
+        failure_reason,
+        lower_failure != NULL ? lower_failure
+                              : "failed to lower join keys or residual join filter");
+    return false;
+  }
 }
 
 static bool
@@ -1317,7 +2561,11 @@ pg_vec_try_translate_scan_filter_agg_plan(QueryDesc *queryDesc, PgVecPlan *plan,
                                           const char **failure_reason) {
   PlannedStmt *plannedstmt;
   Plan *plantree;
+  Limit *limit = NULL;
+  Sort *sort = NULL;
+  Sort *group_sort = NULL;
   Agg *agg;
+  Plan *scan_plan;
   SeqScan *seqscan;
   RangeTblEntry *rte;
   PgVecLowerContext ctx;
@@ -1325,8 +2573,21 @@ pg_vec_try_translate_scan_filter_agg_plan(QueryDesc *queryDesc, PgVecPlan *plan,
   plannedstmt = queryDesc->plannedstmt;
   plantree = plannedstmt->planTree;
 
+  MemSet(&ctx, 0, sizeof(ctx));
+  ctx.queryDesc = queryDesc;
+
+  if (IsA(plantree, Limit)) {
+    limit = castNode(Limit, plantree);
+    if (limit->plan.righttree != NULL) {
+      pg_vec_set_failure_reason(failure_reason,
+                                "top-level Limit must have a single child");
+      return false;
+    }
+    plantree = limit->plan.lefttree;
+  }
+
   if (IsA(plantree, Sort)) {
-    Sort *sort = castNode(Sort, plantree);
+    sort = castNode(Sort, plantree);
 
     if (sort->plan.righttree != NULL || !IsA(sort->plan.lefttree, Agg)) {
       pg_vec_set_failure_reason(failure_reason,
@@ -1343,13 +2604,30 @@ pg_vec_try_translate_scan_filter_agg_plan(QueryDesc *queryDesc, PgVecPlan *plan,
   }
 
   agg = castNode(Agg, plantree);
-  if (agg->plan.righttree != NULL || !IsA(agg->plan.lefttree, SeqScan)) {
+  if (!pg_vec_top_agg_split_supported(agg)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "single-input path only supports SIMPLE or FINAL aggregates");
+    return false;
+  }
+  scan_plan = agg->plan.lefttree;
+  if (sort == NULL && IsA(scan_plan, Sort)) {
+    group_sort = castNode(Sort, scan_plan);
+    if (group_sort->plan.righttree != NULL) {
+      pg_vec_set_failure_reason(failure_reason,
+                                "input Sort below Agg must have a single child");
+      return false;
+    }
+    scan_plan = group_sort->plan.lefttree;
+  }
+
+  if (agg->plan.righttree != NULL || !IsA(scan_plan, SeqScan)) {
     pg_vec_set_failure_reason(failure_reason,
                               "single-input path expects Agg over SeqScan");
     return false;
   }
 
-  seqscan = castNode(SeqScan, agg->plan.lefttree);
+  seqscan = castNode(SeqScan, scan_plan);
   rte = rt_fetch(seqscan->scan.scanrelid, plannedstmt->rtable);
   if (rte == NULL || rte->rtekind != RTE_RELATION) {
     pg_vec_set_failure_reason(
@@ -1375,6 +2653,28 @@ pg_vec_try_translate_scan_filter_agg_plan(QueryDesc *queryDesc, PgVecPlan *plan,
         "failed to lower aggregate targetlist for single-input path");
     return false;
   }
+  if (!pg_vec_append_post_agg_filter_quals(agg->plan.qual,
+                                           &agg->plan,
+                                           &ctx,
+                                           plan,
+                                           &plan->agg.having)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "failed to lower aggregate HAVING quals for single-input path");
+    return false;
+  }
+  if (!pg_vec_lower_topn_spec(limit, sort, agg->plan.targetlist, plan)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "failed to lower top-level sort or limit for single-input path");
+    return false;
+  }
+  if (!pg_vec_lower_grouped_input_sort_spec(agg, group_sort, plan)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "failed to lower grouped input sort order for single-input path");
+    return false;
+  }
   if (!pg_vec_lower_filter_quals(seqscan->scan.plan.qual, &seqscan->scan.plan,
                                  &ctx, plan, &plan->inputs[0].filter)) {
     pg_vec_set_failure_reason(
@@ -1391,19 +2691,33 @@ pg_vec_try_translate_join_filter_agg_plan(QueryDesc *queryDesc, PgVecPlan *plan,
                                           const char **failure_reason) {
   PlannedStmt *plannedstmt;
   Plan *plantree;
+  Limit *limit = NULL;
+  Sort *sort = NULL;
+  Sort *group_sort = NULL;
   Agg *agg;
   Plan *join_plan;
-  SeqScan *left_scan;
-  SeqScan *right_scan;
-  RangeTblEntry *left_rte;
-  RangeTblEntry *right_rte;
   PgVecLowerContext ctx;
+  PgVecJoinTreeInfo join_info;
 
   plannedstmt = queryDesc->plannedstmt;
   plantree = plannedstmt->planTree;
 
+  MemSet(&ctx, 0, sizeof(ctx));
+  MemSet(&join_info, 0, sizeof(join_info));
+  ctx.queryDesc = queryDesc;
+
+  if (IsA(plantree, Limit)) {
+    limit = castNode(Limit, plantree);
+    if (limit->plan.righttree != NULL) {
+      pg_vec_set_failure_reason(failure_reason,
+                                "top-level Limit must have a single child");
+      return false;
+    }
+    plantree = limit->plan.lefttree;
+  }
+
   if (IsA(plantree, Sort)) {
-    Sort *sort = castNode(Sort, plantree);
+    sort = castNode(Sort, plantree);
 
     if (sort->plan.righttree != NULL || !IsA(sort->plan.lefttree, Agg)) {
       pg_vec_set_failure_reason(failure_reason,
@@ -1420,74 +2734,85 @@ pg_vec_try_translate_join_filter_agg_plan(QueryDesc *queryDesc, PgVecPlan *plan,
   }
 
   agg = castNode(Agg, plantree);
+  if (!pg_vec_top_agg_split_supported(agg)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "join path only supports SIMPLE or FINAL aggregates");
+    return false;
+  }
   join_plan = agg->plan.lefttree;
-  if (join_plan == NULL ||
-      (!IsA(join_plan, HashJoin) && !IsA(join_plan, MergeJoin) &&
-       !IsA(join_plan, NestLoop))) {
-    pg_vec_set_failure_reason(
-        failure_reason,
-        "join path expects Agg over HashJoin, MergeJoin, or NestLoop");
-    return false;
+  if (sort == NULL && IsA(join_plan, Sort)) {
+    group_sort = castNode(Sort, join_plan);
+    if (group_sort->plan.righttree != NULL) {
+      pg_vec_set_failure_reason(
+          failure_reason,
+          "input Sort below Agg must have a single child in join path");
+      return false;
+    }
+    join_plan = group_sort->plan.lefttree;
   }
-
-  if (join_plan->lefttree == NULL || join_plan->righttree == NULL ||
-      !IsA(join_plan->lefttree, SeqScan) ||
-      !IsA(join_plan->righttree, SeqScan)) {
+  if (join_plan == NULL) {
     pg_vec_set_failure_reason(
         failure_reason,
-        "join path currently requires two base-relation SeqScan inputs");
-    return false;
-  }
-
-  left_scan = castNode(SeqScan, join_plan->lefttree);
-  right_scan = castNode(SeqScan, join_plan->righttree);
-  left_rte = rt_fetch(left_scan->scan.scanrelid, plannedstmt->rtable);
-  right_rte = rt_fetch(right_scan->scan.scanrelid, plannedstmt->rtable);
-  if (left_rte == NULL || right_rte == NULL ||
-      left_rte->rtekind != RTE_RELATION || right_rte->rtekind != RTE_RELATION) {
-    pg_vec_set_failure_reason(
-        failure_reason,
-        "join path requires both SeqScan inputs to be base relations");
+        "join path expects Agg over a left-deep join subtree");
     return false;
   }
 
   plan->kind = PG_VEC_PLAN_SCAN_FILTER_AGG;
-  plan->ninputs = 2;
-  plan->inputs[0].relid = left_rte->relid;
-  plan->inputs[1].relid = right_rte->relid;
   plan->agg.grouped = (agg->numCols > 0);
 
-  if (!pg_vec_make_join_input_context(left_scan, right_scan, plannedstmt,
-                                      &ctx)) {
-    pg_vec_set_failure_reason(
-        failure_reason, "failed to map join inputs into pg_vec input context");
+  if (!pg_vec_lower_join_tree(join_plan,
+                              plannedstmt,
+                              &ctx,
+                              plan,
+                              &join_info,
+                              failure_reason)) {
+    if (failure_reason != NULL && *failure_reason == NULL)
+      pg_vec_set_failure_reason(failure_reason,
+                                "failed to lower join tree");
     return false;
   }
-  if (!pg_vec_lower_join_spec(join_plan, &ctx, plan)) {
-    pg_vec_set_failure_reason(failure_reason,
-                              "failed to lower join keys or join metadata");
-    return false;
-  }
-  if (!pg_vec_lower_filter_quals(left_scan->scan.plan.qual,
-                                 &left_scan->scan.plan, &ctx, plan,
-                                 &plan->inputs[0].filter)) {
-    pg_vec_set_failure_reason(
-        failure_reason,
-        "failed to lower left-input filter quals for join path");
-    return false;
-  }
-  if (!pg_vec_lower_filter_quals(right_scan->scan.plan.qual,
-                                 &right_scan->scan.plan, &ctx, plan,
-                                 &plan->inputs[1].filter)) {
+  plan->njoins = join_info.njoins;
+  for (int join_idx = 0; join_idx < join_info.njoins; join_idx++)
+    plan->joins[join_idx] = join_info.joins[join_idx];
+  if (plan->ninputs < 2 || plan->njoins < 1) {
     pg_vec_set_failure_reason(
         failure_reason,
-        "failed to lower right-input filter quals for join path");
+        "join path requires at least two base-relation inputs");
+    return false;
+  }
+  if (join_info.ninputs != plan->ninputs) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "join path failed to preserve a consistent input count");
     return false;
   }
   if (!pg_vec_lower_agg_targetlist(queryDesc, agg->plan.targetlist, &agg->plan,
                                    &ctx, plan)) {
     pg_vec_set_failure_reason(
         failure_reason, "failed to lower aggregate targetlist for join path");
+    return false;
+  }
+  if (!pg_vec_append_post_agg_filter_quals(agg->plan.qual,
+                                           &agg->plan,
+                                           &ctx,
+                                           plan,
+                                           &plan->agg.having)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "failed to lower aggregate HAVING quals for join path");
+    return false;
+  }
+  if (!pg_vec_lower_topn_spec(limit, sort, agg->plan.targetlist, plan)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "failed to lower top-level sort or limit for join path");
+    return false;
+  }
+  if (!pg_vec_lower_grouped_input_sort_spec(agg, group_sort, plan)) {
+    pg_vec_set_failure_reason(
+        failure_reason,
+        "failed to lower grouped input sort order for join path");
     return false;
   }
 

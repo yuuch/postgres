@@ -7,6 +7,8 @@
 
 #include "state.h"
 
+extern bool pg_vec_jit_deform;
+
 bool pg_vec_execute_query(QueryDesc *queryDesc,
 						  PgVecQueryState *state,
 						  ScanDirection direction,

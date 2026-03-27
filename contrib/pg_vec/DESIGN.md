@@ -142,9 +142,26 @@ As of the current implementation:
 - `Q1` runs on the generic single-table `SeqScan -> Filter -> Agg` path
 - `Q6` runs on the same generic path and is the first stable fully columnar
   hot path
-- a minimal two-input inner-join plus aggregate path exists and is sufficient
-  for the current `q14` regression shape
-- more general TPCH join/lowering coverage is still in progress
+- `Q12`, `Q14`, and `Q19` now all run on the generic two-input inner-join plus
+  aggregate path
+- `Q4` now runs after widening the same join pipeline to accept planner
+  semi-join shapes as well as pre-unique inner joins
+- `Q3`, `Q5`, `Q7`, `Q8`, `Q9`, and `Q10` now run on the generic multi-join
+  grouped top-N / grouped aggregate path
+- `Q11` now runs after lowering aggregate `HAVING` clauses into a post-agg
+  filter IR and resolving uncorrelated scalar `InitPlan` values into constants
+- the `Q19` fix required lowering residual join predicates from `Join.joinqual`
+  instead of only looking at `Plan.qual`
+- the live planner path for `Q3` required accepting top
+  `Finalize GroupAggregate` / `FINAL_DESERIAL` shapes and seeing through
+  elidable `Partial HashAggregate` wrappers inside a join subtree
+- the `Q10` fix required join-tree lowering to tolerate commuted bushy
+  inner-join shapes while still producing a left-deep join chain for the
+  executor
+- the current derived-expression coverage now includes flattened derived-table
+  shapes such as `Q8` and contains-`LIKE` arithmetic shapes such as `Q9`
+- the next large semantic gap is derived aggregate inputs and non-aggregate
+  top plans such as `Q15` and `Q18`
 
 ## Why C + C++ Is The Right Split
 
@@ -361,16 +378,90 @@ FlatVector<T>
 For the TPC-H fast path, many hot columns are `NOT NULL`, so the validity
 bitmap can often be omitted entirely.
 
-For strings, use a simple flat representation first:
+For strings, the current implementation is intentionally simple but should be
+viewed as a transitional design rather than the desired end state.
+
+Today, `pg_vec` stores strings as a fixed inline payload:
+
+```text
+FlatVector<String128>
+  String128 values[capacity]
+
+String128
+  uint16 len
+  char bytes[128]
+```
+
+This is already columnar, but it is not yet a strong vectorized string layout:
+
+- every value is eagerly decoded from PostgreSQL varlena form
+- every value is copied into a fixed-width inline object
+- equality and ordering still fall back to length trimming plus `memcmp`
+- there is no offset buffer, prefix cache, dictionary encoding, or late
+  materialization
+
+That is good enough for correctness and for bringing up string predicates, but
+it is one reason string-heavy TPC-H queries still lag core PostgreSQL.
+
+The recommended target is a two-level string layout:
 
 ```text
 FlatVector<StringRef>
-  StringRef values[capacity]
+  StringRef refs[capacity]
+  uint8 data_arena[...]
 
 StringRef
-  const char *ptr
+  uint32 offset
   uint32 len
+  uint64 prefix
 ```
+
+In that design:
+
+- `offset` points into a chunk-local or materialized-input-local byte arena
+- `len` is the logical string length after any type-specific normalization
+- `prefix` stores the first 8 bytes, zero-padded when shorter
+
+This representation lets the engine:
+
+- compare `len` and `prefix` before touching full payload bytes
+- hash strings from cheap metadata first, then fall back to full-byte checks on
+  collisions
+- avoid copying large fixed-width string objects around the pipeline
+- reuse the same representation in both scan chunks and materialized join build
+  inputs
+
+For low-cardinality TPC-H string columns, a further optimization is worth
+planning from the start:
+
+```text
+DictionaryVector<StringId>
+  uint16 ids[capacity]
+  StringRef dictionary[ndistinct]
+```
+
+This is especially relevant for values such as shipping modes, priorities,
+status flags, brands, and containers, where joins, filters, grouping, and
+sorting can often run entirely on integer ids.
+
+The intended progression is:
+
+1. keep the current `String128` path as the correctness baseline
+2. add `StringRef + arena + prefix` for general `text` / `varchar` / `bpchar`
+   execution
+3. add dictionary fast paths for low-cardinality columns
+4. keep final row materialization as the only place that must reconstruct a
+   client-visible string result
+
+The current codebase is now in the middle of step 2:
+
+- scan `DataChunk` storage uses `StringRef + arena + prefix`
+- materialized join-build inputs use the same representation
+- `bpchar` values are normalized during deform by trimming trailing spaces once
+- string comparisons in the engine hot path now compare `len + prefix + tail`
+  directly instead of reconstructing full inline string objects first
+- grouped result rows and bridge output still use `PgVecStringConst` as the
+  stable boundary format
 
 Dictionary encoding can be added later for low-cardinality group keys, but it
 does not need to block Q6 or Q1.
@@ -683,6 +774,85 @@ On the current local 10GB TPC-H environment:
   - median `pg_vec=off`: `21622.518 ms`
   - median `pg_vec=on`: `10542.608 ms`
 
+On March 26, 2026, after retuning the live `/Users/chenyunwen/data/pg_tpch`
+instance for analytic TPC-H work
+(`shared_buffers=6GB`, `effective_cache_size=18GB`, `work_mem=128MB`,
+`maintenance_work_mem=2GB`, `wal_buffers=64MB`, `max_wal_size=8GB`,
+`default_statistics_target=500`, `jit=off`), the same 10GB benchmark with
+session-local parallelism disabled produced:
+
+- `Q1` still wins materially on `pg_vec`
+  - median `pg_vec=off`: `21838.034 ms`
+  - median `pg_vec=on`: `12630.044 ms`
+  - improvement: about `42.2%`
+- `Q6` regresses slightly versus core PostgreSQL
+  - median `pg_vec=off`: `4152.239 ms`
+  - median `pg_vec=on`: `4282.139 ms`
+  - regression: about `3.1%`
+- `Q14` regresses more noticeably on the generic join path
+  - median `pg_vec=off`: `4522.797 ms`
+  - median `pg_vec=on`: `4896.474 ms`
+  - regression: about `8.3%`
+
+The latest live `Q14` sample confirms that the hottest leaf is still
+`DataChunkDeformer::append_tuple()`, with the next visible buckets in
+`evaluate_filter_clause()`, join hash lookup, and the generic aggregate
+expression interpreter. The flamegraph generated from that run lives at
+`contrib/pg_vec/tests/q14_pgvec_on.flame.svg`.
+
+After the string-column refactor, execution-time scan chunks and materialized
+join inputs now use `StringRef + arena + prefix` instead of the original
+`String128` copies on the hot path. Grouped result rows and the bridge output
+still keep `String128` as the stable boundary format.
+
+A first conservative late-materialization prototype now exists for the
+single-join path:
+
+- columns used only by aggregate/group expressions can be marked `late`
+- scanner/materialize only keep early columns plus row identity
+- materialized build-side rows lazily cache late columns on first access
+- streaming probe-side rows can decode late columns from a chunk-local tuple
+  copy fast path for sparse survivor sets
+
+This is still a bring-up implementation rather than a finished design. On the
+latest live 10GB retest after wiring that prototype, the medians were:
+
+- `Q12`
+  - median `pg_vec=off`: `9499.880 ms`
+  - median `pg_vec=on`: `10163.336 ms`
+  - regression: about `7.0%`
+- `Q14`
+  - median `pg_vec=off`: `6255.407 ms`
+  - median `pg_vec=on`: `7363.543 ms`
+  - regression: about `17.7%`
+- `Q19`
+  - median `pg_vec=off`: `7245.564 ms`
+  - median `pg_vec=on`: `9689.324 ms`
+  - regression: about `33.7%`
+
+On the latest live 10GB retest after widening the generic multi-join grouped
+aggregate path far enough for `Q5`, the medians were:
+
+- `Q5`
+  - median `pg_vec=off`: `6786.118 ms`
+  - median `pg_vec=on`: `8790.786 ms`
+  - regression: about `29.5%`
+
+On the latest live 10GB retest after adding grouped
+`EXTRACT(YEAR FROM date)` support and deferring multi-join residual filters
+until all referenced inputs are bound, the medians were:
+
+- `Q7`
+  - median `pg_vec=off`: `6277.694 ms`
+  - median `pg_vec=on`: `11635.590 ms`
+  - regression: about `85.3%`
+
+The main takeaway is that late materialization does help recover some of the
+string/numeric eager-decode cost on join queries, but it is not yet enough to
+close the gap with core PostgreSQL. The remaining hot path is still dominated
+by numeric decode, residual filter work, and the row-wise nature of the
+current join probe pipeline.
+
 The most recent improvements that moved Q6 from a regression to parity were:
 
 - switching the scanner to PostgreSQL's `read_stream` sequential scan path
@@ -691,6 +861,16 @@ The most recent improvements that moved Q6 from a regression to parity were:
 
 The next likely hotspot for Q6-style queries is aggregate input expression
 evaluation, which still uses the generic expression interpreter.
+
+For multi-join grouped queries, the current executor no longer materializes a
+full intermediate joined-row set. It now streams the leftmost input, probes a
+left-deep chain of right-side hash tables, and aggregates immediately on
+successful probe chains. This is what made live `Q3` practical on the 10GB
+dataset after translator support for finalize/partial aggregate planner shapes
+was added. `Q7` extends the same path with one additional expression feature:
+group keys can now be lowered as compact expression programs rather than only
+as base columns, and the current engine specifically supports
+`EXTRACT(YEAR FROM date)` on that path.
 
 ### Aggregation strategy
 
@@ -880,18 +1060,18 @@ The current status against that plan is:
 - steps 1 through 3 are done
 - step 4 is in progress
   - a minimal two-input inner join plus aggregate path exists
-  - the current regression `q14` shape is covered
+  - the current regression shapes `q12`, `q14`, and `q19` are covered
   - broader live TPCH join/lowering coverage still needs work
 - steps 5 through 7 have not started yet as full features
 
 The current near-term priority is:
 
 1. widen the generic join/lowering path so live TPCH `Q12`, `Q14`, and `Q19`
-   all use the same engine path
+   stay on the same engine path as planner shapes drift
 2. keep reducing interpreter work in hot loops, especially aggregate input
    expression evaluation
-3. extend filter fast paths from simple conjunctive comparisons to `OR`,
-   `IN (...)`, and aggregate-local filters
+3. extend the same live-shape multi-join grouped top-N path from `Q3` to wider
+   join graphs such as `Q10` and `Q5`
 
 This sequence gets to "TPC-H runs end-to-end" much faster than chasing generic
 executor parity.

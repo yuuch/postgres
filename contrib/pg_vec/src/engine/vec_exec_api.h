@@ -17,9 +17,12 @@ typedef struct PgVecScanFilterAggExecParams
 	int			ninputs;
 	Relation	rels[PG_VEC_MAX_INPUTS];
 	Snapshot	snapshot;
+	bool		enable_jit_deform;
 	PgVecInputSpec inputs[PG_VEC_MAX_INPUTS];
-	PgVecJoinSpec join;
+	int			njoins;
+	PgVecJoinSpec joins[PG_VEC_MAX_JOINS];
 	PgVecAggSpec agg;
+	PgVecTopNSpec topn;
 } PgVecScanFilterAggExecParams;
 
 typedef struct PgVecAggExecState

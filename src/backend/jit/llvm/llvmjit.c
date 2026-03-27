@@ -53,17 +53,17 @@ typedef struct LLVMJitHandle
 
 
 /* types & functions commonly needed for JITing */
-LLVMTypeRef TypeSizeT;
+PGDLLEXPORT LLVMTypeRef TypeSizeT;
 LLVMTypeRef TypeDatum;
 LLVMTypeRef TypeParamBool;
 LLVMTypeRef TypeStorageBool;
 LLVMTypeRef TypePGFunction;
 LLVMTypeRef StructNullableDatum;
-LLVMTypeRef StructHeapTupleData;
+PGDLLEXPORT LLVMTypeRef StructHeapTupleData;
 LLVMTypeRef StructMinimalTupleData;
 LLVMTypeRef StructTupleDescData;
 LLVMTypeRef StructTupleTableSlot;
-LLVMTypeRef StructHeapTupleHeaderData;
+PGDLLEXPORT LLVMTypeRef StructHeapTupleHeaderData;
 LLVMTypeRef StructHeapTupleTableSlot;
 LLVMTypeRef StructMinimalTupleTableSlot;
 LLVMTypeRef StructMemoryContextData;
@@ -220,7 +220,7 @@ llvm_recreate_llvm_context(void)
  * the context is explicitly released, or when the lifetime of
  * CurrentResourceOwner ends (usually the end of the current [sub]xact).
  */
-LLVMJitContext *
+PGDLLEXPORT LLVMJitContext *
 llvm_create_context(int jitFlags)
 {
 	LLVMJitContext *context;
@@ -244,6 +244,16 @@ llvm_create_context(int jitFlags)
 	llvm_jit_context_in_use_count++;
 
 	return context;
+}
+
+PGDLLEXPORT void
+llvm_release_context_direct(LLVMJitContext *context)
+{
+	if (context == NULL)
+		return;
+
+	llvm_release_context(&context->base);
+	pfree(context);
 }
 
 /*
@@ -313,7 +323,7 @@ llvm_release_context(JitContext *context)
 /*
  * Return module which may be modified, e.g. by creating new functions.
  */
-LLVMModuleRef
+PGDLLEXPORT LLVMModuleRef
 llvm_mutable_module(LLVMJitContext *context)
 {
 	llvm_assert_in_fatal_section();
@@ -338,7 +348,7 @@ llvm_mutable_module(LLVMJitContext *context)
  * generating code, when adding new externally visible function definitions to
  * a Module.
  */
-char *
+PGDLLEXPORT char *
 llvm_expand_funcname(struct LLVMJitContext *context, const char *basename)
 {
 	Assert(context->module != NULL);
@@ -359,7 +369,7 @@ llvm_expand_funcname(struct LLVMJitContext *context, const char *basename)
  * Return pointer to function funcname, which has to exist. If there's pending
  * code to be optimized and emitted, do so first.
  */
-void *
+PGDLLEXPORT void *
 llvm_get_function(LLVMJitContext *context, const char *funcname)
 {
 	ListCell   *lc;

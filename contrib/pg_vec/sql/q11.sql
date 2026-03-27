@@ -1,0 +1,71 @@
+SET client_min_messages = warning;
+SET datestyle = 'ISO, MDY';
+SET join_collapse_limit = 1;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = on;
+
+CREATE TABLE nation (
+	n_nationkey integer NOT NULL,
+	n_name char(25) NOT NULL
+);
+
+CREATE TABLE supplier (
+	s_suppkey integer NOT NULL,
+	s_nationkey integer NOT NULL
+);
+
+CREATE TABLE partsupp (
+	ps_partkey integer NOT NULL,
+	ps_suppkey integer NOT NULL,
+	ps_availqty integer NOT NULL,
+	ps_supplycost numeric(15,2) NOT NULL
+);
+
+INSERT INTO nation VALUES
+	(1, 'GERMANY'),
+	(2, 'FRANCE');
+
+INSERT INTO supplier VALUES
+	(1, 1),
+	(2, 1),
+	(3, 2);
+
+INSERT INTO partsupp VALUES
+	(1, 1, 1, 1000.00),
+	(2, 2, 1, 0.01),
+	(3, 3, 100, 9.99);
+
+select
+	ps_partkey,
+	sum(ps_supplycost * ps_availqty) as value
+from
+	partsupp,
+	supplier,
+	nation
+where
+	ps_suppkey = s_suppkey
+	and s_nationkey = n_nationkey
+	and n_name = 'GERMANY'
+group by
+	ps_partkey having
+		sum(ps_supplycost * ps_availqty) > (
+			select
+				sum(ps_supplycost * ps_availqty) * 0.0001
+			from
+				partsupp,
+				supplier,
+				nation
+			where
+				ps_suppkey = s_suppkey
+				and s_nationkey = n_nationkey
+				and n_name = 'GERMANY'
+		)
+order by
+	value desc;
+
+DROP TABLE partsupp;
+DROP TABLE supplier;
+DROP TABLE nation;
+DROP EXTENSION pg_vec;

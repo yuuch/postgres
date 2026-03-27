@@ -16,6 +16,7 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static bool pg_vec_enabled = true;
 static bool pg_vec_trace_hooks = false;
+bool pg_vec_jit_deform = true;
 
 static void pg_vec_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_vec_ExecutorRun(QueryDesc *queryDesc,
@@ -48,6 +49,17 @@ _PG_init(void)
 							 NULL,
 							 &pg_vec_trace_hooks,
 							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("pg_vec.jit_deform",
+							 "Enable LLVM JIT deform for pg_vec when a supported deform program is available.",
+							 NULL,
+							 &pg_vec_jit_deform,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL,

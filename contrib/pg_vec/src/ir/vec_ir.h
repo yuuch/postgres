@@ -8,7 +8,7 @@
 
 enum
 {
-	PG_VEC_MAX_INPUTS = 2,
+	PG_VEC_MAX_INPUTS = 8,
 	PG_VEC_MAX_SCAN_COLUMNS = 24,
 	PG_VEC_MAX_EXPR_NODES = 64,
 	PG_VEC_MAX_FILTER_NODES = 64,
@@ -17,7 +17,10 @@ enum
 	PG_VEC_MAX_OUTPUT_COLUMNS = PG_VEC_MAX_GROUP_KEYS + PG_VEC_MAX_AGG_CALLS,
 	PG_VEC_MAX_OUTPUT_EXPR_NODES = 32,
 	PG_VEC_INLINE_STRING_MAX = 128,
-	PG_VEC_MAX_JOIN_KEYS = 4
+	PG_VEC_STRING_PREFIX_BYTES = 8,
+	PG_VEC_MAX_JOIN_KEYS = 4,
+	PG_VEC_MAX_JOINS = PG_VEC_MAX_INPUTS - 1,
+	PG_VEC_MAX_SORT_KEYS = 8
 };
 
 typedef enum PgVecPlanKind
@@ -32,6 +35,7 @@ typedef enum PgVecScalarKind
 	PG_VEC_SCALAR_INT32,
 	PG_VEC_SCALAR_DATE32,
 	PG_VEC_SCALAR_DECIMAL64_S2,
+	PG_VEC_SCALAR_DECIMAL128_S2,
 	PG_VEC_SCALAR_DECIMAL128_S4,
 	PG_VEC_SCALAR_DECIMAL128_S6,
 	PG_VEC_SCALAR_CHAR1,
@@ -43,6 +47,14 @@ typedef struct PgVecStringConst
 	uint16		len;
 	char		bytes[PG_VEC_INLINE_STRING_MAX];
 } PgVecStringConst;
+
+typedef struct PgVecStringRef
+{
+	uint32		tail_offset;
+	uint16		len;
+	uint16		flags;
+	uint64		prefix;
+} PgVecStringRef;
 
 typedef struct PgVecColumnRef
 {
@@ -65,6 +77,7 @@ typedef enum PgVecExprKind
 	PG_VEC_EXPR_INVALID = 0,
 	PG_VEC_EXPR_COLUMN,
 	PG_VEC_EXPR_CONST,
+	PG_VEC_EXPR_EXTRACT_YEAR,
 	PG_VEC_EXPR_ADD,
 	PG_VEC_EXPR_SUB,
 	PG_VEC_EXPR_MUL
@@ -91,11 +104,13 @@ typedef enum PgVecFilterOp
 {
 	PG_VEC_OP_INVALID = 0,
 	PG_VEC_OP_EQ,
+	PG_VEC_OP_NE,
 	PG_VEC_OP_LT,
 	PG_VEC_OP_LE,
 	PG_VEC_OP_GT,
 	PG_VEC_OP_GE,
-	PG_VEC_OP_PREFIX_LIKE
+	PG_VEC_OP_PREFIX_LIKE,
+	PG_VEC_OP_CONTAINS_LIKE
 } PgVecFilterOp;
 
 typedef enum PgVecQualKind
@@ -173,15 +188,30 @@ typedef struct PgVecOutputExprProgram
 	PgVecOutputExprNode nodes[PG_VEC_MAX_OUTPUT_EXPR_NODES];
 } PgVecOutputExprProgram;
 
+typedef struct PgVecPostAggFilterSpec
+{
+	PgVecOutputExprProgram exprs;
+	int			root;
+	int			nnodes;
+	PgVecQualNode nodes[PG_VEC_MAX_FILTER_NODES];
+} PgVecPostAggFilterSpec;
+
+typedef struct PgVecGroupKeySpec
+{
+	PgVecScalarKind scalar_kind;
+	PgVecExprProgram expr;
+} PgVecGroupKeySpec;
+
 typedef struct PgVecAggSpec
 {
 	bool		grouped;
 	int			ngroup_keys;
-	PgVecColumnRef group_keys[PG_VEC_MAX_GROUP_KEYS];
+	PgVecGroupKeySpec group_keys[PG_VEC_MAX_GROUP_KEYS];
 	int			noutputs;
 	PgVecOutputExprProgram outputs[PG_VEC_MAX_OUTPUT_COLUMNS];
 	int			naggs;
 	PgVecAggCall aggs[PG_VEC_MAX_AGG_CALLS];
+	PgVecPostAggFilterSpec having;
 } PgVecAggSpec;
 
 typedef struct PgVecInputSpec
@@ -195,7 +225,8 @@ typedef struct PgVecInputSpec
 typedef enum PgVecJoinKind
 {
 	PG_VEC_JOIN_INVALID = 0,
-	PG_VEC_JOIN_INNER
+	PG_VEC_JOIN_INNER,
+	PG_VEC_JOIN_SEMI
 } PgVecJoinKind;
 
 typedef struct PgVecJoinKey
@@ -206,21 +237,39 @@ typedef struct PgVecJoinKey
 
 typedef struct PgVecJoinSpec
 {
-	bool		enabled;
 	PgVecJoinKind kind;
 	int			left_input;
 	int			right_input;
 	int			nkeys;
 	PgVecJoinKey keys[PG_VEC_MAX_JOIN_KEYS];
+	PgVecFilterSpec filter;
 } PgVecJoinSpec;
+
+typedef struct PgVecSortKey
+{
+	int			output_idx;
+	bool		descending;
+	bool		nulls_first;
+} PgVecSortKey;
+
+typedef struct PgVecTopNSpec
+{
+	bool		enabled;
+	bool		has_limit;
+	int64		limit_count;
+	int			nsortkeys;
+	PgVecSortKey sort_keys[PG_VEC_MAX_SORT_KEYS];
+} PgVecTopNSpec;
 
 typedef struct PgVecPlan
 {
 	PgVecPlanKind kind;
 	int			ninputs;
 	PgVecInputSpec inputs[PG_VEC_MAX_INPUTS];
-	PgVecJoinSpec join;
+	int			njoins;
+	PgVecJoinSpec joins[PG_VEC_MAX_JOINS];
 	PgVecAggSpec agg;
+	PgVecTopNSpec topn;
 } PgVecPlan;
 
 #endif

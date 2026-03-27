@@ -12,6 +12,7 @@ extern Datum numeric_add(PG_FUNCTION_ARGS);
 extern Datum numeric_sub(PG_FUNCTION_ARGS);
 extern Datum numeric_mul(PG_FUNCTION_ARGS);
 extern Datum numeric_div(PG_FUNCTION_ARGS);
+extern bool pg_vec_jit_deform;
 
 static bool pg_vec_execute_scan_filter_agg(QueryDesc *queryDesc,
 										   PgVecQueryState *state,
@@ -103,14 +104,18 @@ pg_vec_execute_scan_filter_agg(QueryDesc *queryDesc,
 
 	MemSet(&exec_params, 0, sizeof(exec_params));
 	exec_params.ninputs = plan->ninputs;
+	exec_params.njoins = plan->njoins;
 	exec_params.snapshot = estate->es_snapshot;
-	exec_params.join = plan->join;
+	exec_params.enable_jit_deform = pg_vec_jit_deform;
 	exec_params.agg = plan->agg;
+	exec_params.topn = plan->topn;
 	for (int input_id = 0; input_id < plan->ninputs; input_id++)
 	{
 		exec_params.rels[input_id] = state->rels[input_id];
 		exec_params.inputs[input_id] = plan->inputs[input_id];
 	}
+	for (int join_idx = 0; join_idx < plan->njoins; join_idx++)
+		exec_params.joins[join_idx] = plan->joins[join_idx];
 
 	pg_vec_execute_scan_filter_agg_datachunk(&exec_params, &exec_result);
 
@@ -164,6 +169,8 @@ pg_vec_scalar_scale(PgVecScalarKind scalar_kind)
 	switch (scalar_kind)
 	{
 		case PG_VEC_SCALAR_DECIMAL64_S2:
+			return 2;
+		case PG_VEC_SCALAR_DECIMAL128_S2:
 			return 2;
 		case PG_VEC_SCALAR_DECIMAL128_S4:
 			return 4;
@@ -257,10 +264,13 @@ pg_vec_const_value_to_datum(PgVecScalarKind scalar_kind,
 	switch (scalar_kind)
 	{
 		case PG_VEC_SCALAR_INT32:
+			if (attr->atttypid == NUMERICOID)
+				return pg_vec_numeric_from_scaled_int128(value->int32_value, 0);
 			return Int32GetDatum(value->int32_value);
 		case PG_VEC_SCALAR_DATE32:
 			return DateADTGetDatum(value->date32);
 		case PG_VEC_SCALAR_DECIMAL64_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S2:
 			return pg_vec_numeric_from_scaled_int128(value->decimal64_s2, 2);
 		case PG_VEC_SCALAR_CHAR1:
 			return pg_vec_bpchar_from_char1(value->char1, attr->atttypmod);
@@ -285,12 +295,17 @@ pg_vec_int128_value_to_datum(PgVecScalarKind scalar_kind,
 	switch (scalar_kind)
 	{
 		case PG_VEC_SCALAR_INT32:
+			if (attr->atttypid == NUMERICOID)
+				return pg_vec_numeric_from_scaled_int128(value, 0);
+			if (attr->atttypid == INT8OID)
+				return Int64GetDatum((int64) value);
 			return Int32GetDatum((int32) value);
 		case PG_VEC_SCALAR_DATE32:
 			return DateADTGetDatum((DateADT) value);
 		case PG_VEC_SCALAR_CHAR1:
 			return pg_vec_bpchar_from_char1((char) value, attr->atttypmod);
 		case PG_VEC_SCALAR_DECIMAL64_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S2:
 		case PG_VEC_SCALAR_DECIMAL128_S4:
 		case PG_VEC_SCALAR_DECIMAL128_S6:
 			scale = pg_vec_scalar_scale(scalar_kind);

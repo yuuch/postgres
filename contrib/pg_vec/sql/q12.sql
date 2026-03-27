@@ -1,0 +1,71 @@
+SET client_min_messages = warning;
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = on;
+
+CREATE TABLE orders (
+	o_orderkey integer NOT NULL,
+	o_orderpriority char(15) NOT NULL
+);
+
+CREATE TABLE lineitem (
+	l_orderkey integer NOT NULL,
+	l_shipmode char(10) NOT NULL,
+	l_commitdate date NOT NULL,
+	l_receiptdate date NOT NULL,
+	l_shipdate date NOT NULL
+);
+
+INSERT INTO orders (o_orderkey, o_orderpriority)
+VALUES
+	(1, '1-URGENT'),
+	(2, '2-HIGH'),
+	(3, '3-MEDIUM'),
+	(4, '4-NOT SPECIFIED'),
+	(5, '5-LOW');
+
+INSERT INTO lineitem (
+	l_orderkey,
+	l_shipmode,
+	l_commitdate,
+	l_receiptdate,
+	l_shipdate
+)
+VALUES
+	(1, 'MAIL', date '1994-03-01', date '1994-03-10', date '1994-02-20'),
+	(2, 'MAIL', date '1994-04-01', date '1994-04-08', date '1994-03-30'),
+	(3, 'MAIL', date '1994-05-01', date '1994-05-20', date '1994-04-29'),
+	(4, 'SHIP', date '1994-06-01', date '1994-06-03', date '1994-05-30'),
+	(2, 'SHIP', date '1994-07-01', date '1994-07-05', date '1994-06-29'),
+	(1, 'RAIL', date '1994-03-01', date '1994-03-10', date '1994-02-20'),
+	(3, 'MAIL', date '1994-08-10', date '1994-08-10', date '1994-08-01'),
+	(5, 'SHIP', date '1994-12-31', date '1995-01-02', date '1994-12-30');
+
+SELECT
+	l_shipmode,
+	sum(CASE
+		WHEN o_orderpriority = '1-URGENT'
+			OR o_orderpriority = '2-HIGH'
+			THEN 1
+		ELSE 0
+	END) AS high_line_count,
+	sum(CASE
+		WHEN o_orderpriority <> '1-URGENT'
+			AND o_orderpriority <> '2-HIGH'
+			THEN 1
+		ELSE 0
+	END) AS low_line_count
+FROM orders, lineitem
+WHERE o_orderkey = l_orderkey
+  AND l_shipmode IN ('MAIL', 'SHIP')
+  AND l_commitdate < l_receiptdate
+  AND l_shipdate < l_commitdate
+  AND l_receiptdate >= date '1994-01-01'
+  AND l_receiptdate < date '1994-01-01' + interval '1 year'
+GROUP BY
+	l_shipmode
+ORDER BY
+	l_shipmode;
+
+DROP TABLE lineitem;
+DROP TABLE orders;
+DROP EXTENSION pg_vec;

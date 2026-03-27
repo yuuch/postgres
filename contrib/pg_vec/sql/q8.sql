@@ -1,0 +1,135 @@
+SET client_min_messages = warning;
+SET datestyle = 'ISO, MDY';
+SET join_collapse_limit = 1;
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = off;
+SET pg_vec.jit_deform = off;
+
+CREATE TABLE region (
+	r_regionkey integer NOT NULL,
+	r_name char(25) NOT NULL
+);
+
+CREATE TABLE nation (
+	n_nationkey integer NOT NULL,
+	n_name char(25) NOT NULL,
+	n_regionkey integer NOT NULL
+);
+
+CREATE TABLE customer (
+	c_custkey integer NOT NULL,
+	c_nationkey integer NOT NULL
+);
+
+CREATE TABLE orders (
+	o_orderkey integer NOT NULL,
+	o_custkey integer NOT NULL,
+	o_orderdate date NOT NULL
+);
+
+CREATE TABLE supplier (
+	s_suppkey integer NOT NULL,
+	s_nationkey integer NOT NULL
+);
+
+CREATE TABLE part (
+	p_partkey integer NOT NULL,
+	p_type varchar(25) NOT NULL
+);
+
+CREATE TABLE lineitem (
+	l_orderkey integer NOT NULL,
+	l_partkey integer NOT NULL,
+	l_suppkey integer NOT NULL,
+	l_extendedprice numeric(15,2) NOT NULL,
+	l_discount numeric(15,2) NOT NULL
+);
+
+INSERT INTO region VALUES
+	(1, 'AMERICA'),
+	(2, 'EUROPE');
+
+INSERT INTO nation VALUES
+	(1, 'BRAZIL', 1),
+	(2, 'ARGENTINA', 1),
+	(3, 'GERMANY', 2);
+
+INSERT INTO customer VALUES
+	(1, 1),
+	(2, 2),
+	(3, 3);
+
+INSERT INTO orders VALUES
+	(1, 1, date '1995-03-15'),
+	(2, 2, date '1995-07-10'),
+	(3, 1, date '1996-02-20'),
+	(4, 2, date '1996-10-05'),
+	(5, 1, date '1994-08-01');
+
+INSERT INTO supplier VALUES
+	(1, 1),
+	(2, 2),
+	(3, 3);
+
+INSERT INTO part VALUES
+	(1, 'ECONOMY ANODIZED STEEL'),
+	(2, 'ECONOMY ANODIZED STEEL'),
+	(3, 'STANDARD POLISHED TIN');
+
+INSERT INTO lineitem VALUES
+	(1, 1, 1, 100.00, 0.10),
+	(2, 2, 2,  50.00, 0.20),
+	(3, 1, 1,  60.00, 0.00),
+	(4, 2, 2,  40.00, 0.25),
+	(5, 1, 1, 999.00, 0.00),
+	(1, 3, 1, 777.00, 0.00),
+	(2, 1, 3, 888.00, 0.00);
+
+SET pg_vec.enabled = on;
+
+select
+	o_year,
+	sum(case
+		when nation = 'BRAZIL' then volume
+		else 0
+	end) / sum(volume) as mkt_share
+from
+	(
+		select
+			extract(year from o_orderdate) as o_year,
+			l_extendedprice * (1 - l_discount) as volume,
+			n2.n_name as nation
+		from
+			part,
+			supplier,
+			lineitem,
+			orders,
+			customer,
+			nation n1,
+			nation n2,
+			region
+		where
+			p_partkey = l_partkey
+			and s_suppkey = l_suppkey
+			and l_orderkey = o_orderkey
+			and o_custkey = c_custkey
+			and c_nationkey = n1.n_nationkey
+			and n1.n_regionkey = r_regionkey
+			and r_name = 'AMERICA'
+			and s_nationkey = n2.n_nationkey
+			and o_orderdate between date '1995-01-01' and date '1996-12-31'
+			and p_type = 'ECONOMY ANODIZED STEEL'
+	) as all_nations
+group by
+	o_year
+order by
+	o_year;
+
+DROP TABLE lineitem;
+DROP TABLE part;
+DROP TABLE supplier;
+DROP TABLE orders;
+DROP TABLE customer;
+DROP TABLE nation;
+DROP TABLE region;
+DROP EXTENSION pg_vec;
