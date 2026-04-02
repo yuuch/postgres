@@ -80,12 +80,17 @@ pg_volvec_close_query_state(PgVolVecQueryState *state)
 static bool
 is_supported_plan(Plan *plan)
 {
-	if (plan == NULL) return false;
-	
-	if (IsA(plan, SeqScan)) return true;
-	
-	if (IsA(plan, Agg)) return true;
-	
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, SeqScan))
+		return plan->lefttree == NULL && plan->righttree == NULL;
+
+	if (IsA(plan, Agg) || IsA(plan, Sort))
+		return plan->lefttree != NULL &&
+			   plan->righttree == NULL &&
+			   is_supported_plan(plan->lefttree);
+
 	return false;
 }
 

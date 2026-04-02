@@ -63,7 +63,6 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 
 	pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_SIZE> *batch = new pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_SIZE>();
 	TupleTableSlot *slot = ExecAllocTableSlot(&queryDesc->estate->es_tupleTable, queryDesc->tupDesc, &TTSOpsVirtual);
-	auto *agg_state = dynamic_cast<pg_volvec::VecAggState *>(state_ptr->vec_plan);
 	uint64 processed = 0;
 	bool send_tuples = (queryDesc->operation == CMD_SELECT || queryDesc->plannedstmt->hasReturning);
 	if (!slot) { delete batch; return false; }
@@ -79,39 +78,41 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 			ExecClearTuple(slot);
 				for (int j = 0; j < slot->tts_tupleDescriptor->natts && j < 16; j++) {
 					Oid typid = TupleDescAttr(slot->tts_tupleDescriptor, j)->atttypid;
-					pg_volvec::VecAggState::NumericOutputKind numeric_kind = pg_volvec::VecAggState::NumericOutputKind::None;
-					int numeric_scale = 0;
-					bool has_exact_numeric = agg_state != nullptr &&
-						agg_state->lookup_numeric_output_meta(j + 1, &numeric_kind, &numeric_scale);
+					pg_volvec::VecOutputColMeta col_meta;
+					bool has_meta = state_ptr->vec_plan->lookup_output_col_meta(j + 1, &col_meta);
 					if (batch->nulls[j][i]) {
 						slot->tts_isnull[j] = true;
 						slot->tts_values[j] = (Datum) 0;
 					} else {
 						slot->tts_isnull[j] = false;
-						if (typid == FLOAT8OID)
+						if (typid == FLOAT8OID) {
 							slot->tts_values[j] = Float8GetDatum(batch->double_columns[j][i]);
-							else if (typid == NUMERICOID) {
-								double fval = batch->double_columns[j][i];
-								int64_t ival = batch->int64_columns[j][i];
-								if (has_exact_numeric && numeric_kind == pg_volvec::VecAggState::NumericOutputKind::Sum)
-									slot->tts_values[j] = int64_scaled_to_numeric(ival, numeric_scale);
-								else if (has_exact_numeric && numeric_kind == pg_volvec::VecAggState::NumericOutputKind::Avg)
-									slot->tts_values[j] = scaled_avg_to_numeric(ival, numeric_scale, (int64_t) batch->double_columns[j][i]);
-								else if (ival == 0 && fval != 0.0)
-									slot->tts_values[j] = DirectFunctionCall1(float8_numeric, Float8GetDatum(fval));
-								else
-									slot->tts_values[j] = int64_scaled_to_numeric(ival, pg_volvec::DEFAULT_NUMERIC_SCALE);
-							}
-						else if (typid == INT8OID)
+						} else if (typid == NUMERICOID) {
+							double fval = batch->double_columns[j][i];
+							int64_t ival = batch->int64_columns[j][i];
+
+							if (has_meta && col_meta.storage_kind == pg_volvec::VecOutputStorageKind::NumericScaledInt64)
+								slot->tts_values[j] = int64_scaled_to_numeric(ival, col_meta.scale);
+							else if (has_meta && col_meta.storage_kind == pg_volvec::VecOutputStorageKind::NumericAvgPair)
+								slot->tts_values[j] = scaled_avg_to_numeric(ival, col_meta.scale, (int64_t) batch->double_columns[j][i]);
+							else if (ival == 0 && fval != 0.0)
+								slot->tts_values[j] = DirectFunctionCall1(float8_numeric, Float8GetDatum(fval));
+							else
+								slot->tts_values[j] = int64_scaled_to_numeric(ival, pg_volvec::DEFAULT_NUMERIC_SCALE);
+						} else if (typid == INT8OID) {
 							slot->tts_values[j] = Int64GetDatum(batch->int64_columns[j][i]);
-					else if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID) {
-						char buf[10]; memset(buf, 0, 10);
-						uint32 len = batch->string_columns[j][i].len;
-						if (len > 8) len = 8;
-						memcpy(buf, &batch->string_columns[j][i].prefix, len);
-						slot->tts_values[j] = CStringGetTextDatum(buf);
-					} else
+						} else if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID) {
+							char buf[10];
+							uint32 len = batch->string_columns[j][i].len;
+
+							memset(buf, 0, sizeof(buf));
+							if (len > 8)
+								len = 8;
+							memcpy(buf, &batch->string_columns[j][i].prefix, len);
+							slot->tts_values[j] = CStringGetTextDatum(buf);
+						} else {
 						slot->tts_values[j] = Int32GetDatum(batch->int32_columns[j][i]);
+						}
 				}
 			}
 			ExecStoreVirtualTuple(slot);

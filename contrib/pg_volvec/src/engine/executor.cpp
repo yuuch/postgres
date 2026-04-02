@@ -1,10 +1,13 @@
 #include "volvec_engine.hpp"
 #include "llvmjit_deform_datachunk.h"
 
+#include <algorithm>
+
 extern "C" {
 #include "utils/lsyscache.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
+#include "access/stratnum.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/bufmgr.h"
 
@@ -19,6 +22,31 @@ static bool
 ShouldUseExactNumericAgg(Oid arg_type)
 {
 	return arg_type == NUMERICOID;
+}
+
+static VecOutputStorageKind
+DefaultOutputStorageKindForType(Oid typid)
+{
+	if (typid == FLOAT8OID)
+		return VecOutputStorageKind::Double;
+	if (typid == NUMERICOID)
+		return VecOutputStorageKind::NumericScaledInt64;
+	if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID)
+		return VecOutputStorageKind::StringRef;
+	if (typid == INT8OID)
+		return VecOutputStorageKind::Int64;
+	return VecOutputStorageKind::Int32;
+}
+
+static uint64_t
+EncodeFloat8SortKey(double value)
+{
+	uint64_t bits;
+
+	memcpy(&bits, &value, sizeof(bits));
+	if ((bits & (UINT64CONST(1) << 63)) != 0)
+		return ~bits;
+	return bits ^ (UINT64CONST(1) << 63);
 }
 
 static DeformDecodeKind
@@ -171,6 +199,8 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 	foreach(lc, node->plan.targetlist) {
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 		VecAggDesc desc; desc.target_resno = tle->resno;
+		desc.output_type = exprType((Node *) tle->expr);
+		desc.output_storage = DefaultOutputStorageKindForType(desc.output_type);
 		if (IsA(tle->expr, Aggref)) {
 			Aggref *aggref = (Aggref *) tle->expr;
 			char *aggname = get_func_name(aggref->aggfnoid);
@@ -187,6 +217,17 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 					desc.numeric_scale = desc.arg_expr->get_register_scale(desc.arg_expr->get_final_res_idx());
 				desc.use_exact_numeric = ShouldUseExactNumericAgg(desc.arg_type) &&
 					desc.arg_expr->get_final_res_idx() >= 0;
+				if (desc.use_exact_numeric)
+				{
+					if (desc.type == VecAggType::AVG)
+						desc.output_storage = VecOutputStorageKind::NumericAvgPair;
+					else
+						desc.output_storage = VecOutputStorageKind::NumericScaledInt64;
+				}
+				else if (desc.type == VecAggType::COUNT)
+					desc.output_storage = VecOutputStorageKind::Int64;
+				else if (desc.output_type == NUMERICOID)
+					desc.output_storage = VecOutputStorageKind::Double;
 			} else desc.arg_expr = nullptr;
 		} else { desc.type = VecAggType::MAX; desc.arg_expr = nullptr; }
 		aggs_.push_back(std::move(desc));
@@ -300,6 +341,28 @@ bool VecAggState::lookup_numeric_output_meta(int target_resno, NumericOutputKind
 	return false;
 }
 
+bool
+VecAggState::lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const
+{
+	for (const auto &agg : aggs_) {
+		if (agg.target_resno != target_resno)
+			continue;
+		if (out != nullptr) {
+			out->sql_type = agg.output_type;
+			out->storage_kind = agg.output_storage;
+			out->scale = agg.numeric_scale;
+		}
+		return true;
+	}
+
+	if (out != nullptr) {
+		out->sql_type = InvalidOid;
+		out->storage_kind = VecOutputStorageKind::Int32;
+		out->scale = 0;
+	}
+	return false;
+}
+
 /* --- VecSeqScanState --- */
 VecSeqScanState::VecSeqScanState(Relation rel, Snapshot snapshot, const DeformProgram *program)
 	: rel_(rel), snapshot_(snapshot), deformer_(RelationGetDescr(rel), program) {
@@ -341,6 +404,26 @@ VecSeqScanState::~VecSeqScanState() {
 			pg_volvec_release_llvm_jit_context(jit_context_);
 			jit_context_ = nullptr;
 		}
+}
+
+bool
+VecSeqScanState::lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const
+{
+	TupleDesc desc = RelationGetDescr(rel_);
+	int att_index = target_resno - 1;
+	Oid typid;
+
+	if (att_index < 0 || att_index >= desc->natts || att_index >= 16)
+		return false;
+
+	typid = TupleDescAttr(desc, att_index)->atttypid;
+	if (out != nullptr) {
+		out->sql_type = typid;
+		out->storage_kind = DefaultOutputStorageKindForType(typid);
+		out->scale = (typid == NUMERICOID) ?
+			GetNumericScaleFromTypmod(TupleDescAttr(desc, att_index)->atttypmod) : 0;
+	}
+	return true;
 }
 
 bool VecSeqScanState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
@@ -426,6 +509,296 @@ bool VecFilterState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 	return false;
 }
 
+VecSortState::VecSortState(std::unique_ptr<VecPlanState> left, Sort *node,
+						   VolVecVector<VecSortKeyDesc> key_descs)
+	: left_(std::move(left)),
+	  node_(node),
+	  memory_context_(CurrentMemoryContext),
+	  payload_chunks_(PgMemoryContextAllocator<DataChunk<DEFAULT_CHUNK_SIZE> *>(memory_context_)),
+	  rows_(PgMemoryContextAllocator<VecRowRef>(memory_context_)),
+	  key_descs_(PgMemoryContextAllocator<VecSortKeyDesc>(memory_context_)),
+	  key_lanes_(PgMemoryContextAllocator<VecSortKeyLane>(memory_context_)),
+	  emit_pos_(0),
+	  output_ncols_(Min(list_length(node->plan.targetlist), 16)),
+	  materialized_(false)
+{
+	for (const auto &key_desc : key_descs)
+	{
+		key_descs_.push_back(key_desc);
+		key_lanes_.emplace_back(key_desc, memory_context_);
+	}
+}
+
+VecSortState::~VecSortState()
+{
+	for (auto *chunk : payload_chunks_)
+		delete chunk;
+}
+
+DataChunk<DEFAULT_CHUNK_SIZE> *
+VecSortState::allocate_payload_chunk()
+{
+	MemoryContext old_context = MemoryContextSwitchTo(memory_context_);
+	DataChunk<DEFAULT_CHUNK_SIZE> *chunk = new DataChunk<DEFAULT_CHUNK_SIZE>();
+	MemoryContextSwitchTo(old_context);
+	payload_chunks_.push_back(chunk);
+	return chunk;
+}
+
+void
+VecSortState::copy_row(const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row,
+					   DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row) const
+{
+	for (int col = 0; col < output_ncols_; col++)
+	{
+		dst.double_columns[col][dst_row] = src.double_columns[col][src_row];
+		dst.int64_columns[col][dst_row] = src.int64_columns[col][src_row];
+		dst.int32_columns[col][dst_row] = src.int32_columns[col][src_row];
+		dst.string_columns[col][dst_row] = src.string_columns[col][src_row];
+		dst.nulls[col][dst_row] = src.nulls[col][src_row];
+	}
+}
+
+void
+VecSortState::append_sort_key(uint32_t ordinal,
+							  const DataChunk<DEFAULT_CHUNK_SIZE> &input,
+							  int src_row)
+{
+	for (auto &lane : key_lanes_)
+	{
+		const VecSortKeyDesc &key = lane.desc;
+		bool is_null = input.nulls[key.col_idx][src_row] != 0;
+
+		Assert(lane.nulls.size() == ordinal);
+		lane.nulls.push_back((uint8_t) is_null);
+		if (is_null)
+		{
+			lane.i32_values.push_back(0);
+			lane.i64_values.push_back(0);
+			lane.u64_values.push_back(0);
+			lane.string_values.push_back(VecStringRef{0, 0, 0});
+			continue;
+		}
+
+		switch (key.storage_kind)
+		{
+			case VecOutputStorageKind::Int32:
+				lane.i32_values.push_back(input.int32_columns[key.col_idx][src_row]);
+				lane.i64_values.push_back(0);
+				lane.u64_values.push_back(0);
+				lane.string_values.push_back(VecStringRef{0, 0, 0});
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+				lane.i32_values.push_back(0);
+				lane.i64_values.push_back(input.int64_columns[key.col_idx][src_row]);
+				lane.u64_values.push_back(0);
+				lane.string_values.push_back(VecStringRef{0, 0, 0});
+				break;
+			case VecOutputStorageKind::Double:
+				lane.i32_values.push_back(0);
+				lane.i64_values.push_back(0);
+				lane.u64_values.push_back(EncodeFloat8SortKey(input.double_columns[key.col_idx][src_row]));
+				lane.string_values.push_back(VecStringRef{0, 0, 0});
+				break;
+			case VecOutputStorageKind::StringRef:
+			{
+				VecStringRef ref = input.string_columns[key.col_idx][src_row];
+
+				if (ref.len > 8)
+					elog(ERROR, "pg_volvec vector sort currently supports string sort keys up to 8 bytes");
+				lane.i32_values.push_back(0);
+				lane.i64_values.push_back(0);
+				lane.u64_values.push_back(0);
+				lane.string_values.push_back(ref);
+				break;
+			}
+			case VecOutputStorageKind::NumericAvgPair:
+				elog(ERROR, "pg_volvec vector sort does not yet support numeric average sort keys");
+				break;
+		}
+	}
+}
+
+void
+VecSortState::append_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input)
+{
+	int active_count = input.has_selection ? input.sel.count : input.count;
+	DataChunk<DEFAULT_CHUNK_SIZE> *dst =
+		payload_chunks_.empty() ? allocate_payload_chunk() : payload_chunks_.back();
+
+	for (int s = 0; s < active_count; s++)
+	{
+		int src_row = input.has_selection ? input.sel.row_ids[s] : s;
+		int dst_row;
+		uint32_t ordinal;
+
+		if (dst->count >= DEFAULT_CHUNK_SIZE)
+			dst = allocate_payload_chunk();
+
+		dst_row = dst->count;
+		ordinal = (uint32_t) rows_.size();
+		copy_row(input, src_row, *dst, dst_row);
+		rows_.push_back(VecRowRef{ordinal, (uint32_t) (payload_chunks_.size() - 1), (uint16_t) dst_row});
+		append_sort_key(ordinal, input, src_row);
+		dst->count++;
+	}
+}
+
+int
+VecSortState::compare_string_ref(const VecStringRef &left, const VecStringRef &right) const
+{
+	int cmp_len = Min((int) left.len, (int) right.len);
+	int cmp;
+
+	if (left.len > 8 || right.len > 8)
+		elog(ERROR, "pg_volvec vector sort currently supports string sort keys up to 8 bytes");
+
+	cmp = memcmp(&left.prefix, &right.prefix, cmp_len);
+	if (cmp < 0)
+		return -1;
+	if (cmp > 0)
+		return 1;
+	if (left.len < right.len)
+		return -1;
+	if (left.len > right.len)
+		return 1;
+	return 0;
+}
+
+bool
+VecSortState::row_less(const VecRowRef &left, const VecRowRef &right) const
+{
+	for (const auto &lane : key_lanes_)
+	{
+		bool left_null = lane.nulls[left.ordinal] != 0;
+		bool right_null = lane.nulls[right.ordinal] != 0;
+		int cmp = 0;
+
+		if (left_null != right_null)
+			return lane.desc.nulls_first ? left_null : !left_null;
+		if (left_null)
+			continue;
+
+		switch (lane.desc.storage_kind)
+		{
+			case VecOutputStorageKind::Int32:
+				if (lane.i32_values[left.ordinal] < lane.i32_values[right.ordinal])
+					cmp = -1;
+				else if (lane.i32_values[left.ordinal] > lane.i32_values[right.ordinal])
+					cmp = 1;
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+				if (lane.i64_values[left.ordinal] < lane.i64_values[right.ordinal])
+					cmp = -1;
+				else if (lane.i64_values[left.ordinal] > lane.i64_values[right.ordinal])
+					cmp = 1;
+				break;
+			case VecOutputStorageKind::Double:
+				if (lane.u64_values[left.ordinal] < lane.u64_values[right.ordinal])
+					cmp = -1;
+				else if (lane.u64_values[left.ordinal] > lane.u64_values[right.ordinal])
+					cmp = 1;
+				break;
+			case VecOutputStorageKind::StringRef:
+				cmp = compare_string_ref(lane.string_values[left.ordinal],
+										 lane.string_values[right.ordinal]);
+				break;
+			case VecOutputStorageKind::NumericAvgPair:
+				elog(ERROR, "pg_volvec vector sort does not yet support numeric average sort keys");
+				break;
+		}
+
+		if (cmp != 0)
+			return lane.desc.descending ? (cmp > 0) : (cmp < 0);
+	}
+
+	return left.ordinal < right.ordinal;
+}
+
+void
+VecSortState::materialize_and_sort()
+{
+	DataChunk<DEFAULT_CHUNK_SIZE> input;
+
+	if (materialized_)
+		return;
+
+	while (left_->get_next_batch(input))
+		append_batch(input);
+
+	std::stable_sort(rows_.begin(), rows_.end(),
+					 [this](const VecRowRef &left, const VecRowRef &right)
+					 {
+						 return row_less(left, right);
+					 });
+	emit_pos_ = 0;
+	materialized_ = true;
+}
+
+bool
+VecSortState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
+{
+	if (!materialized_)
+		materialize_and_sort();
+
+	chunk.reset();
+	while (emit_pos_ < rows_.size() && chunk.count < DEFAULT_CHUNK_SIZE)
+	{
+		const VecRowRef &row = rows_[emit_pos_];
+		const DataChunk<DEFAULT_CHUNK_SIZE> *src = payload_chunks_[row.chunk_idx];
+
+		copy_row(*src, row.row_idx, chunk, chunk.count);
+		chunk.count++;
+		emit_pos_++;
+	}
+
+	return chunk.count > 0;
+}
+
+static bool
+BuildSortKeyDescs(Sort *sort_node, VecPlanState *child,
+				  VolVecVector<VecSortKeyDesc> *out_keys)
+{
+	for (int i = 0; i < sort_node->numCols; i++)
+	{
+		VecOutputColMeta meta;
+		VecSortKeyDesc key_desc;
+		Oid opfamily = InvalidOid;
+		Oid opcintype = InvalidOid;
+		CompareType cmptype = COMPARE_INVALID;
+		int target_resno = sort_node->sortColIdx[i];
+
+		if (target_resno <= 0 || target_resno > 16)
+			return false;
+		if (child == nullptr || !child->lookup_output_col_meta(target_resno, &meta))
+			return false;
+		if (!get_ordering_op_properties(sort_node->sortOperators[i], &opfamily, &opcintype, &cmptype))
+			return false;
+		(void) opfamily;
+		(void) opcintype;
+		if (meta.storage_kind == VecOutputStorageKind::NumericAvgPair)
+			return false;
+		if (meta.storage_kind == VecOutputStorageKind::StringRef &&
+			meta.sql_type != BPCHAROID)
+			return false;
+		if (cmptype != COMPARE_LT && cmptype != COMPARE_GT)
+			return false;
+
+		key_desc.col_idx = (uint16_t) (target_resno - 1);
+		key_desc.sql_type = meta.sql_type;
+		key_desc.storage_kind = meta.storage_kind;
+		key_desc.descending = (cmptype == COMPARE_GT);
+		key_desc.nulls_first = sort_node->nullsFirst[i];
+		key_desc.collation = sort_node->collations[i];
+		key_desc.scale = meta.scale;
+		out_keys->push_back(key_desc);
+	}
+
+	return true;
+}
+
 static std::unique_ptr<VecPlanState>
 ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs)
 {
@@ -433,7 +806,15 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs)
 	if (required_attrs == nullptr)
 		CollectRequiredAttrsForPlan(plan, &required_attrs);
 	std::unique_ptr<VecPlanState> current_state = nullptr;
-	if (IsA(plan, Agg)) {
+	if (IsA(plan, Sort)) {
+		VolVecVector<VecSortKeyDesc> key_descs{PgMemoryContextAllocator<VecSortKeyDesc>(CurrentMemoryContext)};
+		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs);
+		if (!left)
+			return nullptr;
+		if (!BuildSortKeyDescs((Sort *) plan, left.get(), &key_descs))
+			return nullptr;
+		current_state = std::make_unique<VecSortState>(std::move(left), (Sort *) plan, std::move(key_descs));
+	} else if (IsA(plan, Agg)) {
 		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs);
 		if (!left) return nullptr;
 		current_state = std::make_unique<VecAggState>(std::move(left), (Agg *) plan);

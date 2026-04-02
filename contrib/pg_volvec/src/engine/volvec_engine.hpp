@@ -471,6 +471,21 @@ using VolVecHashMap = std::unordered_map<Key, Value, Hash, KeyEqual,
 struct SelectionVector { uint16_t row_ids[DEFAULT_CHUNK_SIZE]; uint16_t count; void clear() { count = 0; } };
 struct VecStringRef { uint32_t len; uint32_t offset; uint64_t prefix; };
 
+enum class VecOutputStorageKind : uint8_t {
+	Int32,
+	Int64,
+	Double,
+	StringRef,
+	NumericScaledInt64,
+	NumericAvgPair
+};
+
+struct VecOutputColMeta {
+	Oid sql_type = InvalidOid;
+	VecOutputStorageKind storage_kind = VecOutputStorageKind::Int32;
+	int scale = 0;
+};
+
 template <uint16_t Capacity>
 struct alignas(16) DataChunk {
 	static void *operator new(std::size_t size)
@@ -562,12 +577,21 @@ private:
 	int register_scales[MAX_REGISTERS];
 };
 
-class VecPlanState : public PgMemoryContextObject { public: virtual ~VecPlanState() = default; virtual bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) = 0; };
+class VecPlanState : public PgMemoryContextObject {
+public:
+	virtual ~VecPlanState() = default;
+	virtual bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) = 0;
+	virtual bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const
+	{
+		return false;
+	}
+};
 
 class VecSeqScanState : public VecPlanState {
 public:
 	VecSeqScanState(Relation rel, Snapshot snapshot, const DeformProgram *program); ~VecSeqScanState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
 private:
 	Relation rel_; Snapshot snapshot_; HeapScanDesc scan_; ReadStream *stream_ = nullptr; Buffer current_buf_ = InvalidBuffer; Buffer vmbuf_ = InvalidBuffer; OffsetNumber current_offnum_ = FirstOffsetNumber; bool all_visible_ = false; DataChunkDeformer deformer_; JitContext *jit_context_ = nullptr;
 };
@@ -579,6 +603,7 @@ public:
 	VecAggState(std::unique_ptr<VecPlanState> left, Agg *node);
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_numeric_output_meta(int target_resno, NumericOutputKind *kind, int *scale) const;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
 private:
 	std::unique_ptr<VecPlanState> left_; Agg *node_; MemoryContext memory_context_; VolVecVector<int> grp_col_indices_;
 	struct VecAggAccumulator {
@@ -596,6 +621,8 @@ private:
 		VecAggType type;
 		std::unique_ptr<VecExprProgram> arg_expr;
 		int target_resno;
+		Oid output_type = InvalidOid;
+		VecOutputStorageKind output_storage = VecOutputStorageKind::Int32;
 		Oid arg_type = InvalidOid;
 		int numeric_scale = 0;
 		bool use_exact_numeric = false;
@@ -611,8 +638,79 @@ class VecFilterState : public VecPlanState {
 public:
 	VecFilterState(std::unique_ptr<VecPlanState> left, std::unique_ptr<VecExprProgram> prog) : left_(std::move(left)), program_(std::move(prog)) {}
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
+	{
+		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+	}
 private:
 	std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
+};
+
+struct VecSortKeyDesc {
+	uint16_t col_idx;
+	Oid sql_type;
+	VecOutputStorageKind storage_kind;
+	bool descending;
+	bool nulls_first;
+	Oid collation;
+	int scale;
+};
+
+struct VecRowRef {
+	uint32_t ordinal;
+	uint32_t chunk_idx;
+	uint16_t row_idx;
+};
+
+struct VecSortKeyLane {
+	VecSortKeyDesc desc;
+	VolVecVector<uint8_t> nulls;
+	VolVecVector<int32_t> i32_values;
+	VolVecVector<int64_t> i64_values;
+	VolVecVector<uint64_t> u64_values;
+	VolVecVector<VecStringRef> string_values;
+
+	VecSortKeyLane(const VecSortKeyDesc &key_desc, MemoryContext context)
+		: desc(key_desc),
+		  nulls(PgMemoryContextAllocator<uint8_t>(context)),
+		  i32_values(PgMemoryContextAllocator<int32_t>(context)),
+		  i64_values(PgMemoryContextAllocator<int64_t>(context)),
+		  u64_values(PgMemoryContextAllocator<uint64_t>(context)),
+		  string_values(PgMemoryContextAllocator<VecStringRef>(context))
+	{
+	}
+};
+
+class VecSortState : public VecPlanState {
+public:
+	VecSortState(std::unique_ptr<VecPlanState> left, Sort *node,
+				 VolVecVector<VecSortKeyDesc> key_descs);
+	~VecSortState() override;
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
+	{
+		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+	}
+private:
+	void materialize_and_sort();
+	DataChunk<DEFAULT_CHUNK_SIZE> *allocate_payload_chunk();
+	void append_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input);
+	void append_sort_key(uint32_t ordinal, const DataChunk<DEFAULT_CHUNK_SIZE> &input, int src_row);
+	void copy_row(const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row,
+				  DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row) const;
+	bool row_less(const VecRowRef &left, const VecRowRef &right) const;
+	int compare_string_ref(const VecStringRef &left, const VecStringRef &right) const;
+
+	std::unique_ptr<VecPlanState> left_;
+	Sort *node_;
+	MemoryContext memory_context_;
+	VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> payload_chunks_;
+	VolVecVector<VecRowRef> rows_;
+	VolVecVector<VecSortKeyDesc> key_descs_;
+	VolVecVector<VecSortKeyLane> key_lanes_;
+	size_t emit_pos_;
+	int output_ncols_;
+	bool materialized_;
 };
 
 struct PgVolVecQueryState { MemoryContext context; VecPlanState* vec_plan; };

@@ -126,14 +126,14 @@ SET parallel_tuple_cost = 1000000000;
 
 ### Q1
 
-当前真正支持并验证的是 no-order 版本：
+no-order 版本仍然是更纯粹的单表 `Agg` 热路径入口：
 
 ```bash
 ./installed/bin/psql -h /tmp -p 5432 -d tpch \
   -f contrib/pg_volvec/test_q1_no_parallel.sql
 ```
 
-原始带 `ORDER BY` 的 Q1 可以跑，但不会真正 offload：
+原始带 `ORDER BY` 的 Q1 现在也已经可以真正 offload：
 
 ```bash
 ./installed/bin/psql -h /tmp -p 5432 -d tpch \
@@ -218,19 +218,26 @@ lldb -p <backend_pid>
 ### 已跑通的主路径
 
 - 单表 `SeqScan -> optional qual -> Agg` 形状已可 offload
-- Q1 no-order 支持形状已验证正确
+- `Sort -> Agg -> SeqScan` 的 full Q1 形状已可 offload
+- Q1 no-order 与 full Q1 都已验证正确
 - Q6 已验证正确
 - tuple deform JIT 可以自动装载 `llvmjit` provider，不再需要手工 `LOAD 'llvmjit'`
 - expression JIT 已真正接到执行路径里，不再只是代码里“有这个函数”
+- 第一版列式 `VecSortState` 已接上，用于 final-result in-memory sort
 
 ### 当前计划支持边界
 
 目前仍然是窄支持面：
 
-- 支持：`SeqScan`、根部 `Agg`、plan `qual`
-- 不支持：`Sort`、`Join`、`Gather`、`Materialize`、`Limit`、`Subquery Scan`
+- 支持：`SeqScan`、根部 `Agg`、根部 `Sort`、plan `qual`
+- 不支持：`Join`、`Gather`、`Materialize`、`Limit`、`Subquery Scan`
 
-所以完整带 `ORDER BY` 的 Q1 仍然不会真正由 `pg_volvec` 接管。
+当前 `Sort` 仍然是第一版实现：
+
+- blocking
+- in-memory single run
+- 通过 row-ref 间接排序
+- 目前只覆盖 Q1 这类顶层 final sort 场景
 
 ### 这轮做过的关键能力
 
@@ -258,6 +265,18 @@ TPC-H 常见 `NUMERIC(15,2)` 现在走：
 
 - 运行时输入是 `HeapTupleHeader`
 - 直接写到 `DataChunk` 目标列数组
+
+#### 4. vectorized sort
+
+当前 sort 路径：
+
+- 先 drain child
+- materialize 为 sort 自己持有的 dense payload chunks
+- 抽出 sort key lane
+- 对 row refs 做间接排序
+- gather 回输出 chunk
+
+第一版没有 spill，也没有 multi-run merge，但已经足够覆盖 full Q1。
 - 支持 query-driven 列裁剪
 - 内联了 `scale=2` numeric fast path
 - 可以自动装载 `llvmjit` provider

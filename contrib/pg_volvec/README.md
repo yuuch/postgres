@@ -7,13 +7,13 @@
 The current code path is no longer just a skeleton. As of April 2, 2026, the following have been verified on the local `~/data/pg_tpch` instance:
 
 - Single-table `SeqScan -> optional qual -> Agg` shapes run in `pg_volvec`.
-- TPC-H Q1 without `ORDER BY` runs correctly and is offloaded.
+- `Sort -> Agg -> SeqScan` is now supported for the current Q1 shape.
+- TPC-H Q1 with and without `ORDER BY` runs correctly and is offloaded.
 - TPC-H Q6 runs correctly and is offloaded.
 - Tuple deform JIT works without manually `LOAD 'llvmjit'`; the provider is auto-loaded when needed.
 - Expression JIT is wired in and generates fused row loops instead of materializing intermediate vector temporaries.
 - `NUMERIC(15,2)` hot paths use scaled `int64`, while aggregation uses widened integer accumulation.
-
-The full SQL form of Q1 with `ORDER BY` is still not offloaded because PostgreSQL plans it as `Sort -> HashAggregate -> Seq Scan`, and `Sort` is not yet handled by `pg_volvec`.
+- A first columnar `VecSortState` exists for in-memory final-result sorting.
 
 For the workspace-validated build, install, startup, test, profile, and benchmark commands, see [LOCAL_RUNBOOK.md](LOCAL_RUNBOOK.md).
 
@@ -35,6 +35,10 @@ The scan node no longer deforms a fixed prefix of attributes unconditionally. It
 
 `VecExprProgram` still uses a linear step IR, but the hot path no longer interprets every step. For supported programs, LLVM emits a fused loop that computes the final result directly for each active row. Intermediate values stay in SSA temporaries instead of being written to `tmp[]` arrays.
 
+### Vectorized final sort
+
+For the current full-Q1 shape, `pg_volvec` now keeps the aggregated result columnar, materializes dense sort-owned chunks, sorts row references indirectly by extracted key lanes, and gathers the final ordered output back into `DataChunk`s. The first cut is an in-memory single-run sort aimed at the top-level Q1 `ORDER BY`.
+
 ### Fixed-point numeric execution
 
 For TPC-H-style `NUMERIC(15,2)` values, the executor uses scaled `int64` inputs and widened arithmetic for aggregation. This removes the old `numeric_float8_no_overflow()` bottleneck from the hot scan/deform path.
@@ -51,6 +55,10 @@ These are local, hot-cache measurements on the developer machine with parallel q
   - native PostgreSQL average: `21.83s`
   - `pg_volvec` average: `4.87s`
   - speedup: about `4.48x`
+- Q1 full SQL form with `ORDER BY`, 1 local hot-cache run:
+  - native PostgreSQL: `21.16s`
+  - `pg_volvec`: `5.74s`
+  - speedup: about `3.69x`
 
 The newest Q6 flame graph also shows the expression interpreter hotspot largely disappearing; the backend is now primarily I/O-bound on that query.
 
@@ -75,6 +83,7 @@ meson install -C build --only-changed
 - `src/engine/expr.cpp`: expression lowering and interpreter
 - `src/engine/llvmjit_expr.cpp`: fused expression JIT
 - `src/engine/llvmjit_deform_datachunk.cpp`: tuple deform JIT
+- `src/engine/executor.cpp`: also contains the current `VecSortState` implementation
 - `tests/`: helper scripts for local benchmarking and profiling
 
 ## Additional Docs
@@ -83,6 +92,7 @@ meson install -C build --only-changed
 - [DESIGN.md](DESIGN.md): current architecture overview
 - [llvmjit_expr.md](llvmjit_expr.md): current expression JIT design
 - [jit_deform_datachunk.md](jit_deform_datachunk.md): current deform JIT design
+- [vecSortDesign.md](vecSortDesign.md): current vectorized sort design
 - [page-wise-scan.md](page-wise-scan.md): page-wise scan design and current status
 - [TODO.md](TODO.md): next engineering steps
 
