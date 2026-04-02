@@ -13,11 +13,15 @@ extern "C" {
 
 extern "C" {
 
+extern bool pg_volvec_trace_hooks;
+
 bool pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *state_ptr)
 {
 	MemoryContext old_context = MemoryContextSwitchTo(state_ptr->context);
 	state_ptr->vec_plan = pg_volvec::ExecInitVecPlan(queryDesc->plannedstmt->planTree, queryDesc->estate).release();
 	MemoryContextSwitchTo(old_context);
+	if (pg_volvec_trace_hooks && state_ptr->vec_plan == nullptr)
+		elog(LOG, "pg_volvec: plan initialization returned null, falling back to PostgreSQL executor");
 	return state_ptr->vec_plan != nullptr;
 }
 

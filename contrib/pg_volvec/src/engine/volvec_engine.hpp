@@ -554,8 +554,45 @@ private:
 	TupleDesc desc_; DeformProgram program_; JitDeformFunc jit_func_ = nullptr; bool jit_path_logged_ = false;
 };
 
-enum class VecOpCode { EEOP_VAR, EEOP_CONST, EEOP_FLOAT8_ADD, EEOP_FLOAT8_SUB, EEOP_FLOAT8_MUL, EEOP_INT64_ADD, EEOP_INT64_SUB, EEOP_INT64_MUL, EEOP_FLOAT8_LT, EEOP_FLOAT8_GT, EEOP_FLOAT8_LE, EEOP_FLOAT8_GE, EEOP_INT64_LT, EEOP_INT64_GT, EEOP_INT64_LE, EEOP_INT64_GE, EEOP_DATE_LT, EEOP_DATE_LE, EEOP_DATE_GE, EEOP_INT32_EQ, EEOP_AND, EEOP_QUAL };
-struct VecExprStep { VecOpCode opcode; int res_idx; union { struct { int att_idx; Oid type; } var; struct { double fval; int64_t i64val; int32_t ival; bool isnull; } constant; struct { int left; int right; } op; } d; };
+enum class VecOpCode {
+	EEOP_VAR,
+	EEOP_CONST,
+	EEOP_FLOAT8_ADD,
+	EEOP_FLOAT8_SUB,
+	EEOP_FLOAT8_MUL,
+	EEOP_INT64_ADD,
+	EEOP_INT64_SUB,
+	EEOP_INT64_MUL,
+	EEOP_INT64_DIV_FLOAT8,
+	EEOP_FLOAT8_LT,
+	EEOP_FLOAT8_GT,
+	EEOP_FLOAT8_LE,
+	EEOP_FLOAT8_GE,
+	EEOP_INT64_LT,
+	EEOP_INT64_GT,
+	EEOP_INT64_LE,
+	EEOP_INT64_GE,
+	EEOP_DATE_LT,
+	EEOP_DATE_LE,
+	EEOP_DATE_GE,
+	EEOP_INT32_EQ,
+	EEOP_AND,
+	EEOP_INT64_CASE,
+	EEOP_FLOAT8_CASE,
+	EEOP_STR_PREFIX_LIKE,
+	EEOP_QUAL
+};
+struct VecExprStep {
+	VecOpCode opcode;
+	int res_idx;
+	union {
+		struct { int att_idx; Oid type; } var;
+		struct { double fval; int64_t i64val; int32_t ival; bool isnull; } constant;
+		struct { int left; int right; } op;
+		struct { int cond; int if_true; int if_false; } ternary;
+		struct { int att_idx; uint32_t len; uint64_t prefix; } str_prefix;
+	} d;
+};
 typedef void (*VecExprJitFunc)(uint32_t count, double** col_f8, int64_t** col_i64, int32_t** col_i32, uint8_t** col_nulls, double* res_f8, int64_t* res_i64, int32_t* res_i32, uint8_t* res_nulls, uint16_t* sel, bool has_sel);
 
 class VecExprProgram : public PgMemoryContextObject {
@@ -565,6 +602,7 @@ public:
 	void try_compile_jit();
 	const double* get_float8_reg(int i) const { return &registers_f8[i * DEFAULT_CHUNK_SIZE]; }
 	const int64_t* get_int64_reg(int i) const { return &registers_i64[i * DEFAULT_CHUNK_SIZE]; }
+	const int32_t* get_int32_reg(int i) const { return &registers_i32[i * DEFAULT_CHUNK_SIZE]; }
 	const uint8_t* get_nulls_reg(int i) const { return &registers_nulls[i * DEFAULT_CHUNK_SIZE]; }
 	int get_register_scale(int i) const { return (i >= 0 && i < MAX_REGISTERS) ? register_scales[i] : 0; }
 	void set_register_scale(int i, int scale) { if (i >= 0 && i < MAX_REGISTERS) register_scales[i] = scale; }
@@ -646,6 +684,108 @@ private:
 	std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
 };
 
+struct VecProjectColDesc {
+	std::unique_ptr<VecExprProgram> expr;
+	int target_resno;
+	Oid sql_type;
+	VecOutputStorageKind storage_kind;
+	int scale;
+	bool direct_var = false;
+	uint16_t input_col = 0;
+};
+
+class VecProjectState : public VecPlanState {
+public:
+	VecProjectState(std::unique_ptr<VecPlanState> left,
+					VolVecVector<VecProjectColDesc> columns);
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+private:
+	std::unique_ptr<VecPlanState> left_;
+	VolVecVector<VecProjectColDesc> columns_;
+	DataChunk<DEFAULT_CHUNK_SIZE> input_chunk_;
+};
+
+enum class VecJoinSide : uint8_t {
+	Outer,
+	Inner
+};
+
+struct VecJoinOutputCol {
+	VecJoinSide side;
+	uint16_t input_col;
+	int output_resno;
+	VecOutputColMeta meta;
+};
+
+struct VecHashPayloadCol {
+	uint16_t source_col;
+	VecOutputColMeta meta;
+};
+
+struct VecRowRef {
+	uint32_t ordinal;
+	uint32_t chunk_idx;
+	uint16_t row_idx;
+};
+
+class VecHashJoinState : public VecPlanState {
+public:
+	VecHashJoinState(std::unique_ptr<VecPlanState> outer,
+					 std::unique_ptr<VecPlanState> inner,
+					 VolVecVector<VecJoinOutputCol> output_cols,
+					 int outer_key_col,
+					 int inner_key_col,
+					 VecOutputStorageKind key_kind);
+	~VecHashJoinState() override;
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+	private:
+		struct VecHashEntry {
+			uint32_t hash;
+			int64_t key;
+			int32_t next;
+			uint32_t chunk_idx;
+			uint16_t row_idx;
+		};
+
+		void build_inner_hash();
+		void init_hash_table(size_t expected_rows);
+		void rehash_hash_table(size_t min_bucket_count);
+		void append_inner_entry(int64_t key, uint32_t hash, uint32_t chunk_idx, uint16_t row_idx);
+		uint16_t ensure_inner_payload_col(uint16_t source_col, const VecOutputColMeta &meta);
+		DataChunk<DEFAULT_CHUNK_SIZE> *allocate_inner_chunk();
+		void copy_inner_payload_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,
+									const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row) const;
+		bool advance_outer_batch();
+		void prepare_probe_batch();
+		bool advance_probe_match(uint16_t probe_idx, int32_t *match_entry_idx);
+		uint32_t hash_key(int64_t key) const;
+		int64_t read_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk, int col, int row) const;
+
+		std::unique_ptr<VecPlanState> outer_;
+		std::unique_ptr<VecPlanState> inner_;
+		MemoryContext memory_context_;
+		VolVecVector<VecJoinOutputCol> output_cols_;
+		VolVecVector<VecHashPayloadCol> inner_payload_cols_;
+		VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> inner_chunks_;
+		VolVecVector<int32_t> bucket_heads_;
+		VolVecVector<VecHashEntry> entries_;
+	DataChunk<DEFAULT_CHUNK_SIZE> outer_chunk_;
+	VolVecVector<uint16_t> probe_rows_;
+	VolVecVector<int64_t> probe_keys_;
+	VolVecVector<uint32_t> probe_hashes_;
+	VolVecVector<int32_t> probe_next_entries_;
+	VolVecVector<uint16_t> active_probe_sel_;
+	VolVecVector<uint16_t> next_probe_sel_;
+	bool inner_built_;
+	bool probe_batch_ready_;
+	size_t bucket_mask_;
+	int outer_key_col_;
+	int inner_key_col_;
+	VecOutputStorageKind key_kind_;
+};
+
 struct VecSortKeyDesc {
 	uint16_t col_idx;
 	Oid sql_type;
@@ -654,12 +794,6 @@ struct VecSortKeyDesc {
 	bool nulls_first;
 	Oid collation;
 	int scale;
-};
-
-struct VecRowRef {
-	uint32_t ordinal;
-	uint32_t chunk_idx;
-	uint16_t row_idx;
 };
 
 struct VecSortKeyLane {

@@ -241,6 +241,7 @@ ResolveBinaryOpcode(const char *opname, Oid left_type, Oid right_type, VecOpCode
 		if (strcmp(opname, "+") == 0) *opcode = VecOpCode::EEOP_INT64_ADD;
 		else if (strcmp(opname, "-") == 0) *opcode = VecOpCode::EEOP_INT64_SUB;
 		else if (strcmp(opname, "*") == 0) *opcode = VecOpCode::EEOP_INT64_MUL;
+		else if (strcmp(opname, "/") == 0) *opcode = VecOpCode::EEOP_INT64_DIV_FLOAT8;
 		else if (strcmp(opname, "<") == 0) *opcode = VecOpCode::EEOP_INT64_LT;
 		else if (strcmp(opname, "<=") == 0) *opcode = VecOpCode::EEOP_INT64_LE;
 		else if (strcmp(opname, ">") == 0) *opcode = VecOpCode::EEOP_INT64_GT;
@@ -259,6 +260,79 @@ ResolveBinaryOpcode(const char *opname, Oid left_type, Oid right_type, VecOpCode
 	}
 
 	return false;
+}
+
+static bool
+TryExtractStringConstPrefix(Const *c, uint64_t *prefix_out, uint32_t *len_out)
+{
+	char *str;
+	uint32_t len;
+	uint64_t prefix = 0;
+
+	if (c == nullptr || c->constisnull)
+		return false;
+	if (c->consttype != TEXTOID &&
+		c->consttype != VARCHAROID &&
+		c->consttype != BPCHAROID)
+		return false;
+
+	str = TextDatumGetCString(c->constvalue);
+	len = (uint32_t) strlen(str);
+	if (len > 8)
+	{
+		pfree(str);
+		return false;
+	}
+	memcpy(&prefix, str, len);
+	pfree(str);
+	if (prefix_out != nullptr)
+		*prefix_out = prefix;
+	if (len_out != nullptr)
+		*len_out = len;
+	return true;
+}
+
+static bool
+TryExtractLikePrefix(Const *c, uint64_t *prefix_out, uint32_t *len_out)
+{
+	char *pattern;
+	size_t len;
+	uint64_t prefix = 0;
+
+	if (c == nullptr || c->constisnull)
+		return false;
+	if (c->consttype != TEXTOID &&
+		c->consttype != VARCHAROID &&
+		c->consttype != BPCHAROID)
+		return false;
+
+	pattern = TextDatumGetCString(c->constvalue);
+	len = strlen(pattern);
+	if (len == 0 || pattern[len - 1] != '%')
+	{
+		pfree(pattern);
+		return false;
+	}
+	for (size_t i = 0; i + 1 < len; i++)
+	{
+		if (pattern[i] == '%' || pattern[i] == '_')
+		{
+			pfree(pattern);
+			return false;
+		}
+	}
+	if (len - 1 > 8)
+	{
+		pfree(pattern);
+		return false;
+	}
+	memcpy(&prefix, pattern, len - 1);
+	if (prefix_out != nullptr)
+		*prefix_out = prefix;
+	if (len_out != nullptr)
+		*len_out = (uint32_t) (len - 1);
+	pfree(pattern);
+	return true;
 }
 
 VecExprProgram::VecExprProgram()
@@ -434,6 +508,48 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program)
 		return res_idx;
 	}
 
+	if (IsA(expr, CaseExpr))
+	{
+		CaseExpr *case_expr = (CaseExpr *) expr;
+		CaseWhen *when_clause;
+		int cond_idx;
+		int true_idx;
+		int false_idx;
+		VecExprStep step;
+
+		if (case_expr->arg != nullptr || list_length(case_expr->args) != 1 || case_expr->defresult == nullptr)
+			return -1;
+
+		when_clause = (CaseWhen *) linitial(case_expr->args);
+		cond_idx = CompileExprRecursive((Expr *) when_clause->expr, program);
+		true_idx = CompileExprRecursive((Expr *) when_clause->result, program);
+		false_idx = CompileExprRecursive((Expr *) case_expr->defresult, program);
+		if (cond_idx < 0 || true_idx < 0 || false_idx < 0)
+			return -1;
+
+		step.res_idx = res_idx;
+		step.d.ternary.cond = cond_idx;
+		step.d.ternary.if_true = true_idx;
+		step.d.ternary.if_false = false_idx;
+		if (IsInt64LikeType(exprType((Node *) when_clause->result)) &&
+			IsInt64LikeType(exprType((Node *) case_expr->defresult)))
+		{
+			step.opcode = VecOpCode::EEOP_INT64_CASE;
+			program.set_register_scale(res_idx,
+				Max(program.get_register_scale(true_idx),
+					program.get_register_scale(false_idx)));
+		}
+		else if (exprType((Node *) when_clause->result) == FLOAT8OID &&
+				 exprType((Node *) case_expr->defresult) == FLOAT8OID)
+		{
+			step.opcode = VecOpCode::EEOP_FLOAT8_CASE;
+		}
+		else
+			return -1;
+		program.steps.push_back(step);
+		return res_idx;
+	}
+
 	if (IsA(expr, OpExpr))
 	{
 		OpExpr *op = (OpExpr *) expr;
@@ -454,6 +570,35 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program)
 		left_type = exprType((Node *) left_expr);
 		right_type = exprType((Node *) right_expr);
 		opname = get_opname(op->opno);
+
+		if ((strcmp(opname, "~~") == 0 || strcmp(opname, "=") == 0) &&
+			IsA(left_expr, Var) &&
+			IsA(right_expr, Const) &&
+			(left_type == BPCHAROID || left_type == TEXTOID || left_type == VARCHAROID))
+		{
+			VecExprStep special_step;
+			uint64_t prefix = 0;
+			uint32_t len = 0;
+			bool ok;
+
+			special_step.res_idx = res_idx;
+			special_step.d.str_prefix.att_idx = ((Var *) left_expr)->varattno - 1;
+			special_step.d.str_prefix.prefix = 0;
+			special_step.d.str_prefix.len = 0;
+			if (strcmp(opname, "~~") == 0)
+			{
+				ok = TryExtractLikePrefix((Const *) right_expr, &prefix, &len);
+				special_step.opcode = VecOpCode::EEOP_STR_PREFIX_LIKE;
+			}
+			else
+				ok = false;
+			if (!ok)
+				return -1;
+			special_step.d.str_prefix.prefix = prefix;
+			special_step.d.str_prefix.len = len;
+			program.steps.push_back(special_step);
+			return res_idx;
+		}
 
 		if (left_type == DATEOID &&
 			IsDateLikeType(right_type) &&
@@ -671,6 +816,22 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 						"numeric multiply result");
 				}
 				break;
+			case VecOpCode::EEOP_INT64_DIV_FLOAT8:
+				for (int i = 0; i < chunk.count; i++)
+				{
+					double left_val;
+					double right_val;
+
+					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
+					if (registers_nulls[res + i])
+						continue;
+					left_val = (double) registers_i64[l + i] / (double) Pow10Int64(left_scale);
+					right_val = (double) registers_i64[r + i] / (double) Pow10Int64(right_scale);
+					if (right_val == 0.0)
+						elog(ERROR, "pg_volvec numeric division by zero");
+					registers_f8[res + i] = left_val / right_val;
+				}
+				break;
 			case VecOpCode::EEOP_INT64_LT:
 				for (int i = 0; i < chunk.count; i++)
 				{
@@ -771,6 +932,64 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					registers_i32[res + i] = registers_i32[l + i] && registers_i32[r + i];
 				}
 				break;
+			case VecOpCode::EEOP_INT64_CASE:
+			{
+				int c = step.d.ternary.cond * DEFAULT_CHUNK_SIZE;
+				int t = step.d.ternary.if_true * DEFAULT_CHUNK_SIZE;
+				int f = step.d.ternary.if_false * DEFAULT_CHUNK_SIZE;
+				int true_scale = get_register_scale(step.d.ternary.if_true);
+				int false_scale = get_register_scale(step.d.ternary.if_false);
+
+				for (int i = 0; i < chunk.count; i++)
+				{
+					bool cond_null = registers_nulls[c + i] != 0;
+					bool take_true = (!cond_null && registers_i32[c + i] != 0);
+					int src = take_true ? t : f;
+					int src_scale = take_true ? true_scale : false_scale;
+
+					registers_nulls[res + i] = registers_nulls[src + i];
+					registers_i64[res + i] =
+						RescaleInt64Value(registers_i64[src + i], src_scale, res_scale);
+				}
+				break;
+			}
+			case VecOpCode::EEOP_FLOAT8_CASE:
+			{
+				int c = step.d.ternary.cond * DEFAULT_CHUNK_SIZE;
+				int t = step.d.ternary.if_true * DEFAULT_CHUNK_SIZE;
+				int f = step.d.ternary.if_false * DEFAULT_CHUNK_SIZE;
+
+				for (int i = 0; i < chunk.count; i++)
+				{
+					bool cond_null = registers_nulls[c + i] != 0;
+					bool take_true = (!cond_null && registers_i32[c + i] != 0);
+					int src = take_true ? t : f;
+
+					registers_nulls[res + i] = registers_nulls[src + i];
+					registers_f8[res + i] = registers_f8[src + i];
+				}
+				break;
+			}
+			case VecOpCode::EEOP_STR_PREFIX_LIKE:
+			{
+				int att = step.d.str_prefix.att_idx;
+				uint32_t prefix_len = step.d.str_prefix.len;
+				uint64_t mask = 0;
+
+				if (prefix_len > 0)
+					mask = (prefix_len >= 8) ? UINT64_MAX : ((UINT64CONST(1) << (prefix_len * 8)) - 1);
+				for (int i = 0; i < chunk.count; i++)
+				{
+					VecStringRef ref = chunk.string_columns[att][i];
+
+					registers_nulls[res + i] = chunk.nulls[att][i];
+					registers_i32[res + i] =
+						(!registers_nulls[res + i] &&
+						 ref.len >= prefix_len &&
+						 (prefix_len == 0 || ((ref.prefix & mask) == (step.d.str_prefix.prefix & mask))));
+				}
+				break;
+			}
 			case VecOpCode::EEOP_QUAL:
 				ApplyQualSelection(chunk, &registers_nulls[res], &registers_i32[res]);
 				break;

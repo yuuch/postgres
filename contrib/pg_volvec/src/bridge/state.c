@@ -86,6 +86,18 @@ is_supported_plan(Plan *plan)
 	if (IsA(plan, SeqScan))
 		return plan->lefttree == NULL && plan->righttree == NULL;
 
+	if (IsA(plan, Hash))
+		return plan->lefttree != NULL &&
+			   plan->righttree == NULL &&
+			   is_supported_plan(plan->lefttree);
+
+	if (IsA(plan, HashJoin))
+		return plan->lefttree != NULL &&
+			   plan->righttree != NULL &&
+			   IsA(plan->righttree, Hash) &&
+			   is_supported_plan(plan->lefttree) &&
+			   is_supported_plan(plan->righttree);
+
 	if (IsA(plan, Agg) || IsA(plan, Sort))
 		return plan->lefttree != NULL &&
 			   plan->righttree == NULL &&

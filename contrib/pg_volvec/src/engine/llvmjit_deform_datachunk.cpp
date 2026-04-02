@@ -44,6 +44,7 @@ static llvm_get_function_type pg_llvm_get_function = nullptr;
 static llvm_mutable_module_type pg_llvm_mutable_module = nullptr;
 static llvm_pg_var_type_type pg_llvm_pg_var_type = nullptr;
 static llvm_release_context_direct_type pg_llvm_release_context_direct = nullptr;
+static uint64_t pg_volvec_deform_jit_serial = 0;
 
 static bool
 resolve_jit_symbols_from_process()
@@ -996,6 +997,8 @@ pg_volvec_try_compile_jit_deform_to_datachunk(TupleDesc desc,
 	LLVMValueRef fn;
 	char *funcname;
 	bool created_context = false;
+	bool success = false;
+	uint64_t serial;
 
 	if (out_func != nullptr) *out_func = nullptr;
 
@@ -1013,23 +1016,43 @@ pg_volvec_try_compile_jit_deform_to_datachunk(TupleDesc desc,
 		created_context = true;
 	}
 	char base_name[96];
-	snprintf(base_name, sizeof(base_name), "pg_volvec_deform_to_chunk_%p", (const void *) program);
+	serial = ++pg_volvec_deform_jit_serial;
+	snprintf(base_name, sizeof(base_name), "pg_volvec_deform_to_chunk_%p_%llu",
+			 (const void *) context,
+			 (unsigned long long) serial);
 	funcname = pg_llvm_expand_funcname(context, base_name);
-	fn = compile_deform_to_datachunk(context, desc, program, funcname);
-	if (fn == nullptr) {
-		if (failure_reason != nullptr) *failure_reason = "failed to build LLVM deform function";
+	PG_TRY();
+	{
+		fn = compile_deform_to_datachunk(context, desc, program, funcname);
+		if (fn == nullptr) {
+			if (failure_reason != nullptr) *failure_reason = "failed to build LLVM deform function";
+			success = false;
+		} else {
+			if (out_func != nullptr)
+				*out_func = reinterpret_cast<JitDeformFunc>(pg_llvm_get_function(context, funcname));
+			if (out_context != nullptr && *out_context == nullptr)
+				*out_context = &context->base;
+			success = (out_func == nullptr || *out_func != nullptr);
+		}
+	}
+	PG_CATCH();
+	{
 		if (created_context)
 			pg_llvm_release_context_direct(context);
 		if (out_context != nullptr && created_context)
 			*out_context = nullptr;
-		pfree(funcname);
-		return false;
+		if (funcname != nullptr)
+			pfree(funcname);
+		PG_RE_THROW();
 	}
+	PG_END_TRY();
 
-	if (out_func != nullptr) *out_func = reinterpret_cast<JitDeformFunc>(pg_llvm_get_function(context, funcname));
-	if (out_context != nullptr && *out_context == nullptr) *out_context = &context->base;
+	if (!success && created_context)
+		pg_llvm_release_context_direct(context);
+	if (out_context != nullptr && created_context && !success)
+		*out_context = nullptr;
 	pfree(funcname);
-	return (out_func == nullptr || *out_func != nullptr);
+	return success;
 }
 
 } /* namespace pg_volvec */
