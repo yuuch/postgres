@@ -1,0 +1,49 @@
+SET client_min_messages = warning;
+SET max_parallel_workers_per_gather = 0;
+SET max_parallel_workers = 0;
+SET jit = off;
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = on;
+
+CREATE TABLE supplier (
+	s_suppkey integer NOT NULL,
+	s_name char(25) NOT NULL,
+	s_address varchar(40) NOT NULL,
+	s_phone char(15) NOT NULL
+);
+
+CREATE TABLE lineitem (
+	l_suppkey integer NOT NULL,
+	l_extendedprice numeric(15,2) NOT NULL,
+	l_discount numeric(15,2) NOT NULL,
+	l_shipdate date NOT NULL
+);
+
+INSERT INTO supplier VALUES
+	(1, 'Supplier#000000001', 'Alpha Ave', '11-111-111-1111'),
+	(2, 'Supplier#000000002', 'Beta Street', '22-222-222-2222'),
+	(3, 'Supplier#000000003', 'Gamma Road', '33-333-333-3333');
+
+INSERT INTO lineitem VALUES
+	(1, 1000.00, 0.10, date '1996-01-10'),
+	(1, 500.00, 0.00, date '1995-12-31'),
+	(2, 1200.00, 0.20, date '1996-02-10'),
+	(3, 500.00, 0.50, date '1996-03-10');
+
+CREATE VIEW revenue0 (supplier_no, total_revenue) AS
+	SELECT l_suppkey, sum(l_extendedprice * (1 - l_discount))
+	FROM lineitem
+	WHERE l_shipdate >= date '1996-01-01'
+	  AND l_shipdate < date '1996-01-01' + interval '3' month
+	GROUP BY l_suppkey;
+
+SELECT s_suppkey, s_name, s_address, s_phone, total_revenue
+FROM supplier, revenue0
+WHERE s_suppkey = supplier_no
+  AND total_revenue = (SELECT max(total_revenue) FROM revenue0)
+ORDER BY s_suppkey;
+
+DROP VIEW revenue0;
+DROP TABLE lineitem;
+DROP TABLE supplier;
+DROP EXTENSION pg_vec;

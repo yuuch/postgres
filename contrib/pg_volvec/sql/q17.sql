@@ -1,0 +1,56 @@
+SET client_min_messages = warning;
+SET max_parallel_workers_per_gather = 0;
+SET max_parallel_workers = 0;
+SET jit = off;
+SET max_stack_depth = '7MB';
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = on;
+SET pg_vec.jit_deform = off;
+
+CREATE TABLE part (
+	p_partkey integer NOT NULL,
+	p_brand char(10) NOT NULL,
+	p_container char(10) NOT NULL
+);
+
+CREATE TABLE lineitem (
+	l_partkey integer NOT NULL,
+	l_quantity numeric(15,2) NOT NULL,
+	l_extendedprice numeric(15,2) NOT NULL
+);
+
+INSERT INTO part VALUES
+	(1, 'Brand#23', 'MED BOX'),
+	(2, 'Brand#23', 'MED BOX'),
+	(3, 'Brand#77', 'SM BOX');
+
+INSERT INTO lineitem VALUES
+	(1, 1.00, 100.00),
+	(1, 1.00, 120.00),
+	(1, 20.00, 500.00),
+	(2, 2.00, 60.00),
+	(2, 2.00, 70.00),
+	(2, 30.00, 400.00),
+	(3, 1.00, 999.00);
+
+SELECT
+	sum(l_extendedprice) / 7.0 AS avg_yearly
+FROM
+	lineitem,
+	part
+WHERE
+	p_partkey = l_partkey
+	AND p_brand = 'Brand#23'
+	AND p_container = 'MED BOX'
+	AND l_quantity < (
+		SELECT
+			0.2 * avg(l_quantity)
+		FROM
+			lineitem
+		WHERE
+			l_partkey = p_partkey
+	);
+
+DROP TABLE lineitem;
+DROP TABLE part;
+DROP EXTENSION pg_vec;

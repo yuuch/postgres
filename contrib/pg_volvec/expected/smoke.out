@@ -1,0 +1,35 @@
+CREATE EXTENSION IF NOT EXISTS pg_volvec;
+SET pg_volvec.enabled = on;
+SET pg_volvec.trace_hooks = on;
+CREATE TABLE vec_lineitem (
+    l_returnflag char(1),
+    l_linestatus char(1),
+    l_quantity float8,
+    l_extendedprice float8
+);
+INSERT INTO vec_lineitem VALUES ('A', 'F', 10.0, 100.0);
+INSERT INTO vec_lineitem VALUES ('A', 'F', 20.0, 200.0);
+INSERT INTO vec_lineitem VALUES ('B', 'O', 30.0, 300.0);
+-- Simple Q1-style aggregation
+SELECT 
+    l_returnflag, 
+    l_linestatus, 
+    sum(l_quantity) as sum_qty, 
+    sum(l_extendedprice) as sum_base_price,
+    count(*) as count_order
+FROM 
+    vec_lineitem
+GROUP BY 
+    l_returnflag, 
+    l_linestatus
+ORDER BY 
+    l_returnflag, 
+    l_linestatus;
+ l_returnflag | l_linestatus | sum_qty | sum_base_price | count_order 
+--------------+--------------+---------+----------------+-------------
+ A            | F            |      30 |            300 |           2
+ B            | O            |      30 |            300 |           1
+(2 rows)
+
+DROP TABLE vec_lineitem;
+DROP EXTENSION pg_volvec;

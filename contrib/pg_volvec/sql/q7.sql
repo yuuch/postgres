@@ -1,0 +1,120 @@
+SET client_min_messages = warning;
+SET datestyle = 'ISO, MDY';
+SET join_collapse_limit = 1;
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = on;
+
+CREATE TABLE supplier (
+	s_suppkey integer NOT NULL,
+	s_nationkey integer NOT NULL
+);
+
+CREATE TABLE lineitem (
+	l_orderkey integer NOT NULL,
+	l_suppkey integer NOT NULL,
+	l_shipdate date NOT NULL,
+	l_extendedprice numeric(15,2) NOT NULL,
+	l_discount numeric(15,2) NOT NULL
+);
+
+CREATE TABLE orders (
+	o_orderkey integer NOT NULL,
+	o_custkey integer NOT NULL
+);
+
+CREATE TABLE customer (
+	c_custkey integer NOT NULL,
+	c_nationkey integer NOT NULL
+);
+
+CREATE TABLE nation (
+	n_nationkey integer NOT NULL,
+	n_name char(25) NOT NULL
+);
+
+INSERT INTO nation (n_nationkey, n_name)
+VALUES
+	(1, 'FRANCE'),
+	(2, 'GERMANY'),
+	(3, 'BRAZIL');
+
+INSERT INTO supplier (s_suppkey, s_nationkey)
+VALUES
+	(1, 1),
+	(2, 2),
+	(3, 3);
+
+INSERT INTO customer (c_custkey, c_nationkey)
+VALUES
+	(1, 1),
+	(2, 2),
+	(3, 3);
+
+INSERT INTO orders (o_orderkey, o_custkey)
+VALUES
+	(1, 1),
+	(2, 2),
+	(3, 1),
+	(4, 2),
+	(5, 1);
+
+INSERT INTO lineitem (
+	l_orderkey,
+	l_suppkey,
+	l_shipdate,
+	l_extendedprice,
+	l_discount
+)
+VALUES
+	(1, 2, date '1995-03-15', 100.00, 0.10),
+	(2, 1, date '1995-06-01', 200.00, 0.20),
+	(3, 2, date '1996-01-10', 50.00, 0.00),
+	(4, 1, date '1996-09-09', 80.00, 0.50),
+	(5, 1, date '1995-02-02', 70.00, 0.00);
+
+SELECT
+	supp_nation,
+	cust_nation,
+	l_year,
+	sum(volume) AS revenue
+FROM
+	(
+		SELECT
+			n1.n_name AS supp_nation,
+			n2.n_name AS cust_nation,
+			extract(year FROM l_shipdate) AS l_year,
+			l_extendedprice * (1 - l_discount) AS volume
+		FROM
+			supplier,
+			lineitem,
+			orders,
+			customer,
+			nation n1,
+			nation n2
+		WHERE
+			s_suppkey = l_suppkey
+			AND o_orderkey = l_orderkey
+			AND c_custkey = o_custkey
+			AND s_nationkey = n1.n_nationkey
+			AND c_nationkey = n2.n_nationkey
+			AND (
+				(n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
+				OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
+			)
+			AND l_shipdate BETWEEN date '1995-01-01' AND date '1996-12-31'
+	) AS shipping
+GROUP BY
+	supp_nation,
+	cust_nation,
+	l_year
+ORDER BY
+	supp_nation,
+	cust_nation,
+	l_year;
+
+DROP TABLE lineitem;
+DROP TABLE orders;
+DROP TABLE customer;
+DROP TABLE supplier;
+DROP TABLE nation;
+DROP EXTENSION pg_vec;

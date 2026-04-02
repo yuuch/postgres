@@ -1,0 +1,84 @@
+SET client_min_messages = warning;
+SET join_collapse_limit = 1;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+SET max_parallel_workers_per_gather = 0;
+SET max_parallel_workers = 0;
+SET jit = off;
+CREATE EXTENSION pg_vec;
+SET pg_vec.enabled = on;
+SET pg_vec.jit_deform = off;
+
+CREATE TABLE part (
+	p_partkey integer NOT NULL,
+	p_brand char(10) NOT NULL,
+	p_type varchar(25) NOT NULL,
+	p_size integer NOT NULL
+);
+
+CREATE TABLE supplier (
+	s_suppkey integer NOT NULL,
+	s_comment varchar(101) NOT NULL
+);
+
+CREATE TABLE partsupp (
+	ps_partkey integer NOT NULL,
+	ps_suppkey integer NOT NULL
+);
+
+INSERT INTO part VALUES
+	(1, 'Brand#11', 'SMALL BRUSHED TIN', 49),
+	(2, 'Brand#45', 'MEDIUM POLISHED COPPER', 14),
+	(3, 'Brand#33', 'LARGE ANODIZED STEEL', 23),
+	(4, 'Brand#33', 'LARGE ANODIZED STEEL', 23);
+
+INSERT INTO supplier VALUES
+	(10, 'Good supplier'),
+	(20, 'Customer and Complaints here'),
+	(30, 'Regular supplier'),
+	(40, 'Customer xxx Complaints xxx');
+
+INSERT INTO partsupp VALUES
+	(1, 10),
+	(1, 30),
+	(2, 20),
+	(3, 20),
+	(3, 30),
+	(4, 30),
+	(4, 40);
+
+SELECT
+	p_brand,
+	p_type,
+	p_size,
+	count(distinct ps_suppkey) as supplier_cnt
+FROM
+	partsupp,
+	part
+WHERE
+	p_partkey = ps_partkey
+	AND p_brand <> 'Brand#45'
+	AND p_type not like 'MEDIUM POLISHED%'
+	AND p_size in (49, 14, 23, 45, 19, 3, 36, 9)
+	AND ps_suppkey not in (
+		SELECT
+			s_suppkey
+		FROM
+			supplier
+		WHERE
+			s_comment like '%Customer%Complaints%'
+	)
+GROUP BY
+	p_brand,
+	p_type,
+	p_size
+ORDER BY
+	supplier_cnt desc,
+	p_brand,
+	p_type,
+	p_size;
+
+DROP TABLE partsupp;
+DROP TABLE supplier;
+DROP TABLE part;
+DROP EXTENSION pg_vec;

@@ -1,0 +1,631 @@
+#ifndef VOLVEC_ENGINE_HPP
+#define VOLVEC_ENGINE_HPP
+
+#include <memory>
+#include <limits>
+#include <new>
+#include <utility>
+#include <vector>
+#include <unordered_map>
+#include <cstdint>
+#include <cstring>
+
+extern "C" {
+#include "postgres.h"
+#include "utils/rel.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/tupdesc_details.h"
+#include "nodes/plannodes.h"
+#include "executor/executor.h"
+#include "jit/jit.h"
+#include "storage/bufmgr.h"
+#include "storage/read_stream.h"
+#include "catalog/pg_type_d.h"
+#include "nodes/makefuncs.h"
+#include "utils/builtins.h"
+#include "utils/numeric.h"
+#include "access/visibilitymap.h"
+#include "optimizer/optimizer.h"
+}
+
+namespace pg_volvec
+{
+
+static constexpr uint16_t DEFAULT_CHUNK_SIZE = 1024;
+static constexpr int MAX_REGISTERS = 64;
+static constexpr int DEFAULT_NUMERIC_SCALE = 2;
+static constexpr int VOLVEC_DEC_DIGITS = 4;
+static constexpr int VOLVEC_NBASE = 10000;
+
+#if defined(__SIZEOF_INT128__)
+using NumericWideInt = __int128_t;
+#else
+struct NumericWideInt
+{
+	uint64_t	lo;
+	int64_t		hi;
+
+	constexpr NumericWideInt() : lo(0), hi(0) {}
+	constexpr NumericWideInt(int64_t value)
+		: lo((uint64_t) value), hi(value < 0 ? -1 : 0) {}
+	constexpr NumericWideInt(uint64_t lo_bits, int64_t hi_bits)
+		: lo(lo_bits), hi(hi_bits) {}
+};
+
+static inline NumericWideInt
+MakeWideIntBits(uint64_t lo, uint64_t hi)
+{
+	return NumericWideInt(lo, (int64_t) hi);
+}
+
+static inline void
+Mul64Wide(uint64_t left, uint64_t right, uint64_t *hi, uint64_t *lo)
+{
+	uint64_t left_lo = (uint32_t) left;
+	uint64_t left_hi = left >> 32;
+	uint64_t right_lo = (uint32_t) right;
+	uint64_t right_hi = right >> 32;
+	uint64_t prod_ll = left_lo * right_lo;
+	uint64_t prod_lh = left_lo * right_hi;
+	uint64_t prod_hl = left_hi * right_lo;
+	uint64_t prod_hh = left_hi * right_hi;
+	uint64_t middle = (prod_ll >> 32) + (uint32_t) prod_lh + (uint32_t) prod_hl;
+
+	*lo = (middle << 32) | (uint32_t) prod_ll;
+	*hi = prod_hh + (prod_lh >> 32) + (prod_hl >> 32) + (middle >> 32);
+}
+
+static inline bool
+operator==(const NumericWideInt &left, const NumericWideInt &right)
+{
+	return left.hi == right.hi && left.lo == right.lo;
+}
+
+static inline bool
+operator!=(const NumericWideInt &left, const NumericWideInt &right)
+{
+	return !(left == right);
+}
+
+static inline bool
+operator<(const NumericWideInt &left, const NumericWideInt &right)
+{
+	if (left.hi != right.hi)
+		return left.hi < right.hi;
+	return left.lo < right.lo;
+}
+
+static inline bool
+operator<=(const NumericWideInt &left, const NumericWideInt &right)
+{
+	return !(right < left);
+}
+
+static inline bool
+operator>(const NumericWideInt &left, const NumericWideInt &right)
+{
+	return right < left;
+}
+
+static inline bool
+operator>=(const NumericWideInt &left, const NumericWideInt &right)
+{
+	return !(left < right);
+}
+
+static inline NumericWideInt
+operator-(const NumericWideInt &value)
+{
+	uint64_t lo = ~value.lo + 1;
+	uint64_t hi = ~((uint64_t) value.hi) + (lo == 0 ? 1 : 0);
+
+	return MakeWideIntBits(lo, hi);
+}
+
+static inline NumericWideInt
+operator+(const NumericWideInt &left, const NumericWideInt &right)
+{
+	uint64_t lo = left.lo + right.lo;
+	uint64_t carry = (lo < left.lo) ? 1 : 0;
+	uint64_t hi = (uint64_t) left.hi + (uint64_t) right.hi + carry;
+
+	return MakeWideIntBits(lo, hi);
+}
+
+static inline NumericWideInt
+operator-(const NumericWideInt &left, const NumericWideInt &right)
+{
+	uint64_t lo = left.lo - right.lo;
+	uint64_t borrow = (left.lo < right.lo) ? 1 : 0;
+	uint64_t hi = (uint64_t) left.hi - (uint64_t) right.hi - borrow;
+
+	return MakeWideIntBits(lo, hi);
+}
+
+static inline NumericWideInt
+operator*(const NumericWideInt &left, const NumericWideInt &right)
+{
+	uint64_t prod_hi = 0;
+	uint64_t prod_lo = 0;
+	uint64_t cross1_hi = 0;
+	uint64_t cross1_lo = 0;
+	uint64_t cross2_hi = 0;
+	uint64_t cross2_lo = 0;
+	uint64_t hi;
+
+	Mul64Wide(left.lo, right.lo, &prod_hi, &prod_lo);
+	Mul64Wide(left.lo, (uint64_t) right.hi, &cross1_hi, &cross1_lo);
+	Mul64Wide((uint64_t) left.hi, right.lo, &cross2_hi, &cross2_lo);
+	hi = prod_hi + cross1_lo + cross2_lo;
+	return MakeWideIntBits(prod_lo, hi);
+}
+
+static inline NumericWideInt &
+operator+=(NumericWideInt &left, const NumericWideInt &right)
+{
+	left = left + right;
+	return left;
+}
+
+static inline NumericWideInt &
+operator-=(NumericWideInt &left, const NumericWideInt &right)
+{
+	left = left - right;
+	return left;
+}
+
+static inline NumericWideInt &
+operator*=(NumericWideInt &left, const NumericWideInt &right)
+{
+	left = left * right;
+	return left;
+}
+#endif
+
+static inline NumericWideInt
+WideIntFromInt64(int64_t value)
+{
+	return NumericWideInt(value);
+}
+
+static inline bool
+WideIntFitsInt64(NumericWideInt value)
+{
+	return value >= WideIntFromInt64(PG_INT64_MIN) &&
+		   value <= WideIntFromInt64(PG_INT64_MAX);
+}
+
+static inline int64_t
+WideIntToInt64Checked(NumericWideInt value, const char *what)
+{
+	if (!WideIntFitsInt64(value))
+		elog(ERROR, "pg_volvec %s exceeds int64 range", what);
+#if defined(__SIZEOF_INT128__)
+	return (int64_t) value;
+#else
+	return (int64_t) value.lo;
+#endif
+}
+
+static inline NumericWideInt
+WideIntMul(NumericWideInt left, NumericWideInt right)
+{
+	return left * right;
+}
+
+static inline int
+GetNumericScaleFromTypmod(int32 typmod)
+{
+	if (typmod < (int32) VARHDRSZ)
+		return DEFAULT_NUMERIC_SCALE;
+	return ((((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024);
+}
+
+struct VolVecNumericShort
+{
+	uint16		n_header;
+	int16		n_data[FLEXIBLE_ARRAY_MEMBER];
+};
+
+struct VolVecNumericLong
+{
+	uint16		n_sign_dscale;
+	int16		n_weight;
+	int16		n_data[FLEXIBLE_ARRAY_MEMBER];
+};
+
+static inline bool
+VolVecNumericHeaderIsShort(const void *datum_ptr)
+{
+	const VolVecNumericShort *num =
+		reinterpret_cast<const VolVecNumericShort *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+	return (num->n_header & 0x8000) != 0;
+}
+
+static inline bool
+VolVecNumericIsSpecial(const void *datum_ptr)
+{
+	const VolVecNumericShort *num =
+		reinterpret_cast<const VolVecNumericShort *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+	return (num->n_header & 0xC000) == 0xC000;
+}
+
+static inline int
+VolVecNumericDscale(const void *datum_ptr)
+{
+	if (VolVecNumericHeaderIsShort(datum_ptr))
+	{
+		const VolVecNumericShort *num =
+			reinterpret_cast<const VolVecNumericShort *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+		return (num->n_header & 0x1F80) >> 7;
+	}
+
+	const VolVecNumericLong *num =
+		reinterpret_cast<const VolVecNumericLong *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+	return (num->n_sign_dscale & 0x3FFF);
+}
+
+static inline int
+VolVecNumericWeight(const void *datum_ptr)
+{
+	if (VolVecNumericHeaderIsShort(datum_ptr))
+	{
+		const VolVecNumericShort *num =
+			reinterpret_cast<const VolVecNumericShort *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+		int weight = num->n_header & 0x003F;
+		if ((num->n_header & 0x0040) != 0)
+			weight |= ~0x003F;
+		return weight;
+	}
+
+	const VolVecNumericLong *num =
+		reinterpret_cast<const VolVecNumericLong *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+	return num->n_weight;
+}
+
+static inline bool
+VolVecNumericNegative(const void *datum_ptr)
+{
+	if (VolVecNumericHeaderIsShort(datum_ptr))
+	{
+		const VolVecNumericShort *num =
+			reinterpret_cast<const VolVecNumericShort *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+		return (num->n_header & 0x2000) != 0;
+	}
+
+	const VolVecNumericLong *num =
+		reinterpret_cast<const VolVecNumericLong *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+	return (num->n_sign_dscale & 0xC000) == 0x4000;
+}
+
+static inline int
+VolVecNumericHeaderSize(const void *datum_ptr)
+{
+	return sizeof(uint16) + (VolVecNumericHeaderIsShort(datum_ptr) ? 0 : sizeof(int16));
+}
+
+static inline const int16 *
+VolVecNumericDigits(const void *datum_ptr)
+{
+	if (VolVecNumericHeaderIsShort(datum_ptr))
+	{
+		const VolVecNumericShort *num =
+			reinterpret_cast<const VolVecNumericShort *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+		return num->n_data;
+	}
+
+	const VolVecNumericLong *num =
+		reinterpret_cast<const VolVecNumericLong *>(VARDATA_ANY((const struct varlena *) datum_ptr));
+	return num->n_data;
+}
+
+static inline int
+VolVecNumericNDigits(const void *datum_ptr)
+{
+	return (VARSIZE_ANY_EXHDR((const struct varlena *) datum_ptr) - VolVecNumericHeaderSize(datum_ptr)) / (int) sizeof(int16);
+}
+
+static inline bool
+TryFastNumericToScaledInt64(Datum value, int target_scale, int64_t *out)
+{
+	const void *datum_ptr = DatumGetPointer(value);
+	const int16 *digits;
+	NumericWideInt accum = 0;
+	int ndigits;
+	int weight;
+	int dscale;
+	int frac_index;
+	int i;
+
+	if (out == nullptr || datum_ptr == nullptr)
+		return false;
+	if (VolVecNumericIsSpecial(datum_ptr))
+		return false;
+	if (target_scale < 0 || target_scale > VOLVEC_DEC_DIGITS)
+		return false;
+
+	dscale = VolVecNumericDscale(datum_ptr);
+	if (dscale < 0 || dscale > VOLVEC_DEC_DIGITS || dscale > target_scale)
+		return false;
+
+	digits = VolVecNumericDigits(datum_ptr);
+	ndigits = VolVecNumericNDigits(datum_ptr);
+	weight = VolVecNumericWeight(datum_ptr);
+
+	for (i = 0; i <= weight; i++)
+	{
+		accum *= VOLVEC_NBASE;
+		if (i >= 0 && i < ndigits)
+			accum += digits[i];
+	}
+
+	for (i = 0; i < target_scale; i++)
+		accum *= 10;
+
+	frac_index = weight + 1;
+	if (target_scale > 0)
+	{
+		int16 frac_digit = (frac_index >= 0 && frac_index < ndigits) ? digits[frac_index] : 0;
+		int divisor = 1;
+
+		for (i = 0; i < VOLVEC_DEC_DIGITS - target_scale; i++)
+			divisor *= 10;
+		if (frac_digit % divisor != 0)
+			return false;
+		accum += frac_digit / divisor;
+	}
+
+	for (i = Max(frac_index + 1, 0); i < ndigits; i++)
+	{
+		if (digits[i] != 0)
+			return false;
+	}
+
+	if (VolVecNumericNegative(datum_ptr))
+		accum = -accum;
+
+	if (!WideIntFitsInt64(accum))
+		return false;
+
+	*out = (int64_t) accum;
+	return true;
+}
+
+class PgMemoryContextObject
+{
+public:
+	static void *operator new(std::size_t size)
+	{
+		return MemoryContextAlloc(CurrentMemoryContext, size);
+	}
+
+	static void operator delete(void *ptr) noexcept
+	{
+		if (ptr != nullptr)
+			pfree(ptr);
+	}
+
+	static void operator delete(void *ptr, std::size_t) noexcept
+	{
+		if (ptr != nullptr)
+			pfree(ptr);
+	}
+};
+
+template <typename T>
+class PgMemoryContextAllocator
+{
+public:
+	using value_type = T;
+
+	PgMemoryContextAllocator() noexcept : context_(CurrentMemoryContext) {}
+	explicit PgMemoryContextAllocator(MemoryContext context) noexcept
+		: context_(context != nullptr ? context : CurrentMemoryContext) {}
+
+	template <typename U>
+	PgMemoryContextAllocator(const PgMemoryContextAllocator<U> &other) noexcept
+		: context_(other.context()) {}
+
+	T *allocate(std::size_t n)
+	{
+		if (n > (std::numeric_limits<std::size_t>::max() / sizeof(T)))
+			elog(ERROR, "pg_volvec allocator size overflow");
+		return static_cast<T *>(MemoryContextAlloc(context_, n * sizeof(T)));
+	}
+
+	void deallocate(T *ptr, std::size_t) noexcept
+	{
+		if (ptr != nullptr)
+			pfree(ptr);
+	}
+
+	MemoryContext context() const noexcept { return context_; }
+
+	template <typename U>
+	bool operator==(const PgMemoryContextAllocator<U> &other) const noexcept
+	{
+		return context_ == other.context();
+	}
+
+	template <typename U>
+	bool operator!=(const PgMemoryContextAllocator<U> &other) const noexcept
+	{
+		return !(*this == other);
+	}
+
+private:
+	template <typename>
+	friend class PgMemoryContextAllocator;
+
+	MemoryContext context_;
+};
+
+template <typename T>
+using VolVecVector = std::vector<T, PgMemoryContextAllocator<T>>;
+
+template <typename Key, typename Value, typename Hash = std::hash<Key>, typename KeyEqual = std::equal_to<Key>>
+using VolVecHashMap = std::unordered_map<Key, Value, Hash, KeyEqual,
+	PgMemoryContextAllocator<std::pair<const Key, Value>>>;
+
+struct SelectionVector { uint16_t row_ids[DEFAULT_CHUNK_SIZE]; uint16_t count; void clear() { count = 0; } };
+struct VecStringRef { uint32_t len; uint32_t offset; uint64_t prefix; };
+
+template <uint16_t Capacity>
+struct alignas(16) DataChunk {
+	static void *operator new(std::size_t size)
+	{
+		return MemoryContextAllocAligned(CurrentMemoryContext, size, alignof(DataChunk), 0);
+	}
+
+	static void operator delete(void *ptr) noexcept
+	{
+		if (ptr != nullptr)
+			pfree(ptr);
+	}
+
+	static void operator delete(void *ptr, std::size_t) noexcept
+	{
+		if (ptr != nullptr)
+			pfree(ptr);
+	}
+
+	uint16_t count;
+	alignas(16) double double_columns[16][Capacity];
+	alignas(16) int64_t int64_columns[16][Capacity];
+	alignas(16) int32_t int32_columns[16][Capacity];
+	alignas(16) VecStringRef string_columns[16][Capacity];
+	alignas(16) uint8_t nulls[16][Capacity]; /* Use uint8_t for reliability */
+	SelectionVector sel;
+	bool has_selection;
+
+	DataChunk() : count(0), has_selection(false) { memset(nulls, 0, sizeof(nulls)); }
+	void reset() { count = 0; sel.clear(); has_selection = false; memset(nulls, 0, sizeof(nulls)); }
+	void get_double_ptrs(double** out) { for(int i=0; i<16; i++) out[i] = double_columns[i]; }
+	void get_int64_ptrs(int64_t** out) { for(int i=0; i<16; i++) out[i] = int64_columns[i]; }
+	void get_int32_ptrs(int32_t** out) { for(int i=0; i<16; i++) out[i] = int32_columns[i]; }
+	void get_null_ptrs(uint8_t** out) { for(int i=0; i<16; i++) out[i] = nulls[i]; }
+};
+
+static constexpr int kMaxDeformTargets = 16;
+enum class DeformDecodeKind : uint8_t { kInt32, kInt64, kDate32, kFloat8, kNumeric, kStringRef };
+struct DeformTarget { int att_index; uint16_t dst_col; DeformDecodeKind decode_kind; };
+struct DeformProgram {
+	int ntargets; int last_att_index; DeformTarget targets[kMaxDeformTargets];
+	void reset() { ntargets = 0; last_att_index = -1; }
+	void add_target(int att, int dst, DeformDecodeKind k) { if(ntargets<kMaxDeformTargets) targets[ntargets++] = {att, (uint16_t)dst, k}; }
+	void finalize() {
+		for (int i = 1; i < ntargets; i++) {
+			DeformTarget key = targets[i];
+			int j = i - 1;
+			while (j >= 0 && targets[j].att_index > key.att_index) {
+				targets[j + 1] = targets[j];
+				j--;
+			}
+			targets[j + 1] = key;
+		}
+		last_att_index = (ntargets > 0) ? targets[ntargets - 1].att_index : -1;
+	}
+};
+struct DeformBindings { void *columns_data[kMaxDeformTargets]; uint8_t *columns_nulls[kMaxDeformTargets]; int ncolumns; };
+typedef void (*JitDeformFunc)(HeapTupleHeader tuphdr, void **col_data_ptrs, uint8_t **col_null_ptrs, uint32 row_idx);
+
+class DataChunkDeformer {
+public:
+	DataChunkDeformer(TupleDesc desc, const DeformProgram *program) : desc_(desc), program_(*program) {}
+	void set_jit_func(JitDeformFunc f) { jit_func_ = f; }
+	void deform_tuple_header(HeapTupleHeader tuphdr, uint32 row_idx, const DeformBindings &bindings);
+private:
+	TupleDesc desc_; DeformProgram program_; JitDeformFunc jit_func_ = nullptr; bool jit_path_logged_ = false;
+};
+
+enum class VecOpCode { EEOP_VAR, EEOP_CONST, EEOP_FLOAT8_ADD, EEOP_FLOAT8_SUB, EEOP_FLOAT8_MUL, EEOP_INT64_ADD, EEOP_INT64_SUB, EEOP_INT64_MUL, EEOP_FLOAT8_LT, EEOP_FLOAT8_GT, EEOP_FLOAT8_LE, EEOP_FLOAT8_GE, EEOP_INT64_LT, EEOP_INT64_GT, EEOP_INT64_LE, EEOP_INT64_GE, EEOP_DATE_LT, EEOP_DATE_LE, EEOP_DATE_GE, EEOP_INT32_EQ, EEOP_AND, EEOP_QUAL };
+struct VecExprStep { VecOpCode opcode; int res_idx; union { struct { int att_idx; Oid type; } var; struct { double fval; int64_t i64val; int32_t ival; bool isnull; } constant; struct { int left; int right; } op; } d; };
+typedef void (*VecExprJitFunc)(uint32_t count, double** col_f8, int64_t** col_i64, int32_t** col_i32, uint8_t** col_nulls, double* res_f8, int64_t* res_i64, int32_t* res_i32, uint8_t* res_nulls, uint16_t* sel, bool has_sel);
+
+class VecExprProgram : public PgMemoryContextObject {
+public:
+	VecExprProgram(); ~VecExprProgram();
+	void evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk);
+	void try_compile_jit();
+	const double* get_float8_reg(int i) const { return &registers_f8[i * DEFAULT_CHUNK_SIZE]; }
+	const int64_t* get_int64_reg(int i) const { return &registers_i64[i * DEFAULT_CHUNK_SIZE]; }
+	const uint8_t* get_nulls_reg(int i) const { return &registers_nulls[i * DEFAULT_CHUNK_SIZE]; }
+	int get_register_scale(int i) const { return (i >= 0 && i < MAX_REGISTERS) ? register_scales[i] : 0; }
+	void set_register_scale(int i, int scale) { if (i >= 0 && i < MAX_REGISTERS) register_scales[i] = scale; }
+	void reset_register_scales() { memset(register_scales, 0, sizeof(register_scales)); }
+	int get_final_res_idx() const { return final_res_idx; }
+	VolVecVector<VecExprStep> steps; int max_reg_idx; int final_res_idx;
+	VecExprJitFunc jit_func = nullptr; void* jit_context = nullptr;
+private:
+	int32_t* registers_i32; int64_t* registers_i64; double* registers_f8; uint8_t* registers_nulls;
+	int register_scales[MAX_REGISTERS];
+};
+
+class VecPlanState : public PgMemoryContextObject { public: virtual ~VecPlanState() = default; virtual bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) = 0; };
+
+class VecSeqScanState : public VecPlanState {
+public:
+	VecSeqScanState(Relation rel, Snapshot snapshot, const DeformProgram *program); ~VecSeqScanState() override;
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+private:
+	Relation rel_; Snapshot snapshot_; HeapScanDesc scan_; ReadStream *stream_ = nullptr; Buffer current_buf_ = InvalidBuffer; Buffer vmbuf_ = InvalidBuffer; OffsetNumber current_offnum_ = FirstOffsetNumber; bool all_visible_ = false; DataChunkDeformer deformer_; JitContext *jit_context_ = nullptr;
+};
+
+class VecAggState : public VecPlanState {
+public:
+	enum class NumericOutputKind { None, Sum, Avg };
+
+	VecAggState(std::unique_ptr<VecPlanState> left, Agg *node);
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_numeric_output_meta(int target_resno, NumericOutputKind *kind, int *scale) const;
+private:
+	std::unique_ptr<VecPlanState> left_; Agg *node_; MemoryContext memory_context_; VolVecVector<int> grp_col_indices_;
+	struct VecAggAccumulator {
+		double float_sum = 0.0;
+		NumericWideInt numeric_sum = 0;
+		int64_t count = 0;
+
+		void update_float(double v) { float_sum += v; count++; }
+		void update_numeric(int64_t v) { numeric_sum += WideIntFromInt64(v); count++; }
+	};
+	struct VecGroupKey { uint64_t prefixes[4]; int num_cols; bool operator==(const VecGroupKey& o) const { if(num_cols!=o.num_cols)return false; for(int i=0;i<4;i++)if(prefixes[i]!=o.prefixes[i])return false; return true; } };
+	struct VecGroupKeyHash { std::size_t operator()(const VecGroupKey& k) const { std::size_t h=0; for(int i=0;i<k.num_cols;i++)h^=std::hash<uint64_t>{}(k.prefixes[i])+0x9e3779b9+(h<<6)+(h>>2); return h; } };
+	enum class VecAggType { SUM, COUNT, AVG, MAX };
+	struct VecAggDesc {
+		VecAggType type;
+		std::unique_ptr<VecExprProgram> arg_expr;
+		int target_resno;
+		Oid arg_type = InvalidOid;
+		int numeric_scale = 0;
+		bool use_exact_numeric = false;
+	};
+	using VecAggAccumulatorList = VolVecVector<VecAggAccumulator>;
+	using VecAggHashTable = VolVecHashMap<VecGroupKey, VecAggAccumulatorList, VecGroupKeyHash>;
+	VolVecVector<VecAggDesc> aggs_; VecAggHashTable hash_table_;
+	VecAggHashTable::iterator it_;
+	bool fully_scanned_ = false; void do_sink();
+};
+
+class VecFilterState : public VecPlanState {
+public:
+	VecFilterState(std::unique_ptr<VecPlanState> left, std::unique_ptr<VecExprProgram> prog) : left_(std::move(left)), program_(std::move(prog)) {}
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+private:
+	std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
+};
+
+struct PgVolVecQueryState { MemoryContext context; VecPlanState* vec_plan; };
+
+void CompileExpr(Expr *expr, VecExprProgram &program, bool is_filter = false);
+std::unique_ptr<VecPlanState> ExecInitVecPlan(Plan *plan, EState *estate);
+
+#ifdef USE_LLVM
+bool pg_volvec_try_compile_jit_deform_to_datachunk(TupleDesc desc, const DeformProgram *program, JitDeformFunc *out_func, JitContext **out_context, const char **failure_reason);
+bool pg_volvec_try_compile_jit_expr(const VecExprProgram *program, VecExprJitFunc *out_func, JitContext **out_context, const char **failure_reason);
+void pg_volvec_release_llvm_jit_context(JitContext *context);
+#endif
+
+} /* namespace pg_volvec */
+
+#endif

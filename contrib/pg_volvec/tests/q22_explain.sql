@@ -1,0 +1,73 @@
+SET datestyle = 'ISO, MDY';
+SET join_collapse_limit = 1;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+SET max_parallel_workers_per_gather = 0;
+SET max_parallel_workers = 0;
+SET jit = off;
+SET max_stack_depth = '7MB';
+
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS customer;
+
+CREATE TABLE customer (
+	c_custkey integer NOT NULL,
+	c_phone char(15) NOT NULL,
+	c_acctbal numeric(15,2) NOT NULL
+);
+
+CREATE TABLE orders (
+	o_orderkey integer NOT NULL,
+	o_custkey integer NOT NULL
+);
+
+INSERT INTO customer VALUES
+	(1, '131234567890123', 100.00),
+	(2, '311234567890123', 200.00),
+	(3, '231234567890123',  50.00),
+	(4, '291234567890123', 300.00),
+	(5, '171234567890123', 150.00),
+	(6, '181234567890123', 500.00),
+	(7, '401234567890123', 400.00);
+
+INSERT INTO orders VALUES
+	(10, 2);
+
+EXPLAIN (VERBOSE, COSTS OFF)
+select
+	cntrycode,
+	count(*) as numcust,
+	sum(c_acctbal) as totacctbal
+from
+	(
+		select
+			substring(c_phone from 1 for 2) as cntrycode,
+			c_acctbal
+		from
+			customer
+		where
+			substring(c_phone from 1 for 2) in
+				('13', '31', '23', '29', '30', '18', '17')
+			and c_acctbal > (
+				select
+					avg(c_acctbal)
+				from
+					customer
+				where
+					c_acctbal > 0.00
+					and substring(c_phone from 1 for 2) in
+						('13', '31', '23', '29', '30', '18', '17')
+			)
+			and not exists (
+				select
+					*
+				from
+					orders
+				where
+					o_custkey = c_custkey
+			)
+	) as custsale
+group by
+	cntrycode
+order by
+	cntrycode;

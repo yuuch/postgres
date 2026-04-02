@@ -1,0 +1,5 @@
+# pg_volvec extension
+comment = 'Experimental vectorized executor (tree-based IR) for TPC-H'
+default_version = '1.0'
+module_pathname = '$libdir/pg_volvec'
+relocatable = true

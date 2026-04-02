@@ -1,0 +1,7 @@
+/.DS_Store
+/build/
+/src/.DS_Store
+/tests/profiles/
+/tests/*.sample.txt
+/tests/*.folded.txt
+/tests/*.flame.svg
