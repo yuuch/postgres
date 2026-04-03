@@ -152,14 +152,14 @@ pg_volvec_jit_deform_supported(TupleDesc desc,
 				*failure_reason = "missing attributes are not supported by deform JIT";
 			return false;
 		}
-		if (att->attlen == -2) {
-			if (failure_reason != nullptr)
-				*failure_reason = "cstring attributes are not supported by deform JIT";
-			return false;
+			if (att->attlen == -2) {
+				if (failure_reason != nullptr)
+					*failure_reason = "cstring attributes are not supported by deform JIT";
+				return false;
+			}
 		}
+		return true;
 	}
-	return true;
-}
 
 static int64_t fast_numeric_to_int64_v8(Numeric num) {
 	int64_t scaled = 0;
@@ -184,6 +184,29 @@ static void pg_volvec_jit_store_stringref(const char *ptr, void *dst) {
 	((uint32_t*)dst)[0] = len;
 	((uint32_t*)dst)[1] = 0;
 	((uint64_t*)((char*)dst + 8))[0] = pref;
+}
+
+static void
+pg_volvec_jit_store_stringref_owned(const char *ptr, void *dst, void *chunk_ptr)
+{
+	DataChunk<DEFAULT_CHUNK_SIZE> *chunk =
+		reinterpret_cast<DataChunk<DEFAULT_CHUNK_SIZE> *>(chunk_ptr);
+	VecStringRef ref;
+	struct varlena *v;
+	char *vptr;
+	int len;
+
+	if (chunk == nullptr)
+	{
+		pg_volvec_jit_store_stringref(ptr, dst);
+		return;
+	}
+
+	v = (struct varlena *) ptr;
+	vptr = VARDATA_ANY(v);
+	len = VARSIZE_ANY_EXHDR(v);
+	ref = chunk->store_string_bytes(vptr, (uint32_t) len);
+	memcpy(dst, &ref, sizeof(ref));
 }
 
 static LLVMValueRef
@@ -699,29 +722,31 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 		LLVMDisposeBuilder(b); return nullptr;
 	}
 
-	/* SIGNATURE: (HeapTupleHeader tuphdr, void** col_data, uint8_t** col_nulls, uint32 row_idx) */
-	LLVMTypeRef param_types[4];
+	/* SIGNATURE: (HeapTupleHeader tuphdr, void** col_data, uint8_t** col_nulls, uint32 row_idx, void *owner_chunk) */
+	LLVMTypeRef param_types[5];
 	param_types[0] = l_ptr(type_heap_tuple_header);
 	param_types[1] = l_ptr(l_ptr(type_i8));
 	param_types[2] = l_ptr(l_ptr(type_i8));
 	param_types[3] = type_i32;
+	param_types[4] = l_ptr(type_i8);
 
-	LLVMTypeRef func_sig = LLVMFunctionType(LLVMVoidTypeInContext(lc), param_types, 4, 0);
+	LLVMTypeRef func_sig = LLVMFunctionType(LLVMVoidTypeInContext(lc), param_types, 5, 0);
 	LLVMValueRef v_func = LLVMAddFunction(mod, funcname, func_sig);
 	LLVMValueRef v_tuphdr = LLVMGetParam(v_func, 0);
 	LLVMValueRef v_col_data = LLVMGetParam(v_func, 1);
 	LLVMValueRef v_col_nulls = LLVMGetParam(v_func, 2);
 	LLVMValueRef v_row_idx = LLVMGetParam(v_func, 3);
+	LLVMValueRef v_owner_chunk = LLVMGetParam(v_func, 4);
 
 	LLVMTypeRef num_fn_args[2] = { l_ptr(type_i8), l_ptr(type_i64) };
-	LLVMTypeRef str_fn_args[2] = { l_ptr(type_i8), l_ptr(type_i8) };
+	LLVMTypeRef str_fn_args[3] = { l_ptr(type_i8), l_ptr(type_i8), l_ptr(type_i8) };
 	LLVMTypeRef num_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(lc), num_fn_args, 2, 0);
-	LLVMTypeRef str_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(lc), str_fn_args, 2, 0);
+	LLVMTypeRef str_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(lc), str_fn_args, 3, 0);
 
 	LLVMTypeRef varsize_any_args[1] = { l_ptr(type_i8) };
 	LLVMTypeRef varsize_any_ty = LLVMFunctionType(type_sizet, varsize_any_args, 1, 0);
 	LLVMValueRef v_num_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&pg_volvec_jit_store_numeric_int64_fast), l_ptr(num_fn_ty));
-	LLVMValueRef v_str_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&pg_volvec_jit_store_stringref), l_ptr(str_fn_ty));
+	LLVMValueRef v_str_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&pg_volvec_jit_store_stringref_owned), l_ptr(str_fn_ty));
 	LLVMValueRef v_varsize_any_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&varsize_any), l_ptr(varsize_any_ty));
 	LLVMValueRef v_num_fast_s2_fn = build_numeric_scale2_fast_store_helper(mod, lc, num_fn_ty, v_num_fn, funcname);
 
@@ -871,8 +896,10 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 						LLVMBuildBitCast(b, v_data_array, l_ptr(type_arr16), ""),
 						&v_row_idx, 1, "dest_str");
 					LLVMValueRef v_dest_i8 = LLVMBuildBitCast(b, v_dest, l_ptr(type_i8), "");
-					LLVMValueRef args[] = {v_attdatap, v_dest_i8};
-					l_call(b, str_fn_ty, v_str_fn, args, 2, "");
+					LLVMValueRef v_owner_chunk_i8 =
+						LLVMBuildBitCast(b, v_owner_chunk, l_ptr(type_i8), "");
+					LLVMValueRef args[] = {v_attdatap, v_dest_i8, v_owner_chunk_i8};
+					l_call(b, str_fn_ty, v_str_fn, args, 3, "");
 					break;
 				}
 			}

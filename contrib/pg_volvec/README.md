@@ -4,16 +4,32 @@
 
 ## Verified Status
 
-The current code path is no longer just a skeleton. As of April 2, 2026, the following have been verified on the local `~/data/pg_tpch` instance:
+The current code path is no longer just a skeleton. As of April 3, 2026, the following have been verified on the local `~/data/pg_tpch` instance:
 
 - Single-table `SeqScan -> optional qual -> Agg` shapes run in `pg_volvec`.
-- `Sort -> Agg -> SeqScan` is now supported for the current Q1 shape.
-- TPC-H Q1 with and without `ORDER BY` runs correctly and is offloaded.
-- TPC-H Q6 runs correctly and is offloaded.
+- `Sort`, `Limit`, `Hash Join`, and `SubqueryScan` wrappers are live in the current offload path.
+- `MergeJoin`-planned shapes can now be intercepted through a temporary hash-join-backed fallback.
 - Tuple deform JIT works without manually `LOAD 'llvmjit'`; the provider is auto-loaded when needed.
 - Expression JIT is wired in and generates fused row loops instead of materializing intermediate vector temporaries.
 - `NUMERIC(15,2)` hot paths use scaled `int64`, while aggregation uses widened integer accumulation.
 - A first columnar `VecSortState` exists for in-memory final-result sorting.
+
+### Verified offloaded TPC-H queries
+
+- Q1
+- Q3
+- Q4
+- Q5
+- Q6
+- Q7
+- Q8
+- Q9
+- Q10
+- Q11
+- Q12
+- Q14
+- Q15
+- Q19
 
 For the workspace-validated build, install, startup, test, profile, and benchmark commands, see [LOCAL_RUNBOOK.md](LOCAL_RUNBOOK.md).
 
@@ -38,6 +54,10 @@ The scan node no longer deforms a fixed prefix of attributes unconditionally. It
 ### Vectorized final sort
 
 For the current full-Q1 shape, `pg_volvec` now keeps the aggregated result columnar, materializes dense sort-owned chunks, sorts row references indirectly by extracted key lanes, and gathers the final ordered output back into `DataChunk`s. The first cut is an in-memory single-run sort aimed at the top-level Q1 `ORDER BY`.
+
+### Join coverage
+
+`pg_volvec` now supports the current validated inner-join wave through a first vectorized `VecHashJoinState`. For queries planned as `MergeJoin`, the current implementation reuses that hash-join execution path to get the query offloaded and correct, while a true vectorized merge-join kernel remains future work.
 
 ### Fixed-point numeric execution
 
@@ -95,6 +115,24 @@ meson install -C build --only-changed
 - [vecSortDesign.md](vecSortDesign.md): current vectorized sort design
 - [page-wise-scan.md](page-wise-scan.md): page-wise scan design and current status
 - [TODO.md](TODO.md): next engineering steps
+
+## Next Likely Target
+
+The next most attractive TPC-H candidate is Q18. With parallel disabled, the planner already rewrites it into a shape that is close to the current engine:
+
+- `Limit`
+- `Sort`
+- `GroupAggregate`
+- inner `HashJoin` chain
+- a `HashAggregate` subquery on `lineitem`
+
+The main remaining blockers look narrower than the other unsolved queries:
+
+- grouped aggregation with more than four group keys
+- finishing the current grouped-aggregate coverage on this wider target list
+- validating the `sum(l_quantity) > 300` subquery path end-to-end
+
+By comparison, Q13 and Q16 would first require larger new capability jumps such as outer joins, `count(distinct ...)`, and stronger anti-join support.
 
 ## License
 

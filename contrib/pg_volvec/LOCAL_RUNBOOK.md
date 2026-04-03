@@ -1,6 +1,6 @@
 # pg_volvec Local Runbook
 
-Last verified: 2026-04-02
+Last verified: 2026-04-03
 
 ## 1. 项目定位
 
@@ -98,7 +98,7 @@ installed/share/extension/pg_volvec--1.0.sql
   "SHOW shared_preload_libraries; SHOW port; SELECT current_setting('server_version');"
 ```
 
-2026-04-02 本地确认值为：
+2026-04-03 本地确认值为：
 
 - `shared_preload_libraries = pg_volvec`
 - `port = 5432`
@@ -213,24 +213,60 @@ lldb -p <backend_pid>
 
 这套流程对 `jit deform`、`expr JIT`、page-wise scan 都很有效。
 
-## 6. 2026-04-02 当前真实进展
+## 6. 2026-04-03 当前真实进展
 
 ### 已跑通的主路径
 
 - 单表 `SeqScan -> optional qual -> Agg` 形状已可 offload
-- `Sort -> Agg -> SeqScan` 的 full Q1 形状已可 offload
-- Q1 no-order 与 full Q1 都已验证正确
-- Q6 已验证正确
+- `Limit -> Sort -> Agg` 形状已可 offload
+- inner `HashJoin` 链已可 offload
+- `SubqueryScan` 已可 offload
+- `MergeJoin` 计划形状当前可通过 hash-join-backed fallback 先跑通
 - tuple deform JIT 可以自动装载 `llvmjit` provider，不再需要手工 `LOAD 'llvmjit'`
 - expression JIT 已真正接到执行路径里，不再只是代码里“有这个函数”
 - 第一版列式 `VecSortState` 已接上，用于 final-result in-memory sort
+- scan 与 join 两侧列裁剪都已接上
+- owned string storage 已接上，并且字符串列现在也可走 deform JIT
+
+### 已验证 offload 的 TPC-H 查询
+
+当前本地 `~/data/pg_tpch` 上已验证的查询共有 14 条：
+
+- Q1
+- Q3
+- Q4
+- Q5
+- Q6
+- Q7
+- Q8
+- Q9
+- Q10
+- Q11
+- Q12
+- Q14
+- Q15
+- Q19
 
 ### 当前计划支持边界
 
-目前仍然是窄支持面：
+目前支持面已经比最早宽很多，但仍然不是通用 SQL 执行器：
 
-- 支持：`SeqScan`、根部 `Agg`、根部 `Sort`、plan `qual`
-- 不支持：`Join`、`Gather`、`Materialize`、`Limit`、`Subquery Scan`
+- 支持：
+  - `SeqScan`
+  - `qual`
+  - `Agg`
+  - `Sort`
+  - `Limit`
+  - inner `HashJoin`
+  - `SubqueryScan`
+  - `MergeJoin` 计划形状的 hash-backed fallback
+- 仍未完成：
+  - outer join
+  - semi/anti join
+  - `Materialize`
+  - `Gather`
+  - `count(distinct ...)`
+  - 真正的 vectorized merge join
 
 当前 `Sort` 仍然是第一版实现：
 
@@ -306,8 +342,22 @@ res[i] = tmp[i] * c[i]
 
 ### 正确性验证
 
-- Q6：`pg_volvec` 结果与原生 PostgreSQL 一致
-- Q1 no-order：`pg_volvec` 结果与原生 PostgreSQL 一致
+当前已验证的 14 条 TPC-H 查询都和原生 PostgreSQL 结果对齐：
+
+- Q1
+- Q3
+- Q4
+- Q5
+- Q6
+- Q7
+- Q8
+- Q9
+- Q10
+- Q11
+- Q12
+- Q14
+- Q15
+- Q19
 
 ### 当前本地性能结果
 
@@ -325,24 +375,31 @@ res[i] = tmp[i] * c[i]
 - `pg_volvec` 平均：`4.87s`
 - 约 `4.48x` 加速
 
+#### 当前多条 query 的本地 checkpoint
+
+- Q3：约 `1.45x`
+- Q4：约 `1.05x`
+- Q6：约 `1.18x - 1.29x`
+- Q10：当前仍慢于原生，属于后续优化对象
+- Q12：在字符串 deform JIT 接回后，已从明显落后收敛到小幅领先
+- Q14：约 `1.23x`
+
 ### 最新 flame graph 信号
 
-Q6 新 flame graph 的主要结论：
+最近几轮 flame graph 的主要结论：
 
-- `VecExprProgram::evaluate` 只剩约 `1.08%`
-- `pg_volvec_jit_store_numeric_int64_fast` 已不再是热点
-- 主瓶颈已经回到 I/O：
-  - `ReadBufferExtended` 约 `67.39%`
-  - `pread` 约 `49.89%`
+- Q6 上，表达式解释执行已基本不再是热点，主瓶颈回到 I/O
+- Q12 上，字符串列重新接回 deform JIT 后，`nocachegetattr` 热点已经被打掉
+- Q14 上，per-side join pruning 与 compact inner payload 之后，hash build 已不再是主瓶颈
 
-这说明 expression JIT 这轮优化已经真正把原先解释执行那块打下去了。
+这说明前一轮的主要收益已经从“功能通了”转向“哪些路径还值得继续优化”。
 
 ## 7. 当前最值得继续收的方向
 
 如果下一步继续做，优先级建议是：
 
-1. `no-null` / `dense` 的更强 expr kernel specialization
-2. `sum(expr)` 继续 fusion，做到 `acc += expr(...)`
-3. `Sort` 支持，把完整 Q1 带 `ORDER BY` 也纳入 offload
-4. Hash Join / 多表查询
+1. Q18：扩 grouped aggregation 超过 4 个 group key 的限制
+2. Q18：验证 `sum(l_quantity) > 300` 的 aggregate subquery 路径
+3. outer join / semi / anti join，这会决定 Q13 / Q16 / Q20 / Q21 / Q22 的推进速度
+4. `count(distinct ...)`
 5. 更完整的 benchmark / regression harness

@@ -98,7 +98,19 @@ is_supported_plan(Plan *plan)
 			   is_supported_plan(plan->lefttree) &&
 			   is_supported_plan(plan->righttree);
 
-	if (IsA(plan, Agg) || IsA(plan, Sort))
+	if (IsA(plan, MergeJoin))
+		return ((Join *) plan)->jointype == JOIN_INNER &&
+			   ((MergeJoin *) plan)->mergeclauses != NIL &&
+			   plan->lefttree != NULL &&
+			   plan->righttree != NULL &&
+			   is_supported_plan(plan->lefttree) &&
+			   is_supported_plan(plan->righttree);
+
+	if (IsA(plan, SubqueryScan))
+		return ((SubqueryScan *) plan)->subplan != NULL &&
+			   is_supported_plan(((SubqueryScan *) plan)->subplan);
+
+	if (IsA(plan, Agg) || IsA(plan, Sort) || IsA(plan, Limit))
 		return plan->lefttree != NULL &&
 			   plan->righttree == NULL &&
 			   is_supported_plan(plan->lefttree);

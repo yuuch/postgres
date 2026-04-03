@@ -2,13 +2,16 @@
 #include "llvmjit_deform_datachunk.h"
 
 #include <algorithm>
+#include <cstring>
 
 extern "C" {
 #include "utils/lsyscache.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "access/stratnum.h"
+#include "executor/nodeSubplan.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 
 extern bool pg_volvec_jit_deform;
@@ -17,6 +20,21 @@ extern bool pg_volvec_trace_hooks;
 
 namespace pg_volvec
 {
+
+static bool
+IsRewriteExprNode(Node *node)
+{
+	return node != nullptr &&
+		(IsA(node, Var) ||
+		 IsA(node, Const) ||
+		 IsA(node, OpExpr) ||
+		 IsA(node, FuncExpr) ||
+		 IsA(node, BoolExpr) ||
+		 IsA(node, CaseExpr) ||
+		 IsA(node, Aggref) ||
+		 IsA(node, RelabelType) ||
+		 IsA(node, CoerceToDomain));
+}
 
 static Expr *
 StripImplicitNodesLocal(Expr *expr)
@@ -32,6 +50,67 @@ StripImplicitNodesLocal(Expr *expr)
 	}
 
 	return expr;
+}
+
+struct TargetListRewriteContext
+{
+	List *targetlist;
+	bool failed;
+};
+
+static Node *
+RewriteExprAgainstTargetListMutator(Node *node, TargetListRewriteContext *context)
+{
+	ListCell *lc;
+
+	if (node == nullptr)
+		return nullptr;
+	if (context == nullptr || context->targetlist == NIL)
+		return (Node *) copyObjectImpl(node);
+
+	foreach(lc, context->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Expr *tle_expr;
+
+		if (tle->resjunk)
+			continue;
+		tle_expr = StripImplicitNodesLocal((Expr *) tle->expr);
+		if (tle_expr != nullptr && equal(node, tle_expr))
+		{
+			if (tle->resno <= 0 || tle->resno > 16)
+			{
+				context->failed = true;
+				return nullptr;
+			}
+			return (Node *) makeVar(1,
+									tle->resno,
+									exprType(node),
+									exprTypmod(node),
+									exprCollation(node),
+									0);
+		}
+	}
+
+	return expression_tree_mutator(node,
+								   RewriteExprAgainstTargetListMutator,
+								   context);
+}
+
+static Expr *
+RewriteExprAgainstTargetList(Expr *expr, List *targetlist)
+{
+	TargetListRewriteContext context;
+
+	if (expr == nullptr)
+		return nullptr;
+	context.targetlist = targetlist;
+	context.failed = false;
+
+	Expr *rewritten = (Expr *) RewriteExprAgainstTargetListMutator((Node *) expr, &context);
+	if (context.failed)
+		return nullptr;
+	return rewritten;
 }
 
 static bool
@@ -63,6 +142,65 @@ EncodeFloat8SortKey(double value)
 	if ((bits & (UINT64CONST(1) << 63)) != 0)
 		return ~bits;
 	return bits ^ (UINT64CONST(1) << 63);
+}
+
+static inline VecStringRef
+CopyStringRefToChunk(DataChunk<DEFAULT_CHUNK_SIZE> &dst,
+					 const DataChunk<DEFAULT_CHUNK_SIZE> &src,
+					 const VecStringRef &ref)
+{
+	return dst.store_string_bytes(src.get_string_ptr(ref), ref.len);
+}
+
+static void
+AdjustProgramVarScales(VecExprProgram *program, VecPlanState *input_state)
+{
+	bool changed = false;
+
+	if (program == nullptr || input_state == nullptr)
+		return;
+
+	for (const auto &step : program->steps)
+	{
+		VecOutputColMeta meta;
+
+		if (step.opcode != VecOpCode::EEOP_VAR)
+			continue;
+		if (step.d.var.att_idx < 0 || step.d.var.att_idx >= 16)
+			continue;
+		if (!input_state->lookup_output_col_meta(step.d.var.att_idx + 1, &meta))
+			continue;
+		if (meta.storage_kind == VecOutputStorageKind::NumericScaledInt64 ||
+			meta.storage_kind == VecOutputStorageKind::NumericAvgPair)
+		{
+			if (program->get_register_scale(step.res_idx) != meta.scale)
+			{
+				program->set_register_scale(step.res_idx, meta.scale);
+				changed = true;
+			}
+		}
+		else if (meta.storage_kind == VecOutputStorageKind::Int64)
+		{
+			if (program->get_register_scale(step.res_idx) != 0)
+			{
+				program->set_register_scale(step.res_idx, 0);
+				changed = true;
+			}
+		}
+	}
+
+	if (!changed)
+		return;
+
+#ifdef USE_LLVM
+	if (program->jit_context != nullptr)
+	{
+		pg_volvec_release_llvm_jit_context((JitContext *) program->jit_context);
+		program->jit_context = nullptr;
+		program->jit_func = nullptr;
+	}
+#endif
+	program->try_compile_jit();
 }
 
 static DeformDecodeKind
@@ -127,6 +265,8 @@ CollectRequiredAttrsForPlan(Plan *plan, Bitmapset **attrs)
 
 	CollectRequiredAttrsForPlan(plan->lefttree, attrs);
 	CollectRequiredAttrsForPlan(plan->righttree, attrs);
+	if (IsA(plan, SubqueryScan))
+		CollectRequiredAttrsForPlan(((SubqueryScan *) plan)->subplan, attrs);
 }
 
 static bool
@@ -158,9 +298,14 @@ ResolvePlanSourceAttno(Plan *plan, int target_resno, int *source_attno)
 				var->varattno > kMaxDeformTargets)
 				return false;
 
-			if (plan->lefttree != nullptr &&
-				(IsA(plan, Hash) || IsA(plan, Sort)))
-				return ResolvePlanSourceAttno(plan->lefttree, var->varattno, source_attno);
+				if (plan->lefttree != nullptr &&
+					(IsA(plan, Hash) || IsA(plan, Sort) || IsA(plan, Limit)))
+					return ResolvePlanSourceAttno(plan->lefttree, var->varattno, source_attno);
+				if (IsA(plan, SubqueryScan) &&
+					((SubqueryScan *) plan)->subplan != nullptr)
+					return ResolvePlanSourceAttno(((SubqueryScan *) plan)->subplan,
+												 var->varattno,
+												 source_attno);
 
 			*source_attno = var->varattno;
 			return true;
@@ -229,25 +374,44 @@ CollectLocalPlanQualAttrs(Plan *plan, Bitmapset **attrs)
 		CollectLocalPlanQualAttrs(plan->lefttree, attrs);
 	if (plan->righttree != nullptr)
 		CollectLocalPlanQualAttrs(plan->righttree, attrs);
+	if (IsA(plan, SubqueryScan))
+		CollectLocalPlanQualAttrs(((SubqueryScan *) plan)->subplan, attrs);
 }
 
 static void
-BuildHashJoinChildRequiredAttrs(HashJoin *hash_join,
-								Plan *outer_plan,
-								Plan *inner_plan,
-								Bitmapset **outer_attrs,
-								Bitmapset **inner_attrs)
+BuildBinaryJoinChildRequiredAttrs(Plan *join_plan,
+								  Node *key_clauses,
+								  Plan *outer_plan,
+								  Plan *inner_plan,
+								  Bitmapset **outer_attrs,
+								  Bitmapset **inner_attrs)
 {
-	CollectResolvedAttrs((Node *) hash_join->join.plan.targetlist, OUTER_VAR, outer_plan, outer_attrs);
-	CollectResolvedAttrs((Node *) hash_join->join.plan.targetlist, INNER_VAR, inner_plan, inner_attrs);
-	CollectResolvedAttrs((Node *) hash_join->hashclauses, OUTER_VAR, outer_plan, outer_attrs);
-	CollectResolvedAttrs((Node *) hash_join->hashclauses, INNER_VAR, inner_plan, inner_attrs);
-	CollectResolvedAttrs((Node *) hash_join->join.joinqual, OUTER_VAR, outer_plan, outer_attrs);
-	CollectResolvedAttrs((Node *) hash_join->join.joinqual, INNER_VAR, inner_plan, inner_attrs);
-	CollectResolvedAttrs((Node *) hash_join->join.plan.qual, OUTER_VAR, outer_plan, outer_attrs);
-	CollectResolvedAttrs((Node *) hash_join->join.plan.qual, INNER_VAR, inner_plan, inner_attrs);
+	Join *join = (Join *) join_plan;
+
+	CollectResolvedAttrs((Node *) join_plan->targetlist, OUTER_VAR, outer_plan, outer_attrs);
+	CollectResolvedAttrs((Node *) join_plan->targetlist, INNER_VAR, inner_plan, inner_attrs);
+	CollectResolvedAttrs(key_clauses, OUTER_VAR, outer_plan, outer_attrs);
+	CollectResolvedAttrs(key_clauses, INNER_VAR, inner_plan, inner_attrs);
+	CollectResolvedAttrs((Node *) join->joinqual, OUTER_VAR, outer_plan, outer_attrs);
+	CollectResolvedAttrs((Node *) join->joinqual, INNER_VAR, inner_plan, inner_attrs);
+	CollectResolvedAttrs((Node *) join_plan->qual, OUTER_VAR, outer_plan, outer_attrs);
+	CollectResolvedAttrs((Node *) join_plan->qual, INNER_VAR, inner_plan, inner_attrs);
 	CollectLocalPlanQualAttrs(outer_plan, outer_attrs);
 	CollectLocalPlanQualAttrs(inner_plan, inner_attrs);
+}
+
+static Expr *
+BuildCombinedQualExpr(List *joinqual, List *planqual)
+{
+	List *quals = NIL;
+
+	if (joinqual != NIL)
+		quals = list_concat(quals, list_copy(joinqual));
+	if (planqual != NIL)
+		quals = list_concat(quals, list_copy(planqual));
+	if (quals == NIL)
+		return nullptr;
+	return (Expr *) make_ands_explicit(quals);
 }
 
 static void
@@ -275,6 +439,46 @@ BuildPrunedDeformProgram(Bitmapset *attrs, TupleDesc desc, DeformProgram *progra
 	program->finalize();
 }
 
+static bool
+ResolveAggPassThroughExpr(Agg *node,
+						  Expr *expr,
+						  int *input_col,
+						  int *group_key_pos)
+{
+	Plan *child_plan;
+	Expr *stripped_expr;
+	ListCell *lc;
+
+	if (node == nullptr || node->plan.lefttree == nullptr || expr == nullptr)
+		return false;
+
+	child_plan = node->plan.lefttree;
+	stripped_expr = StripImplicitNodesLocal(expr);
+	foreach(lc, child_plan->targetlist)
+	{
+		TargetEntry *child_tle = (TargetEntry *) lfirst(lc);
+		Expr *child_expr = StripImplicitNodesLocal((Expr *) child_tle->expr);
+
+		if (child_tle->resno <= 0 || child_tle->resno > 16 || child_expr == nullptr)
+			continue;
+		if (!equal(stripped_expr, child_expr))
+			continue;
+
+		for (int g = 0; g < node->numCols; g++)
+		{
+			if (node->grpColIdx[g] != child_tle->resno)
+				continue;
+			if (input_col != nullptr)
+				*input_col = child_tle->resno - 1;
+			if (group_key_pos != nullptr)
+				*group_key_pos = g;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /* --- Optimized DataChunkDeformer --- */
 void DataChunkDeformer::deform_tuple_header(HeapTupleHeader tuphdr, uint32 row_idx, const DeformBindings &bindings) {
 	if (jit_func_) {
@@ -282,7 +486,11 @@ void DataChunkDeformer::deform_tuple_header(HeapTupleHeader tuphdr, uint32 row_i
 			elog(LOG, "pg_volvec: using deform JIT path for row deconstruction");
 			jit_path_logged_ = true;
 		}
-		jit_func_(tuphdr, (void**)bindings.columns_data, (uint8_t**)bindings.columns_nulls, row_idx);
+		jit_func_(tuphdr,
+				  (void**)bindings.columns_data,
+				  (uint8_t**)bindings.columns_nulls,
+				  row_idx,
+				  bindings.owner_chunk);
 		return;
 	}
 	/* 
@@ -310,48 +518,78 @@ void DataChunkDeformer::deform_tuple_header(HeapTupleHeader tuphdr, uint32 row_i
 				((double*)bindings.columns_data[target.dst_col])[row_idx] = DatumGetFloat8(val);
 			else if (target.decode_kind == DeformDecodeKind::kInt64)
 				((int64_t*)bindings.columns_data[target.dst_col])[row_idx] = DatumGetInt64(val);
-			else if (target.decode_kind == DeformDecodeKind::kStringRef) {
-				struct varlena *v = (struct varlena *) DatumGetPointer(val);
-				char *vptr = VARDATA_ANY(v);
-				int len = VARSIZE_ANY_EXHDR(v);
-				uint64_t pref = 0;
-				memcpy(&pref, vptr, len > 8 ? 8 : len);
-				((VecStringRef*)bindings.columns_data[target.dst_col])[row_idx] = { (uint32_t)len, 0, pref };
-			}
+				else if (target.decode_kind == DeformDecodeKind::kStringRef) {
+					struct varlena *v = (struct varlena *) DatumGetPointer(val);
+					char *vptr = VARDATA_ANY(v);
+					int len = VARSIZE_ANY_EXHDR(v);
+					((VecStringRef*)bindings.columns_data[target.dst_col])[row_idx] =
+						bindings.owner_chunk->store_string_bytes(vptr, (uint32_t) len);
+				}
 		}
 	}
 }
 
 /* --- VecAggState --- */
 VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
-	: left_(std::move(left)),
-	  node_(node),
-	  memory_context_(CurrentMemoryContext),
-	  grp_col_indices_(PgMemoryContextAllocator<int>(memory_context_)),
-	  aggs_(PgMemoryContextAllocator<VecAggDesc>(memory_context_)),
-	  hash_table_(0, VecGroupKeyHash{}, std::equal_to<VecGroupKey>{},
-				 PgMemoryContextAllocator<std::pair<const VecGroupKey, VecAggAccumulatorList>>(memory_context_)),
-	  fully_scanned_(false)
+		: left_(std::move(left)),
+		  node_(node),
+		  memory_context_(CurrentMemoryContext),
+		  grp_col_indices_(PgMemoryContextAllocator<int>(memory_context_)),
+		  grp_col_meta_(PgMemoryContextAllocator<VecOutputColMeta>(memory_context_)),
+		  aggs_(PgMemoryContextAllocator<VecAggDesc>(memory_context_)),
+		  hash_table_(0, VecGroupKeyHash{}, std::equal_to<VecGroupKey>{},
+					 PgMemoryContextAllocator<std::pair<const VecGroupKey, VecAggGroupState>>(memory_context_)),
+		  rep_chunks_(PgMemoryContextAllocator<DataChunk<DEFAULT_CHUNK_SIZE> *>(memory_context_)),
+		  fully_scanned_(false)
 {
-	for (int i = 0; i < node->numCols; i++) grp_col_indices_.push_back(node->grpColIdx[i] - 1);
-	ListCell *lc;
-	foreach(lc, node->plan.targetlist) {
-		TargetEntry *tle = (TargetEntry *) lfirst(lc);
-		VecAggDesc desc; desc.target_resno = tle->resno;
-		desc.output_type = exprType((Node *) tle->expr);
-		desc.output_storage = DefaultOutputStorageKindForType(desc.output_type);
+		for (int i = 0; i < node->numCols; i++) {
+			VecOutputColMeta meta;
+			int target_resno = node->grpColIdx[i];
+
+			grp_col_indices_.push_back(target_resno - 1);
+			if (left_ == nullptr || !left_->lookup_output_col_meta(target_resno, &meta))
+			{
+				meta.sql_type = InvalidOid;
+				meta.storage_kind = VecOutputStorageKind::Int32;
+				meta.scale = 0;
+			}
+			grp_col_meta_.push_back(meta);
+		}
+		ListCell *lc;
+		foreach(lc, node->plan.targetlist) {
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+			VecAggDesc desc; desc.target_resno = tle->resno;
+			desc.output_type = exprType((Node *) tle->expr);
+			desc.output_storage = DefaultOutputStorageKindForType(desc.output_type);
 		if (IsA(tle->expr, Aggref)) {
 			Aggref *aggref = (Aggref *) tle->expr;
 			char *aggname = get_func_name(aggref->aggfnoid);
 			if (aggname && strcmp(aggname, "sum") == 0) desc.type = VecAggType::SUM;
 			else if (aggname && strcmp(aggname, "count") == 0) desc.type = VecAggType::COUNT;
 			else if (aggname && strcmp(aggname, "avg") == 0) desc.type = VecAggType::AVG;
+			else if (aggname && strcmp(aggname, "max") == 0) desc.type = VecAggType::MAX;
 			else desc.type = VecAggType::SUM;
 			if (aggref->args != NIL) {
 				TargetEntry *arg_tle = (TargetEntry *) linitial(aggref->args);
 				desc.arg_type = exprType((Node *) arg_tle->expr);
 				desc.arg_expr = std::make_unique<VecExprProgram>();
 				CompileExpr((Expr *) arg_tle->expr, *desc.arg_expr, false);
+				AdjustProgramVarScales(desc.arg_expr.get(), left_.get());
+				if (desc.arg_expr->get_final_res_idx() >= 0)
+				{
+					Expr *arg_expr = StripImplicitNodesLocal((Expr *) arg_tle->expr);
+
+					if (arg_expr != nullptr && IsA(arg_expr, Var) && left_ != nullptr)
+					{
+						VecOutputColMeta input_meta;
+						Var *var = (Var *) arg_expr;
+
+						if (left_->lookup_output_col_meta(var->varattno, &input_meta) &&
+							input_meta.storage_kind == VecOutputStorageKind::NumericScaledInt64)
+							desc.arg_expr->set_register_scale(desc.arg_expr->get_final_res_idx(),
+															  input_meta.scale);
+					}
+				}
 				if (desc.arg_expr->get_final_res_idx() >= 0)
 					desc.numeric_scale = desc.arg_expr->get_register_scale(desc.arg_expr->get_final_res_idx());
 				desc.use_exact_numeric = ShouldUseExactNumericAgg(desc.arg_type) &&
@@ -368,8 +606,96 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 				else if (desc.output_type == NUMERICOID)
 					desc.output_storage = VecOutputStorageKind::Double;
 			} else desc.arg_expr = nullptr;
-		} else { desc.type = VecAggType::MAX; desc.arg_expr = nullptr; }
-		aggs_.push_back(std::move(desc));
+			} else {
+				Expr *expr = StripImplicitNodesLocal((Expr *) tle->expr);
+				desc.type = VecAggType::MAX;
+				desc.arg_expr = nullptr;
+				if (expr != nullptr && IsA(expr, Var))
+				{
+					Var *var = (Var *) expr;
+					VecOutputColMeta input_meta;
+					desc.input_col = var->varattno - 1;
+					if (left_ != nullptr && left_->lookup_output_col_meta(var->varattno, &input_meta))
+					{
+						desc.output_storage = input_meta.storage_kind;
+						desc.numeric_scale = input_meta.scale;
+					}
+
+					for (int g = 0; g < node->numCols; g++)
+					{
+						if (node->grpColIdx[g] == var->varattno)
+						{
+							desc.group_key_pos = g;
+							break;
+						}
+					}
+				}
+				else if (ResolveAggPassThroughExpr(node, (Expr *) tle->expr,
+												  &desc.input_col, &desc.group_key_pos))
+				{
+					VecOutputColMeta input_meta;
+
+					if (left_ != nullptr && left_->lookup_output_col_meta(desc.input_col + 1, &input_meta))
+					{
+						desc.output_storage = input_meta.storage_kind;
+						desc.numeric_scale = input_meta.scale;
+					}
+				}
+			}
+			aggs_.push_back(std::move(desc));
+		}
+}
+
+VecAggState::~VecAggState()
+{
+	for (auto *chunk : rep_chunks_)
+		delete chunk;
+}
+
+DataChunk<DEFAULT_CHUNK_SIZE> *
+VecAggState::allocate_rep_chunk()
+{
+	MemoryContext old_context = MemoryContextSwitchTo(memory_context_);
+	DataChunk<DEFAULT_CHUNK_SIZE> *chunk = new DataChunk<DEFAULT_CHUNK_SIZE>();
+	MemoryContextSwitchTo(old_context);
+	rep_chunks_.push_back(chunk);
+	return chunk;
+}
+
+void
+VecAggState::copy_rep_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,
+						  const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row) const
+{
+	for (const auto &agg : aggs_)
+	{
+		int out_col = agg.target_resno - 1;
+		int src_col = agg.input_col;
+
+		if (agg.arg_expr != nullptr || out_col < 0 || out_col >= 16 || src_col < 0 || src_col >= 16)
+			continue;
+		dst.nulls[out_col][dst_row] = src.nulls[src_col][src_row];
+		if (dst.nulls[out_col][dst_row])
+			continue;
+		switch (agg.output_storage)
+		{
+			case VecOutputStorageKind::Double:
+				dst.double_columns[out_col][dst_row] = src.double_columns[src_col][src_row];
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+			case VecOutputStorageKind::NumericAvgPair:
+				dst.int64_columns[out_col][dst_row] = src.int64_columns[src_col][src_row];
+				dst.double_columns[out_col][dst_row] = src.double_columns[src_col][src_row];
+				break;
+			case VecOutputStorageKind::StringRef:
+				dst.string_columns[out_col][dst_row] =
+					CopyStringRefToChunk(dst, src, src.string_columns[src_col][src_row]);
+				break;
+			case VecOutputStorageKind::Int32:
+			default:
+				dst.int32_columns[out_col][dst_row] = src.int32_columns[src_col][src_row];
+				break;
+		}
 	}
 }
 
@@ -378,24 +704,86 @@ void VecAggState::do_sink() {
 	while (left_->get_next_batch(*batch)) {
 		for (auto &agg : aggs_) if (agg.arg_expr) agg.arg_expr->evaluate(*batch);
 		int n = batch->has_selection ? batch->sel.count : batch->count;
-		for (int s = 0; s < n; s++) {
-			int i = batch->has_selection ? batch->sel.row_ids[s] : s;
-			VecGroupKey key; key.num_cols = (int)grp_col_indices_.size(); if (key.num_cols > 4) key.num_cols = 4;
-			for (int k = 0; k < 4; k++) key.prefixes[k] = 0;
+			for (int s = 0; s < n; s++) {
+				int i = batch->has_selection ? batch->sel.row_ids[s] : s;
+				VecGroupKey key;
+
+				key.num_cols = (int) grp_col_indices_.size();
+				if (key.num_cols > 4)
+					key.num_cols = 4;
+				for (int k = 0; k < 4; k++)
+				{
+					key.values[k] = 0;
+					key.aux[k] = 0;
+					key.is_null[k] = 0;
+				}
 				for (int k = 0; k < key.num_cols; k++) {
 					int idx = grp_col_indices_[k];
-					if (idx >= 0 && idx < 16) key.prefixes[k] = batch->string_columns[idx][i].prefix;
+					const VecOutputColMeta &meta = grp_col_meta_[k];
+
+					if (idx < 0 || idx >= 16)
+						continue;
+					key.is_null[k] = batch->nulls[idx][i];
+					if (key.is_null[k])
+						continue;
+					switch (meta.storage_kind)
+					{
+						case VecOutputStorageKind::StringRef:
+							key.values[k] = batch->string_columns[idx][i].prefix;
+							key.aux[k] = batch->string_columns[idx][i].len;
+							break;
+						case VecOutputStorageKind::Int64:
+						case VecOutputStorageKind::NumericScaledInt64:
+						case VecOutputStorageKind::NumericAvgPair:
+							key.values[k] = (uint64_t) batch->int64_columns[idx][i];
+							break;
+						case VecOutputStorageKind::Double:
+							memcpy(&key.values[k], &batch->double_columns[idx][i], sizeof(uint64_t));
+							break;
+						case VecOutputStorageKind::Int32:
+						default:
+							key.values[k] = (uint64_t) (uint32_t) batch->int32_columns[idx][i];
+							break;
+					}
 				}
-					auto it = hash_table_.find(key);
-					if (it == hash_table_.end())
-						it = hash_table_.emplace(key, VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_))).first;
-					auto& accs = it->second; if (accs.empty()) accs.resize(aggs_.size());
-					for (size_t a = 0; a < aggs_.size(); a++) {
-						if (aggs_[a].type == VecAggType::COUNT) accs[a].count++;
-						else if (aggs_[a].arg_expr) {
+				auto it = hash_table_.find(key);
+				if (it == hash_table_.end())
+				{
+					VecAggGroupState new_group;
+					DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+						rep_chunks_.empty() ? allocate_rep_chunk() : rep_chunks_.back();
+
+					new_group.accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+					if (rep_chunk->count >= DEFAULT_CHUNK_SIZE)
+						rep_chunk = allocate_rep_chunk();
+					new_group.rep_chunk_idx = (uint32_t) (rep_chunks_.size() - 1);
+					new_group.rep_row_idx = (uint16_t) rep_chunk->count;
+					new_group.has_rep_row = true;
+					copy_rep_row(*rep_chunk, rep_chunk->count, *batch, i);
+					rep_chunk->count++;
+					it = hash_table_.emplace(key, std::move(new_group)).first;
+				}
+				auto& accs = it->second.accs; if (accs.empty()) accs.resize(aggs_.size());
+				for (size_t a = 0; a < aggs_.size(); a++) {
+					if (aggs_[a].type == VecAggType::COUNT) accs[a].count++;
+					else if (aggs_[a].arg_expr) {
 						int r = aggs_[a].arg_expr->final_res_idx;
 						if (r >= 0 && !aggs_[a].arg_expr->get_nulls_reg(r)[i]) {
-							if (aggs_[a].use_exact_numeric) {
+							if (aggs_[a].type == VecAggType::MAX) {
+								if (aggs_[a].use_exact_numeric ||
+									aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
+									aggs_[a].output_storage == VecOutputStorageKind::NumericScaledInt64 ||
+									aggs_[a].output_storage == VecOutputStorageKind::NumericAvgPair) {
+									const int64_t *r64 = aggs_[a].arg_expr->get_int64_reg(r);
+									accs[a].update_max_int64(r64[i]);
+								} else if (aggs_[a].output_storage == VecOutputStorageKind::Double) {
+									const double *rf8 = aggs_[a].arg_expr->get_float8_reg(r);
+									accs[a].update_max_float(rf8[i]);
+								} else {
+									const int32_t *r32 = aggs_[a].arg_expr->get_int32_reg(r);
+									accs[a].update_max_int32(r32[i]);
+								}
+							} else if (aggs_[a].use_exact_numeric) {
 								const int64_t* r64 = aggs_[a].arg_expr->get_int64_reg(r);
 								accs[a].update_numeric(r64[i]);
 							} else {
@@ -412,22 +800,48 @@ void VecAggState::do_sink() {
 					}
 				}
 			}
-	}
-	fully_scanned_ = true; it_ = hash_table_.begin();
+		}
+		fully_scanned_ = true; it_ = hash_table_.begin();
 }
 
 bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 	if (!fully_scanned_) do_sink();
 	chunk.reset();
 	while (it_ != hash_table_.end() && chunk.count < DEFAULT_CHUNK_SIZE) {
-		const auto& accs = it_->second; const auto& key = it_->first;
-		for (size_t a = 0; a < aggs_.size(); a++) {
-			int tidx = aggs_[a].target_resno - 1; if (tidx < 0 || tidx >= 16) continue;
-			chunk.nulls[tidx][chunk.count] = 0;
+			const auto& accs = it_->second.accs;
+			const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+				it_->second.has_rep_row ? rep_chunks_[it_->second.rep_chunk_idx] : nullptr;
+			int rep_row = it_->second.rep_row_idx;
+			for (size_t a = 0; a < aggs_.size(); a++) {
+				int tidx = aggs_[a].target_resno - 1; if (tidx < 0 || tidx >= 16) continue;
+				chunk.nulls[tidx][chunk.count] = 0;
 				if (aggs_[a].arg_expr == nullptr && aggs_[a].type == VecAggType::MAX) {
-					if (a < (size_t)key.num_cols) {
-						chunk.string_columns[tidx][chunk.count].prefix = key.prefixes[a];
-						chunk.string_columns[tidx][chunk.count].len = 1; 
+					if (rep_chunk != nullptr)
+					{
+						chunk.nulls[tidx][chunk.count] = rep_chunk->nulls[tidx][rep_row];
+						if (!chunk.nulls[tidx][chunk.count])
+						{
+							switch (aggs_[a].output_storage)
+							{
+								case VecOutputStorageKind::StringRef:
+									chunk.string_columns[tidx][chunk.count] =
+										CopyStringRefToChunk(chunk, *rep_chunk, rep_chunk->string_columns[tidx][rep_row]);
+									break;
+								case VecOutputStorageKind::Int64:
+								case VecOutputStorageKind::NumericScaledInt64:
+								case VecOutputStorageKind::NumericAvgPair:
+									chunk.int64_columns[tidx][chunk.count] = rep_chunk->int64_columns[tidx][rep_row];
+									chunk.double_columns[tidx][chunk.count] = rep_chunk->double_columns[tidx][rep_row];
+									break;
+								case VecOutputStorageKind::Double:
+									chunk.double_columns[tidx][chunk.count] = rep_chunk->double_columns[tidx][rep_row];
+									break;
+								case VecOutputStorageKind::Int32:
+								default:
+									chunk.int32_columns[tidx][chunk.count] = rep_chunk->int32_columns[tidx][rep_row];
+									break;
+							}
+						}
 					}
 				} else {
 					if (aggs_[a].type == VecAggType::AVG) {
@@ -440,6 +854,19 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 						}
 					}
 					else if (aggs_[a].type == VecAggType::COUNT) chunk.int64_columns[tidx][chunk.count] = accs[a].count;
+					else if (aggs_[a].type == VecAggType::MAX) {
+						if (!accs[a].has_value)
+							chunk.nulls[tidx][chunk.count] = 1;
+						else if (aggs_[a].use_exact_numeric ||
+								 aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
+								 aggs_[a].output_storage == VecOutputStorageKind::NumericScaledInt64 ||
+								 aggs_[a].output_storage == VecOutputStorageKind::NumericAvgPair)
+							chunk.int64_columns[tidx][chunk.count] = accs[a].int64_max;
+						else if (aggs_[a].output_storage == VecOutputStorageKind::Double)
+							chunk.double_columns[tidx][chunk.count] = accs[a].float_max;
+						else
+							chunk.int32_columns[tidx][chunk.count] = accs[a].int32_max;
+					}
 					else { 
 						if (aggs_[a].use_exact_numeric) {
 							chunk.int64_columns[tidx][chunk.count] =
@@ -452,8 +879,8 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 				}
 			}
 			chunk.count++; ++it_;
-	}
-	return chunk.count > 0;
+		}
+		return chunk.count > 0;
 }
 
 bool VecAggState::lookup_numeric_output_meta(int target_resno, NumericOutputKind *kind, int *scale) const {
@@ -569,6 +996,7 @@ bool VecSeqScanState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 	chunk.reset();
 	DeformBindings bindings;
 	for (int i = 0; i < 16; i++) { bindings.columns_data[i] = chunk.int32_columns[i]; bindings.columns_nulls[i] = chunk.nulls[i]; }
+	bindings.owner_chunk = &chunk;
 	TupleDesc desc = RelationGetDescr(rel_);
 	for (int i = 0; i < desc->natts && i < 16; i++) {
 		Oid typid = TupleDescAttr(desc, i)->atttypid;
@@ -653,6 +1081,7 @@ IsIdentityVarTargetList(List *targetlist)
 {
 	ListCell *lc;
 	int expected_resno = 1;
+	bool saw_visible = false;
 
 	foreach(lc, targetlist)
 	{
@@ -661,7 +1090,7 @@ IsIdentityVarTargetList(List *targetlist)
 		Var *var;
 
 		if (tle->resjunk)
-			return false;
+			continue;
 		expr = StripImplicitNodesLocal((Expr *) tle->expr);
 		if (expr == nullptr || !IsA(expr, Var))
 			return false;
@@ -669,9 +1098,10 @@ IsIdentityVarTargetList(List *targetlist)
 		if (tle->resno != expected_resno || var->varattno != expected_resno)
 			return false;
 		expected_resno++;
+		saw_visible = true;
 	}
 
-	return expected_resno > 1;
+	return saw_visible;
 }
 
 static std::unique_ptr<VecPlanState>
@@ -692,7 +1122,7 @@ BuildDirectVarProject(std::unique_ptr<VecPlanState> left, List *targetlist)
 		VecOutputColMeta meta;
 
 		if (tle->resjunk)
-			return nullptr;
+			continue;
 		if (expr == nullptr || !IsA(expr, Var))
 			return nullptr;
 		var = (Var *) expr;
@@ -710,6 +1140,9 @@ BuildDirectVarProject(std::unique_ptr<VecPlanState> left, List *targetlist)
 		project_col.input_col = (uint16_t) (var->varattno - 1);
 		project_cols.push_back(std::move(project_col));
 	}
+
+	if (project_cols.empty())
+		return left;
 
 	return std::make_unique<VecProjectState>(std::move(left), std::move(project_cols));
 }
@@ -795,12 +1228,13 @@ VecProjectState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 							input_chunk_.int32_columns[column.input_col][src_row] :
 							column.expr->get_int32_reg(reg)[src_row];
 						break;
-					case VecOutputStorageKind::StringRef:
-						if (!column.direct_var)
-							elog(ERROR, "pg_volvec computed string projection is not supported");
-						chunk.string_columns[out_col][dst_row] =
-							input_chunk_.string_columns[column.input_col][src_row];
-						break;
+						case VecOutputStorageKind::StringRef:
+							if (!column.direct_var)
+								elog(ERROR, "pg_volvec computed string projection is not supported");
+							chunk.string_columns[out_col][dst_row] =
+								CopyStringRefToChunk(chunk, input_chunk_,
+													 input_chunk_.string_columns[column.input_col][src_row]);
+							break;
 					default:
 						elog(ERROR, "pg_volvec project output kind is not supported");
 						break;
@@ -815,33 +1249,71 @@ VecProjectState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 	return false;
 }
 
+bool
+VecLimitState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
+{
+	if (done_ || left_ == nullptr)
+		return false;
+
+	while (left_->get_next_batch(chunk))
+	{
+		uint64_t remaining;
+		int active_count;
+
+		if (emitted_ >= limit_count_)
+		{
+			done_ = true;
+			chunk.reset();
+			return false;
+		}
+
+		active_count = chunk.has_selection ? chunk.sel.count : chunk.count;
+		if (active_count <= 0)
+			continue;
+
+		remaining = limit_count_ - emitted_;
+		if ((uint64_t) active_count > remaining)
+		{
+			if (chunk.has_selection)
+				chunk.sel.count = (uint16_t) remaining;
+			else
+				chunk.count = (int) remaining;
+			active_count = (int) remaining;
+			done_ = true;
+		}
+		emitted_ += (uint64_t) active_count;
+		return active_count > 0;
+	}
+
+	done_ = true;
+	return false;
+}
+
 VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 								   std::unique_ptr<VecPlanState> inner,
 								   VolVecVector<VecJoinOutputCol> output_cols,
-								   int outer_key_col,
-								   int inner_key_col,
-								   VecOutputStorageKind key_kind)
+								   VolVecVector<VecHashJoinKeyCol> key_cols)
 	: outer_(std::move(outer)),
 	  inner_(std::move(inner)),
 	  memory_context_(CurrentMemoryContext),
 	  output_cols_(PgMemoryContextAllocator<VecJoinOutputCol>(memory_context_)),
+	  key_cols_(PgMemoryContextAllocator<VecHashJoinKeyCol>(memory_context_)),
 	  inner_payload_cols_(PgMemoryContextAllocator<VecHashPayloadCol>(memory_context_)),
 	  inner_chunks_(PgMemoryContextAllocator<DataChunk<DEFAULT_CHUNK_SIZE> *>(memory_context_)),
 	  bucket_heads_(PgMemoryContextAllocator<int32_t>(memory_context_)),
 	  entries_(PgMemoryContextAllocator<VecHashEntry>(memory_context_)),
 	  probe_rows_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
-	  probe_keys_(PgMemoryContextAllocator<int64_t>(memory_context_)),
+	  probe_keys_(PgMemoryContextAllocator<VecHashJoinKey>(memory_context_)),
 	  probe_hashes_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
 	  probe_next_entries_(PgMemoryContextAllocator<int32_t>(memory_context_)),
 		  active_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
 		  next_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
 		  inner_built_(false),
 		  probe_batch_ready_(false),
-		  bucket_mask_(0),
-		  outer_key_col_(outer_key_col),
-		  inner_key_col_(inner_key_col),
-		  key_kind_(key_kind)
+		  bucket_mask_(0)
 {
+	for (const auto &key_col : key_cols)
+		key_cols_.push_back(key_col);
 	for (const auto &output_col : output_cols)
 	{
 		VecJoinOutputCol remapped = output_col;
@@ -892,7 +1364,7 @@ VecHashJoinState::rehash_hash_table(size_t min_bucket_count)
 }
 
 void
-VecHashJoinState::append_inner_entry(int64_t key, uint32_t hash,
+VecHashJoinState::append_inner_entry(const VecHashJoinKey &key, uint32_t hash,
 									 uint32_t chunk_idx, uint16_t row_idx)
 {
 	size_t next_size = entries_.size() + 1;
@@ -978,9 +1450,10 @@ VecHashJoinState::copy_inner_payload_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int
 				dst.int64_columns[dst_col][dst_row] = src.int64_columns[src_col][src_row];
 				dst.double_columns[dst_col][dst_row] = src.double_columns[src_col][src_row];
 				break;
-			case VecOutputStorageKind::StringRef:
-				dst.string_columns[dst_col][dst_row] = src.string_columns[src_col][src_row];
-				break;
+				case VecOutputStorageKind::StringRef:
+					dst.string_columns[dst_col][dst_row] =
+						CopyStringRefToChunk(dst, src, src.string_columns[src_col][src_row]);
+					break;
 			case VecOutputStorageKind::Int32:
 				dst.int32_columns[dst_col][dst_row] = src.int32_columns[src_col][src_row];
 				break;
@@ -988,33 +1461,72 @@ VecHashJoinState::copy_inner_payload_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int
 	}
 }
 
-int64_t
-VecHashJoinState::read_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk, int col, int row) const
+bool
+VecHashJoinState::read_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk, bool inner_side, int row,
+						   VecHashJoinKey *key) const
 {
-	switch (key_kind_)
+	if (key == nullptr || key_cols_.empty() || key_cols_.size() > kMaxJoinKeys)
+		return false;
+
+	memset(key->values, 0, sizeof(key->values));
+	key->num_keys = (uint8_t) key_cols_.size();
+	for (size_t i = 0; i < key_cols_.size(); i++)
 	{
-		case VecOutputStorageKind::Int32:
-			return (int64_t) chunk.int32_columns[col][row];
-		case VecOutputStorageKind::Int64:
-		case VecOutputStorageKind::NumericScaledInt64:
-			return chunk.int64_columns[col][row];
-		default:
-			elog(ERROR, "pg_volvec hash join key kind is not supported");
-			return 0;
+		const VecHashJoinKeyCol &key_col = key_cols_[i];
+		int col = inner_side ? key_col.inner_col : key_col.outer_col;
+
+		if (col < 0 || col >= 16 || chunk.nulls[col][row])
+			return false;
+
+		switch (key_col.kind)
+		{
+			case VecOutputStorageKind::Int32:
+				key->values[i] = (uint64_t) (uint32_t) chunk.int32_columns[col][row];
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+				key->values[i] = (uint64_t) chunk.int64_columns[col][row];
+				break;
+			default:
+				elog(ERROR, "pg_volvec hash join key kind is not supported");
+				return false;
+		}
 	}
+
+	return true;
 }
 
 uint32_t
-VecHashJoinState::hash_key(int64_t key) const
+VecHashJoinState::hash_key(const VecHashJoinKey &key) const
 {
-	uint64_t value = (uint64_t) key;
+	uint64_t hash = UINT64CONST(0x9e3779b97f4a7c15);
 
-	value ^= value >> 33;
-	value *= UINT64CONST(0xff51afd7ed558ccd);
-	value ^= value >> 33;
-	value *= UINT64CONST(0xc4ceb9fe1a85ec53);
-	value ^= value >> 33;
-	return (uint32_t) (value ^ (value >> 32));
+	for (int i = 0; i < key.num_keys; i++)
+	{
+		uint64_t value = key.values[i];
+
+		value ^= value >> 33;
+		value *= UINT64CONST(0xff51afd7ed558ccd);
+		value ^= value >> 33;
+		value *= UINT64CONST(0xc4ceb9fe1a85ec53);
+		value ^= value >> 33;
+		hash ^= value + UINT64CONST(0x9e3779b97f4a7c15) + (hash << 6) + (hash >> 2);
+	}
+
+	return (uint32_t) (hash ^ (hash >> 32));
+}
+
+bool
+VecHashJoinState::keys_equal(const VecHashJoinKey &left, const VecHashJoinKey &right) const
+{
+	if (left.num_keys != right.num_keys)
+		return false;
+	for (int i = 0; i < left.num_keys; i++)
+	{
+		if (left.values[i] != right.values[i])
+			return false;
+	}
+	return true;
 }
 
 void
@@ -1037,15 +1549,14 @@ VecHashJoinState::build_inner_hash()
 		{
 			int src_row = input.has_selection ? input.sel.row_ids[s] : s;
 			int dst_row;
-			int64_t key;
+			VecHashJoinKey key;
 
-			if (input.nulls[inner_key_col_][src_row])
+			if (!read_key(input, true, src_row, &key))
 				continue;
 			if (dst->count >= DEFAULT_CHUNK_SIZE)
 				dst = allocate_inner_chunk();
 			dst_row = dst->count;
 			copy_inner_payload_row(*dst, dst_row, input, src_row);
-			key = read_key(input, inner_key_col_, src_row);
 			append_inner_entry(key, hash_key(key),
 							  (uint32_t) (inner_chunks_.size() - 1),
 							  (uint16_t) dst_row);
@@ -1092,15 +1603,14 @@ VecHashJoinState::prepare_probe_batch()
 	for (int s = 0; s < active_count; s++)
 	{
 		int row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
-		int64_t key;
+		VecHashJoinKey key;
 		uint32_t hash;
 		int32_t head;
 		uint16_t probe_idx;
 
-		if (outer_chunk_.nulls[outer_key_col_][row])
+		if (!read_key(outer_chunk_, false, row, &key))
 			continue;
 
-		key = read_key(outer_chunk_, outer_key_col_, row);
 		hash = hash_key(key);
 		head = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
 		if (head < 0)
@@ -1121,7 +1631,7 @@ bool
 VecHashJoinState::advance_probe_match(uint16_t probe_idx, int32_t *match_entry_idx)
 {
 	int32_t entry_idx = probe_next_entries_[probe_idx];
-	int64_t key = probe_keys_[probe_idx];
+	const VecHashJoinKey &key = probe_keys_[probe_idx];
 	uint32_t hash = probe_hashes_[probe_idx];
 
 	while (entry_idx >= 0)
@@ -1129,7 +1639,7 @@ VecHashJoinState::advance_probe_match(uint16_t probe_idx, int32_t *match_entry_i
 		const VecHashEntry &entry = entries_[entry_idx];
 
 		probe_next_entries_[probe_idx] = entry.next;
-		if (entry.hash == hash && entry.key == key)
+		if (entry.hash == hash && keys_equal(entry.key, key))
 		{
 			if (match_entry_idx != nullptr)
 				*match_entry_idx = entry_idx;
@@ -1205,9 +1715,10 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 							chunk.int64_columns[out_col][dst_row] = src->int64_columns[src_col][src_row];
 							chunk.double_columns[out_col][dst_row] = src->double_columns[src_col][src_row];
 							break;
-						case VecOutputStorageKind::StringRef:
-							chunk.string_columns[out_col][dst_row] = src->string_columns[src_col][src_row];
-							break;
+							case VecOutputStorageKind::StringRef:
+								chunk.string_columns[out_col][dst_row] =
+									CopyStringRefToChunk(chunk, *src, src->string_columns[src_col][src_row]);
+								break;
 						case VecOutputStorageKind::Int32:
 							chunk.int32_columns[out_col][dst_row] = src->int32_columns[src_col][src_row];
 							break;
@@ -1231,7 +1742,8 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 }
 
 VecSortState::VecSortState(std::unique_ptr<VecPlanState> left, Sort *node,
-						   VolVecVector<VecSortKeyDesc> key_descs)
+						   VolVecVector<VecSortKeyDesc> key_descs,
+						   int output_ncols)
 	: left_(std::move(left)),
 	  node_(node),
 	  memory_context_(CurrentMemoryContext),
@@ -1240,7 +1752,7 @@ VecSortState::VecSortState(std::unique_ptr<VecPlanState> left, Sort *node,
 	  key_descs_(PgMemoryContextAllocator<VecSortKeyDesc>(memory_context_)),
 	  key_lanes_(PgMemoryContextAllocator<VecSortKeyLane>(memory_context_)),
 	  emit_pos_(0),
-	  output_ncols_(Min(list_length(node->plan.targetlist), 16)),
+	  output_ncols_(output_ncols > 0 ? Min(output_ncols, 16) : Min(list_length(node->plan.targetlist), 16)),
 	  materialized_(false)
 {
 	for (const auto &key_desc : key_descs)
@@ -1270,15 +1782,19 @@ void
 VecSortState::copy_row(const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row,
 					   DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row) const
 {
-	for (int col = 0; col < output_ncols_; col++)
-	{
-		dst.double_columns[col][dst_row] = src.double_columns[col][src_row];
-		dst.int64_columns[col][dst_row] = src.int64_columns[col][src_row];
-		dst.int32_columns[col][dst_row] = src.int32_columns[col][src_row];
-		dst.string_columns[col][dst_row] = src.string_columns[col][src_row];
-		dst.nulls[col][dst_row] = src.nulls[col][src_row];
+		for (int col = 0; col < output_ncols_; col++)
+		{
+			dst.double_columns[col][dst_row] = src.double_columns[col][src_row];
+			dst.int64_columns[col][dst_row] = src.int64_columns[col][src_row];
+			dst.int32_columns[col][dst_row] = src.int32_columns[col][src_row];
+			dst.nulls[col][dst_row] = src.nulls[col][src_row];
+			if (!dst.nulls[col][dst_row])
+				dst.string_columns[col][dst_row] =
+					CopyStringRefToChunk(dst, src, src.string_columns[col][src_row]);
+			else
+				dst.string_columns[col][dst_row] = VecStringRef{0, 0, 0};
+		}
 	}
-}
 
 void
 VecSortState::append_sort_key(uint32_t ordinal,
@@ -1326,12 +1842,11 @@ VecSortState::append_sort_key(uint32_t ordinal,
 			{
 				VecStringRef ref = input.string_columns[key.col_idx][src_row];
 
-				if (ref.len > 8)
-					elog(ERROR, "pg_volvec vector sort currently supports string sort keys up to 8 bytes");
 				lane.i32_values.push_back(0);
 				lane.i64_values.push_back(0);
 				lane.u64_values.push_back(0);
-				lane.string_values.push_back(ref);
+				lane.string_values.push_back(
+					lane.store_string_bytes(input.get_string_ptr(ref), ref.len));
 				break;
 			}
 			case VecOutputStorageKind::NumericAvgPair:
@@ -1367,22 +1882,34 @@ VecSortState::append_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input)
 }
 
 int
-VecSortState::compare_string_ref(const VecStringRef &left, const VecStringRef &right) const
+VecSortState::compare_string_ref(const VecSortKeyLane &lane,
+								 const VecStringRef &left,
+								 const VecStringRef &right) const
 {
-	int cmp_len = Min((int) left.len, (int) right.len);
+	const char *left_ptr = lane.get_string_ptr(left);
+	const char *right_ptr = lane.get_string_ptr(right);
+	uint32_t left_len = left.len;
+	uint32_t right_len = right.len;
+	int cmp_len;
 	int cmp;
 
-	if (left.len > 8 || right.len > 8)
-		elog(ERROR, "pg_volvec vector sort currently supports string sort keys up to 8 bytes");
+	if (lane.desc.sql_type == BPCHAROID)
+	{
+		while (left_len > 0 && left_ptr[left_len - 1] == ' ')
+			left_len--;
+		while (right_len > 0 && right_ptr[right_len - 1] == ' ')
+			right_len--;
+	}
 
-	cmp = memcmp(&left.prefix, &right.prefix, cmp_len);
+	cmp_len = Min((int) left_len, (int) right_len);
+	cmp = memcmp(left_ptr, right_ptr, cmp_len);
 	if (cmp < 0)
 		return -1;
 	if (cmp > 0)
 		return 1;
-	if (left.len < right.len)
+	if (left_len < right_len)
 		return -1;
-	if (left.len > right.len)
+	if (left_len > right_len)
 		return 1;
 	return 0;
 }
@@ -1423,7 +1950,8 @@ VecSortState::row_less(const VecRowRef &left, const VecRowRef &right) const
 					cmp = 1;
 				break;
 			case VecOutputStorageKind::StringRef:
-				cmp = compare_string_ref(lane.string_values[left.ordinal],
+				cmp = compare_string_ref(lane,
+										 lane.string_values[left.ordinal],
 										 lane.string_values[right.ordinal]);
 				break;
 			case VecOutputStorageKind::NumericAvgPair:
@@ -1482,6 +2010,8 @@ struct AggrefRewriteContext
 {
 	const VolVecVector<const Aggref *> *aggrefs;
 	const VolVecVector<int> *aggresnos;
+	const VolVecVector<const Expr *> *group_exprs;
+	const VolVecVector<int> *group_resnos;
 };
 
 static bool
@@ -1556,14 +2086,77 @@ ReplaceAggrefsWithVarsMutator(Node *node, AggrefRewriteContext *context)
 		}
 		elog(ERROR, "pg_volvec could not rewrite aggregate reference");
 	}
+	if (IsRewriteExprNode(node) &&
+		context->group_exprs != nullptr && context->group_resnos != nullptr)
+	{
+		Expr *expr = StripImplicitNodesLocal((Expr *) node);
+
+		for (size_t i = 0; i < context->group_exprs->size(); i++)
+		{
+			if (!equal(expr, (*context->group_exprs)[i]))
+				continue;
+			return (Node *) makeVar(OUTER_VAR,
+									(*context->group_resnos)[i],
+									exprType(node),
+									exprTypmod(node),
+									exprCollation(node),
+									0);
+		}
+	}
 	return expression_tree_mutator(node, ReplaceAggrefsWithVarsMutator, context);
 }
 
 static bool
-IsSimpleAggTargetExpr(Expr *expr)
+CollectAggGroupExprs(Agg *node,
+					 VolVecVector<const Expr *> *group_exprs,
+					 VolVecVector<int> *group_resnos,
+					 List **synthetic_tlist,
+					 int *next_resno)
+{
+	Plan *child_plan;
+
+	if (node == nullptr || group_exprs == nullptr || group_resnos == nullptr ||
+		synthetic_tlist == nullptr || next_resno == nullptr)
+		return false;
+
+	child_plan = node->plan.lefttree;
+	if (node->numCols == 0)
+		return true;
+	if (child_plan == nullptr)
+		return false;
+
+	for (int g = 0; g < node->numCols; g++)
+	{
+		int child_resno = node->grpColIdx[g];
+		TargetEntry *child_tle = get_tle_by_resno(child_plan->targetlist, child_resno);
+		Expr *group_expr;
+
+		if (child_tle == nullptr)
+			return false;
+		group_expr = StripImplicitNodesLocal((Expr *) child_tle->expr);
+		if (group_expr == nullptr)
+			return false;
+
+		group_exprs->push_back(group_expr);
+		group_resnos->push_back(*next_resno);
+		*synthetic_tlist = lappend(*synthetic_tlist,
+								   makeTargetEntry((Expr *) copyObjectImpl(child_tle->expr),
+												   *next_resno,
+												   NULL,
+												   false));
+		(*next_resno)++;
+	}
+
+	return true;
+}
+
+static bool
+IsSimpleAggTargetExpr(Agg *node, Expr *expr)
 {
 	expr = StripImplicitNodesLocal(expr);
-	return expr != nullptr && (IsA(expr, Aggref) || IsA(expr, Var));
+	return expr != nullptr &&
+		(IsA(expr, Aggref) || IsA(expr, Var) ||
+		 ResolveAggPassThroughExpr(node, expr, nullptr, nullptr));
 }
 
 static VecOutputStorageKind
@@ -1585,7 +2178,7 @@ InferProjectStorageKind(Expr *expr, VecExprProgram *program)
 }
 
 static std::unique_ptr<VecPlanState>
-BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node)
+BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node, EState *estate)
 {
 	bool simple = true;
 	ListCell *lc;
@@ -1594,7 +2187,7 @@ BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 
-		if (!IsSimpleAggTargetExpr((Expr *) tle->expr))
+		if (!IsSimpleAggTargetExpr(node, (Expr *) tle->expr))
 		{
 			simple = false;
 			break;
@@ -1604,17 +2197,19 @@ BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node)
 	if (simple)
 		return std::make_unique<VecAggState>(std::move(left), node);
 
-	if (node->numCols != 0)
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: aggregate project fallback does not yet support grouped projection rewrite");
-		return nullptr;
-	}
-
 	VolVecVector<const Aggref *> aggrefs{PgMemoryContextAllocator<const Aggref *>(CurrentMemoryContext)};
 	VolVecVector<int> aggresnos{PgMemoryContextAllocator<int>(CurrentMemoryContext)};
+	VolVecVector<const Expr *> group_exprs{PgMemoryContextAllocator<const Expr *>(CurrentMemoryContext)};
+	VolVecVector<int> group_resnos{PgMemoryContextAllocator<int>(CurrentMemoryContext)};
 	List *synthetic_tlist = NIL;
 	int next_resno = 1;
+
+	if (!CollectAggGroupExprs(node, &group_exprs, &group_resnos, &synthetic_tlist, &next_resno))
+	{
+		if (pg_volvec_trace_hooks)
+			elog(LOG, "pg_volvec: aggregate project rewrite could not collect grouped expressions");
+		return nullptr;
+	}
 
 	foreach(lc, node->plan.targetlist)
 	{
@@ -1633,9 +2228,12 @@ BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node)
 	}
 	if (aggrefs.empty())
 	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: aggregate project rewrite found no Aggref nodes");
-		return nullptr;
+		if (group_exprs.empty())
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: aggregate project rewrite found no Aggref or grouped expressions");
+			return nullptr;
+		}
 	}
 
 	Agg *synthetic = (Agg *) palloc0(sizeof(Agg));
@@ -1644,7 +2242,7 @@ BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node)
 
 	auto agg_state = std::make_unique<VecAggState>(std::move(left), synthetic);
 	VolVecVector<VecProjectColDesc> project_cols{PgMemoryContextAllocator<VecProjectColDesc>(CurrentMemoryContext)};
-	AggrefRewriteContext rewrite_context{&aggrefs, &aggresnos};
+	AggrefRewriteContext rewrite_context{&aggrefs, &aggresnos, &group_exprs, &group_resnos};
 
 	foreach(lc, node->plan.targetlist)
 	{
@@ -1652,20 +2250,44 @@ BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node)
 		VecProjectColDesc project_col;
 		Expr *rewritten_expr =
 			(Expr *) ReplaceAggrefsWithVarsMutator((Node *) tle->expr, &rewrite_context);
+		Expr *stripped_expr = StripImplicitNodesLocal(rewritten_expr);
 
-		project_col.expr = std::make_unique<VecExprProgram>();
-		CompileExpr(rewritten_expr, *project_col.expr, false);
-		if (project_col.expr->get_final_res_idx() < 0)
-		{
-			if (pg_volvec_trace_hooks)
-				elog(LOG, "pg_volvec: aggregate project expression compilation failed for target resno %d",
-					 tle->resno);
-			return nullptr;
-		}
 		project_col.target_resno = tle->resno;
 		project_col.sql_type = exprType((Node *) tle->expr);
-		project_col.storage_kind = InferProjectStorageKind((Expr *) tle->expr, project_col.expr.get());
-		project_col.scale = project_col.expr->get_register_scale(project_col.expr->get_final_res_idx());
+		if (stripped_expr != nullptr && IsA(stripped_expr, Var))
+		{
+			Var *var = (Var *) stripped_expr;
+			VecOutputColMeta meta;
+
+			if (var->varattno <= 0 || var->varattno > 16 ||
+				!agg_state->lookup_output_col_meta(var->varattno, &meta))
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: aggregate project direct-var metadata lookup failed for target resno %d",
+						 tle->resno);
+				return nullptr;
+			}
+			project_col.expr = nullptr;
+			project_col.storage_kind = meta.storage_kind;
+			project_col.scale = meta.scale;
+			project_col.direct_var = true;
+			project_col.input_col = (uint16_t) (var->varattno - 1);
+		}
+		else
+		{
+			project_col.expr = std::make_unique<VecExprProgram>();
+			CompileExpr(rewritten_expr, *project_col.expr, false, estate);
+			AdjustProgramVarScales(project_col.expr.get(), agg_state.get());
+			if (project_col.expr->get_final_res_idx() < 0)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: aggregate project expression compilation failed for target resno %d",
+						 tle->resno);
+				return nullptr;
+			}
+			project_col.storage_kind = InferProjectStorageKind((Expr *) tle->expr, project_col.expr.get());
+			project_col.scale = project_col.expr->get_register_scale(project_col.expr->get_final_res_idx());
+		}
 		project_cols.push_back(std::move(project_col));
 	}
 
@@ -1716,150 +2338,399 @@ LookupPlanOutputMeta(Plan *plan,
 }
 
 static bool
-BuildHashJoinOutputCols(HashJoin *hash_join,
-						Plan *outer_plan,
-						Plan *inner_plan,
-						VecPlanState *outer,
-						VecPlanState *inner,
-						VolVecVector<VecJoinOutputCol> *output_cols)
+ResolveHashJoinVarBinding(Var *var,
+						  Plan *outer_plan,
+						  Plan *inner_plan,
+						  VecPlanState *outer,
+						  VecPlanState *inner,
+						  VecJoinSide *side,
+						  uint16_t *source_col,
+						  VecOutputColMeta *meta)
+{
+	if (var == nullptr || source_col == nullptr || meta == nullptr)
+		return false;
+	if (var->varattno <= 0 || var->varattno > 16)
+		return false;
+
+	if (var->varno == OUTER_VAR)
+	{
+		if (!LookupPlanOutputMeta(outer_plan, outer, var->varattno, source_col, meta))
+			return false;
+		if (side != nullptr)
+			*side = VecJoinSide::Outer;
+		return true;
+	}
+	if (var->varno == INNER_VAR)
+	{
+		if (!LookupPlanOutputMeta(inner_plan, inner, var->varattno, source_col, meta))
+			return false;
+		if (side != nullptr)
+			*side = VecJoinSide::Inner;
+		return true;
+	}
+	return false;
+}
+
+static bool
+EnsureHashJoinOutputCol(VecJoinSide side,
+						  uint16_t source_col,
+						  const VecOutputColMeta &meta,
+						  VolVecVector<VecJoinOutputCol> *output_cols,
+						  int *join_resno)
+{
+	if (output_cols == nullptr)
+		return false;
+
+	for (const auto &output_col : *output_cols)
+	{
+		if (output_col.side == side && output_col.input_col == source_col)
+		{
+			if (join_resno != nullptr)
+				*join_resno = output_col.output_resno;
+			return true;
+		}
+	}
+
+	if (output_cols->size() >= 16)
+		return false;
+
+	output_cols->push_back(VecJoinOutputCol{side,
+											 source_col,
+											 (int) output_cols->size() + 1,
+											 meta});
+	if (join_resno != nullptr)
+		*join_resno = output_cols->back().output_resno;
+	return true;
+}
+
+struct HashJoinFilterRewriteContext
+{
+	Plan *outer_plan;
+	Plan *inner_plan;
+	VecPlanState *outer;
+	VecPlanState *inner;
+	VolVecVector<VecJoinOutputCol> *output_cols;
+	bool failed;
+};
+
+static Node *
+RewriteHashJoinFilterVarsMutator(Node *node, HashJoinFilterRewriteContext *context)
+{
+	if (node == nullptr)
+		return nullptr;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+		VecJoinSide side;
+		VecOutputColMeta meta;
+		uint16_t source_col = 0;
+		int join_resno = 0;
+		Var *rewritten;
+
+		if (!ResolveHashJoinVarBinding(var,
+										 context->outer_plan,
+										 context->inner_plan,
+										 context->outer,
+										 context->inner,
+										 &side,
+										 &source_col,
+										 &meta) ||
+			!EnsureHashJoinOutputCol(side, source_col, meta,
+									 context->output_cols, &join_resno))
+		{
+			context->failed = true;
+			return nullptr;
+		}
+
+		rewritten = makeVar(1,
+							join_resno,
+							var->vartype,
+							var->vartypmod,
+							var->varcollid,
+							var->varlevelsup);
+		rewritten->location = var->location;
+		return (Node *) rewritten;
+	}
+
+	return expression_tree_mutator(node,
+								   (Node *(*)(Node *, void *)) RewriteHashJoinFilterVarsMutator,
+								   context);
+}
+
+static Expr *
+RewriteHashJoinFilterExpr(Expr *expr,
+						   Plan *outer_plan,
+						   Plan *inner_plan,
+						   VecPlanState *outer,
+						   VecPlanState *inner,
+						   VolVecVector<VecJoinOutputCol> *output_cols)
+{
+	HashJoinFilterRewriteContext context;
+
+	if (expr == nullptr)
+		return nullptr;
+
+	context.outer_plan = outer_plan;
+	context.inner_plan = inner_plan;
+	context.outer = outer;
+	context.inner = inner;
+	context.output_cols = output_cols;
+	context.failed = false;
+
+	Expr *rewritten = (Expr *) RewriteHashJoinFilterVarsMutator((Node *) expr, &context);
+	if (context.failed)
+		return nullptr;
+	return rewritten;
+}
+
+static bool
+BuildJoinOutputCols(List *targetlist,
+					Plan *outer_plan,
+					Plan *inner_plan,
+					VecPlanState *outer,
+					VecPlanState *inner,
+					VolVecVector<VecJoinOutputCol> *output_cols,
+					bool *needs_project)
 {
 	ListCell *lc;
 
-	foreach(lc, hash_join->join.plan.targetlist)
+	if (needs_project != nullptr)
+		*needs_project = false;
+	foreach(lc, targetlist)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 		Expr *expr = StripImplicitNodesLocal((Expr *) tle->expr);
-		VecJoinOutputCol output_col;
-		VecOutputColMeta meta;
-		Var *var;
-		uint16_t source_col;
+		if (expr != nullptr && IsA(expr, Var))
+		{
+			Var *var = (Var *) expr;
+			VecJoinSide side;
+			VecOutputColMeta meta;
+			uint16_t source_col = 0;
+			int join_resno = 0;
 
-		if (expr == nullptr || !IsA(expr, Var))
-			return false;
-		var = (Var *) expr;
-		if (var->varattno <= 0 || var->varattno > 16)
-			return false;
-		if (var->varno == OUTER_VAR)
-		{
-			if (!LookupPlanOutputMeta(outer_plan, outer, var->varattno, &source_col, &meta))
+			if (!ResolveHashJoinVarBinding(var,
+										   outer_plan,
+										   inner_plan,
+										   outer,
+										   inner,
+										   &side,
+										   &source_col,
+										   &meta) ||
+				!EnsureHashJoinOutputCol(side, source_col, meta, output_cols, &join_resno))
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: hash join output var binding failed for target resno %d",
+						 tle->resno);
 				return false;
-			output_col.side = VecJoinSide::Outer;
+			}
+			if (needs_project != nullptr && join_resno != tle->resno)
+				*needs_project = true;
+			continue;
 		}
-		else if (var->varno == INNER_VAR)
+
+		if (RewriteHashJoinFilterExpr((Expr *) copyObjectImpl(tle->expr),
+									  outer_plan,
+									  inner_plan,
+									  outer,
+									  inner,
+									  output_cols) == nullptr)
 		{
-			if (!LookupPlanOutputMeta(inner_plan, inner, var->varattno, &source_col, &meta))
-				return false;
-			output_col.side = VecJoinSide::Inner;
-		}
-		else
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join output rewrite failed for target resno %d",
+					 tle->resno);
 			return false;
-		output_col.input_col = source_col;
-		output_col.output_resno = tle->resno;
-		output_col.meta = meta;
-		output_cols->push_back(output_col);
+		}
+		if (needs_project != nullptr)
+			*needs_project = true;
 	}
 
 	return true;
 }
 
-static bool
-ExtractHashJoinKey(HashJoin *hash_join,
-				   int *outer_key_col,
-				   int *inner_key_col,
-				   VecOutputStorageKind *key_kind,
-				   Plan *outer_plan,
-				   Plan *inner_plan,
-				   VecPlanState *outer,
-				   VecPlanState *inner)
+static std::unique_ptr<VecPlanState>
+BuildJoinProject(std::unique_ptr<VecPlanState> left,
+				 List *targetlist,
+				 Plan *outer_plan,
+				 Plan *inner_plan,
+				 VecPlanState *outer,
+				 VecPlanState *inner,
+				 VolVecVector<VecJoinOutputCol> *output_cols,
+				 EState *estate)
 {
-	OpExpr *hash_clause;
-	Expr *left_expr;
-	Expr *right_expr;
-	Var *outer_var = nullptr;
-	Var *inner_var = nullptr;
-	VecOutputColMeta outer_meta;
-	VecOutputColMeta inner_meta;
-	uint16_t outer_source_col;
-	uint16_t inner_source_col;
+	VolVecVector<VecProjectColDesc> project_cols{PgMemoryContextAllocator<VecProjectColDesc>(CurrentMemoryContext)};
+	ListCell *lc;
 
-	if (hash_join->hashclauses == NIL || list_length(hash_join->hashclauses) != 1)
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: hash join requires exactly one hash clause");
-		return false;
-	}
-	if (hash_join->join.joinqual != NIL || hash_join->join.plan.qual != NIL)
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: hash join joinqual/plan.qual is not supported yet");
-		return false;
-	}
+	if (!left || output_cols == nullptr)
+		return nullptr;
 
-	hash_clause = (OpExpr *) linitial(hash_join->hashclauses);
-	if (!IsA(hash_clause, OpExpr) || list_length(hash_clause->args) != 2)
+	foreach(lc, targetlist)
 	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: hash clause is not a binary OpExpr");
-		return false;
-	}
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		VecProjectColDesc project_col;
+		Expr *rewritten_expr =
+			RewriteHashJoinFilterExpr((Expr *) copyObjectImpl(tle->expr),
+									  outer_plan,
+									  inner_plan,
+									  outer,
+									  inner,
+									  output_cols);
+		Expr *stripped_expr;
 
-	left_expr = StripImplicitNodesLocal((Expr *) linitial(hash_clause->args));
-	right_expr = StripImplicitNodesLocal((Expr *) lsecond(hash_clause->args));
-	if (!IsA(left_expr, Var) || !IsA(right_expr, Var))
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: hash join keys must be simple Vars after stripping relabels");
-		return false;
-	}
-	if (((Var *) left_expr)->varno == OUTER_VAR && ((Var *) right_expr)->varno == INNER_VAR)
-	{
-		outer_var = (Var *) left_expr;
-		inner_var = (Var *) right_expr;
-	}
-	else if (((Var *) left_expr)->varno == INNER_VAR && ((Var *) right_expr)->varno == OUTER_VAR)
-	{
-		outer_var = (Var *) right_expr;
-		inner_var = (Var *) left_expr;
-	}
-	else
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: hash join key Vars are not OUTER_VAR/INNER_VAR");
-		return false;
-	}
+		if (rewritten_expr == nullptr)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join project rewrite failed for target resno %d",
+					 tle->resno);
+			return nullptr;
+		}
 
-	if (!LookupPlanOutputMeta(outer_plan, outer, outer_var->varattno, &outer_source_col, &outer_meta) ||
-		!LookupPlanOutputMeta(inner_plan, inner, inner_var->varattno, &inner_source_col, &inner_meta))
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: hash join could not resolve key metadata (outer attno=%d inner attno=%d)",
-				 outer_var != nullptr ? outer_var->varattno : -1,
-				 inner_var != nullptr ? inner_var->varattno : -1);
-		return false;
-	}
-	if (outer_meta.storage_kind != inner_meta.storage_kind)
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG,
-				 "pg_volvec: hash join key storage kinds do not match (outer attno=%d kind=%d type=%u, inner attno=%d kind=%d type=%u)",
-				 outer_var->varattno, (int) outer_meta.storage_kind, outer_meta.sql_type,
-				 inner_var->varattno, (int) inner_meta.storage_kind, inner_meta.sql_type);
-		return false;
-	}
-	if (outer_meta.storage_kind != VecOutputStorageKind::Int32 &&
-		outer_meta.storage_kind != VecOutputStorageKind::Int64 &&
-		outer_meta.storage_kind != VecOutputStorageKind::NumericScaledInt64)
-	{
-		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: hash join key kind %d is not supported",
-				 (int) outer_meta.storage_kind);
-		return false;
+		project_col.target_resno = tle->resno;
+		project_col.sql_type = exprType((Node *) tle->expr);
+		stripped_expr = StripImplicitNodesLocal(rewritten_expr);
+		if (stripped_expr != nullptr && IsA(stripped_expr, Var))
+		{
+			Var *var = (Var *) stripped_expr;
+			VecOutputColMeta meta;
+
+			if (var->varattno <= 0 || var->varattno > 16 ||
+				!left->lookup_output_col_meta(var->varattno, &meta))
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: hash join project direct-var metadata lookup failed for target resno %d",
+						 tle->resno);
+				return nullptr;
+			}
+			project_col.expr = nullptr;
+			project_col.storage_kind = meta.storage_kind;
+			project_col.scale = meta.scale;
+			project_col.direct_var = true;
+			project_col.input_col = (uint16_t) (var->varattno - 1);
+		}
+		else
+		{
+			project_col.expr = std::make_unique<VecExprProgram>();
+			CompileExpr(rewritten_expr, *project_col.expr, false, estate);
+			AdjustProgramVarScales(project_col.expr.get(), left.get());
+			if (project_col.expr->get_final_res_idx() < 0)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: hash join project expression compilation failed for target resno %d",
+						 tle->resno);
+				return nullptr;
+			}
+			project_col.storage_kind = InferProjectStorageKind((Expr *) tle->expr, project_col.expr.get());
+			project_col.scale = project_col.expr->get_register_scale(project_col.expr->get_final_res_idx());
+		}
+		project_cols.push_back(std::move(project_col));
 	}
 
-	*outer_key_col = (int) outer_source_col;
-	*inner_key_col = (int) inner_source_col;
-	*key_kind = outer_meta.storage_kind;
-	return true;
+	return std::make_unique<VecProjectState>(std::move(left), std::move(project_cols));
+}
+
+static bool
+ExtractJoinKeysFromClauses(List *clauses,
+						   const char *clause_kind,
+						   Plan *outer_plan,
+						   Plan *inner_plan,
+						   VecPlanState *outer,
+						   VecPlanState *inner,
+						   VolVecVector<VecHashJoinKeyCol> *key_cols)
+{
+	ListCell *lc;
+
+	if (key_cols == nullptr)
+		return false;
+	if (clauses == NIL || list_length(clauses) > kMaxJoinKeys)
+	{
+		if (pg_volvec_trace_hooks)
+			elog(LOG, "pg_volvec: %s requires between 1 and %d key clauses",
+				 clause_kind != nullptr ? clause_kind : "join",
+				 kMaxJoinKeys);
+		return false;
+	}
+
+	foreach(lc, clauses)
+	{
+		OpExpr *hash_clause = (OpExpr *) lfirst(lc);
+		Expr *left_expr;
+		Expr *right_expr;
+		Var *outer_var = nullptr;
+		Var *inner_var = nullptr;
+		VecOutputColMeta outer_meta;
+		VecOutputColMeta inner_meta;
+		uint16_t outer_source_col;
+		uint16_t inner_source_col;
+
+		if (!IsA(hash_clause, OpExpr) || list_length(hash_clause->args) != 2)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash clause is not a binary OpExpr");
+			return false;
+		}
+
+		left_expr = StripImplicitNodesLocal((Expr *) linitial(hash_clause->args));
+		right_expr = StripImplicitNodesLocal((Expr *) lsecond(hash_clause->args));
+		if (!IsA(left_expr, Var) || !IsA(right_expr, Var))
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join keys must be simple Vars after stripping relabels");
+			return false;
+		}
+		if (((Var *) left_expr)->varno == OUTER_VAR && ((Var *) right_expr)->varno == INNER_VAR)
+		{
+			outer_var = (Var *) left_expr;
+			inner_var = (Var *) right_expr;
+		}
+		else if (((Var *) left_expr)->varno == INNER_VAR && ((Var *) right_expr)->varno == OUTER_VAR)
+		{
+			outer_var = (Var *) right_expr;
+			inner_var = (Var *) left_expr;
+		}
+		else
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join key Vars are not OUTER_VAR/INNER_VAR");
+			return false;
+		}
+
+		if (!LookupPlanOutputMeta(outer_plan, outer, outer_var->varattno, &outer_source_col, &outer_meta) ||
+			!LookupPlanOutputMeta(inner_plan, inner, inner_var->varattno, &inner_source_col, &inner_meta))
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join could not resolve key metadata (outer attno=%d inner attno=%d)",
+					 outer_var != nullptr ? outer_var->varattno : -1,
+					 inner_var != nullptr ? inner_var->varattno : -1);
+			return false;
+		}
+		if (outer_meta.storage_kind != inner_meta.storage_kind || outer_meta.scale != inner_meta.scale)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG,
+					 "pg_volvec: hash join key metadata do not match (outer attno=%d kind=%d scale=%d, inner attno=%d kind=%d scale=%d)",
+					 outer_var->varattno, (int) outer_meta.storage_kind, outer_meta.scale,
+					 inner_var->varattno, (int) inner_meta.storage_kind, inner_meta.scale);
+			return false;
+		}
+		if (outer_meta.storage_kind != VecOutputStorageKind::Int32 &&
+			outer_meta.storage_kind != VecOutputStorageKind::Int64 &&
+			outer_meta.storage_kind != VecOutputStorageKind::NumericScaledInt64)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join key kind %d is not supported",
+					 (int) outer_meta.storage_kind);
+			return false;
+		}
+
+		key_cols->push_back(VecHashJoinKeyCol{
+			outer_source_col,
+			inner_source_col,
+			outer_meta.storage_kind,
+			outer_meta.scale
+		});
+	}
+
+	return !key_cols->empty();
 }
 
 static bool
@@ -1924,15 +2795,88 @@ BuildSortKeyDescs(Sort *sort_node, VecPlanState *child,
 	return true;
 }
 
+static bool
+ExtractLimitCount(Limit *limit_node, uint64_t *limit_count)
+{
+	Expr *count_expr;
+	Const *count_const;
+
+	if (limit_node == nullptr || limit_count == nullptr)
+		return false;
+	if (limit_node->limitOption != LIMIT_OPTION_COUNT)
+		return false;
+	if (limit_node->limitOffset != nullptr)
+	{
+		Expr *offset_expr = StripImplicitNodesLocal((Expr *) limit_node->limitOffset);
+
+		if (offset_expr == nullptr)
+			return false;
+		if (!IsA(offset_expr, Const))
+			return false;
+		if (((Const *) offset_expr)->constisnull)
+			return false;
+		if ((((Const *) offset_expr)->consttype == INT8OID &&
+			 DatumGetInt64(((Const *) offset_expr)->constvalue) != 0) ||
+			(((Const *) offset_expr)->consttype == INT4OID &&
+			 DatumGetInt32(((Const *) offset_expr)->constvalue) != 0))
+			return false;
+	}
+
+	count_expr = StripImplicitNodesLocal((Expr *) limit_node->limitCount);
+	if (count_expr == nullptr || !IsA(count_expr, Const))
+		return false;
+	count_const = (Const *) count_expr;
+	if (count_const->constisnull)
+		return false;
+	if (count_const->consttype == INT8OID)
+	{
+		int64_t count = DatumGetInt64(count_const->constvalue);
+
+		if (count < 0)
+			return false;
+		*limit_count = (uint64_t) count;
+		return true;
+	}
+	if (count_const->consttype == INT4OID)
+	{
+		int32_t count = DatumGetInt32(count_const->constvalue);
+
+		if (count < 0)
+			return false;
+		*limit_count = (uint64_t) count;
+		return true;
+	}
+	return false;
+}
+
 static std::unique_ptr<VecPlanState>
 ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 						bool force_full_deform)
 {
 	if (plan == NULL) return nullptr;
+	if (estate != nullptr && plan->extParam != NULL)
+		ExecSetParamPlanMulti(plan->extParam, GetPerTupleExprContext(estate));
 	if (required_attrs == nullptr && !force_full_deform)
 		CollectRequiredAttrsForPlan(plan, &required_attrs);
 	std::unique_ptr<VecPlanState> current_state = nullptr;
-	if (IsA(plan, Sort)) {
+	bool plan_qual_already_applied = false;
+	if (IsA(plan, Limit)) {
+		uint64_t limit_count = 0;
+		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
+		if (!left)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: limit initialization could not build child state");
+			return nullptr;
+		}
+		if (!ExtractLimitCount((Limit *) plan, &limit_count))
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: limit count/offset shape is not supported");
+			return nullptr;
+		}
+		current_state = std::make_unique<VecLimitState>(std::move(left), limit_count);
+	} else if (IsA(plan, Sort)) {
 		VolVecVector<VecSortKeyDesc> key_descs{PgMemoryContextAllocator<VecSortKeyDesc>(CurrentMemoryContext)};
 		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
 		if (!left)
@@ -1945,55 +2889,251 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 			return nullptr;
 		current_state = std::make_unique<VecSortState>(std::move(left), (Sort *) plan, std::move(key_descs));
 	} else if (IsA(plan, Agg)) {
+		Agg *agg_node = (Agg *) plan;
 		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
 		if (!left) {
 			if (pg_volvec_trace_hooks)
 				elog(LOG, "pg_volvec: aggregate initialization could not build child state");
 			return nullptr;
 		}
-		current_state = BuildAggWithOptionalProject(std::move(left), (Agg *) plan);
+		current_state = BuildAggWithOptionalProject(std::move(left), agg_node, estate);
 		if (!current_state)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: aggregate state/project initialization failed");
 			return nullptr;
+		}
+		if (agg_node->numCols > 0 &&
+			agg_node->aggstrategy != AGG_HASHED &&
+			IsA(plan->lefttree, Sort))
+		{
+			VolVecVector<VecSortKeyDesc> key_descs{PgMemoryContextAllocator<VecSortKeyDesc>(CurrentMemoryContext)};
+
+			if (!BuildSortKeyDescs((Sort *) plan->lefttree, current_state.get(), &key_descs))
+				return nullptr;
+			current_state = std::make_unique<VecSortState>(std::move(current_state),
+														   (Sort *) plan->lefttree,
+														   std::move(key_descs),
+														   list_length(agg_node->plan.targetlist));
+		}
+	} else if (IsA(plan, SubqueryScan)) {
+		SubqueryScan *subquery_scan = (SubqueryScan *) plan;
+		auto left = ExecInitVecPlanInternal(subquery_scan->subplan, estate, nullptr, force_full_deform);
+
+		if (!left)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: subquery scan initialization could not build subplan state");
+			return nullptr;
+		}
+		current_state = BuildDirectVarProject(std::move(left), plan->targetlist);
+		if (!current_state)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: subquery scan targetlist projection is not supported");
+			return nullptr;
+		}
 	} else if (IsA(plan, HashJoin)) {
 		HashJoin *hash_join = (HashJoin *) plan;
 		Hash *hash_node;
+		Expr *join_filter_expr = nullptr;
 		VolVecVector<VecJoinOutputCol> output_cols{PgMemoryContextAllocator<VecJoinOutputCol>(CurrentMemoryContext)};
-		VecOutputStorageKind key_kind;
-		int outer_key_col;
-		int inner_key_col;
+		VolVecVector<VecHashJoinKeyCol> key_cols{PgMemoryContextAllocator<VecHashJoinKeyCol>(CurrentMemoryContext)};
+		bool needs_project = false;
 		Bitmapset *outer_required_attrs = nullptr;
 		Bitmapset *inner_required_attrs = nullptr;
 		std::unique_ptr<VecPlanState> outer;
 		std::unique_ptr<VecPlanState> inner;
+		VecPlanState *outer_state = nullptr;
+		VecPlanState *inner_state = nullptr;
 
 			if (!IsA(plan->righttree, Hash))
 			{
-				if (pg_volvec_trace_hooks)
-					elog(LOG, "pg_volvec: hash join right tree is not a Hash node");
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join right tree is not a Hash node");
 				return nullptr;
 			}
 			hash_node = (Hash *) plan->righttree;
-			BuildHashJoinChildRequiredAttrs(hash_join, plan->lefttree, (Plan *) hash_node,
-										   &outer_required_attrs, &inner_required_attrs);
+			BuildBinaryJoinChildRequiredAttrs(&hash_join->join.plan,
+											  (Node *) hash_join->hashclauses,
+											  plan->lefttree,
+											  (Plan *) hash_node,
+											  &outer_required_attrs,
+											  &inner_required_attrs);
 			outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false);
 			inner = ExecInitVecPlanInternal(hash_node->plan.lefttree, estate, inner_required_attrs, false);
 			if (!outer || !inner)
 			{
-				if (pg_volvec_trace_hooks)
-					elog(LOG, "pg_volvec: hash join child initialization failed (outer=%s inner=%s)",
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: hash join child initialization failed (outer=%s inner=%s)",
 						 outer ? "ok" : "null", inner ? "ok" : "null");
 				return nullptr;
+		}
+		outer_state = outer.get();
+		inner_state = inner.get();
+		if (!ExtractJoinKeysFromClauses(hash_join->hashclauses,
+									   "hash join",
+									   plan->lefttree,
+									   (Plan *) hash_node,
+									   outer_state,
+									   inner_state,
+									   &key_cols))
+			return nullptr;
+		if (!BuildJoinOutputCols(hash_join->join.plan.targetlist,
+								 plan->lefttree,
+								 (Plan *) hash_node,
+								 outer_state,
+								 inner_state,
+								 &output_cols,
+								 &needs_project))
+			return nullptr;
+		join_filter_expr = BuildCombinedQualExpr(hash_join->join.joinqual,
+												 hash_join->join.plan.qual);
+		if (join_filter_expr != nullptr)
+		{
+			join_filter_expr = RewriteHashJoinFilterExpr(join_filter_expr,
+														 plan->lefttree,
+														 (Plan *) hash_node,
+														 outer_state,
+														 inner_state,
+														 &output_cols);
+			if (join_filter_expr == nullptr)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: hash join filter rewrite failed");
+				return nullptr;
 			}
-		if (!ExtractHashJoinKey(hash_join, &outer_key_col, &inner_key_col, &key_kind,
-								plan->lefttree, (Plan *) hash_node,
-								outer.get(), inner.get()))
-			return nullptr;
-		if (!BuildHashJoinOutputCols(hash_join, plan->lefttree, (Plan *) hash_node,
-									 outer.get(), inner.get(), &output_cols))
-			return nullptr;
+		}
 		current_state = std::make_unique<VecHashJoinState>(std::move(outer), std::move(inner),
 														   std::move(output_cols),
-														   outer_key_col, inner_key_col, key_kind);
+														   std::move(key_cols));
+		if (join_filter_expr != nullptr)
+		{
+			auto program = std::make_unique<VecExprProgram>();
+
+			CompileExpr(join_filter_expr, *program, true, estate);
+			if (program->get_final_res_idx() < 0)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: hash join filter expression compilation failed");
+				return nullptr;
+			}
+			current_state = std::make_unique<VecFilterState>(std::move(current_state), std::move(program));
+			plan_qual_already_applied = true;
+		}
+		if (needs_project)
+		{
+			current_state = BuildJoinProject(std::move(current_state),
+											 hash_join->join.plan.targetlist,
+											 plan->lefttree,
+											 (Plan *) hash_node,
+											 outer_state,
+											 inner_state,
+											 &output_cols,
+											 estate);
+			if (!current_state)
+				return nullptr;
+		}
+	} else if (IsA(plan, MergeJoin)) {
+		MergeJoin *merge_join = (MergeJoin *) plan;
+		Expr *join_filter_expr = nullptr;
+		VolVecVector<VecJoinOutputCol> output_cols{PgMemoryContextAllocator<VecJoinOutputCol>(CurrentMemoryContext)};
+		VolVecVector<VecHashJoinKeyCol> key_cols{PgMemoryContextAllocator<VecHashJoinKeyCol>(CurrentMemoryContext)};
+		bool needs_project = false;
+		Bitmapset *outer_required_attrs = nullptr;
+		Bitmapset *inner_required_attrs = nullptr;
+		std::unique_ptr<VecPlanState> outer;
+		std::unique_ptr<VecPlanState> inner;
+		VecPlanState *outer_state = nullptr;
+		VecPlanState *inner_state = nullptr;
+
+		if (merge_join->join.jointype != JOIN_INNER)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: merge join fallback only supports inner joins");
+			return nullptr;
+		}
+		BuildBinaryJoinChildRequiredAttrs(&merge_join->join.plan,
+										  (Node *) merge_join->mergeclauses,
+										  plan->lefttree,
+										  plan->righttree,
+										  &outer_required_attrs,
+										  &inner_required_attrs);
+		outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false);
+		inner = ExecInitVecPlanInternal(plan->righttree, estate, inner_required_attrs, false);
+		if (!outer || !inner)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: merge join child initialization failed (outer=%s inner=%s)",
+					 outer ? "ok" : "null", inner ? "ok" : "null");
+			return nullptr;
+		}
+		outer_state = outer.get();
+		inner_state = inner.get();
+		if (!ExtractJoinKeysFromClauses(merge_join->mergeclauses,
+									   "merge join",
+									   plan->lefttree,
+									   plan->righttree,
+									   outer_state,
+									   inner_state,
+									   &key_cols))
+			return nullptr;
+		if (!BuildJoinOutputCols(merge_join->join.plan.targetlist,
+								 plan->lefttree,
+								 plan->righttree,
+								 outer_state,
+								 inner_state,
+								 &output_cols,
+								 &needs_project))
+			return nullptr;
+		join_filter_expr = BuildCombinedQualExpr(merge_join->join.joinqual,
+												 merge_join->join.plan.qual);
+		if (join_filter_expr != nullptr)
+		{
+			join_filter_expr = RewriteHashJoinFilterExpr(join_filter_expr,
+														 plan->lefttree,
+														 plan->righttree,
+														 outer_state,
+														 inner_state,
+														 &output_cols);
+			if (join_filter_expr == nullptr)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: merge join filter rewrite failed");
+				return nullptr;
+			}
+		}
+		current_state = std::make_unique<VecHashJoinState>(std::move(outer),
+														   std::move(inner),
+														   std::move(output_cols),
+														   std::move(key_cols));
+		if (join_filter_expr != nullptr)
+		{
+			auto program = std::make_unique<VecExprProgram>();
+
+			CompileExpr(join_filter_expr, *program, true, estate);
+			if (program->get_final_res_idx() < 0)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: merge join filter expression compilation failed");
+				return nullptr;
+			}
+			current_state = std::make_unique<VecFilterState>(std::move(current_state), std::move(program));
+			plan_qual_already_applied = true;
+		}
+		if (needs_project)
+		{
+			current_state = BuildJoinProject(std::move(current_state),
+											 merge_join->join.plan.targetlist,
+											 plan->lefttree,
+											 plan->righttree,
+											 outer_state,
+											 inner_state,
+											 &output_cols,
+											 estate);
+			if (!current_state)
+				return nullptr;
+		}
 	} else if (IsA(plan, SeqScan)) {
 		SeqScan *sscan = (SeqScan *) plan;
 		Oid relid = exec_rt_fetch(sscan->scan.scanrelid, estate)->relid;
@@ -2003,12 +3143,26 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		BuildPrunedDeformProgram(required_attrs, desc, &prog);
 			current_state = std::make_unique<VecSeqScanState>(rel, estate->es_snapshot, &prog);
 	}
-	if (current_state && plan->qual != NIL) {
+	if (current_state && plan->qual != NIL && !plan_qual_already_applied) {
 		auto program = std::make_unique<VecExprProgram>();
 		Expr *combined_qual = (Expr *) make_ands_explicit(plan->qual);
-		CompileExpr(combined_qual, *program, true);
+
+		if (IsA(plan, Agg))
+		{
+			Expr *rewritten_qual = RewriteExprAgainstTargetList(combined_qual, plan->targetlist);
+
+			if (rewritten_qual != nullptr)
+				combined_qual = rewritten_qual;
+		}
+		CompileExpr(combined_qual, *program, true, estate);
+		AdjustProgramVarScales(program.get(), current_state.get());
 		if (program->get_final_res_idx() < 0)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: plan qual compilation failed for node type %d",
+					 (int) nodeTag(plan));
 			return nullptr;
+		}
 		current_state = std::make_unique<VecFilterState>(std::move(current_state), std::move(program));
 	}
 	if (current_state && IsA(plan, SeqScan)) {

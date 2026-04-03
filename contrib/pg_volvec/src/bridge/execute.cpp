@@ -103,20 +103,15 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 								slot->tts_values[j] = DirectFunctionCall1(float8_numeric, Float8GetDatum(fval));
 							else
 								slot->tts_values[j] = int64_scaled_to_numeric(ival, pg_volvec::DEFAULT_NUMERIC_SCALE);
-						} else if (typid == INT8OID) {
-							slot->tts_values[j] = Int64GetDatum(batch->int64_columns[j][i]);
-						} else if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID) {
-							char buf[10];
-							uint32 len = batch->string_columns[j][i].len;
-
-							memset(buf, 0, sizeof(buf));
-							if (len > 8)
-								len = 8;
-							memcpy(buf, &batch->string_columns[j][i].prefix, len);
-							slot->tts_values[j] = CStringGetTextDatum(buf);
-						} else {
-						slot->tts_values[j] = Int32GetDatum(batch->int32_columns[j][i]);
-						}
+							} else if (typid == INT8OID) {
+								slot->tts_values[j] = Int64GetDatum(batch->int64_columns[j][i]);
+							} else if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID) {
+								const pg_volvec::VecStringRef &ref = batch->string_columns[j][i];
+								slot->tts_values[j] =
+									PointerGetDatum(cstring_to_text_with_len(batch->get_string_ptr(ref), ref.len));
+							} else {
+							slot->tts_values[j] = Int32GetDatum(batch->int32_columns[j][i]);
+							}
 				}
 			}
 			ExecStoreVirtualTuple(slot);

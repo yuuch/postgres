@@ -513,12 +513,37 @@ struct alignas(16) DataChunk {
 	alignas(16) uint8_t nulls[16][Capacity]; /* Use uint8_t for reliability */
 	SelectionVector sel;
 	bool has_selection;
+	VolVecVector<char> string_arena;
 
-	DataChunk() : count(0), has_selection(false) { memset(nulls, 0, sizeof(nulls)); }
-	void reset() { count = 0; sel.clear(); has_selection = false; memset(nulls, 0, sizeof(nulls)); }
+	DataChunk()
+		: count(0),
+		  has_selection(false),
+		  string_arena(PgMemoryContextAllocator<char>(CurrentMemoryContext))
+	{
+		memset(nulls, 0, sizeof(nulls));
+	}
+	void reset() { count = 0; sel.clear(); has_selection = false; memset(nulls, 0, sizeof(nulls)); string_arena.clear(); }
+	VecStringRef store_string_bytes(const char *data, uint32_t len)
+	{
+		VecStringRef ref{len, 0, 0};
+
+		if (len == 0 || data == nullptr)
+			return ref;
+		ref.offset = (uint32_t) string_arena.size();
+		string_arena.insert(string_arena.end(), data, data + len);
+		memcpy(&ref.prefix, data, len > 8 ? 8 : len);
+		return ref;
+	}
+	const char *get_string_ptr(const VecStringRef &ref) const
+	{
+		if (ref.len == 0)
+			return "";
+		return string_arena.data() + ref.offset;
+	}
 	void get_double_ptrs(double** out) { for(int i=0; i<16; i++) out[i] = double_columns[i]; }
 	void get_int64_ptrs(int64_t** out) { for(int i=0; i<16; i++) out[i] = int64_columns[i]; }
 	void get_int32_ptrs(int32_t** out) { for(int i=0; i<16; i++) out[i] = int32_columns[i]; }
+	void get_string_ptrs(VecStringRef** out) { for(int i=0; i<16; i++) out[i] = string_columns[i]; }
 	void get_null_ptrs(uint8_t** out) { for(int i=0; i<16; i++) out[i] = nulls[i]; }
 };
 
@@ -542,8 +567,8 @@ struct DeformProgram {
 		last_att_index = (ntargets > 0) ? targets[ntargets - 1].att_index : -1;
 	}
 };
-struct DeformBindings { void *columns_data[kMaxDeformTargets]; uint8_t *columns_nulls[kMaxDeformTargets]; int ncolumns; };
-typedef void (*JitDeformFunc)(HeapTupleHeader tuphdr, void **col_data_ptrs, uint8_t **col_null_ptrs, uint32 row_idx);
+struct DeformBindings { void *columns_data[kMaxDeformTargets]; uint8_t *columns_nulls[kMaxDeformTargets]; int ncolumns; DataChunk<DEFAULT_CHUNK_SIZE> *owner_chunk; };
+typedef void (*JitDeformFunc)(HeapTupleHeader tuphdr, void **col_data_ptrs, uint8_t **col_null_ptrs, uint32 row_idx, DataChunk<DEFAULT_CHUNK_SIZE> *owner_chunk);
 
 class DataChunkDeformer {
 public:
@@ -572,14 +597,20 @@ enum class VecOpCode {
 	EEOP_INT64_GT,
 	EEOP_INT64_LE,
 	EEOP_INT64_GE,
+	EEOP_INT64_EQ,
 	EEOP_DATE_LT,
 	EEOP_DATE_LE,
 	EEOP_DATE_GE,
+	EEOP_DATE_PART_YEAR,
 	EEOP_INT32_EQ,
 	EEOP_AND,
+	EEOP_OR,
 	EEOP_INT64_CASE,
 	EEOP_FLOAT8_CASE,
+	EEOP_STR_EQ,
+	EEOP_STR_NE,
 	EEOP_STR_PREFIX_LIKE,
+	EEOP_STR_CONTAINS_LIKE,
 	EEOP_QUAL
 };
 struct VecExprStep {
@@ -590,16 +621,33 @@ struct VecExprStep {
 		struct { double fval; int64_t i64val; int32_t ival; bool isnull; } constant;
 		struct { int left; int right; } op;
 		struct { int cond; int if_true; int if_false; } ternary;
-		struct { int att_idx; uint32_t len; uint64_t prefix; } str_prefix;
+		struct { int att_idx; uint32_t len; uint32_t offset; uint64_t prefix; Oid type; } str_prefix;
 	} d;
-};
-typedef void (*VecExprJitFunc)(uint32_t count, double** col_f8, int64_t** col_i64, int32_t** col_i32, uint8_t** col_nulls, double* res_f8, int64_t* res_i64, int32_t* res_i32, uint8_t* res_nulls, uint16_t* sel, bool has_sel);
+	};
+typedef void (*VecExprJitFunc)(uint32_t count, double** col_f8, int64_t** col_i64, int32_t** col_i32, VecStringRef** col_str, uint8_t** col_nulls, double* res_f8, int64_t* res_i64, int32_t* res_i32, uint8_t* res_nulls, uint16_t* sel, bool has_sel);
 
 class VecExprProgram : public PgMemoryContextObject {
 public:
 	VecExprProgram(); ~VecExprProgram();
 	void evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk);
 	void try_compile_jit();
+	void clear_string_consts() { string_constants.clear(); }
+	uint32_t store_string_const(const char *data, uint32_t len)
+	{
+		uint32_t offset;
+
+		if (data == nullptr || len == 0)
+			return UINT32_MAX;
+		offset = (uint32_t) string_constants.size();
+		string_constants.insert(string_constants.end(), data, data + len);
+		return offset;
+	}
+	const char *get_string_const_ptr(uint32_t offset) const
+	{
+		if (offset == UINT32_MAX)
+			return nullptr;
+		return string_constants.data() + offset;
+	}
 	const double* get_float8_reg(int i) const { return &registers_f8[i * DEFAULT_CHUNK_SIZE]; }
 	const int64_t* get_int64_reg(int i) const { return &registers_i64[i * DEFAULT_CHUNK_SIZE]; }
 	const int32_t* get_int32_reg(int i) const { return &registers_i32[i * DEFAULT_CHUNK_SIZE]; }
@@ -612,6 +660,7 @@ public:
 	VecExprJitFunc jit_func = nullptr; void* jit_context = nullptr;
 private:
 	int32_t* registers_i32; int64_t* registers_i64; double* registers_f8; uint8_t* registers_nulls;
+	VolVecVector<char> string_constants;
 	int register_scales[MAX_REGISTERS];
 };
 
@@ -639,38 +688,104 @@ public:
 	enum class NumericOutputKind { None, Sum, Avg };
 
 	VecAggState(std::unique_ptr<VecPlanState> left, Agg *node);
+	~VecAggState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_numeric_output_meta(int target_resno, NumericOutputKind *kind, int *scale) const;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
 private:
-	std::unique_ptr<VecPlanState> left_; Agg *node_; MemoryContext memory_context_; VolVecVector<int> grp_col_indices_;
+		std::unique_ptr<VecPlanState> left_; Agg *node_; MemoryContext memory_context_; VolVecVector<int> grp_col_indices_;
+		VolVecVector<VecOutputColMeta> grp_col_meta_;
 	struct VecAggAccumulator {
 		double float_sum = 0.0;
 		NumericWideInt numeric_sum = 0;
+		double float_max = 0.0;
+		int64_t int64_max = 0;
+		int32_t int32_max = 0;
 		int64_t count = 0;
+		bool has_value = false;
 
 		void update_float(double v) { float_sum += v; count++; }
 		void update_numeric(int64_t v) { numeric_sum += WideIntFromInt64(v); count++; }
+		void update_max_float(double v)
+		{
+			if (!has_value || v > float_max)
+				float_max = v;
+			has_value = true;
+		}
+		void update_max_int64(int64_t v)
+		{
+			if (!has_value || v > int64_max)
+				int64_max = v;
+			has_value = true;
+		}
+		void update_max_int32(int32_t v)
+		{
+			if (!has_value || v > int32_max)
+				int32_max = v;
+			has_value = true;
+		}
 	};
-	struct VecGroupKey { uint64_t prefixes[4]; int num_cols; bool operator==(const VecGroupKey& o) const { if(num_cols!=o.num_cols)return false; for(int i=0;i<4;i++)if(prefixes[i]!=o.prefixes[i])return false; return true; } };
-	struct VecGroupKeyHash { std::size_t operator()(const VecGroupKey& k) const { std::size_t h=0; for(int i=0;i<k.num_cols;i++)h^=std::hash<uint64_t>{}(k.prefixes[i])+0x9e3779b9+(h<<6)+(h>>2); return h; } };
+		struct VecGroupKey {
+			uint64_t values[4];
+			uint32_t aux[4];
+			uint8_t is_null[4];
+			int num_cols;
+			bool operator==(const VecGroupKey& o) const {
+				if (num_cols != o.num_cols)
+					return false;
+				for (int i = 0; i < num_cols; i++)
+				{
+					if (is_null[i] != o.is_null[i])
+						return false;
+					if (!is_null[i] && (values[i] != o.values[i] || aux[i] != o.aux[i]))
+						return false;
+				}
+				return true;
+			}
+		};
+		struct VecGroupKeyHash {
+			std::size_t operator()(const VecGroupKey& k) const {
+				std::size_t h = 0;
+				for (int i = 0; i < k.num_cols; i++)
+				{
+					h ^= std::hash<uint8_t>{}(k.is_null[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+					if (k.is_null[i])
+						continue;
+					h ^= std::hash<uint64_t>{}(k.values[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+					h ^= std::hash<uint32_t>{}(k.aux[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+				}
+				return h;
+			}
+		};
 	enum class VecAggType { SUM, COUNT, AVG, MAX };
-	struct VecAggDesc {
-		VecAggType type;
-		std::unique_ptr<VecExprProgram> arg_expr;
-		int target_resno;
-		Oid output_type = InvalidOid;
-		VecOutputStorageKind output_storage = VecOutputStorageKind::Int32;
-		Oid arg_type = InvalidOid;
-		int numeric_scale = 0;
-		bool use_exact_numeric = false;
+		struct VecAggDesc {
+			VecAggType type;
+			std::unique_ptr<VecExprProgram> arg_expr;
+			int target_resno;
+			int group_key_pos = -1;
+			int input_col = -1;
+			Oid output_type = InvalidOid;
+			VecOutputStorageKind output_storage = VecOutputStorageKind::Int32;
+			Oid arg_type = InvalidOid;
+			int numeric_scale = 0;
+			bool use_exact_numeric = false;
+		};
+		using VecAggAccumulatorList = VolVecVector<VecAggAccumulator>;
+		struct VecAggGroupState {
+			VecAggAccumulatorList accs;
+			uint32_t rep_chunk_idx = 0;
+			uint16_t rep_row_idx = 0;
+			bool has_rep_row = false;
+		};
+		using VecAggHashTable = VolVecHashMap<VecGroupKey, VecAggGroupState, VecGroupKeyHash>;
+		DataChunk<DEFAULT_CHUNK_SIZE> *allocate_rep_chunk();
+		void copy_rep_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,
+						  const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row) const;
+		VolVecVector<VecAggDesc> aggs_; VecAggHashTable hash_table_;
+		VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> rep_chunks_;
+		VecAggHashTable::iterator it_;
+		bool fully_scanned_ = false; void do_sink();
 	};
-	using VecAggAccumulatorList = VolVecVector<VecAggAccumulator>;
-	using VecAggHashTable = VolVecHashMap<VecGroupKey, VecAggAccumulatorList, VecGroupKeyHash>;
-	VolVecVector<VecAggDesc> aggs_; VecAggHashTable hash_table_;
-	VecAggHashTable::iterator it_;
-	bool fully_scanned_ = false; void do_sink();
-};
 
 class VecFilterState : public VecPlanState {
 public:
@@ -706,6 +821,22 @@ private:
 	DataChunk<DEFAULT_CHUNK_SIZE> input_chunk_;
 };
 
+class VecLimitState : public VecPlanState {
+public:
+	VecLimitState(std::unique_ptr<VecPlanState> left, uint64_t limit_count)
+		: left_(std::move(left)), limit_count_(limit_count), emitted_(0), done_(false) {}
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
+	{
+		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+	}
+private:
+	std::unique_ptr<VecPlanState> left_;
+	uint64_t limit_count_;
+	uint64_t emitted_;
+	bool done_;
+};
+
 enum class VecJoinSide : uint8_t {
 	Outer,
 	Inner
@@ -723,6 +854,20 @@ struct VecHashPayloadCol {
 	VecOutputColMeta meta;
 };
 
+static constexpr int kMaxJoinKeys = 4;
+
+struct VecHashJoinKeyCol {
+	uint16_t outer_col;
+	uint16_t inner_col;
+	VecOutputStorageKind kind;
+	int scale;
+};
+
+struct VecHashJoinKey {
+	uint64_t values[kMaxJoinKeys];
+	uint8_t num_keys;
+};
+
 struct VecRowRef {
 	uint32_t ordinal;
 	uint32_t chunk_idx;
@@ -734,16 +879,14 @@ public:
 	VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 					 std::unique_ptr<VecPlanState> inner,
 					 VolVecVector<VecJoinOutputCol> output_cols,
-					 int outer_key_col,
-					 int inner_key_col,
-					 VecOutputStorageKind key_kind);
+					 VolVecVector<VecHashJoinKeyCol> key_cols);
 	~VecHashJoinState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
 	private:
 		struct VecHashEntry {
 			uint32_t hash;
-			int64_t key;
+			VecHashJoinKey key;
 			int32_t next;
 			uint32_t chunk_idx;
 			uint16_t row_idx;
@@ -752,7 +895,7 @@ public:
 		void build_inner_hash();
 		void init_hash_table(size_t expected_rows);
 		void rehash_hash_table(size_t min_bucket_count);
-		void append_inner_entry(int64_t key, uint32_t hash, uint32_t chunk_idx, uint16_t row_idx);
+		void append_inner_entry(const VecHashJoinKey &key, uint32_t hash, uint32_t chunk_idx, uint16_t row_idx);
 		uint16_t ensure_inner_payload_col(uint16_t source_col, const VecOutputColMeta &meta);
 		DataChunk<DEFAULT_CHUNK_SIZE> *allocate_inner_chunk();
 		void copy_inner_payload_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,
@@ -760,20 +903,22 @@ public:
 		bool advance_outer_batch();
 		void prepare_probe_batch();
 		bool advance_probe_match(uint16_t probe_idx, int32_t *match_entry_idx);
-		uint32_t hash_key(int64_t key) const;
-		int64_t read_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk, int col, int row) const;
+		uint32_t hash_key(const VecHashJoinKey &key) const;
+		bool read_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk, bool inner_side, int row, VecHashJoinKey *key) const;
+		bool keys_equal(const VecHashJoinKey &left, const VecHashJoinKey &right) const;
 
 		std::unique_ptr<VecPlanState> outer_;
 		std::unique_ptr<VecPlanState> inner_;
 		MemoryContext memory_context_;
 		VolVecVector<VecJoinOutputCol> output_cols_;
+		VolVecVector<VecHashJoinKeyCol> key_cols_;
 		VolVecVector<VecHashPayloadCol> inner_payload_cols_;
 		VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> inner_chunks_;
 		VolVecVector<int32_t> bucket_heads_;
 		VolVecVector<VecHashEntry> entries_;
 	DataChunk<DEFAULT_CHUNK_SIZE> outer_chunk_;
 	VolVecVector<uint16_t> probe_rows_;
-	VolVecVector<int64_t> probe_keys_;
+	VolVecVector<VecHashJoinKey> probe_keys_;
 	VolVecVector<uint32_t> probe_hashes_;
 	VolVecVector<int32_t> probe_next_entries_;
 	VolVecVector<uint16_t> active_probe_sel_;
@@ -781,9 +926,6 @@ public:
 	bool inner_built_;
 	bool probe_batch_ready_;
 	size_t bucket_mask_;
-	int outer_key_col_;
-	int inner_key_col_;
-	VecOutputStorageKind key_kind_;
 };
 
 struct VecSortKeyDesc {
@@ -803,6 +945,7 @@ struct VecSortKeyLane {
 	VolVecVector<int64_t> i64_values;
 	VolVecVector<uint64_t> u64_values;
 	VolVecVector<VecStringRef> string_values;
+	VolVecVector<char> string_arena;
 
 	VecSortKeyLane(const VecSortKeyDesc &key_desc, MemoryContext context)
 		: desc(key_desc),
@@ -810,15 +953,36 @@ struct VecSortKeyLane {
 		  i32_values(PgMemoryContextAllocator<int32_t>(context)),
 		  i64_values(PgMemoryContextAllocator<int64_t>(context)),
 		  u64_values(PgMemoryContextAllocator<uint64_t>(context)),
-		  string_values(PgMemoryContextAllocator<VecStringRef>(context))
+		  string_values(PgMemoryContextAllocator<VecStringRef>(context)),
+		  string_arena(PgMemoryContextAllocator<char>(context))
 	{
+	}
+
+	VecStringRef store_string_bytes(const char *data, uint32_t len)
+	{
+		VecStringRef ref{len, 0, 0};
+
+		if (len == 0 || data == nullptr)
+			return ref;
+		ref.offset = (uint32_t) string_arena.size();
+		string_arena.insert(string_arena.end(), data, data + len);
+		memcpy(&ref.prefix, data, len > 8 ? 8 : len);
+		return ref;
+	}
+
+	const char *get_string_ptr(const VecStringRef &ref) const
+	{
+		if (ref.len == 0)
+			return "";
+		return string_arena.data() + ref.offset;
 	}
 };
 
 class VecSortState : public VecPlanState {
 public:
 	VecSortState(std::unique_ptr<VecPlanState> left, Sort *node,
-				 VolVecVector<VecSortKeyDesc> key_descs);
+				 VolVecVector<VecSortKeyDesc> key_descs,
+				 int output_ncols = -1);
 	~VecSortState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
@@ -833,7 +997,9 @@ private:
 	void copy_row(const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row,
 				  DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row) const;
 	bool row_less(const VecRowRef &left, const VecRowRef &right) const;
-	int compare_string_ref(const VecStringRef &left, const VecStringRef &right) const;
+	int compare_string_ref(const VecSortKeyLane &lane,
+						  const VecStringRef &left,
+						  const VecStringRef &right) const;
 
 	std::unique_ptr<VecPlanState> left_;
 	Sort *node_;
@@ -849,7 +1015,7 @@ private:
 
 struct PgVolVecQueryState { MemoryContext context; VecPlanState* vec_plan; };
 
-void CompileExpr(Expr *expr, VecExprProgram &program, bool is_filter = false);
+void CompileExpr(Expr *expr, VecExprProgram &program, bool is_filter = false, EState *estate = nullptr);
 std::unique_ptr<VecPlanState> ExecInitVecPlan(Plan *plan, EState *estate);
 
 #ifdef USE_LLVM

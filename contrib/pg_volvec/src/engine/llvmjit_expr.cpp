@@ -158,6 +158,7 @@ struct ExprJitColumnBases
 	std::array<LLVMValueRef, kMaxDeformTargets> f8;
 	std::array<LLVMValueRef, kMaxDeformTargets> i64;
 	std::array<LLVMValueRef, kMaxDeformTargets> i32;
+	std::array<LLVMValueRef, kMaxDeformTargets> str;
 	std::array<LLVMValueRef, kMaxDeformTargets> nulls;
 
 	ExprJitColumnBases()
@@ -165,6 +166,7 @@ struct ExprJitColumnBases
 		f8.fill(nullptr);
 		i64.fill(nullptr);
 		i32.fill(nullptr);
+		str.fill(nullptr);
 		nulls.fill(nullptr);
 	}
 };
@@ -190,10 +192,17 @@ pg_volvec_expr_opcode_supported(VecOpCode opcode)
 		case VecOpCode::EEOP_INT64_GT:
 		case VecOpCode::EEOP_INT64_LE:
 		case VecOpCode::EEOP_INT64_GE:
+		case VecOpCode::EEOP_INT64_EQ:
 		case VecOpCode::EEOP_DATE_LT:
 		case VecOpCode::EEOP_DATE_LE:
 		case VecOpCode::EEOP_DATE_GE:
 		case VecOpCode::EEOP_AND:
+		case VecOpCode::EEOP_OR:
+		case VecOpCode::EEOP_INT64_CASE:
+		case VecOpCode::EEOP_FLOAT8_CASE:
+		case VecOpCode::EEOP_STR_EQ:
+		case VecOpCode::EEOP_STR_NE:
+		case VecOpCode::EEOP_STR_PREFIX_LIKE:
 		case VecOpCode::EEOP_QUAL:
 			return true;
 		default:
@@ -206,10 +215,12 @@ pg_volvec_preload_expr_column_bases(LLVMBuilderRef b,
 								   LLVMTypeRef type_i8,
 								   LLVMTypeRef type_i64,
 								   LLVMTypeRef type_i32,
+								   LLVMTypeRef type_stringref,
 								   LLVMTypeRef type_double,
 								   LLVMValueRef v_col_f8,
 								   LLVMValueRef v_col_i64,
 								   LLVMValueRef v_col_i32,
+								   LLVMValueRef v_col_str,
 								   LLVMValueRef v_col_nulls,
 								   const VecExprProgram *program)
 {
@@ -217,11 +228,17 @@ pg_volvec_preload_expr_column_bases(LLVMBuilderRef b,
 
 	for (const auto &step : program->steps)
 	{
-		if (step.opcode != VecOpCode::EEOP_VAR)
-			continue;
-
-		int att = step.d.var.att_idx;
+		int att = -1;
 		LLVMValueRef v_att;
+
+		if (step.opcode == VecOpCode::EEOP_VAR)
+			att = step.d.var.att_idx;
+		else if (step.opcode == VecOpCode::EEOP_STR_EQ ||
+				 step.opcode == VecOpCode::EEOP_STR_NE ||
+				 step.opcode == VecOpCode::EEOP_STR_PREFIX_LIKE)
+			att = step.d.str_prefix.att_idx;
+		else
+			continue;
 
 		if (att < 0 || att >= kMaxDeformTargets)
 			continue;
@@ -233,6 +250,17 @@ pg_volvec_preload_expr_column_bases(LLVMBuilderRef b,
 				l_ptr(type_i8),
 				LLVMBuildGEP2(b, l_ptr(type_i8), v_col_nulls, &v_att, 1, ""),
 				"");
+
+		if (step.opcode != VecOpCode::EEOP_VAR)
+		{
+			if (bases.str[att] == nullptr)
+				bases.str[att] = LLVMBuildLoad2(
+					b,
+					l_ptr(type_stringref),
+					LLVMBuildGEP2(b, l_ptr(type_stringref), v_col_str, &v_att, 1, ""),
+					"");
+			continue;
+		}
 
 		if (step.d.var.type == FLOAT8OID)
 		{
@@ -254,7 +282,18 @@ pg_volvec_preload_expr_column_bases(LLVMBuilderRef b,
 		}
 		else
 		{
-			if (bases.i32[att] == nullptr)
+			if (step.d.var.type == BPCHAROID ||
+				step.d.var.type == TEXTOID ||
+				step.d.var.type == VARCHAROID)
+			{
+				if (bases.str[att] == nullptr)
+					bases.str[att] = LLVMBuildLoad2(
+						b,
+						l_ptr(type_stringref),
+						LLVMBuildGEP2(b, l_ptr(type_stringref), v_col_str, &v_att, 1, ""),
+						"");
+			}
+			else if (bases.i32[att] == nullptr)
 				bases.i32[att] = LLVMBuildLoad2(
 					b,
 					l_ptr(type_i32),
@@ -302,6 +341,180 @@ pg_volvec_build_rescale_int64(LLVMBuilderRef b,
 	return LLVMBuildSelect(b, round_down, minus_one, rounded, "");
 }
 
+static LLVMValueRef
+pg_volvec_build_i32_truthy(LLVMBuilderRef b,
+						   LLVMTypeRef type_i32,
+						   LLVMValueRef is_null,
+						   LLVMValueRef value)
+{
+	LLVMValueRef not_null = LLVMBuildNot(b, is_null, "");
+	LLVMValueRef nonzero =
+		LLVMBuildICmp(b, LLVMIntNE, value, pg_volvec_i32_const(type_i32, 0), "");
+
+	return LLVMBuildAnd(b, not_null, nonzero, "");
+}
+
+static LLVMValueRef
+pg_volvec_build_i32_falsey(LLVMBuilderRef b,
+						   LLVMTypeRef type_i32,
+						   LLVMValueRef is_null,
+						   LLVMValueRef value)
+{
+	LLVMValueRef not_null = LLVMBuildNot(b, is_null, "");
+	LLVMValueRef zero =
+		LLVMBuildICmp(b, LLVMIntEQ, value, pg_volvec_i32_const(type_i32, 0), "");
+
+	return LLVMBuildAnd(b, not_null, zero, "");
+}
+
+static void
+pg_volvec_emit_bool_and(LLVMBuilderRef b,
+						  LLVMTypeRef type_i32,
+						  LLVMValueRef left_null,
+						  LLVMValueRef left_val,
+						  LLVMValueRef right_null,
+						  LLVMValueRef right_val,
+						  LLVMValueRef *out_null,
+						  LLVMValueRef *out_val)
+{
+	LLVMValueRef left_true =
+		pg_volvec_build_i32_truthy(b, type_i32, left_null, left_val);
+	LLVMValueRef right_true =
+		pg_volvec_build_i32_truthy(b, type_i32, right_null, right_val);
+	LLVMValueRef left_false =
+		pg_volvec_build_i32_falsey(b, type_i32, left_null, left_val);
+	LLVMValueRef right_false =
+		pg_volvec_build_i32_falsey(b, type_i32, right_null, right_val);
+	LLVMValueRef result_false = LLVMBuildOr(b, left_false, right_false, "");
+	LLVMValueRef result_true = LLVMBuildAnd(b, left_true, right_true, "");
+	LLVMValueRef known = LLVMBuildOr(b, result_false, result_true, "");
+
+	*out_null = LLVMBuildNot(b, known, "");
+	*out_val = LLVMBuildZExt(b, result_true, type_i32, "");
+}
+
+static void
+pg_volvec_emit_bool_or(LLVMBuilderRef b,
+						 LLVMTypeRef type_i32,
+						 LLVMValueRef left_null,
+						 LLVMValueRef left_val,
+						 LLVMValueRef right_null,
+						 LLVMValueRef right_val,
+						 LLVMValueRef *out_null,
+						 LLVMValueRef *out_val)
+{
+	LLVMValueRef left_true =
+		pg_volvec_build_i32_truthy(b, type_i32, left_null, left_val);
+	LLVMValueRef right_true =
+		pg_volvec_build_i32_truthy(b, type_i32, right_null, right_val);
+	LLVMValueRef left_false =
+		pg_volvec_build_i32_falsey(b, type_i32, left_null, left_val);
+	LLVMValueRef right_false =
+		pg_volvec_build_i32_falsey(b, type_i32, right_null, right_val);
+	LLVMValueRef result_true = LLVMBuildOr(b, left_true, right_true, "");
+	LLVMValueRef result_false = LLVMBuildAnd(b, left_false, right_false, "");
+	LLVMValueRef known = LLVMBuildOr(b, result_false, result_true, "");
+
+	*out_null = LLVMBuildNot(b, known, "");
+	*out_val = LLVMBuildZExt(b, result_true, type_i32, "");
+}
+
+static LLVMValueRef
+pg_volvec_emit_string_const_match(LLVMBuilderRef b,
+									LLVMTypeRef type_i1,
+									LLVMTypeRef type_i8,
+									LLVMTypeRef type_i32,
+									LLVMTypeRef type_i64,
+									LLVMTypeRef type_stringref,
+									LLVMValueRef string_base,
+									LLVMValueRef row_idx_ext,
+									const VecExprStep &step)
+{
+	LLVMValueRef ref_ptr;
+	LLVMValueRef ref_val;
+	LLVMValueRef ref_len;
+	LLVMValueRef ref_prefix;
+	LLVMValueRef prefix_match;
+	uint32_t match_len = step.d.str_prefix.len;
+	uint64_t mask = 0;
+
+	if (string_base == nullptr)
+		return nullptr;
+	if (step.d.str_prefix.offset != UINT32_MAX)
+		return nullptr;
+
+	ref_ptr = LLVMBuildGEP2(b, type_stringref, string_base, &row_idx_ext, 1, "");
+	ref_val = LLVMBuildLoad2(b, type_stringref, ref_ptr, "");
+	ref_len = LLVMBuildExtractValue(b, ref_val, 0, "str_len");
+	ref_prefix = LLVMBuildExtractValue(b, ref_val, 2, "str_prefix");
+	if (match_len > 0)
+		mask = (match_len >= 8) ? UINT64_MAX : ((UINT64CONST(1) << (match_len * 8)) - 1);
+	if (match_len == 0)
+		prefix_match = LLVMConstInt(type_i1, 1, false);
+	else
+	{
+		LLVMValueRef v_mask = LLVMConstInt(type_i64, mask, false);
+		LLVMValueRef v_prefix =
+			LLVMConstInt(type_i64, step.d.str_prefix.prefix & mask, false);
+		LLVMValueRef lhs = LLVMBuildAnd(b, ref_prefix, v_mask, "");
+		LLVMValueRef rhs = LLVMBuildAnd(b, v_prefix, v_mask, "");
+
+		prefix_match = LLVMBuildICmp(b, LLVMIntEQ, lhs, rhs, "");
+	}
+
+	if (step.opcode == VecOpCode::EEOP_STR_PREFIX_LIKE)
+	{
+		LLVMValueRef len_ok =
+			LLVMBuildICmp(b, LLVMIntUGE, ref_len, pg_volvec_i32_const(type_i32, match_len), "");
+
+		return LLVMBuildAnd(b, len_ok, prefix_match, "");
+	}
+
+	if (step.d.str_prefix.type == BPCHAROID)
+	{
+		LLVMValueRef len_eq =
+			LLVMBuildICmp(b, LLVMIntEQ, ref_len, pg_volvec_i32_const(type_i32, match_len), "");
+		LLVMValueRef len_gt =
+			LLVMBuildICmp(b, LLVMIntUGT, ref_len, pg_volvec_i32_const(type_i32, match_len), "");
+		LLVMValueRef trailing_ok = LLVMConstInt(type_i1, 1, false);
+
+		if (match_len < 8)
+		{
+			for (uint32_t j = match_len; j < 8; j++)
+			{
+				LLVMValueRef need_check =
+					LLVMBuildICmp(b, LLVMIntUGT, ref_len, pg_volvec_i32_const(type_i32, j), "");
+				LLVMValueRef shifted =
+					LLVMBuildLShr(b, ref_prefix, LLVMConstInt(type_i64, j * 8, false), "");
+				LLVMValueRef byte_val =
+					LLVMBuildTrunc(b,
+								   LLVMBuildAnd(b, shifted, LLVMConstInt(type_i64, 0xff, false), ""),
+								   type_i8,
+								   "");
+				LLVMValueRef is_space =
+					LLVMBuildICmp(b, LLVMIntEQ, byte_val,
+								  LLVMConstInt(type_i8, ' ', false), "");
+				LLVMValueRef ok =
+					LLVMBuildOr(b, LLVMBuildNot(b, need_check, ""), is_space, "");
+
+				trailing_ok = LLVMBuildAnd(b, trailing_ok, ok, "");
+			}
+		}
+
+		return LLVMBuildAnd(
+			b,
+			prefix_match,
+			LLVMBuildOr(b, len_eq, LLVMBuildAnd(b, len_gt, trailing_ok, ""), ""),
+			"");
+	}
+
+	return LLVMBuildAnd(
+		b,
+		prefix_match,
+		LLVMBuildICmp(b, LLVMIntEQ, ref_len, pg_volvec_i32_const(type_i32, match_len), ""),
+		"");
+}
+
 static bool
 pg_volvec_emit_expr_row(LLVMBuilderRef b,
 						LLVMTypeRef type_i1,
@@ -309,6 +522,7 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 						LLVMTypeRef type_i32,
 						LLVMTypeRef type_i64,
 						LLVMTypeRef type_i128,
+						LLVMTypeRef type_stringref,
 						LLVMTypeRef type_double,
 						const VecExprProgram *program,
 						const ExprJitColumnBases &bases,
@@ -479,6 +693,7 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 			case VecOpCode::EEOP_INT64_LE:
 			case VecOpCode::EEOP_INT64_GT:
 			case VecOpCode::EEOP_INT64_GE:
+			case VecOpCode::EEOP_INT64_EQ:
 			{
 				LLVMIntPredicate pred;
 				LLVMValueRef left_val;
@@ -501,6 +716,8 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 					pred = LLVMIntSGT;
 				else if (step.opcode == VecOpCode::EEOP_INT64_GE)
 					pred = LLVMIntSGE;
+				else if (step.opcode == VecOpCode::EEOP_INT64_EQ)
+					pred = LLVMIntEQ;
 				reg_i32[res] = LLVMBuildZExt(
 					b, LLVMBuildICmp(b, pred, left_val, right_val, ""), type_i32, "");
 				break;
@@ -525,9 +742,86 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 			case VecOpCode::EEOP_AND:
 				if (!reg_null[l] || !reg_null[r] || !reg_i32[l] || !reg_i32[r])
 					return false;
-				reg_null[res] = LLVMBuildOr(b, reg_null[l], reg_null[r], "");
-				reg_i32[res] = LLVMBuildAnd(b, reg_i32[l], reg_i32[r], "");
+				pg_volvec_emit_bool_and(b, type_i32,
+										 reg_null[l], reg_i32[l],
+										 reg_null[r], reg_i32[r],
+										 &reg_null[res], &reg_i32[res]);
 				break;
+			case VecOpCode::EEOP_OR:
+				if (!reg_null[l] || !reg_null[r] || !reg_i32[l] || !reg_i32[r])
+					return false;
+				pg_volvec_emit_bool_or(b, type_i32,
+										reg_null[l], reg_i32[l],
+										reg_null[r], reg_i32[r],
+										&reg_null[res], &reg_i32[res]);
+				break;
+			case VecOpCode::EEOP_INT64_CASE:
+			{
+				int c = step.d.ternary.cond;
+				int t = step.d.ternary.if_true;
+				int f = step.d.ternary.if_false;
+				int true_scale = program->get_register_scale(t);
+				int false_scale = program->get_register_scale(f);
+				LLVMValueRef cond_true;
+				LLVMValueRef true_val;
+				LLVMValueRef false_val;
+
+				if (!reg_null[c] || !reg_i32[c] || !reg_null[t] || !reg_null[f] ||
+					!reg_i64[t] || !reg_i64[f])
+					return false;
+				cond_true = pg_volvec_build_i32_truthy(b, type_i32,
+														 reg_null[c], reg_i32[c]);
+				true_val = pg_volvec_build_rescale_int64(b, type_i64, type_i128,
+														 reg_i64[t], true_scale, res_scale);
+				false_val = pg_volvec_build_rescale_int64(b, type_i64, type_i128,
+														  reg_i64[f], false_scale, res_scale);
+				reg_null[res] = LLVMBuildSelect(b, cond_true, reg_null[t], reg_null[f], "");
+				reg_i64[res] = LLVMBuildSelect(b, cond_true, true_val, false_val, "");
+				break;
+			}
+			case VecOpCode::EEOP_FLOAT8_CASE:
+			{
+				int c = step.d.ternary.cond;
+				int t = step.d.ternary.if_true;
+				int f = step.d.ternary.if_false;
+				LLVMValueRef cond_true;
+
+				if (!reg_null[c] || !reg_i32[c] || !reg_null[t] || !reg_null[f] ||
+					!reg_f8[t] || !reg_f8[f])
+					return false;
+				cond_true = pg_volvec_build_i32_truthy(b, type_i32,
+														 reg_null[c], reg_i32[c]);
+				reg_null[res] = LLVMBuildSelect(b, cond_true, reg_null[t], reg_null[f], "");
+				reg_f8[res] = LLVMBuildSelect(b, cond_true, reg_f8[t], reg_f8[f], "");
+				break;
+			}
+			case VecOpCode::EEOP_STR_PREFIX_LIKE:
+			case VecOpCode::EEOP_STR_EQ:
+			case VecOpCode::EEOP_STR_NE:
+			{
+				int att = step.d.str_prefix.att_idx;
+				LLVMValueRef matches;
+
+				if (att < 0 || att >= kMaxDeformTargets ||
+					bases.str[att] == nullptr || bases.nulls[att] == nullptr)
+					return false;
+				reg_null[res] = LLVMBuildTrunc(
+					b,
+					LLVMBuildLoad2(b, type_i8,
+								   LLVMBuildGEP2(b, type_i8, bases.nulls[att], &v_row_idx_ext, 1, ""),
+								   ""),
+					type_i1,
+					"");
+					matches = pg_volvec_emit_string_const_match(
+					b, type_i1, type_i8, type_i32, type_i64, type_stringref,
+					bases.str[att], v_row_idx_ext, step);
+				if (matches == nullptr)
+					return false;
+				if (step.opcode == VecOpCode::EEOP_STR_NE)
+					matches = LLVMBuildNot(b, matches, "");
+				reg_i32[res] = LLVMBuildZExt(b, matches, type_i32, "");
+				break;
+			}
 			case VecOpCode::EEOP_QUAL:
 				break;
 			default:
@@ -578,32 +872,36 @@ compile_expr_to_jit(LLVMJitContext *context,
 	LLVMTypeRef type_i64 = LLVMInt64TypeInContext(lc);
 	LLVMTypeRef type_i128 = LLVMIntTypeInContext(lc, 128);
 	LLVMTypeRef type_double = LLVMDoubleTypeInContext(lc);
-	LLVMTypeRef param_types[11];
+	LLVMTypeRef type_stringref_members[3] = {type_i32, type_i32, type_i64};
+	LLVMTypeRef type_stringref = LLVMStructTypeInContext(lc, type_stringref_members, 3, false);
+	LLVMTypeRef param_types[12];
 	param_types[0] = type_i32;
 	param_types[1] = l_ptr(l_ptr(type_double));
 	param_types[2] = l_ptr(l_ptr(type_i64));
 	param_types[3] = l_ptr(l_ptr(type_i32));
-	param_types[4] = l_ptr(l_ptr(type_i8));
-	param_types[5] = l_ptr(type_double);
-	param_types[6] = l_ptr(type_i64);
-	param_types[7] = l_ptr(type_i32);
-	param_types[8] = l_ptr(type_i8);
-	param_types[9] = l_ptr(type_i16);
-	param_types[10] = type_i1;
+	param_types[4] = l_ptr(l_ptr(type_stringref));
+	param_types[5] = l_ptr(l_ptr(type_i8));
+	param_types[6] = l_ptr(type_double);
+	param_types[7] = l_ptr(type_i64);
+	param_types[8] = l_ptr(type_i32);
+	param_types[9] = l_ptr(type_i8);
+	param_types[10] = l_ptr(type_i16);
+	param_types[11] = type_i1;
 
-	LLVMTypeRef func_sig = LLVMFunctionType(LLVMVoidTypeInContext(lc), param_types, 11, 0);
+	LLVMTypeRef func_sig = LLVMFunctionType(LLVMVoidTypeInContext(lc), param_types, 12, 0);
 	LLVMValueRef v_func = LLVMAddFunction(mod, funcname, func_sig);
 	LLVMValueRef v_count = LLVMGetParam(v_func, 0);
 	LLVMValueRef v_col_f8 = LLVMGetParam(v_func, 1);
 	LLVMValueRef v_col_i64 = LLVMGetParam(v_func, 2);
 	LLVMValueRef v_col_i32 = LLVMGetParam(v_func, 3);
-	LLVMValueRef v_col_nulls = LLVMGetParam(v_func, 4);
-	LLVMValueRef v_res_f8 = LLVMGetParam(v_func, 5);
-	LLVMValueRef v_res_i64 = LLVMGetParam(v_func, 6);
-	LLVMValueRef v_res_i32 = LLVMGetParam(v_func, 7);
-	LLVMValueRef v_res_nulls = LLVMGetParam(v_func, 8);
-	LLVMValueRef v_sel = LLVMGetParam(v_func, 9);
-	LLVMValueRef v_has_sel = LLVMGetParam(v_func, 10);
+	LLVMValueRef v_col_str = LLVMGetParam(v_func, 4);
+	LLVMValueRef v_col_nulls = LLVMGetParam(v_func, 5);
+	LLVMValueRef v_res_f8 = LLVMGetParam(v_func, 6);
+	LLVMValueRef v_res_i64 = LLVMGetParam(v_func, 7);
+	LLVMValueRef v_res_i32 = LLVMGetParam(v_func, 8);
+	LLVMValueRef v_res_nulls = LLVMGetParam(v_func, 9);
+	LLVMValueRef v_sel = LLVMGetParam(v_func, 10);
+	LLVMValueRef v_has_sel = LLVMGetParam(v_func, 11);
 	ExprJitColumnBases bases;
 	LLVMBasicBlockRef b_entry;
 	LLVMBasicBlockRef b_dense_cond;
@@ -632,8 +930,8 @@ compile_expr_to_jit(LLVMJitContext *context,
 	b_exit = LLVMAppendBasicBlockInContext(lc, v_func, "exit");
 	LLVMPositionBuilderAtEnd(b, b_entry);
 	bases = pg_volvec_preload_expr_column_bases(b, type_i8, type_i64, type_i32,
-												type_double, v_col_f8, v_col_i64,
-												v_col_i32, v_col_nulls, program);
+												type_stringref, type_double, v_col_f8, v_col_i64,
+												v_col_i32, v_col_str, v_col_nulls, program);
 	LLVMBuildCondBr(b, v_has_sel, b_selected_cond, b_dense_cond);
 
 	LLVMPositionBuilderAtEnd(b, b_dense_cond);
@@ -651,6 +949,7 @@ compile_expr_to_jit(LLVMJitContext *context,
 		LLVMValueRef v_dense_next;
 
 		if (!pg_volvec_emit_expr_row(b, type_i1, type_i8, type_i32, type_i64, type_i128,
+									 type_stringref,
 									 type_double, program, bases, v_dense_idx_ext,
 									 v_dense_idx_ext, v_res_f8, v_res_i64, v_res_i32,
 									 v_res_nulls))
@@ -683,6 +982,7 @@ compile_expr_to_jit(LLVMJitContext *context,
 		LLVMValueRef v_selected_next;
 
 		if (!pg_volvec_emit_expr_row(b, type_i1, type_i8, type_i32, type_i64, type_i128,
+									 type_stringref,
 									 type_double, program, bases, v_row_idx_ext,
 									 v_row_idx_ext, v_res_f8, v_res_i64, v_res_i32,
 									 v_res_nulls))
