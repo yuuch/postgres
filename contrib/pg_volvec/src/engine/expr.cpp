@@ -26,6 +26,8 @@ StripImplicitNodes(Expr *expr)
 			expr = ((RelabelType *) expr)->arg;
 		else if (IsA(expr, CoerceToDomain))
 			expr = ((CoerceToDomain *) expr)->arg;
+		else if (IsA(expr, CoerceViaIO))
+			expr = ((CoerceViaIO *) expr)->arg;
 		else
 			break;
 	}
@@ -83,6 +85,138 @@ TryExtractYearFieldConst(Const *c)
 	matches = (pg_strcasecmp(field, "year") == 0);
 	pfree(field);
 	return matches;
+}
+
+static bool
+TryExtractConstInt32(Const *c, int32_t *out)
+{
+	if (c == nullptr || c->constisnull || out == nullptr)
+		return false;
+
+	if (c->consttype == INT4OID)
+	{
+		*out = DatumGetInt32(c->constvalue);
+		return true;
+	}
+	if (c->consttype == INT8OID)
+	{
+		int64_t value = DatumGetInt64(c->constvalue);
+
+		if (value < PG_INT32_MIN || value > PG_INT32_MAX)
+			return false;
+		*out = (int32_t) value;
+		return true;
+	}
+	return false;
+}
+
+static bool
+ExtractStringSourceVar(Expr *expr, Var **var_out, Oid *type_out)
+{
+	expr = StripImplicitNodes(expr);
+	if (var_out != nullptr)
+		*var_out = nullptr;
+	if (type_out != nullptr)
+		*type_out = InvalidOid;
+	if (expr == nullptr)
+		return false;
+	if (IsA(expr, Var))
+	{
+		Var *var = (Var *) expr;
+		Oid type = exprType((Node *) expr);
+
+		if (type != BPCHAROID && type != TEXTOID && type != VARCHAROID)
+			return false;
+		if (var_out != nullptr)
+			*var_out = var;
+		if (type_out != nullptr)
+			*type_out = type;
+		return true;
+	}
+	if (IsA(expr, FuncExpr))
+	{
+		FuncExpr *func = (FuncExpr *) expr;
+		char *funcname = get_func_name(func->funcid);
+		Oid rettype = exprType((Node *) expr);
+
+		if (list_length(func->args) == 1 &&
+			(rettype == BPCHAROID || rettype == TEXTOID || rettype == VARCHAROID))
+			return ExtractStringSourceVar(StripImplicitNodes((Expr *) linitial(func->args)),
+										var_out,
+										type_out);
+	}
+	return false;
+}
+
+static bool
+MatchStringPrefixFuncExpr(Expr *expr, int *att_idx, Oid *source_type, uint32_t *prefix_len)
+{
+	FuncExpr *func;
+	char *funcname;
+	Expr *arg_expr;
+	Expr *start_expr;
+	Expr *len_expr;
+	Var *var = nullptr;
+	int32_t start_val;
+	int32_t len_val;
+	Oid arg_type;
+
+	expr = StripImplicitNodes(expr);
+	if (att_idx != nullptr)
+		*att_idx = -1;
+	if (source_type != nullptr)
+		*source_type = InvalidOid;
+	if (prefix_len != nullptr)
+		*prefix_len = 0;
+	if (expr == nullptr || !IsA(expr, FuncExpr))
+		return false;
+
+	func = (FuncExpr *) expr;
+	funcname = get_func_name(func->funcid);
+	if (list_length(func->args) == 1 &&
+		(exprType((Node *) expr) == BPCHAROID ||
+		 exprType((Node *) expr) == TEXTOID ||
+		 exprType((Node *) expr) == VARCHAROID))
+		return MatchStringPrefixFuncExpr((Expr *) linitial(func->args),
+										 att_idx,
+										 source_type,
+										 prefix_len);
+	if (funcname == nullptr ||
+		(strcmp(funcname, "substring") != 0 && strcmp(funcname, "substr") != 0) ||
+		(list_length(func->args) != 2 && list_length(func->args) != 3))
+		return false;
+
+	arg_expr = StripImplicitNodes((Expr *) linitial(func->args));
+	start_expr = StripImplicitNodes((Expr *) lsecond(func->args));
+	len_expr = list_length(func->args) == 3 ?
+		StripImplicitNodes((Expr *) lthird(func->args)) : nullptr;
+	if (arg_expr == nullptr || start_expr == nullptr || !IsA(start_expr, Const))
+		return false;
+	if (!ExtractStringSourceVar(arg_expr, &var, &arg_type) ||
+		var == nullptr ||
+		var->varattno <= 0 || var->varattno > 16 ||
+		!TryExtractConstInt32((Const *) start_expr, &start_val) ||
+		start_val != 1)
+		return false;
+	if (len_expr != nullptr)
+	{
+		if (!IsA(len_expr, Const) || !TryExtractConstInt32((Const *) len_expr, &len_val))
+			return false;
+	}
+	else
+	{
+		return false;
+	}
+	if (len_val < 0)
+		return false;
+
+	if (att_idx != nullptr)
+		*att_idx = var->varattno - 1;
+	if (source_type != nullptr)
+		*source_type = arg_type;
+	if (prefix_len != nullptr)
+		*prefix_len = (uint32_t) len_val;
+	return true;
 }
 
 static int64_t
@@ -274,6 +408,7 @@ static bool TryExtractStringConstPrefix(Const *c, uint64_t *prefix_out, uint32_t
 static bool TryExtractLikePrefix(Const *c, uint64_t *prefix_out, uint32_t *len_out);
 static bool TryExtractLikeContains(Const *c, char **str_out, uint32_t *len_out, uint64_t *prefix_out);
 static bool TryExtractStringConst(Const *c, char **str_out, uint32_t *len_out, uint64_t *prefix_out);
+static int CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate);
 
 static bool
 AppendStringCompareStep(VecExprProgram &program,
@@ -287,24 +422,31 @@ AppendStringCompareStep(VecExprProgram &program,
 	uint32_t len = 0;
 	bool ok;
 	Oid left_type;
+	int left_att_idx = -1;
 
 	if (opname == nullptr ||
 		left_expr == nullptr ||
 		right_expr == nullptr ||
-		!IsA(left_expr, Var) ||
 		!IsA(right_expr, Const))
 		return false;
 
-	left_type = exprType((Node *) left_expr);
+	if (IsA(left_expr, Var))
+	{
+		left_att_idx = ((Var *) left_expr)->varattno - 1;
+		left_type = exprType((Node *) left_expr);
+	}
+	else if (!MatchStringPrefixFuncExpr(left_expr, &left_att_idx, &left_type, &len))
+		return false;
+
 	if (left_type != BPCHAROID &&
 		left_type != TEXTOID &&
 		left_type != VARCHAROID)
 		return false;
 
 	special_step.res_idx = res_idx;
-	special_step.d.str_prefix.att_idx = ((Var *) left_expr)->varattno - 1;
+	special_step.d.str_prefix.att_idx = left_att_idx;
 	special_step.d.str_prefix.prefix = 0;
-	special_step.d.str_prefix.len = 0;
+	special_step.d.str_prefix.len = len;
 	special_step.d.str_prefix.offset = UINT32_MAX;
 	special_step.d.str_prefix.type = left_type;
 
@@ -322,6 +464,18 @@ AppendStringCompareStep(VecExprProgram &program,
 				special_step.d.str_prefix.offset = program.store_string_const(match, len);
 		}
 		if (match != nullptr)
+		{
+			pfree(match);
+			match = nullptr;
+		}
+		if (!ok)
+		{
+			ok = TryExtractStringConst((Const *) right_expr, &match, &len, &prefix);
+			special_step.opcode = VecOpCode::EEOP_STR_LIKE_PATTERN;
+			if (ok && len > 8)
+				special_step.d.str_prefix.offset = program.store_string_const(match, len);
+		}
+		if (match != nullptr)
 			pfree(match);
 	}
 	else if (strcmp(opname, "=") == 0)
@@ -333,7 +487,8 @@ AppendStringCompareStep(VecExprProgram &program,
 			special_step.d.str_prefix.offset = program.store_string_const(match, len);
 		if (match != nullptr)
 			pfree(match);
-		special_step.opcode = VecOpCode::EEOP_STR_EQ;
+		special_step.opcode = IsA(StripImplicitNodes(left_expr), FuncExpr) ?
+			VecOpCode::EEOP_STR_PREFIX_LIKE : VecOpCode::EEOP_STR_EQ;
 	}
 	else if (strcmp(opname, "<>") == 0)
 	{
@@ -430,10 +585,26 @@ AppendBoolCombineStep(VecExprProgram &program,
 	return true;
 }
 
+static bool
+AppendBoolNotStep(VecExprProgram &program, int arg, int res_idx)
+{
+	VecExprStep step;
+
+	if (arg < 0 || res_idx < 0)
+		return false;
+	step.opcode = VecOpCode::EEOP_NOT;
+	step.res_idx = res_idx;
+	step.d.op.left = arg;
+	step.d.op.right = 0;
+	program.steps.push_back(step);
+	return true;
+}
+
 static int
 CompileScalarArrayExpr(ScalarArrayOpExpr *array_expr,
 					   VecExprProgram &program,
-					   int res_idx)
+					   int res_idx,
+					   EState *estate)
 {
 	Expr *left_expr;
 	Expr *right_expr;
@@ -495,6 +666,7 @@ CompileScalarArrayExpr(ScalarArrayOpExpr *array_expr,
 	{
 		Const elem_const;
 		int cmp_reg;
+		OpExpr cmp_expr;
 
 		if (elem_nulls[i])
 			return -1;
@@ -510,11 +682,19 @@ CompileScalarArrayExpr(ScalarArrayOpExpr *array_expr,
 		elem_const.location = -1;
 		elem_const.constvalue = elem_values[i];
 
-		cmp_reg = AllocateResultRegister(program);
-		if (cmp_reg < 0)
-			return -1;
+		memset(&cmp_expr, 0, sizeof(cmp_expr));
+		cmp_expr.xpr.type = T_OpExpr;
+		cmp_expr.opno = array_expr->opno;
+		cmp_expr.opfuncid = array_expr->opfuncid;
+		cmp_expr.opresulttype = BOOLOID;
+		cmp_expr.opretset = false;
+		cmp_expr.opcollid = InvalidOid;
+		cmp_expr.inputcollid = array_expr->inputcollid;
+		cmp_expr.args = list_make2(left_expr, &elem_const);
+		cmp_expr.location = -1;
 
-		if (!AppendStringCompareStep(program, cmp_reg, left_expr, (Expr *) &elem_const, opname))
+		cmp_reg = CompileExprRecursive((Expr *) &cmp_expr, program, estate);
+		if (cmp_reg < 0)
 			return -1;
 
 		if (left < 0)
@@ -881,6 +1061,64 @@ StringConstContains(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
 	return false;
 }
 
+static bool
+StringLikePatternMatches(const char *text, uint32_t text_len,
+						 const char *pattern, uint32_t pattern_len)
+{
+	uint32_t text_pos = 0;
+	uint32_t pattern_pos = 0;
+	uint32_t star_pattern = UINT32_MAX;
+	uint32_t star_text = 0;
+
+	while (text_pos < text_len)
+	{
+		if (pattern_pos < pattern_len &&
+			(pattern[pattern_pos] == '_' || pattern[pattern_pos] == text[text_pos]))
+		{
+			pattern_pos++;
+			text_pos++;
+			continue;
+		}
+		if (pattern_pos < pattern_len && pattern[pattern_pos] == '%')
+		{
+			star_pattern = pattern_pos++;
+			star_text = text_pos;
+			continue;
+		}
+		if (star_pattern != UINT32_MAX)
+		{
+			pattern_pos = star_pattern + 1;
+			text_pos = ++star_text;
+			continue;
+		}
+		return false;
+	}
+
+	while (pattern_pos < pattern_len && pattern[pattern_pos] == '%')
+		pattern_pos++;
+	return pattern_pos == pattern_len;
+}
+
+static bool
+StringConstLikePattern(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
+					   const VecExprProgram &program,
+					   const VecStringRef &ref,
+					   const VecExprStep &step)
+{
+	const char *text = chunk.get_string_ptr(ref);
+	uint32_t text_len = ref.len;
+	const char *pattern;
+
+	if (step.d.str_prefix.len == 0)
+		return true;
+	if (step.d.str_prefix.type == BPCHAROID)
+		text_len = TrimBpcharLength(text, text_len);
+	pattern = (step.d.str_prefix.len <= 8 && step.d.str_prefix.offset == UINT32_MAX) ?
+		(const char *) &step.d.str_prefix.prefix :
+		program.get_string_const_ptr(step.d.str_prefix.offset);
+	return StringLikePatternMatches(text, text_len, pattern, step.d.str_prefix.len);
+}
+
 static int
 PopulateConstStep(VecExprProgram &program,
 				 VecExprStep *step,
@@ -1022,6 +1260,17 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 
 		if (bool_expr->args == NIL)
 			return -1;
+		if (bool_expr->boolop == NOT_EXPR)
+		{
+			int arg_idx;
+
+			if (list_length(bool_expr->args) != 1)
+				return -1;
+			arg_idx = CompileExprRecursive((Expr *) linitial(bool_expr->args), program, estate);
+			if (arg_idx < 0 || !AppendBoolNotStep(program, arg_idx, res_idx))
+				return -1;
+			return res_idx;
+		}
 		if (bool_expr->boolop == AND_EXPR)
 			combine_opcode = VecOpCode::EEOP_AND;
 		else if (bool_expr->boolop == OR_EXPR)
@@ -1099,7 +1348,7 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 	}
 
 	if (IsA(expr, ScalarArrayOpExpr))
-		return CompileScalarArrayExpr((ScalarArrayOpExpr *) expr, program, res_idx);
+		return CompileScalarArrayExpr((ScalarArrayOpExpr *) expr, program, res_idx, estate);
 
 	if (IsA(expr, FuncExpr))
 	{
@@ -1166,6 +1415,18 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 
 		if (AppendStringCompareStep(program, res_idx, left_expr, right_expr, opname))
 			return res_idx;
+		if (opname != nullptr &&
+			strcmp(opname, "!~~") == 0)
+		{
+			int like_reg = AllocateResultRegister(program);
+
+			if (like_reg < 0)
+				return -1;
+			if (!AppendStringCompareStep(program, like_reg, left_expr, right_expr, "~~") ||
+				!AppendBoolNotStep(program, like_reg, res_idx))
+				return -1;
+			return res_idx;
+		}
 
 		if (left_type == DATEOID &&
 			IsDateLikeType(right_type) &&
@@ -1535,6 +1796,14 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 							   &registers_nulls[res + i], &registers_i32[res + i]);
 				}
 				break;
+			case VecOpCode::EEOP_NOT:
+				for (int i = 0; i < chunk.count; i++)
+				{
+					registers_nulls[res + i] = registers_nulls[l + i];
+					registers_i32[res + i] =
+						registers_nulls[l + i] ? 0 : (registers_i32[l + i] == 0);
+				}
+				break;
 			case VecOpCode::EEOP_INT64_CASE:
 			{
 				int c = step.d.ternary.cond * DEFAULT_CHUNK_SIZE;
@@ -1604,6 +1873,20 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 						registers_nulls[res + i] = chunk.nulls[att][i];
 						registers_i32[res + i] = !registers_nulls[res + i] &&
 							StringConstContains(chunk, *this, ref, step);
+					}
+					break;
+				}
+			case VecOpCode::EEOP_STR_LIKE_PATTERN:
+				{
+					int att = step.d.str_prefix.att_idx;
+
+					for (int i = 0; i < chunk.count; i++)
+					{
+						VecStringRef ref = chunk.string_columns[att][i];
+
+						registers_nulls[res + i] = chunk.nulls[att][i];
+						registers_i32[res + i] = !registers_nulls[res + i] &&
+							StringConstLikePattern(chunk, *this, ref, step);
 					}
 					break;
 				}

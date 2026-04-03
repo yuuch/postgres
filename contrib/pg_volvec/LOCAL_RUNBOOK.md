@@ -52,6 +52,22 @@ meson compile -C build pg_volvec
 meson install -C build --only-changed
 ```
 
+### 推荐的重装与重启顺序
+
+这台机器上，安装和重启不要并行做。一个稳妥顺序是：
+
+```bash
+meson compile -C build pg_volvec
+meson install -C build --only-changed
+./installed/bin/pg_ctl -D ~/data/pg_tpch restart -m fast
+```
+
+如果需要把 `elog(LOG)` 稳定打到文件里，当前本地更稳的方式是显式带 `-l` 重启：
+
+```bash
+./installed/bin/pg_ctl -D ~/data/pg_tpch restart -m fast -l ~/data/pg_tpch/logfile
+```
+
 ### 关键安装产物
 
 ```text
@@ -230,7 +246,7 @@ lldb -p <backend_pid>
 
 ### 已验证 offload 的 TPC-H 查询
 
-当前本地 `~/data/pg_tpch` 上已验证的查询共有 14 条：
+当前本地 `~/data/pg_tpch` 上，已经与原生结果逐项对齐的 offload 查询有 17 条：
 
 - Q1
 - Q3
@@ -245,7 +261,15 @@ lldb -p <backend_pid>
 - Q12
 - Q14
 - Q15
+- Q16
+- Q18
 - Q19
+- Q22
+
+另外两条已经确认会真正 offload，但验证边界还更窄：
+
+- Q2：当前 live 数据集上的 full native diff 还没补完，因为原生查询较慢
+- Q17：TPCH 大表上已确认 offload，小表 exact check 已对齐，但 full native TPCH-side diff 还没补完
 
 ### 当前计划支持边界
 
@@ -260,12 +284,13 @@ lldb -p <backend_pid>
   - inner `HashJoin`
   - `SubqueryScan`
   - `MergeJoin` 计划形状的 hash-backed fallback
+  - Q22 当前用到的 right anti 计划形状的 hash-backed fallback
 - 仍未完成：
   - outer join
-  - semi/anti join
+  - 真正的 nested-loop / merge-based semi/anti join
   - `Materialize`
   - `Gather`
-  - `count(distinct ...)`
+  - 更广的 `count(distinct ...)`
   - 真正的 vectorized merge join
 
 当前 `Sort` 仍然是第一版实现：
@@ -317,7 +342,7 @@ TPC-H 常见 `NUMERIC(15,2)` 现在走：
 - 内联了 `scale=2` numeric fast path
 - 可以自动装载 `llvmjit` provider
 
-#### 4. JIT expr
+#### 5. JIT expr
 
 `VecExprProgram` 当前依然先 lowering 成线性 step IR，但热路径已经不是解释器了。
 
@@ -342,7 +367,7 @@ res[i] = tmp[i] * c[i]
 
 ### 正确性验证
 
-当前已验证的 14 条 TPC-H 查询都和原生 PostgreSQL 结果对齐：
+当前已验证对齐的 17 条 TPC-H 查询都和原生 PostgreSQL 结果对齐：
 
 - Q1
 - Q3
@@ -357,7 +382,10 @@ res[i] = tmp[i] * c[i]
 - Q12
 - Q14
 - Q15
+- Q16
+- Q18
 - Q19
+- Q22
 
 ### 当前本地性能结果
 
@@ -398,8 +426,8 @@ res[i] = tmp[i] * c[i]
 
 如果下一步继续做，优先级建议是：
 
-1. Q18：扩 grouped aggregation 超过 4 个 group key 的限制
-2. Q18：验证 `sum(l_quantity) > 300` 的 aggregate subquery 路径
-3. outer join / semi / anti join，这会决定 Q13 / Q16 / Q20 / Q21 / Q22 的推进速度
-4. `count(distinct ...)`
+1. Q20：补 hash-backed `Nested Loop` / `Semi Join`，或者真正的 vectorized nested-loop 家族
+2. Q20：把相关标量 lookup 扩到双键及更多键
+3. 修复当前本地 `tpch` 库里缺失的 `orders` / `customer` 列，这会决定 Q13 / Q21 能不能变成真实 executor 目标
+4. 把 `count(distinct ...)` 从当前已验证的标量-key 子集继续泛化
 5. 更完整的 benchmark / regression harness

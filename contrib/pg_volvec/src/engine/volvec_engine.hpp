@@ -605,12 +605,14 @@ enum class VecOpCode {
 	EEOP_INT32_EQ,
 	EEOP_AND,
 	EEOP_OR,
+	EEOP_NOT,
 	EEOP_INT64_CASE,
 	EEOP_FLOAT8_CASE,
 	EEOP_STR_EQ,
 	EEOP_STR_NE,
 	EEOP_STR_PREFIX_LIKE,
 	EEOP_STR_CONTAINS_LIKE,
+	EEOP_STR_LIKE_PATTERN,
 	EEOP_QUAL
 };
 struct VecExprStep {
@@ -724,11 +726,14 @@ private:
 				int32_max = v;
 			has_value = true;
 		}
+
+		using DistinctValueSet = VolVecHashMap<int64_t, char>;
+		DistinctValueSet *distinct_values = nullptr;
 	};
 		struct VecGroupKey {
-			uint64_t values[4];
-			uint32_t aux[4];
-			uint8_t is_null[4];
+			uint64_t values[kMaxDeformTargets];
+			uint32_t aux[kMaxDeformTargets];
+			uint8_t is_null[kMaxDeformTargets];
 			int num_cols;
 			bool operator==(const VecGroupKey& o) const {
 				if (num_cols != o.num_cols)
@@ -757,6 +762,21 @@ private:
 				return h;
 			}
 		};
+		struct VecSimpleGroupKey {
+			int64_t value = 0;
+			uint8_t is_null = 0;
+			bool operator==(const VecSimpleGroupKey& o) const {
+				return value == o.value && is_null == o.is_null;
+			}
+		};
+		struct VecSimpleGroupKeyHash {
+			std::size_t operator()(const VecSimpleGroupKey& k) const {
+				std::size_t h = std::hash<uint8_t>{}(k.is_null);
+				if (!k.is_null)
+					h ^= std::hash<int64_t>{}(k.value) + 0x9e3779b9 + (h << 6) + (h >> 2);
+				return h;
+			}
+		};
 	enum class VecAggType { SUM, COUNT, AVG, MAX };
 		struct VecAggDesc {
 			VecAggType type;
@@ -769,6 +789,7 @@ private:
 			Oid arg_type = InvalidOid;
 			int numeric_scale = 0;
 			bool use_exact_numeric = false;
+			bool is_distinct = false;
 		};
 		using VecAggAccumulatorList = VolVecVector<VecAggAccumulator>;
 		struct VecAggGroupState {
@@ -778,12 +799,17 @@ private:
 			bool has_rep_row = false;
 		};
 		using VecAggHashTable = VolVecHashMap<VecGroupKey, VecAggGroupState, VecGroupKeyHash>;
+		using VecAggSimpleHashTable = VolVecHashMap<VecSimpleGroupKey, VecAggGroupState, VecSimpleGroupKeyHash>;
 		DataChunk<DEFAULT_CHUNK_SIZE> *allocate_rep_chunk();
 		void copy_rep_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,
 						  const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row) const;
 		VolVecVector<VecAggDesc> aggs_; VecAggHashTable hash_table_;
+		VecAggSimpleHashTable simple_hash_table_;
 		VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> rep_chunks_;
 		VecAggHashTable::iterator it_;
+		VecAggSimpleHashTable::iterator simple_it_;
+		bool use_simple_group_key_ = false;
+		VecOutputStorageKind simple_group_storage_ = VecOutputStorageKind::Int32;
 		bool fully_scanned_ = false; void do_sink();
 	};
 
@@ -799,6 +825,109 @@ private:
 	std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
 };
 
+struct VecLookupScalarKey {
+	int64_t value = 0;
+	uint8_t is_null = 0;
+
+	bool operator==(const VecLookupScalarKey &other) const
+	{
+		return value == other.value && is_null == other.is_null;
+	}
+};
+
+struct VecLookupScalarKeyHash {
+	std::size_t operator()(const VecLookupScalarKey &key) const
+	{
+		std::size_t h = std::hash<uint8_t>{}(key.is_null);
+
+		if (!key.is_null)
+			h ^= std::hash<int64_t>{}(key.value) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		return h;
+	}
+};
+
+struct VecLookupScalarValue {
+	int32_t i32 = 0;
+	int64_t i64 = 0;
+	double f8 = 0.0;
+	uint8_t is_null = 1;
+};
+
+using VecLookupScalarHashTable =
+	VolVecHashMap<VecLookupScalarKey, VecLookupScalarValue, VecLookupScalarKeyHash>;
+
+class VecLookupProjectState : public VecPlanState {
+public:
+	VecLookupProjectState(std::unique_ptr<VecPlanState> left,
+						  std::unique_ptr<VecPlanState> lookup_source,
+						  uint16_t input_key_col,
+						  VecOutputColMeta input_key_meta,
+						  uint16_t lookup_key_col,
+						  VecOutputColMeta lookup_key_meta,
+						  uint16_t lookup_value_col,
+						  int output_resno,
+						  VecOutputColMeta output_meta);
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+private:
+	bool build_lookup();
+	bool extract_lookup_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
+							int row,
+							uint16_t col,
+							const VecOutputColMeta &meta,
+							VecLookupScalarKey *key) const;
+
+	std::unique_ptr<VecPlanState> left_;
+	std::unique_ptr<VecPlanState> lookup_source_;
+	MemoryContext memory_context_;
+	VecLookupScalarHashTable lookup_table_;
+	DataChunk<DEFAULT_CHUNK_SIZE> lookup_chunk_;
+	uint16_t input_key_col_;
+	VecOutputColMeta input_key_meta_;
+	uint16_t lookup_key_col_;
+	VecOutputColMeta lookup_key_meta_;
+	uint16_t lookup_value_col_;
+	int output_resno_;
+	VecOutputColMeta output_meta_;
+	bool lookup_built_;
+};
+
+class VecLookupFilterState : public VecPlanState {
+public:
+	VecLookupFilterState(std::unique_ptr<VecPlanState> left,
+						 std::unique_ptr<VecPlanState> lookup_source,
+						 uint16_t input_key_col,
+						 VecOutputColMeta input_key_meta,
+						 uint16_t lookup_key_col,
+						 VecOutputColMeta lookup_key_meta,
+						 bool negate);
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
+	{
+		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+	}
+private:
+	bool build_lookup();
+	bool extract_lookup_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
+							int row,
+							uint16_t col,
+							const VecOutputColMeta &meta,
+							VecLookupScalarKey *key) const;
+
+	std::unique_ptr<VecPlanState> left_;
+	std::unique_ptr<VecPlanState> lookup_source_;
+	MemoryContext memory_context_;
+	VecLookupScalarHashTable lookup_table_;
+	DataChunk<DEFAULT_CHUNK_SIZE> lookup_chunk_;
+	uint16_t input_key_col_;
+	VecOutputColMeta input_key_meta_;
+	uint16_t lookup_key_col_;
+	VecOutputColMeta lookup_key_meta_;
+	bool negate_;
+	bool lookup_built_;
+	bool lookup_has_null_;
+};
+
 struct VecProjectColDesc {
 	std::unique_ptr<VecExprProgram> expr;
 	int target_resno;
@@ -806,7 +935,9 @@ struct VecProjectColDesc {
 	VecOutputStorageKind storage_kind;
 	int scale;
 	bool direct_var = false;
+	bool string_prefix_var = false;
 	uint16_t input_col = 0;
+	uint32_t string_prefix_len = 0;
 };
 
 class VecProjectState : public VecPlanState {
@@ -878,6 +1009,7 @@ class VecHashJoinState : public VecPlanState {
 public:
 	VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 					 std::unique_ptr<VecPlanState> inner,
+					 JoinType jointype,
 					 VolVecVector<VecJoinOutputCol> output_cols,
 					 VolVecVector<VecHashJoinKeyCol> key_cols);
 	~VecHashJoinState() override;
@@ -909,6 +1041,7 @@ public:
 
 		std::unique_ptr<VecPlanState> outer_;
 		std::unique_ptr<VecPlanState> inner_;
+		JoinType jointype_;
 		MemoryContext memory_context_;
 		VolVecVector<VecJoinOutputCol> output_cols_;
 		VolVecVector<VecHashJoinKeyCol> key_cols_;
@@ -916,6 +1049,7 @@ public:
 		VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> inner_chunks_;
 		VolVecVector<int32_t> bucket_heads_;
 		VolVecVector<VecHashEntry> entries_;
+		VolVecVector<uint8_t> inner_entry_matched_;
 	DataChunk<DEFAULT_CHUNK_SIZE> outer_chunk_;
 	VolVecVector<uint16_t> probe_rows_;
 	VolVecVector<VecHashJoinKey> probe_keys_;
@@ -925,6 +1059,9 @@ public:
 	VolVecVector<uint16_t> next_probe_sel_;
 	bool inner_built_;
 	bool probe_batch_ready_;
+	bool right_anti_marked_;
+	uint16_t anti_outer_pos_;
+	uint32_t right_anti_emit_pos_;
 	size_t bucket_mask_;
 };
 

@@ -9,12 +9,15 @@ The current code path is no longer just a skeleton. As of April 3, 2026, the fol
 - Single-table `SeqScan -> optional qual -> Agg` shapes run in `pg_volvec`.
 - `Sort`, `Limit`, `Hash Join`, and `SubqueryScan` wrappers are live in the current offload path.
 - `MergeJoin`-planned shapes can now be intercepted through a temporary hash-join-backed fallback.
+- Q22-style right-anti plans can now be intercepted through the current hash-backed anti path.
 - Tuple deform JIT works without manually `LOAD 'llvmjit'`; the provider is auto-loaded when needed.
 - Expression JIT is wired in and generates fused row loops instead of materializing intermediate vector temporaries.
 - `NUMERIC(15,2)` hot paths use scaled `int64`, while aggregation uses widened integer accumulation.
 - A first columnar `VecSortState` exists for in-memory final-result sorting.
+- Single-column `count(distinct ...)` for the currently validated scalar-key cases is live and verified through Q16.
+- Correlated scalar aggregate lookup is no longer limited to `Agg <- SeqScan`; Q2-style lookup over `Agg <- HashJoin` is now in place.
 
-### Verified offloaded TPC-H queries
+### Fully verified offloaded TPC-H queries
 
 - Q1
 - Q3
@@ -29,7 +32,19 @@ The current code path is no longer just a skeleton. As of April 3, 2026, the fol
 - Q12
 - Q14
 - Q15
+- Q16
+- Q18
 - Q19
+- Q22
+
+### Offloaded with narrower validation so far
+
+- Q2
+  - confirmed to offload on `~/data/pg_tpch`
+  - a full native diff on the current live dataset is still pending because the native query is slow
+- Q17
+  - confirmed to offload on `~/data/pg_tpch`
+  - exact semantics were checked on a reduced reproducer, while a full native TPCH-side diff is still pending
 
 For the workspace-validated build, install, startup, test, profile, and benchmark commands, see [LOCAL_RUNBOOK.md](LOCAL_RUNBOOK.md).
 
@@ -57,7 +72,7 @@ For the current full-Q1 shape, `pg_volvec` now keeps the aggregated result colum
 
 ### Join coverage
 
-`pg_volvec` now supports the current validated inner-join wave through a first vectorized `VecHashJoinState`. For queries planned as `MergeJoin`, the current implementation reuses that hash-join execution path to get the query offloaded and correct, while a true vectorized merge-join kernel remains future work.
+`pg_volvec` now supports the current validated inner-join wave through a first vectorized `VecHashJoinState`. For queries planned as `MergeJoin`, the current implementation reuses that hash-join execution path to get the query offloaded and correct, while a true vectorized merge-join kernel remains future work. Q22-style anti paths are also still running through a hash-backed fallback rather than a dedicated anti-join kernel.
 
 ### Fixed-point numeric execution
 
@@ -116,23 +131,17 @@ meson install -C build --only-changed
 - [page-wise-scan.md](page-wise-scan.md): page-wise scan design and current status
 - [TODO.md](TODO.md): next engineering steps
 
-## Next Likely Target
+## Next Likely Targets
 
-The next most attractive TPC-H candidate is Q18. With parallel disabled, the planner already rewrites it into a shape that is close to the current engine:
+The next most practical TPC-H target is Q20. On the current local `tpch` instance, the remaining blockers are now much clearer:
 
-- `Limit`
-- `Sort`
-- `GroupAggregate`
-- inner `HashJoin` chain
-- a `HashAggregate` subquery on `lineitem`
+- a hash-backed `Nested Loop` / `Semi Join` execution path, or a real vectorized nested-loop family
+- multi-key correlated scalar lookup, because the `0.5 * sum(l_quantity)` subquery is correlated on both `ps_partkey` and `ps_suppkey`
 
-The main remaining blockers look narrower than the other unsolved queries:
+Two other caveats matter for the current roadmap:
 
-- grouped aggregation with more than four group keys
-- finishing the current grouped-aggregate coverage on this wider target list
-- validating the `sum(l_quantity) > 300` subquery path end-to-end
-
-By comparison, Q13 and Q16 would first require larger new capability jumps such as outer joins, `count(distinct ...)`, and stronger anti-join support.
+- Q13 and Q21 are blocked by the live `tpch` schema itself, not just executor coverage. The local `orders` table is missing columns such as `o_comment` and `o_orderstatus`, and the local `customer` table is also trimmed.
+- `count(distinct ...)` is no longer an all-or-nothing blocker, but broader distinct coverage beyond the currently validated scalar-key cases is still future work.
 
 ## License
 

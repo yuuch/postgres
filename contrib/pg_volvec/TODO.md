@@ -12,13 +12,16 @@
   - `HashJoin`
   - `SubqueryScan`
   - `MergeJoin`-planned shapes via a temporary hash-join-backed fallback
+  - current Q22-style right-anti-planned shapes via a hash-backed fallback
 - Column pruning is implemented for scans and for per-side join materialization.
 - LLVM JIT deform is live, auto-loads the provider when needed, and now supports owned string storage too.
 - LLVM expression JIT is live and replaces the interpreter on supported programs.
 - Chunk-owned string storage is in place for correctness across join/agg/sort/output paths.
 - Fixed-point `NUMERIC(15,2)` hot paths use scaled `int64`, while aggregation uses widened accumulation.
 - Aggregation grouping is typed for integer/date/string keys instead of assuming string-only group keys.
-- Verified offloaded TPC-H queries on `~/data/pg_tpch`:
+- Single-column `count(distinct ...)` on the currently validated scalar-key path is live and was exercised by Q16.
+- Correlated scalar lookup now works not only for `Agg <- SeqScan`, but also for the current Q2-style `Agg <- HashJoin` path.
+- Fully verified offloaded TPC-H queries on `~/data/pg_tpch`:
   - Q1
   - Q3
   - Q4
@@ -32,16 +35,22 @@
   - Q12
   - Q14
   - Q15
+  - Q16
+  - Q18
   - Q19
+  - Q22
+- Offloaded with narrower validation so far:
+  - Q2
+  - Q17
 
 ## Near-Term Roadmap
 
-### 1. Finish The Next Query Wave
+### 1. Finish The Remaining Query Wave
 
-- [ ] Q18: lift grouped aggregation beyond the current 4-key `VecGroupKey` limit.
-- [ ] Q18: validate the `HashAggregate` subquery with `sum(l_quantity) > 300` end-to-end.
-- [ ] Q18: make sure the top `Limit -> Sort -> GroupAggregate -> HashJoin` chain can offload without planner-shape-specific hacks.
-- [ ] Re-check Q2 / Q13 / Q16 / Q17 / Q18 / Q20 / Q21 / Q22 after each capability bump to keep the next target honest.
+- [ ] Q20: add a hash-backed `Nested Loop` / `Semi Join` execution path, or a true vectorized nested-loop family.
+- [ ] Q20: support multi-key correlated scalar lookup, because the current subquery is correlated on both `ps_partkey` and `ps_suppkey`.
+- [ ] Re-check Q2 / Q17 / Q20 after each capability bump to keep the correlated-subquery path honest.
+- [ ] Restore the missing local `orders` / `customer` TPCH columns needed to make Q13 and Q21 meaningful targets again.
 
 ### 2. Join And Subquery Coverage
 
@@ -49,8 +58,8 @@
 - [ ] Support richer join filters on top of hash keys.
 - [ ] Decide when `MergeJoin` should keep using the temporary hash fallback versus needing a real vectorized merge kernel.
 - [ ] Add `Materialize` handling where planner output requires it.
-- [ ] Add real semi/anti join support instead of depending on planner rewrites.
-- [ ] Support outer-join-planned shapes, starting from the Q13-style right/left outer join family.
+- [ ] Add real semi/anti join support instead of depending on planner rewrites or hash-backed fallbacks.
+- [ ] Support outer-join-planned shapes, starting from the Q13-style right/left outer join family once the local schema is repaired.
 
 ### 3. Expression And Aggregation Fusion
 
@@ -74,6 +83,7 @@
 - [ ] Broaden `ScalarArrayOpExpr` coverage beyond the current constant-array subset.
 - [ ] Extend boolean and pattern support needed by the remaining TPC-H queries.
 - [ ] Generalize string sort coverage beyond the current in-memory owned-string path.
+- [ ] Broaden `count(distinct ...)` beyond the current validated single-column scalar-key cases.
 
 ### 6. Quality
 

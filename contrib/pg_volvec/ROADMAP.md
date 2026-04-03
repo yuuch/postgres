@@ -12,6 +12,7 @@ This document describes a realistic path from the current `pg_volvec` prototype 
   - inner `HashJoin` chains
   - `SubqueryScan`
   - `MergeJoin`-planned shapes through a temporary hash-backed fallback
+  - current Q22-style right-anti-planned shapes through a hash-backed fallback
 - Verified offloaded queries:
   - Q1
   - Q3
@@ -26,7 +27,13 @@ This document describes a realistic path from the current `pg_volvec` prototype 
   - Q12
   - Q14
   - Q15
+  - Q16
+  - Q18
   - Q19
+  - Q22
+- Offloaded with narrower validation so far:
+  - Q2
+  - Q17
 - Verified capabilities:
   - vectorized `SeqScan`, `Filter`, grouped `Agg`
   - first-cut vectorized in-memory `Sort`
@@ -36,6 +43,8 @@ This document describes a realistic path from the current `pg_volvec` prototype 
   - expression JIT with fused row loops
   - fixed-point `NUMERIC(15,2)` hot path
   - owned-string storage across join/agg/sort/output
+  - single-column `count(distinct ...)` on the currently validated scalar-key path
+  - correlated scalar lookup beyond `Agg <- SeqScan`, including the current Q2-style `Agg <- HashJoin` case
 
 ### Local checkpoints
 
@@ -61,13 +70,13 @@ These numbers are local engineering checkpoints, not broad claims:
 ### Main current limitations
 
 - No true outer join support
-- No true semi / anti join execution
-- No `count(distinct ...)`
+- No true nested-loop-based semi / anti join execution
+- No broad `count(distinct ...)` coverage beyond the current validated scalar-key cases
 - No `Materialize` or broader plan-node coverage around rescan-heavy shapes
 - No direct aggregate fusion of `sum(expr)` / `avg(expr)`
 - Current `Sort` is still a first-cut single-run in-memory implementation
 - `MergeJoin` is still executed through a hash-backed fallback, not a true merge kernel
-- Grouped aggregation still has some width limits and rewrite special cases
+- Q13 and Q21 are currently blocked by the live `tpch` schema missing columns in `orders` / `customer`
 
 ## Roadmap Principles
 
@@ -95,33 +104,31 @@ Turn the current working wave into a cleaner, better-instrumented base before th
 - Makes Q1/Q6/Q14/Q12-style paths more stable and easier to extend.
 - Reduces the amount of one-off query-specific cleanup before the next wave.
 
-## Phase 2: Q18
+## Phase 2: Q20 And Schema Repair
 
 ### Goal
 
-Unlock Q18 as the next best planner shape after the current validated set.
+Unlock the next practical query family after the current validated set, and remove environment blockers for the remaining outer-join wave.
 
-### Why Q18 is next
+### Why this is next
 
-With parallel disabled, Q18 already plans into a shape close to the current engine:
+Q18 is already done. The next real query gap is Q20, whose remaining blockers are now narrow enough to name precisely:
 
-- `Limit`
-- `GroupAggregate`
-- `Sort`
-- inner `HashJoin` chain
-- `HashAggregate` subquery on `lineitem`
+- a hash-backed `Nested Loop` / `Semi Join` execution path, or a real vectorized nested-loop family
+- multi-key correlated scalar lookup because the scalar subquery depends on both `ps_partkey` and `ps_suppkey`
 
-It avoids the bigger new capability jumps needed by outer-join and distinct-heavy queries.
+In parallel, Q13 and Q21 cannot be used as honest executor milestones until the local `tpch` schema is repaired.
 
 ### Tasks
 
-- [ ] Lift grouped aggregation beyond the current 4-key `VecGroupKey` limit.
-- [ ] Validate the `HashAggregate` subquery with `sum(l_quantity) > 300`.
-- [ ] Make sure the top `Limit -> Sort -> GroupAggregate -> HashJoin` stack works without query-specific hacks.
+- [ ] Add a hash-backed `Nested Loop` / `Semi Join` path suitable for Q20, or a real vectorized nested-loop family.
+- [ ] Extend correlated scalar lookup to multi-key correlation.
+- [ ] Repair the local `orders` / `customer` TPCH schema so Q13 and Q21 are meaningful targets again.
 
 ### TPC-H impact
 
-- Q18 becomes the next concrete query unlocked.
+- Q20 becomes the next concrete query unlock.
+- Q13 / Q21 stop being blocked by environment drift.
 
 ## Phase 3: Outer Join And Distinct Wave
 
@@ -132,18 +139,15 @@ Unlock the remaining families blocked mainly by outer joins, distinct, and anti-
 ### Candidate queries
 
 - Q13
-- Q16
-- Q17
 - Q20
 - Q21
-- Q22
 
 ### Required features
 
 - outer join support
 - semi / anti join support
 - stronger subquery support
-- `count(distinct ...)`
+- broader `count(distinct ...)`
 
 ## Phase 4: Broaden Boolean Logic And Join Semantics
 
@@ -180,10 +184,9 @@ Close the remaining gaps after Q18, outer joins, distinct, and stronger subquery
 
 ### Candidate queries
 
-- Q2
-- Q13
-- Q16
-- Q22
+- Q2 full native diff closure on the live dataset
+- Q17 full native TPCH-side diff closure
+- residual hard cases after Q20 / Q13 / Q21
 
 ## Cross-Cutting Priorities
 
@@ -225,10 +228,10 @@ These may matter later, but they should not distort the near-term roadmap:
 
 ## Recommended Next Step
 
-If work resumes immediately after this document, the highest-value next milestone is Q18:
+If work resumes immediately after this document, the highest-value next milestone is Q20:
 
-1. extend grouped aggregation beyond four key columns
-2. validate the `sum(l_quantity) > 300` aggregate subquery path
-3. keep the existing `Limit -> Sort -> GroupAggregate -> HashJoin` stack composable
+1. add a hash-backed `Nested Loop` / `Semi Join` path, or a real vectorized nested-loop family
+2. extend correlated scalar lookup to multi-key correlation
+3. repair the local TPCH schema so Q13 and Q21 stop being blocked by environment drift
 
 That ordering stays close to the next real query unlock instead of drifting into abstract executor work.
