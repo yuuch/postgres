@@ -304,6 +304,74 @@ MatchStringPrefixExpr(Expr *expr, uint16_t *input_col, uint32_t *prefix_len)
 }
 
 static void
+RecomputeProgramResultScales(VecExprProgram *program)
+{
+	auto clamp_scale = [](int scale) {
+		if (scale < 0)
+			return 0;
+		if (scale > 18)
+			return 18;
+		return scale;
+	};
+
+	if (program == nullptr)
+		return;
+
+	for (const auto &step : program->steps)
+	{
+		int scale;
+
+		switch (step.opcode)
+		{
+			case VecOpCode::EEOP_INT64_ADD:
+			case VecOpCode::EEOP_INT64_SUB:
+			case VecOpCode::EEOP_INT64_LT:
+			case VecOpCode::EEOP_INT64_LE:
+			case VecOpCode::EEOP_INT64_GT:
+			case VecOpCode::EEOP_INT64_GE:
+			case VecOpCode::EEOP_INT64_EQ:
+				scale = Max(program->get_register_scale(step.d.op.left),
+							program->get_register_scale(step.d.op.right));
+				program->set_register_scale(step.res_idx, scale);
+				break;
+			case VecOpCode::EEOP_INT64_MUL:
+				scale = clamp_scale(program->get_register_scale(step.d.op.left) +
+								   program->get_register_scale(step.d.op.right));
+				program->set_register_scale(step.res_idx, scale);
+				break;
+			case VecOpCode::EEOP_INT64_CASE:
+				scale = Max(program->get_register_scale(step.d.ternary.if_true),
+							program->get_register_scale(step.d.ternary.if_false));
+				program->set_register_scale(step.res_idx, scale);
+				break;
+			case VecOpCode::EEOP_FLOAT8_ADD:
+			case VecOpCode::EEOP_FLOAT8_SUB:
+			case VecOpCode::EEOP_FLOAT8_MUL:
+			case VecOpCode::EEOP_INT64_DIV_FLOAT8:
+			case VecOpCode::EEOP_FLOAT8_LT:
+			case VecOpCode::EEOP_FLOAT8_GT:
+			case VecOpCode::EEOP_FLOAT8_LE:
+			case VecOpCode::EEOP_FLOAT8_GE:
+			case VecOpCode::EEOP_FLOAT8_CASE:
+			case VecOpCode::EEOP_DATE_LT:
+			case VecOpCode::EEOP_DATE_LE:
+			case VecOpCode::EEOP_DATE_GE:
+			case VecOpCode::EEOP_AND:
+			case VecOpCode::EEOP_OR:
+			case VecOpCode::EEOP_STR_EQ:
+			case VecOpCode::EEOP_STR_NE:
+			case VecOpCode::EEOP_STR_PREFIX_LIKE:
+			case VecOpCode::EEOP_DATE_PART_YEAR:
+			case VecOpCode::EEOP_QUAL:
+				program->set_register_scale(step.res_idx, 0);
+				break;
+			default:
+				break;
+		}
+	}
+}
+
+static void
 AdjustProgramVarScales(VecExprProgram *program, VecPlanState *input_state)
 {
 	bool changed = false;
@@ -342,6 +410,8 @@ AdjustProgramVarScales(VecExprProgram *program, VecPlanState *input_state)
 
 	if (!changed)
 		return;
+
+	RecomputeProgramResultScales(program);
 
 #ifdef USE_LLVM
 	if (program->jit_context != nullptr)
@@ -1306,6 +1376,7 @@ VecSeqScanState::VecSeqScanState(Relation rel, Snapshot snapshot, const DeformPr
 	 * custom loop never wraps back around to block 0.
 	 */
 	scan_ = (HeapScanDesc) heap_beginscan(rel_, snapshot_, 0, NULL, NULL, SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
+	stream_ = scan_->rs_read_stream;
 	current_buf_ = InvalidBuffer;
 	vmbuf_ = InvalidBuffer;
 	current_offnum_ = FirstOffsetNumber;
@@ -1325,6 +1396,8 @@ VecSeqScanState::VecSeqScanState(Relation rel, Snapshot snapshot, const DeformPr
 		elog(LOG, "pg_volvec: deform JIT disabled by GUC");
 	}
 #endif
+	if (pg_volvec_trace_hooks && stream_ != nullptr)
+		elog(LOG, "pg_volvec: VecSeqScanState using heap read_stream for scan prefetch");
 }
 
 VecSeqScanState::~VecSeqScanState() { 
@@ -1376,15 +1449,25 @@ bool VecSeqScanState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 
 	while (chunk.count < DEFAULT_CHUNK_SIZE) {
 		if (current_buf_ == InvalidBuffer) {
-			if (scan_->rs_cblock == InvalidBlockNumber) {
-				scan_->rs_cblock = scan_->rs_startblock;
+			if (stream_ != nullptr) {
+				current_buf_ = read_stream_next_buffer(stream_, NULL);
+				if (!BufferIsValid(current_buf_))
+					break;
+				scan_->rs_cblock = BufferGetBlockNumber(current_buf_);
 			} else {
-				scan_->rs_cblock++;
+				if (scan_->rs_cblock == InvalidBlockNumber) {
+					scan_->rs_cblock = scan_->rs_startblock;
+				} else {
+					scan_->rs_cblock++;
+				}
+
+				if (scan_->rs_cblock >= scan_->rs_nblocks)
+					break;
+
+				current_buf_ = ReadBufferExtended(rel_, MAIN_FORKNUM, scan_->rs_cblock,
+												 RBM_NORMAL, scan_->rs_strategy);
 			}
 
-			if (scan_->rs_cblock >= scan_->rs_nblocks) break;
-
-			current_buf_ = ReadBufferExtended(rel_, MAIN_FORKNUM, scan_->rs_cblock, RBM_NORMAL, scan_->rs_strategy);
 			LockBuffer(current_buf_, BUFFER_LOCK_SHARE);
 			current_offnum_ = FirstOffsetNumber;
 

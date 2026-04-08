@@ -249,6 +249,52 @@ IsDateLikeType(Oid type)
 }
 
 static bool
+ExprProducesFloat8Result(Expr *expr)
+{
+	OpExpr *op;
+	Expr *left_expr;
+	Expr *right_expr;
+	Oid left_type;
+	Oid right_type;
+	char *opname;
+
+	expr = StripImplicitNodes(expr);
+	if (expr == nullptr)
+		return false;
+	if (exprType((Node *) expr) == FLOAT8OID)
+		return true;
+	if (!IsA(expr, OpExpr))
+		return false;
+
+	op = (OpExpr *) expr;
+	if (list_length(op->args) != 2)
+		return false;
+
+	left_expr = StripImplicitNodes((Expr *) linitial(op->args));
+	right_expr = StripImplicitNodes((Expr *) lsecond(op->args));
+	if (left_expr == nullptr || right_expr == nullptr)
+		return false;
+
+	left_type = exprType((Node *) left_expr);
+	right_type = exprType((Node *) right_expr);
+	opname = get_opname(op->opno);
+	if (opname == nullptr)
+		return false;
+
+	if (strcmp(opname, "/") == 0 &&
+		IsInt64LikeType(left_type) && IsInt64LikeType(right_type))
+		return true;
+
+	if ((strcmp(opname, "+") == 0 ||
+		 strcmp(opname, "-") == 0 ||
+		 strcmp(opname, "*") == 0) &&
+		(ExprProducesFloat8Result(left_expr) || ExprProducesFloat8Result(right_expr)))
+		return true;
+
+	return false;
+}
+
+static bool
 IsValidNumericTypmod(int32 typmod)
 {
 	return typmod >= (int32) VARHDRSZ;
@@ -1472,7 +1518,21 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 		step.res_idx = res_idx;
 		step.d.op.left = left;
 		step.d.op.right = right;
-		if (!ResolveBinaryOpcode(opname, left_type, right_type, &step.opcode))
+		if ((strcmp(opname, "+") == 0 ||
+			 strcmp(opname, "-") == 0 ||
+			 strcmp(opname, "*") == 0) &&
+			(ExprProducesFloat8Result(left_expr) || ExprProducesFloat8Result(right_expr)) &&
+			((left_type == FLOAT8OID || IsInt64LikeType(left_type)) &&
+			 (right_type == FLOAT8OID || IsInt64LikeType(right_type))))
+		{
+			if (strcmp(opname, "+") == 0)
+				step.opcode = VecOpCode::EEOP_FLOAT8_ADD;
+			else if (strcmp(opname, "-") == 0)
+				step.opcode = VecOpCode::EEOP_FLOAT8_SUB;
+			else
+				step.opcode = VecOpCode::EEOP_FLOAT8_MUL;
+		}
+		else if (!ResolveBinaryOpcode(opname, left_type, right_type, &step.opcode))
 			return -1;
 
 		program.set_register_scale(

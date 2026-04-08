@@ -95,7 +95,9 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 							double fval = batch->double_columns[j][i];
 							int64_t ival = batch->int64_columns[j][i];
 
-							if (has_meta && col_meta.storage_kind == pg_volvec::VecOutputStorageKind::NumericScaledInt64)
+							if (has_meta && col_meta.storage_kind == pg_volvec::VecOutputStorageKind::Double)
+								slot->tts_values[j] = DirectFunctionCall1(float8_numeric, Float8GetDatum(fval));
+							else if (has_meta && col_meta.storage_kind == pg_volvec::VecOutputStorageKind::NumericScaledInt64)
 								slot->tts_values[j] = int64_scaled_to_numeric(ival, col_meta.scale);
 							else if (has_meta && col_meta.storage_kind == pg_volvec::VecOutputStorageKind::NumericAvgPair)
 								slot->tts_values[j] = scaled_avg_to_numeric(ival, col_meta.scale, (int64_t) batch->double_columns[j][i]);
