@@ -1,0 +1,22 @@
+query	native_seconds	volvec_seconds	source
+q1	22.941	6.048	2026-04-08 full sweep
+q2	180.000	180.000	2026-04-08 full sweep timeout cap
+q3	8.627	5.939	2026-04-08 full sweep
+q4	16.508	11.341	2026-04-08 full sweep
+q5	8.123	5.832	2026-04-08 full sweep
+q6	4.860	4.830	2026-04-09 alternating median
+q7	7.333	5.512	2026-04-08 full sweep
+q8	8.410	6.156	2026-04-08 full sweep
+q9	18.750	13.840	2026-04-08 full sweep
+q10	8.672	6.464	2026-04-08 full sweep
+q11	1.112	0.922	2026-04-08 full sweep
+q12	8.315	5.467	2026-04-08 full sweep
+q13	11.288	5.508	2026-04-08 full sweep
+q14	5.100	5.020	2026-04-09 alternating median
+q15	9.940	9.830	2026-04-09 alternating median
+q16	4.074	1.725	2026-04-08 full sweep
+q17	180.000	14.808	2026-04-08 full sweep timeout cap
+q18	45.517	21.732	2026-04-08 full sweep
+q19	5.700	5.110	2026-04-09 alternating median
+q20	180.000	58.487	2026-04-08 full sweep timeout cap
+q22	3.224	1.751	2026-04-08 full sweep

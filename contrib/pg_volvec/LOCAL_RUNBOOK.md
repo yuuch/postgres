@@ -246,7 +246,7 @@ lldb -p <backend_pid>
 
 ### 已验证 offload 的 TPC-H 查询
 
-当前本地 `~/data/pg_tpch` 上，已经与原生结果逐项对齐的 offload 查询有 17 条：
+当前本地 `~/data/pg_tpch` 上，已经与原生结果逐项对齐的 offload 查询有 18 条：
 
 - Q1
 - Q3
@@ -259,11 +259,13 @@ lldb -p <backend_pid>
 - Q10
 - Q11
 - Q12
+- Q13
 - Q14
 - Q15
 - Q16
 - Q18
 - Q19
+- Q20
 - Q22
 
 另外两条已经确认会真正 offload，但验证边界还更窄：
@@ -282,11 +284,12 @@ lldb -p <backend_pid>
   - `Sort`
   - `Limit`
   - inner `HashJoin`
+  - Q13 当前用到的 right/left outer hash join 子集
   - `SubqueryScan`
   - `MergeJoin` 计划形状的 hash-backed fallback
   - Q22 当前用到的 right anti 计划形状的 hash-backed fallback
 - 仍未完成：
-  - outer join
+  - 更广的 outer join
   - 真正的 nested-loop / merge-based semi/anti join
   - `Materialize`
   - `Gather`
@@ -367,7 +370,7 @@ res[i] = tmp[i] * c[i]
 
 ### 正确性验证
 
-当前已验证对齐的 17 条 TPC-H 查询都和原生 PostgreSQL 结果对齐：
+当前已验证对齐的 18 条 TPC-H 查询都和原生 PostgreSQL 结果对齐：
 
 - Q1
 - Q3
@@ -380,12 +383,15 @@ res[i] = tmp[i] * c[i]
 - Q10
 - Q11
 - Q12
+- Q13
 - Q14
 - Q15
 - Q16
 - Q18
 - Q19
 - Q22
+
+另外，Q21 当前已经能在本地 `~/data/pg_tpch` 上真正 offload 并跑完，但还没有做成和上面 18 条同等级的完整验证闭环；后续也不再把它当成默认的下一条执行器目标。当前判断更偏向于：Q21 在本地主要受 PostgreSQL 对多表 join 加子链接形状的计划质量影响，而不是首先受 `pg_volvec` 执行器能力限制。
 
 ### 当前本地性能结果
 
@@ -426,8 +432,8 @@ res[i] = tmp[i] * c[i]
 
 如果下一步继续做，优先级建议是：
 
-1. Q20：补 hash-backed `Nested Loop` / `Semi Join`，或者真正的 vectorized nested-loop 家族
-2. Q20：把相关标量 lookup 扩到双键及更多键
-3. 修复当前本地 `tpch` 库里缺失的 `orders` / `customer` 列，这会决定 Q13 / Q21 能不能变成真实 executor 目标
+1. 继续收 Q1 / Q6 / Q10 / Q12 / Q14 这些已验证路径的性能热点
+2. 继续收 Q2 / Q17 的完整 live-dataset validation closure
+3. 建更完整的 benchmark / regression harness
 4. 把 `count(distinct ...)` 从当前已验证的标量-key 子集继续泛化
-5. 更完整的 benchmark / regression harness
+5. 对 Q21 保持“已能 offload、但暂不继续追执行器”的判断，除非后面 planner 形状先变得更合理

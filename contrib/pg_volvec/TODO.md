@@ -10,6 +10,7 @@
   - in-memory final `Sort`
   - constant-count `Limit`
   - `HashJoin`
+  - current hash-backed right/left outer join family
   - `SubqueryScan`
   - `MergeJoin`-planned shapes via a temporary hash-join-backed fallback
   - current Q22-style right-anti-planned shapes via a hash-backed fallback
@@ -33,33 +34,35 @@
   - Q10
   - Q11
   - Q12
+  - Q13
   - Q14
   - Q15
   - Q16
   - Q18
   - Q19
+  - Q20
   - Q22
 - Offloaded with narrower validation so far:
   - Q2
   - Q17
+  - Q21
 
 ## Near-Term Roadmap
 
-### 1. Finish The Remaining Query Wave
+### 1. Stabilize The Current Query Wave
 
-- [ ] Q20: add a hash-backed `Nested Loop` / `Semi Join` execution path, or a true vectorized nested-loop family.
-- [ ] Q20: support multi-key correlated scalar lookup, because the current subquery is correlated on both `ps_partkey` and `ps_suppkey`.
 - [ ] Re-check Q2 / Q17 / Q20 after each capability bump to keep the correlated-subquery path honest.
-- [ ] Restore the missing local `orders` / `customer` TPCH columns needed to make Q13 and Q21 meaningful targets again.
+- [ ] Re-check Q13 after future join/filter rewrites so the new outer-join path stays honest.
+- [ ] Decide how much more Q21-specific work is justified once planner quality, not executor coverage, is the dominant issue on the local many-join-plus-sublink plan.
 
 ### 2. Join And Subquery Coverage
 
-- [ ] Broaden `HashJoin` beyond the current validated inner-join subset.
+- [ ] Broaden `HashJoin` beyond the current validated inner + first outer-join subset.
 - [ ] Support richer join filters on top of hash keys.
 - [ ] Decide when `MergeJoin` should keep using the temporary hash fallback versus needing a real vectorized merge kernel.
-- [ ] Add `Materialize` handling where planner output requires it.
 - [ ] Add real semi/anti join support instead of depending on planner rewrites or hash-backed fallbacks.
-- [ ] Support outer-join-planned shapes, starting from the Q13-style right/left outer join family once the local schema is repaired.
+- [ ] Broaden outer-join-planned shapes beyond the current Q13-style right/left hash-join subset.
+- [ ] Prefer planner-aware offload heuristics over deeper executor work when a query is mainly hurt by a bad PostgreSQL join or sublink plan.
 
 ### 3. Expression And Aggregation Fusion
 
@@ -70,6 +73,9 @@
 
 ### 4. Scan Path Improvements
 
+- [ ] **Parallel Deform Workers** remain deferred for now.
+  - Fresh flame graphs show scan I/O, expression evaluation, and string-heavy join paths dominating far ahead of deform itself.
+  - The current `DataChunk` / `MemoryContext` / owned-string model also does not map cleanly to the older shared-`DataChunk` sketch in `parallel_deformer.md`.
 - [ ] Add stronger `no-null` / fixed-layout deform specializations.
 - [ ] Explore page-level deform fusion instead of tuple-at-a-time JIT calls.
 - [ ] Decide how late materialization should interact with the current deform pipeline.
@@ -90,11 +96,13 @@
 - [ ] Build a repeatable local benchmark harness for the verified TPC-H set.
 - [ ] Add regression coverage for JIT-on and JIT-off correctness.
 - [ ] Improve fallback behavior reporting when a plan or expression is rejected.
+- [ ] Record Q21 as an offloaded-but-deprioritized shape so future work does not treat it as the default next executor milestone.
 
 ### 7. Deferred Query-Specific Optimization
 
 - [ ] Q14 follow-up: consider pushing `p_type LIKE 'PROMO%'` into a build-side flag so the join payload does not need to carry a string ref.
 - [ ] Q14 follow-up: keep investigating scan/read-path cost now that hash-build materialization is no longer the dominant hotspot.
 - [ ] Q10/Q12 follow-up: reduce string-heavy join/agg/sort overhead now that correctness is in place.
+- [x] Scan I/O checkpoint: `VecSeqScanState` now reuses heap `read_stream` for asynchronous prefetch instead of hand-rolled `ReadBufferExtended()` stepping.
 - [x] Q14 optimization checkpoint: per-side join pruning plus compact inner payload storage reduced deform targets from `16/9` to `4/2`.
 - [x] Q14 optimization checkpoint: local alternating benchmark moved from roughly `4.72s` native vs `5.84s-6.10s` `pg_volvec` to about `4.72s` native vs `3.83s` `pg_volvec`.

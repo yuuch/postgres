@@ -58,6 +58,12 @@ StripImplicitNodesLocal(Expr *expr)
 	return expr;
 }
 
+static bool
+IsInt64LikeTypeLocal(Oid type)
+{
+	return type == NUMERICOID || type == INT8OID || type == INT4OID || type == INT2OID;
+}
+
 struct TargetListRewriteContext
 {
 	List *targetlist;
@@ -330,6 +336,7 @@ RecomputeProgramResultScales(VecExprProgram *program)
 			case VecOpCode::EEOP_INT64_GT:
 			case VecOpCode::EEOP_INT64_GE:
 			case VecOpCode::EEOP_INT64_EQ:
+			case VecOpCode::EEOP_INT64_NE:
 				scale = Max(program->get_register_scale(step.d.op.left),
 							program->get_register_scale(step.d.op.right));
 				program->set_register_scale(step.res_idx, scale);
@@ -355,6 +362,7 @@ RecomputeProgramResultScales(VecExprProgram *program)
 			case VecOpCode::EEOP_FLOAT8_CASE:
 			case VecOpCode::EEOP_DATE_LT:
 			case VecOpCode::EEOP_DATE_LE:
+			case VecOpCode::EEOP_DATE_GT:
 			case VecOpCode::EEOP_DATE_GE:
 			case VecOpCode::EEOP_AND:
 			case VecOpCode::EEOP_OR:
@@ -520,7 +528,7 @@ ResolvePlanSourceAttno(Plan *plan, int target_resno, int *source_attno)
 				return false;
 
 				if (plan->lefttree != nullptr &&
-					(IsA(plan, Hash) || IsA(plan, Sort) || IsA(plan, Limit)))
+					(IsA(plan, Hash) || IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Material)))
 					return ResolvePlanSourceAttno(plan->lefttree, var->varattno, source_attno);
 				if (IsA(plan, SubqueryScan) &&
 					((SubqueryScan *) plan)->subplan != nullptr)
@@ -633,6 +641,84 @@ BuildCombinedQualExpr(List *joinqual, List *planqual)
 	if (quals == NIL)
 		return nullptr;
 	return (Expr *) make_ands_explicit(quals);
+}
+
+static int
+CountVisibleTargetEntries(List *targetlist)
+{
+	ListCell *lc;
+	int count = 0;
+
+	foreach(lc, targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (!tle->resjunk)
+			count++;
+	}
+	return count;
+}
+
+static bool
+ShouldSwapInnerJoinBuildSides(JoinType jointype, Plan *outer_plan, Plan *inner_plan)
+{
+	double outer_rows;
+	double inner_rows;
+
+	if (jointype != JOIN_INNER || outer_plan == nullptr || inner_plan == nullptr)
+		return false;
+	outer_rows = outer_plan->plan_rows;
+	inner_rows = inner_plan->plan_rows;
+	if (outer_rows <= 0 || inner_rows <= 0)
+		return false;
+	return outer_rows < inner_rows;
+}
+
+static bool
+ShouldBuildSmallerSide(Plan *outer_plan, Plan *inner_plan)
+{
+	double outer_rows;
+	double inner_rows;
+
+	if (outer_plan == nullptr || inner_plan == nullptr)
+		return false;
+	outer_rows = outer_plan->plan_rows;
+	inner_rows = inner_plan->plan_rows;
+	if (outer_rows <= 0 || inner_rows <= 0)
+		return false;
+	return outer_rows < inner_rows;
+}
+
+static bool
+RewriteSemiJoinVisibleInnerOutputsToOuterKeys(VolVecVector<VecJoinOutputCol> *output_cols,
+											  const VolVecVector<VecHashJoinKeyCol> &key_cols,
+											  int visible_output_count)
+{
+	if (output_cols == nullptr)
+		return false;
+
+	for (auto &output_col : *output_cols)
+	{
+		bool matched = false;
+
+		if (output_col.output_resno > visible_output_count ||
+			output_col.side != VecJoinSide::Inner)
+			continue;
+		for (const auto &key_col : key_cols)
+		{
+			if (key_col.inner_col != output_col.input_col)
+				continue;
+			output_col.side = VecJoinSide::Outer;
+			output_col.input_col = key_col.outer_col;
+			output_col.meta = VecOutputColMeta{output_col.meta.sql_type, key_col.kind, output_col.meta.scale};
+			matched = true;
+			break;
+		}
+		if (!matched)
+			return false;
+	}
+
+	return true;
 }
 
 static void
@@ -986,7 +1072,16 @@ void VecAggState::do_sink() {
 			if (aggs_[a].type == VecAggType::COUNT) {
 				if (!aggs_[a].is_distinct)
 				{
-					accs[a].count++;
+					if (!aggs_[a].arg_expr)
+					{
+						accs[a].count++;
+						continue;
+					}
+
+					int r = aggs_[a].arg_expr->final_res_idx;
+
+					if (r >= 0 && !aggs_[a].arg_expr->get_nulls_reg(r)[row_idx])
+						accs[a].count++;
 					continue;
 				}
 				if (!aggs_[a].arg_expr)
@@ -1694,6 +1789,201 @@ VecLookupProjectState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 	return false;
 }
 
+VecLookupProjectStateMultiKey::VecLookupProjectStateMultiKey(
+	std::unique_ptr<VecPlanState> left,
+	std::unique_ptr<VecPlanState> lookup_source,
+	int num_keys,
+	const uint16_t *input_key_cols,
+	const VecOutputColMeta *input_key_metas,
+	const uint16_t *lookup_key_cols,
+	const VecOutputColMeta *lookup_key_metas,
+	uint16_t lookup_value_col,
+	int output_resno,
+	VecOutputColMeta output_meta)
+	: left_(std::move(left)),
+	  lookup_source_(std::move(lookup_source)),
+	  memory_context_(CurrentMemoryContext),
+	  lookup_table_(0, VecLookupCompositeKeyHash{}, std::equal_to<VecLookupCompositeKey>{},
+					PgMemoryContextAllocator<std::pair<const VecLookupCompositeKey, VecLookupScalarValue>>(memory_context_)),
+	  num_keys_(num_keys),
+	  lookup_value_col_(lookup_value_col),
+	  output_resno_(output_resno),
+	  output_meta_(output_meta),
+	  lookup_built_(false)
+{
+	Assert(num_keys_ > 0 && num_keys_ <= kMaxLookupKeys);
+	for (int i = 0; i < kMaxLookupKeys; i++)
+	{
+		input_key_cols_[i] = 0;
+		input_key_metas_[i] = VecOutputColMeta{InvalidOid, VecOutputStorageKind::Int32, 0};
+		lookup_key_cols_[i] = 0;
+		lookup_key_metas_[i] = VecOutputColMeta{InvalidOid, VecOutputStorageKind::Int32, 0};
+	}
+	for (int i = 0; i < num_keys_; i++)
+	{
+		input_key_cols_[i] = input_key_cols[i];
+		input_key_metas_[i] = input_key_metas[i];
+		lookup_key_cols_[i] = lookup_key_cols[i];
+		lookup_key_metas_[i] = lookup_key_metas[i];
+	}
+}
+
+bool
+VecLookupProjectStateMultiKey::lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const
+{
+	if (target_resno == output_resno_)
+	{
+		if (out != nullptr)
+			*out = output_meta_;
+		return true;
+	}
+	return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+}
+
+bool
+VecLookupProjectStateMultiKey::extract_lookup_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
+												  int row,
+												  const uint16_t *cols,
+												  const VecOutputColMeta *metas,
+												  VecLookupCompositeKey *key) const
+{
+	if (key == nullptr)
+		return false;
+
+	key->num_keys = (uint8_t) num_keys_;
+	key->is_null = 0;
+	for (int i = 0; i < num_keys_; i++)
+	{
+		uint16_t col = cols[i];
+		const VecOutputColMeta &meta = metas[i];
+
+		key->values[i] = 0;
+		if (col >= 16)
+			return false;
+		if (chunk.nulls[col][row])
+		{
+			key->is_null = 1;
+			continue;
+		}
+
+		switch (meta.storage_kind)
+		{
+			case VecOutputStorageKind::Int32:
+				key->values[i] = (int64_t) chunk.int32_columns[col][row];
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+				key->values[i] = chunk.int64_columns[col][row];
+				break;
+			default:
+				return false;
+		}
+	}
+
+	return true;
+}
+
+bool
+VecLookupProjectStateMultiKey::build_lookup()
+{
+	if (lookup_built_)
+		return true;
+	if (lookup_source_ == nullptr)
+		return false;
+
+	while (lookup_source_->get_next_batch(lookup_chunk_))
+	{
+		int active_count = lookup_chunk_.has_selection ? lookup_chunk_.sel.count : lookup_chunk_.count;
+
+		for (int s = 0; s < active_count; s++)
+		{
+			int row = lookup_chunk_.has_selection ? lookup_chunk_.sel.row_ids[s] : s;
+			VecLookupCompositeKey key;
+			VecLookupScalarValue value;
+
+			if (!extract_lookup_key(lookup_chunk_, row, lookup_key_cols_, lookup_key_metas_, &key))
+				return false;
+			value.is_null = lookup_chunk_.nulls[lookup_value_col_][row] ? 1 : 0;
+			if (!value.is_null)
+			{
+				switch (output_meta_.storage_kind)
+				{
+					case VecOutputStorageKind::Int32:
+						value.i32 = lookup_chunk_.int32_columns[lookup_value_col_][row];
+						break;
+					case VecOutputStorageKind::Int64:
+					case VecOutputStorageKind::NumericScaledInt64:
+						value.i64 = lookup_chunk_.int64_columns[lookup_value_col_][row];
+						break;
+					case VecOutputStorageKind::Double:
+						value.f8 = lookup_chunk_.double_columns[lookup_value_col_][row];
+						break;
+					default:
+						return false;
+				}
+			}
+			lookup_table_[key] = value;
+		}
+	}
+
+	lookup_built_ = true;
+	return true;
+}
+
+bool
+VecLookupProjectStateMultiKey::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
+{
+	int out_col = output_resno_ - 1;
+
+	if (out_col < 0 || out_col >= 16)
+		return false;
+	if (!build_lookup())
+		return false;
+
+	while (left_->get_next_batch(chunk))
+	{
+		for (int row = 0; row < chunk.count; row++)
+		{
+			VecLookupCompositeKey key;
+			auto it = lookup_table_.end();
+
+			if (!extract_lookup_key(chunk, row, input_key_cols_, input_key_metas_, &key))
+				return false;
+			if (!key.is_null)
+				it = lookup_table_.find(key);
+			if (key.is_null || it == lookup_table_.end())
+			{
+				chunk.nulls[out_col][row] = 1;
+				continue;
+			}
+
+			chunk.nulls[out_col][row] = it->second.is_null;
+			if (chunk.nulls[out_col][row])
+				continue;
+			switch (output_meta_.storage_kind)
+			{
+				case VecOutputStorageKind::Int32:
+					chunk.int32_columns[out_col][row] = it->second.i32;
+					break;
+				case VecOutputStorageKind::Int64:
+				case VecOutputStorageKind::NumericScaledInt64:
+					chunk.int64_columns[out_col][row] = it->second.i64;
+					break;
+				case VecOutputStorageKind::Double:
+					chunk.double_columns[out_col][row] = it->second.f8;
+					break;
+				default:
+					return false;
+			}
+		}
+
+		if ((chunk.has_selection ? chunk.sel.count : chunk.count) > 0)
+			return true;
+	}
+
+	return false;
+}
+
 VecLookupFilterState::VecLookupFilterState(std::unique_ptr<VecPlanState> left,
 											 std::unique_ptr<VecPlanState> lookup_source,
 											 uint16_t input_key_col,
@@ -2051,11 +2341,14 @@ VecLimitState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 								   std::unique_ptr<VecPlanState> inner,
 								   JoinType jointype,
+								   bool build_outer_side,
+								   int visible_output_count,
 								   VolVecVector<VecJoinOutputCol> output_cols,
 								   VolVecVector<VecHashJoinKeyCol> key_cols)
 	: outer_(std::move(outer)),
 	  inner_(std::move(inner)),
 	  jointype_(jointype),
+	  visible_output_count_(visible_output_count),
 	  memory_context_(CurrentMemoryContext),
 	  output_cols_(PgMemoryContextAllocator<VecJoinOutputCol>(memory_context_)),
 	  key_cols_(PgMemoryContextAllocator<VecHashJoinKeyCol>(memory_context_)),
@@ -2072,21 +2365,39 @@ VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 		  next_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
 		  inner_built_(false),
 		  probe_batch_ready_(false),
-		  right_anti_marked_(false),
-		  anti_outer_pos_(0),
-		  right_anti_emit_pos_(0),
-		  bucket_mask_(0)
+		  probe_input_exhausted_(false),
+	  build_outer_side_(build_outer_side),
+	  join_filter_program_(nullptr),
+	  semi_build_marked_(false),
+	  semi_build_emit_pos_(0),
+	  anti_build_marked_(false),
+	  anti_build_emit_pos_(0),
+	  right_anti_marked_(false),
+	  anti_outer_pos_(0),
+	  right_anti_emit_pos_(0),
+	  bucket_mask_(0)
 {
+	Assert(!build_outer_side_ ||
+		   jointype_ == JOIN_INNER ||
+		   jointype_ == JOIN_SEMI ||
+		   jointype_ == JOIN_ANTI);
 	for (const auto &key_col : key_cols)
 		key_cols_.push_back(key_col);
 	for (const auto &output_col : output_cols)
 	{
 		VecJoinOutputCol remapped = output_col;
 
-		if (remapped.side == VecJoinSide::Inner)
+		if ((build_outer_side_ && remapped.side == VecJoinSide::Outer) ||
+			(!build_outer_side_ && remapped.side == VecJoinSide::Inner))
 			remapped.input_col = ensure_inner_payload_col(remapped.input_col, remapped.meta);
 		output_cols_.push_back(remapped);
 	}
+}
+
+void
+VecHashJoinState::set_join_filter_program(std::unique_ptr<VecExprProgram> program)
+{
+	join_filter_program_ = std::move(program);
 }
 
 VecHashJoinState::~VecHashJoinState()
@@ -2299,13 +2610,15 @@ void
 VecHashJoinState::build_inner_hash()
 {
 	DataChunk<DEFAULT_CHUNK_SIZE> input;
+	VecPlanState *build_state = build_outer_side_ ? outer_.get() : inner_.get();
+	bool build_is_inner = !build_outer_side_;
 
 	if (inner_built_)
 		return;
 
 	init_hash_table(DEFAULT_CHUNK_SIZE);
 
-	while (inner_->get_next_batch(input))
+	while (build_state->get_next_batch(input))
 	{
 		int active_count = input.has_selection ? input.sel.count : input.count;
 		DataChunk<DEFAULT_CHUNK_SIZE> *dst =
@@ -2317,7 +2630,7 @@ VecHashJoinState::build_inner_hash()
 			int dst_row;
 			VecHashJoinKey key;
 
-			if (!read_key(input, true, src_row, &key))
+			if (!read_key(input, build_is_inner, src_row, &key))
 				continue;
 			if (dst->count >= DEFAULT_CHUNK_SIZE)
 				dst = allocate_inner_chunk();
@@ -2337,7 +2650,9 @@ VecHashJoinState::build_inner_hash()
 bool
 VecHashJoinState::advance_outer_batch()
 {
-	while (outer_->get_next_batch(outer_chunk_))
+	VecPlanState *probe_state = build_outer_side_ ? inner_.get() : outer_.get();
+
+	while (probe_state->get_next_batch(outer_chunk_))
 	{
 		int active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
 
@@ -2345,8 +2660,10 @@ VecHashJoinState::advance_outer_batch()
 			continue;
 		anti_outer_pos_ = 0;
 		probe_batch_ready_ = false;
+		probe_input_exhausted_ = false;
 		return true;
 	}
+	probe_input_exhausted_ = true;
 	return false;
 }
 
@@ -2376,7 +2693,7 @@ VecHashJoinState::prepare_probe_batch()
 		int32_t head;
 		uint16_t probe_idx;
 
-		if (!read_key(outer_chunk_, false, row, &key))
+		if (!read_key(outer_chunk_, build_outer_side_, row, &key))
 			continue;
 
 		hash = hash_key(key);
@@ -2421,14 +2738,154 @@ VecHashJoinState::advance_probe_match(uint16_t probe_idx, int32_t *match_entry_i
 }
 
 bool
+VecHashJoinState::candidate_passes_join_filter(const DataChunk<DEFAULT_CHUNK_SIZE> &outer_src,
+											   int outer_row,
+											   const DataChunk<DEFAULT_CHUNK_SIZE> &inner_src,
+											   int inner_row)
+{
+	if (!join_filter_program_)
+		return true;
+
+	join_filter_chunk_.reset();
+	join_filter_chunk_.count = 1;
+	for (const auto &output_col : output_cols_)
+	{
+		int out_col = output_col.output_resno - 1;
+		const DataChunk<DEFAULT_CHUNK_SIZE> *src =
+			output_col.side == VecJoinSide::Outer ? &outer_src : &inner_src;
+		int src_row = output_col.side == VecJoinSide::Outer ? outer_row : inner_row;
+		int src_col = output_col.input_col;
+
+		join_filter_chunk_.nulls[out_col][0] = src->nulls[src_col][src_row];
+		if (join_filter_chunk_.nulls[out_col][0])
+			continue;
+		switch (output_col.meta.storage_kind)
+		{
+			case VecOutputStorageKind::Double:
+				join_filter_chunk_.double_columns[out_col][0] = src->double_columns[src_col][src_row];
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+			case VecOutputStorageKind::NumericAvgPair:
+				join_filter_chunk_.int64_columns[out_col][0] = src->int64_columns[src_col][src_row];
+				join_filter_chunk_.double_columns[out_col][0] = src->double_columns[src_col][src_row];
+				break;
+			case VecOutputStorageKind::StringRef:
+				join_filter_chunk_.string_columns[out_col][0] =
+					CopyStringRefToChunk(join_filter_chunk_, *src, src->string_columns[src_col][src_row]);
+				break;
+			case VecOutputStorageKind::Int32:
+				join_filter_chunk_.int32_columns[out_col][0] = src->int32_columns[src_col][src_row];
+				break;
+		}
+	}
+
+	join_filter_program_->evaluate(join_filter_chunk_);
+	return (join_filter_chunk_.has_selection ? join_filter_chunk_.sel.count : join_filter_chunk_.count) > 0;
+}
+
+bool
 VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 {
 	if (!inner_built_)
 		build_inner_hash();
 
 	chunk.reset();
+	auto copy_output_value = [&chunk](int dst_row,
+									 int out_col,
+									 const VecOutputColMeta &meta,
+									 const DataChunk<DEFAULT_CHUNK_SIZE> &src,
+									 int src_col,
+									 int src_row) {
+		chunk.nulls[out_col][dst_row] = src.nulls[src_col][src_row];
+		if (chunk.nulls[out_col][dst_row])
+			return;
+		switch (meta.storage_kind)
+		{
+			case VecOutputStorageKind::Double:
+				chunk.double_columns[out_col][dst_row] = src.double_columns[src_col][src_row];
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+			case VecOutputStorageKind::NumericAvgPair:
+				chunk.int64_columns[out_col][dst_row] = src.int64_columns[src_col][src_row];
+				chunk.double_columns[out_col][dst_row] = src.double_columns[src_col][src_row];
+				break;
+			case VecOutputStorageKind::StringRef:
+				chunk.string_columns[out_col][dst_row] =
+					CopyStringRefToChunk(chunk, src, src.string_columns[src_col][src_row]);
+				break;
+			case VecOutputStorageKind::Int32:
+				chunk.int32_columns[out_col][dst_row] = src.int32_columns[src_col][src_row];
+				break;
+		}
+	};
 	if (jointype_ == JOIN_ANTI)
 	{
+		if (build_outer_side_)
+		{
+			if (!anti_build_marked_)
+			{
+				while (advance_outer_batch())
+				{
+					int active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
+
+					for (int s = 0; s < active_count; s++)
+					{
+						int probe_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
+						VecHashJoinKey key;
+						uint32_t hash;
+						int32_t entry_idx;
+
+						if (!read_key(outer_chunk_, true, probe_row, &key))
+							continue;
+						hash = hash_key(key);
+						entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
+						while (entry_idx >= 0)
+						{
+							const VecHashEntry &entry = entries_[entry_idx];
+							const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk =
+								inner_chunks_[entry.chunk_idx];
+
+							if (entry.hash == hash &&
+								keys_equal(entry.key, key) &&
+								candidate_passes_join_filter(*build_chunk, entry.row_idx,
+															 outer_chunk_, probe_row))
+								inner_entry_matched_[entry_idx] = 1;
+							entry_idx = entry.next;
+						}
+					}
+				}
+				anti_build_marked_ = true;
+				anti_build_emit_pos_ = 0;
+			}
+
+			while (anti_build_emit_pos_ < entries_.size() &&
+				   chunk.count < DEFAULT_CHUNK_SIZE)
+			{
+				const VecHashEntry &entry = entries_[anti_build_emit_pos_];
+				const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk;
+
+				if (inner_entry_matched_[anti_build_emit_pos_++])
+					continue;
+				build_chunk = inner_chunks_[entry.chunk_idx];
+				for (const auto &output_col : output_cols_)
+				{
+					int out_col = output_col.output_resno - 1;
+
+					if (output_col.output_resno > visible_output_count_)
+						continue;
+					if (output_col.side != VecJoinSide::Outer)
+						elog(ERROR, "pg_volvec anti join build-outer path cannot expose inner columns");
+					copy_output_value(chunk.count, out_col, output_col.meta,
+									  *build_chunk, output_col.input_col, entry.row_idx);
+				}
+				chunk.count++;
+			}
+
+			return chunk.count > 0;
+		}
+
 		while (chunk.count < DEFAULT_CHUNK_SIZE)
 		{
 			int active_count;
@@ -2455,8 +2912,11 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					while (entry_idx >= 0)
 					{
 						const VecHashEntry &entry = entries_[entry_idx];
+						const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
 
-						if (entry.hash == hash && keys_equal(entry.key, key))
+						if (entry.hash == hash &&
+							keys_equal(entry.key, key) &&
+							candidate_passes_join_filter(outer_chunk_, outer_row, *inner_chunk, entry.row_idx))
 						{
 							has_match = true;
 							break;
@@ -2472,6 +2932,8 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					int out_col = output_col.output_resno - 1;
 					int src_col = output_col.input_col;
 
+					if (output_col.output_resno > visible_output_count_)
+						continue;
 					if (output_col.side != VecJoinSide::Outer)
 						elog(ERROR, "pg_volvec anti join does not support inner output columns");
 					chunk.nulls[out_col][chunk.count] = outer_chunk_.nulls[src_col][outer_row];
@@ -2513,6 +2975,201 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 
 		return chunk.count > 0;
 	}
+	if (jointype_ == JOIN_SEMI)
+	{
+		if (build_outer_side_)
+		{
+			if (!semi_build_marked_)
+			{
+				while (advance_outer_batch())
+				{
+					int active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
+
+					for (int s = 0; s < active_count; s++)
+					{
+						int probe_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
+						VecHashJoinKey key;
+						uint32_t hash;
+						int32_t entry_idx;
+
+						if (!read_key(outer_chunk_, true, probe_row, &key))
+							continue;
+						hash = hash_key(key);
+						entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
+						while (entry_idx >= 0)
+						{
+							const VecHashEntry &entry = entries_[entry_idx];
+							const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk = inner_chunks_[entry.chunk_idx];
+
+							if (entry.hash == hash &&
+								keys_equal(entry.key, key) &&
+								candidate_passes_join_filter(*build_chunk, entry.row_idx, outer_chunk_, probe_row))
+								inner_entry_matched_[entry_idx] = 1;
+							entry_idx = entry.next;
+						}
+					}
+				}
+				semi_build_marked_ = true;
+				semi_build_emit_pos_ = 0;
+			}
+
+			while (semi_build_emit_pos_ < entries_.size() && chunk.count < DEFAULT_CHUNK_SIZE)
+			{
+				const VecHashEntry &entry = entries_[semi_build_emit_pos_];
+				const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk;
+
+				if (!inner_entry_matched_[semi_build_emit_pos_++])
+					continue;
+				build_chunk = inner_chunks_[entry.chunk_idx];
+				for (const auto &output_col : output_cols_)
+				{
+					int out_col = output_col.output_resno - 1;
+					int src_col = output_col.input_col;
+
+					if (output_col.output_resno > visible_output_count_)
+						continue;
+					if (output_col.side != VecJoinSide::Outer)
+						elog(ERROR, "pg_volvec semi join build-outer path cannot expose unmatched inner columns");
+					chunk.nulls[out_col][chunk.count] = build_chunk->nulls[src_col][entry.row_idx];
+					if (chunk.nulls[out_col][chunk.count])
+						continue;
+					switch (output_col.meta.storage_kind)
+					{
+						case VecOutputStorageKind::Double:
+							chunk.double_columns[out_col][chunk.count] =
+								build_chunk->double_columns[src_col][entry.row_idx];
+							break;
+						case VecOutputStorageKind::Int64:
+						case VecOutputStorageKind::NumericScaledInt64:
+						case VecOutputStorageKind::NumericAvgPair:
+							chunk.int64_columns[out_col][chunk.count] =
+								build_chunk->int64_columns[src_col][entry.row_idx];
+							chunk.double_columns[out_col][chunk.count] =
+								build_chunk->double_columns[src_col][entry.row_idx];
+							break;
+						case VecOutputStorageKind::StringRef:
+							chunk.string_columns[out_col][chunk.count] =
+								CopyStringRefToChunk(chunk, *build_chunk,
+													 build_chunk->string_columns[src_col][entry.row_idx]);
+							break;
+						case VecOutputStorageKind::Int32:
+							chunk.int32_columns[out_col][chunk.count] =
+								build_chunk->int32_columns[src_col][entry.row_idx];
+							break;
+					}
+				}
+				chunk.count++;
+			}
+
+			return chunk.count > 0;
+		}
+
+		while (chunk.count < DEFAULT_CHUNK_SIZE)
+		{
+			int active_count;
+
+			if ((outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count) == 0 &&
+				!advance_outer_batch())
+				break;
+
+			active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
+			while (anti_outer_pos_ < active_count && chunk.count < DEFAULT_CHUNK_SIZE)
+			{
+				int outer_row = outer_chunk_.has_selection ?
+					outer_chunk_.sel.row_ids[anti_outer_pos_] : anti_outer_pos_;
+				VecHashJoinKey key;
+				bool has_match = false;
+				int32_t entry_idx = -1;
+				int32_t matched_entry_idx = -1;
+
+				anti_outer_pos_++;
+				if (read_key(outer_chunk_, false, outer_row, &key))
+				{
+					uint32_t hash = hash_key(key);
+
+					entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
+					while (entry_idx >= 0)
+					{
+						const VecHashEntry &entry = entries_[entry_idx];
+						const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
+
+						if (entry.hash == hash &&
+							keys_equal(entry.key, key) &&
+							candidate_passes_join_filter(outer_chunk_, outer_row, *inner_chunk, entry.row_idx))
+						{
+							has_match = true;
+							matched_entry_idx = entry_idx;
+							break;
+						}
+						entry_idx = entry.next;
+					}
+				}
+				if (!has_match)
+					continue;
+
+				for (const auto &output_col : output_cols_)
+				{
+					int out_col = output_col.output_resno - 1;
+					int src_col = output_col.input_col;
+					const VecHashEntry &matched_entry = entries_[matched_entry_idx];
+					const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk =
+						inner_chunks_[matched_entry.chunk_idx];
+
+					if (output_col.output_resno > visible_output_count_)
+						continue;
+					if (output_col.side == VecJoinSide::Outer)
+						chunk.nulls[out_col][chunk.count] = outer_chunk_.nulls[src_col][outer_row];
+					else
+						chunk.nulls[out_col][chunk.count] = inner_chunk->nulls[src_col][matched_entry.row_idx];
+					if (chunk.nulls[out_col][chunk.count])
+						continue;
+					switch (output_col.meta.storage_kind)
+					{
+						case VecOutputStorageKind::Double:
+							chunk.double_columns[out_col][chunk.count] =
+								(output_col.side == VecJoinSide::Outer) ?
+								outer_chunk_.double_columns[src_col][outer_row] :
+								inner_chunk->double_columns[src_col][matched_entry.row_idx];
+							break;
+						case VecOutputStorageKind::Int64:
+						case VecOutputStorageKind::NumericScaledInt64:
+						case VecOutputStorageKind::NumericAvgPair:
+							chunk.int64_columns[out_col][chunk.count] =
+								(output_col.side == VecJoinSide::Outer) ?
+								outer_chunk_.int64_columns[src_col][outer_row] :
+								inner_chunk->int64_columns[src_col][matched_entry.row_idx];
+							chunk.double_columns[out_col][chunk.count] =
+								(output_col.side == VecJoinSide::Outer) ?
+								outer_chunk_.double_columns[src_col][outer_row] :
+								inner_chunk->double_columns[src_col][matched_entry.row_idx];
+							break;
+						case VecOutputStorageKind::StringRef:
+							chunk.string_columns[out_col][chunk.count] =
+								(output_col.side == VecJoinSide::Outer) ?
+								CopyStringRefToChunk(chunk, outer_chunk_,
+													 outer_chunk_.string_columns[src_col][outer_row]) :
+								CopyStringRefToChunk(chunk, *inner_chunk,
+													 inner_chunk->string_columns[src_col][matched_entry.row_idx]);
+							break;
+						case VecOutputStorageKind::Int32:
+							chunk.int32_columns[out_col][chunk.count] =
+								(output_col.side == VecJoinSide::Outer) ?
+								outer_chunk_.int32_columns[src_col][outer_row] :
+								inner_chunk->int32_columns[src_col][matched_entry.row_idx];
+							break;
+					}
+				}
+				chunk.count++;
+			}
+
+			if (anti_outer_pos_ >= active_count)
+				outer_chunk_.reset();
+			if (chunk.count > 0)
+				return true;
+		}
+
+		return chunk.count > 0;
+	}
 	if (jointype_ == JOIN_RIGHT_ANTI)
 	{
 		if (!right_anti_marked_)
@@ -2535,8 +3192,11 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					while (entry_idx >= 0)
 					{
 						const VecHashEntry &entry = entries_[entry_idx];
+						const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
 
-						if (entry.hash == hash && keys_equal(entry.key, key))
+						if (entry.hash == hash &&
+							keys_equal(entry.key, key) &&
+							candidate_passes_join_filter(outer_chunk_, outer_row, *inner_chunk, entry.row_idx))
 							inner_entry_matched_[entry_idx] = 1;
 						entry_idx = entry.next;
 					}
@@ -2559,6 +3219,8 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				int out_col = output_col.output_resno - 1;
 				int src_col = output_col.input_col;
 
+				if (output_col.output_resno > visible_output_count_)
+					continue;
 				if (output_col.side != VecJoinSide::Inner)
 					elog(ERROR, "pg_volvec right anti join does not support outer output columns");
 				chunk.nulls[out_col][chunk.count] = inner_chunk->nulls[src_col][entry.row_idx];
@@ -2628,41 +3290,54 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
 				int outer_row = probe_rows_[probe_idx];
 				int dst_row = chunk.count++;
+				bool probe_is_outer = !build_outer_side_;
+
+				if (jointype_ == JOIN_RIGHT)
+					inner_entry_matched_[match_entry_idx] = 1;
 
 				for (const auto &output_col : output_cols_)
 				{
 					int out_col = output_col.output_resno - 1;
-					const DataChunk<DEFAULT_CHUNK_SIZE> *src =
-						(output_col.side == VecJoinSide::Outer) ? &outer_chunk_ : inner_chunk;
-					int src_row = (output_col.side == VecJoinSide::Outer) ? outer_row : entry.row_idx;
+					const DataChunk<DEFAULT_CHUNK_SIZE> *src;
+					int src_row;
 					int src_col = output_col.input_col;
 
-					chunk.nulls[out_col][dst_row] = src->nulls[src_col][src_row];
-					if (chunk.nulls[out_col][dst_row])
-						continue;
-					switch (output_col.meta.storage_kind)
+					if ((output_col.side == VecJoinSide::Outer && probe_is_outer) ||
+						(output_col.side == VecJoinSide::Inner && !probe_is_outer))
 					{
-						case VecOutputStorageKind::Double:
-							chunk.double_columns[out_col][dst_row] = src->double_columns[src_col][src_row];
-							break;
-						case VecOutputStorageKind::Int64:
-						case VecOutputStorageKind::NumericScaledInt64:
-						case VecOutputStorageKind::NumericAvgPair:
-							chunk.int64_columns[out_col][dst_row] = src->int64_columns[src_col][src_row];
-							chunk.double_columns[out_col][dst_row] = src->double_columns[src_col][src_row];
-							break;
-							case VecOutputStorageKind::StringRef:
-								chunk.string_columns[out_col][dst_row] =
-									CopyStringRefToChunk(chunk, *src, src->string_columns[src_col][src_row]);
-								break;
-						case VecOutputStorageKind::Int32:
-							chunk.int32_columns[out_col][dst_row] = src->int32_columns[src_col][src_row];
-							break;
+						src = &outer_chunk_;
+						src_row = outer_row;
 					}
+					else
+					{
+						src = inner_chunk;
+						src_row = entry.row_idx;
+					}
+
+					copy_output_value(dst_row, out_col, output_col.meta, *src, src_col, src_row);
 				}
 
 				if (probe_next_entries_[probe_idx] >= 0)
 					next_probe_sel_.push_back(probe_idx);
+			}
+			else if (jointype_ == JOIN_LEFT && !build_outer_side_)
+			{
+				int outer_row = probe_rows_[probe_idx];
+				int dst_row = chunk.count++;
+
+				for (const auto &output_col : output_cols_)
+				{
+					int out_col = output_col.output_resno - 1;
+
+					if (output_col.side == VecJoinSide::Outer)
+						copy_output_value(dst_row, out_col, output_col.meta,
+										  outer_chunk_, output_col.input_col, outer_row);
+					else
+					{
+						chunk.nulls[out_col][dst_row] = 1;
+						chunk.string_columns[out_col][dst_row] = VecStringRef{0, 0, 0};
+					}
+				}
 			}
 		}
 
@@ -2671,6 +3346,41 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 		{
 			outer_chunk_.reset();
 			probe_batch_ready_ = false;
+		}
+	}
+
+	if (jointype_ == JOIN_RIGHT)
+	{
+		if (!right_anti_marked_)
+		{
+			if (!probe_input_exhausted_)
+				return chunk.count > 0;
+			right_anti_marked_ = true;
+			right_anti_emit_pos_ = 0;
+		}
+
+		while (right_anti_emit_pos_ < entries_.size() && chunk.count < DEFAULT_CHUNK_SIZE)
+		{
+			const VecHashEntry &entry = entries_[right_anti_emit_pos_];
+			const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk;
+
+			if (inner_entry_matched_[right_anti_emit_pos_++])
+				continue;
+			inner_chunk = inner_chunks_[entry.chunk_idx];
+			for (const auto &output_col : output_cols_)
+			{
+				int out_col = output_col.output_resno - 1;
+
+				if (output_col.side == VecJoinSide::Outer)
+				{
+					chunk.nulls[out_col][chunk.count] = 1;
+					chunk.string_columns[out_col][chunk.count] = VecStringRef{0, 0, 0};
+					continue;
+				}
+				copy_output_value(chunk.count, out_col, output_col.meta,
+								  *inner_chunk, output_col.input_col, entry.row_idx);
+			}
+			chunk.count++;
 		}
 	}
 
@@ -3682,6 +4392,141 @@ BuildCorrelatedLookupAggState(EState *estate,
 	return lookup_state;
 }
 
+static bool
+ExtractComparableLookupVar(Expr *expr, Var **var_out)
+{
+	Expr *stripped = StripImplicitNodesLocal(expr);
+
+	if (var_out != nullptr)
+		*var_out = nullptr;
+	if (stripped == nullptr)
+		return false;
+	if (IsA(stripped, Var))
+	{
+		if (var_out != nullptr)
+			*var_out = (Var *) stripped;
+		return true;
+	}
+	if (IsA(stripped, FuncExpr))
+	{
+		FuncExpr *func = (FuncExpr *) stripped;
+		Expr *arg;
+
+		if (list_length(func->args) != 1 || exprType((Node *) stripped) != NUMERICOID)
+			return false;
+		arg = StripImplicitNodesLocal((Expr *) linitial(func->args));
+		if (arg == nullptr || !IsA(arg, Var))
+			return false;
+		if (!IsInt64LikeTypeLocal(exprType((Node *) arg)))
+			return false;
+		if (var_out != nullptr)
+			*var_out = (Var *) arg;
+		return true;
+	}
+	return false;
+}
+
+static int
+FindNextFreeOutputResno(VecPlanState *state)
+{
+	VecOutputColMeta meta;
+
+	if (state == nullptr)
+		return -1;
+	for (int resno = 1; resno <= 16; resno++)
+	{
+		if (!state->lookup_output_col_meta(resno, &meta))
+			return resno;
+	}
+	return -1;
+}
+
+static std::unique_ptr<VecPlanState>
+BuildCorrelatedLookupAggStateMulti(EState *estate,
+								   Agg *subplan_agg,
+								   List *paramids,
+								   List *args,
+								   int *num_keys_out,
+								   VecOutputColMeta *key_metas_out,
+								   VecOutputColMeta *value_meta)
+{
+	Agg *grouped_agg;
+	Plan *grouped_child;
+	TargetEntry *value_tle;
+	std::unique_ptr<VecPlanState> lookup_state;
+	List *synthetic_tlist = NIL;
+	ListCell *lc_param;
+	ListCell *lc_arg;
+	int num_keys = 0;
+
+	if (estate == nullptr || subplan_agg == nullptr ||
+		subplan_agg->plan.lefttree == nullptr ||
+		subplan_agg->plan.targetlist == NIL ||
+		paramids == NIL || args == NIL ||
+		list_length(paramids) != list_length(args) ||
+		list_length(paramids) <= 0 ||
+		list_length(paramids) > kMaxLookupKeys)
+		return nullptr;
+
+	grouped_agg = (Agg *) copyObjectImpl(subplan_agg);
+	grouped_child = grouped_agg->plan.lefttree;
+	value_tle = (TargetEntry *) linitial(subplan_agg->plan.targetlist);
+
+	if (!IsA(grouped_child, SeqScan))
+		return nullptr;
+
+	grouped_agg->aggstrategy = AGG_HASHED;
+	grouped_agg->numCols = list_length(paramids);
+	grouped_agg->grpColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * grouped_agg->numCols);
+	grouped_agg->plan.qual = NIL;
+
+	forboth(lc_param, paramids, lc_arg, args)
+	{
+		int paramid = lfirst_int(lc_param);
+		Expr *arg_expr = StripImplicitNodesLocal((Expr *) lfirst(lc_arg));
+		Var *lookup_key_var = nullptr;
+		bool removed = false;
+
+		if (arg_expr == nullptr || !IsA(arg_expr, Var))
+			return nullptr;
+		StripParamEqualityFromPlanQuals(grouped_child, paramid, &lookup_key_var, &removed);
+		if (!removed || lookup_key_var == nullptr)
+			return nullptr;
+		grouped_agg->grpColIdx[num_keys] = (AttrNumber) lookup_key_var->varattno;
+		synthetic_tlist =
+			lappend(synthetic_tlist,
+					makeTargetEntry((Expr *) copyObjectImpl(lookup_key_var),
+									num_keys + 1,
+									NULL,
+									false));
+		num_keys++;
+	}
+
+	synthetic_tlist =
+		lappend(synthetic_tlist,
+				makeTargetEntry((Expr *) copyObjectImpl(value_tle->expr),
+								num_keys + 1,
+								NULL,
+								false));
+	grouped_agg->plan.targetlist = synthetic_tlist;
+
+	lookup_state = ExecInitVecPlanInternal((Plan *) grouped_agg, estate, nullptr, false);
+	if (!lookup_state)
+		return nullptr;
+	for (int i = 0; i < num_keys; i++)
+	{
+		if (key_metas_out != nullptr &&
+			!lookup_state->lookup_output_col_meta(i + 1, &key_metas_out[i]))
+			return nullptr;
+	}
+	if (value_meta != nullptr &&
+		!lookup_state->lookup_output_col_meta(num_keys + 1, value_meta))
+		return nullptr;
+	if (num_keys_out != nullptr)
+		*num_keys_out = num_keys;
+	return lookup_state;
+}
+
 struct CorrelatedLookupFilterSpec
 {
 	std::unique_ptr<VecPlanState> lookup_state;
@@ -3690,6 +4535,20 @@ struct CorrelatedLookupFilterSpec
 	VecOutputColMeta input_key_meta;
 	uint16_t lookup_key_col = 0;
 	VecOutputColMeta lookup_key_meta;
+	uint16_t lookup_value_col = 0;
+	int output_resno = 0;
+	VecOutputColMeta output_meta;
+};
+
+struct CorrelatedLookupProjectSpec
+{
+	std::unique_ptr<VecPlanState> lookup_state;
+	Expr *rewritten_expr = nullptr;
+	int num_keys = 0;
+	uint16_t input_key_cols[kMaxLookupKeys] = {0, 0, 0, 0};
+	VecOutputColMeta input_key_metas[kMaxLookupKeys];
+	uint16_t lookup_key_cols[kMaxLookupKeys] = {0, 0, 0, 0};
+	VecOutputColMeta lookup_key_metas[kMaxLookupKeys];
 	uint16_t lookup_value_col = 0;
 	int output_resno = 0;
 	VecOutputColMeta output_meta;
@@ -3865,6 +4724,192 @@ TryBuildLookupMembershipFilterSpec(Expr *expr,
 		spec->residual_expr = (Expr *) linitial(residual_list);
 	else
 		spec->residual_expr = (Expr *) make_ands_explicit(residual_list);
+	return true;
+}
+
+static bool
+MatchPlanCorrelatedLookupQual(Expr *expr,
+							  VecPlanState *input_state,
+							  EState *estate,
+							  CorrelatedLookupProjectSpec *spec)
+{
+	Expr *stripped = StripImplicitNodesLocal(expr);
+	OpExpr *compare_op;
+	Expr *left_arg;
+	Expr *right_arg;
+	Expr *compare_expr = nullptr;
+	Var *compare_var = nullptr;
+	SubPlan *subplan = nullptr;
+	Plan *subplan_plan;
+	Agg *subplan_agg;
+	VecOutputColMeta lookup_key_metas[kMaxLookupKeys];
+	VecOutputColMeta value_meta;
+	std::unique_ptr<VecPlanState> lookup_state;
+	OpExpr *rewritten_op;
+	List *rewritten_args = NIL;
+	int num_keys = 0;
+	ListCell *lc_arg;
+	int arg_index = 0;
+
+	if (expr == nullptr || input_state == nullptr || estate == nullptr || spec == nullptr)
+		return false;
+	if (stripped == nullptr || !IsA(stripped, OpExpr))
+		return false;
+	compare_op = (OpExpr *) stripped;
+	if (list_length(compare_op->args) != 2)
+		return false;
+
+	left_arg = StripImplicitNodesLocal((Expr *) linitial(compare_op->args));
+	right_arg = StripImplicitNodesLocal((Expr *) lsecond(compare_op->args));
+	if (left_arg != nullptr && right_arg != nullptr &&
+		!IsA(left_arg, SubPlan) && IsA(right_arg, SubPlan) &&
+		ExtractComparableLookupVar(left_arg, &compare_var))
+	{
+		compare_expr = left_arg;
+		subplan = (SubPlan *) right_arg;
+	}
+	else if (left_arg != nullptr && right_arg != nullptr &&
+			 IsA(left_arg, SubPlan) && !IsA(right_arg, SubPlan) &&
+			 ExtractComparableLookupVar(right_arg, &compare_var))
+	{
+		compare_expr = right_arg;
+		subplan = (SubPlan *) left_arg;
+	}
+	else
+		return false;
+
+	if (subplan == nullptr ||
+		subplan->subLinkType != EXPR_SUBLINK ||
+		subplan->useHashTable ||
+		subplan->parParam == NIL ||
+		subplan->args == NIL ||
+		list_length(subplan->parParam) != list_length(subplan->args) ||
+		list_length(subplan->parParam) <= 0 ||
+		list_length(subplan->parParam) > kMaxLookupKeys)
+		return false;
+
+	subplan_plan = LookupReferencedSubPlan(estate, subplan);
+	if (subplan_plan == nullptr || !IsA(subplan_plan, Agg))
+		return false;
+	subplan_agg = (Agg *) subplan_plan;
+	lookup_state = BuildCorrelatedLookupAggStateMulti(estate,
+													  subplan_agg,
+													  subplan->parParam,
+													  subplan->args,
+													  &num_keys,
+													  lookup_key_metas,
+													  &value_meta);
+	if (!lookup_state)
+		return false;
+
+	spec->num_keys = num_keys;
+	foreach(lc_arg, subplan->args)
+	{
+		Expr *arg_expr = StripImplicitNodesLocal((Expr *) lfirst(lc_arg));
+		Var *arg_var = nullptr;
+		VecOutputColMeta input_key_meta;
+
+		if (arg_expr == nullptr || !IsA(arg_expr, Var))
+			return false;
+		arg_var = (Var *) arg_expr;
+		if (arg_var->varattno <= 0 || arg_var->varattno > 16 ||
+			!input_state->lookup_output_col_meta(arg_var->varattno, &input_key_meta) ||
+			!IsLookupCompatibleStorage(input_key_meta.storage_kind) ||
+			!IsLookupCompatibleStorage(lookup_key_metas[arg_index].storage_kind))
+			return false;
+
+		spec->input_key_cols[arg_index] = (uint16_t) (arg_var->varattno - 1);
+		spec->input_key_metas[arg_index] = input_key_meta;
+		spec->lookup_key_cols[arg_index] = (uint16_t) arg_index;
+		spec->lookup_key_metas[arg_index] = lookup_key_metas[arg_index];
+		arg_index++;
+	}
+
+	if (value_meta.storage_kind != VecOutputStorageKind::Int32 &&
+		value_meta.storage_kind != VecOutputStorageKind::Int64 &&
+		value_meta.storage_kind != VecOutputStorageKind::NumericScaledInt64 &&
+		value_meta.storage_kind != VecOutputStorageKind::Double)
+		return false;
+
+	spec->lookup_state = std::move(lookup_state);
+	spec->lookup_value_col = (uint16_t) num_keys;
+	spec->output_resno = FindNextFreeOutputResno(input_state);
+	spec->output_meta = value_meta;
+	if (spec->output_resno <= 0)
+		return false;
+
+	rewritten_op = (OpExpr *) copyObjectImpl(compare_op);
+	if (compare_expr == left_arg)
+	{
+		rewritten_args = list_make2((Node *) copyObjectImpl(compare_var),
+									makeVar(1,
+											spec->output_resno,
+											value_meta.sql_type,
+											-1,
+											InvalidOid,
+											0));
+	}
+	else
+	{
+		rewritten_args = list_make2(makeVar(1,
+											spec->output_resno,
+											value_meta.sql_type,
+											-1,
+											InvalidOid,
+											0),
+									(Node *) copyObjectImpl(compare_var));
+	}
+	rewritten_op->args = rewritten_args;
+	spec->rewritten_expr = (Expr *) rewritten_op;
+	return true;
+}
+
+static bool
+TryBuildPlanCorrelatedLookupProjectSpec(Expr *expr,
+										VecPlanState *input_state,
+										EState *estate,
+										CorrelatedLookupProjectSpec *spec)
+{
+	List *qual_list = NIL;
+	List *rewritten_quals = NIL;
+	ListCell *lc;
+	bool matched = false;
+
+	if (expr == nullptr || input_state == nullptr || estate == nullptr || spec == nullptr)
+		return false;
+
+	*spec = CorrelatedLookupProjectSpec{};
+	expr = StripImplicitNodesLocal(expr);
+	if (expr != nullptr && IsA(expr, BoolExpr) &&
+		((BoolExpr *) expr)->boolop == AND_EXPR)
+		qual_list = list_copy(((BoolExpr *) expr)->args);
+	else
+		qual_list = list_make1(expr);
+
+	foreach(lc, qual_list)
+	{
+		Expr *qual = (Expr *) lfirst(lc);
+		CorrelatedLookupProjectSpec candidate;
+
+		if (!matched && MatchPlanCorrelatedLookupQual(qual, input_state, estate, &candidate))
+		{
+			*spec = std::move(candidate);
+			rewritten_quals = lappend(rewritten_quals, spec->rewritten_expr);
+			matched = true;
+			continue;
+		}
+		rewritten_quals = lappend(rewritten_quals, qual);
+	}
+
+	if (!matched)
+		return false;
+
+	if (rewritten_quals == NIL)
+		spec->rewritten_expr = nullptr;
+	else if (list_length(rewritten_quals) == 1)
+		spec->rewritten_expr = (Expr *) linitial(rewritten_quals);
+	else
+		spec->rewritten_expr = (Expr *) make_ands_explicit(rewritten_quals);
 	return true;
 }
 
@@ -4628,9 +5673,164 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 				elog(LOG, "pg_volvec: subquery scan targetlist projection is not supported");
 			return nullptr;
 		}
+	} else if (IsA(plan, Material)) {
+		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
+
+		if (!left)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: materialize initialization could not build child state");
+			return nullptr;
+		}
+		current_state = BuildDirectVarProject(std::move(left), plan->targetlist);
+		if (!current_state)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: materialize targetlist projection is not supported");
+			return nullptr;
+		}
+	} else if (IsA(plan, NestLoop)) {
+		NestLoop *nest_loop = (NestLoop *) plan;
+		List *key_clauses = NIL;
+		List *residual_clauses = NIL;
+		Expr *join_filter_expr = nullptr;
+		VolVecVector<VecJoinOutputCol> output_cols{PgMemoryContextAllocator<VecJoinOutputCol>(CurrentMemoryContext)};
+		VolVecVector<VecHashJoinKeyCol> key_cols{PgMemoryContextAllocator<VecHashJoinKeyCol>(CurrentMemoryContext)};
+		bool needs_project = false;
+		Bitmapset *outer_required_attrs = nullptr;
+		Bitmapset *inner_required_attrs = nullptr;
+		std::unique_ptr<VecPlanState> outer;
+		std::unique_ptr<VecPlanState> inner;
+		VecPlanState *outer_state = nullptr;
+		VecPlanState *inner_state = nullptr;
+		bool build_outer_side = false;
+		int visible_output_count = CountVisibleTargetEntries(nest_loop->join.plan.targetlist);
+
+		if (nest_loop->join.jointype != JOIN_INNER &&
+			nest_loop->join.jointype != JOIN_SEMI)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: nestloop fallback only supports inner/semi joins");
+			return nullptr;
+		}
+
+		PartitionJoinClauses(nest_loop->join.joinqual, &key_clauses, &residual_clauses);
+		if (key_clauses == NIL)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: nestloop fallback requires at least one simple equality join key");
+			return nullptr;
+		}
+
+		BuildBinaryJoinChildRequiredAttrs(&nest_loop->join.plan,
+										  (Node *) key_clauses,
+										  plan->lefttree,
+										  plan->righttree,
+										  &outer_required_attrs,
+										  &inner_required_attrs);
+		outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false);
+		inner = ExecInitVecPlanInternal(plan->righttree, estate, inner_required_attrs, false);
+		if (!outer || !inner)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: nestloop child initialization failed (outer=%s inner=%s)",
+					 outer ? "ok" : "null", inner ? "ok" : "null");
+			return nullptr;
+		}
+		outer_state = outer.get();
+		inner_state = inner.get();
+		build_outer_side = ShouldSwapInnerJoinBuildSides(nest_loop->join.jointype,
+														 plan->lefttree,
+														 plan->righttree);
+		if (!ExtractJoinKeysFromClauses(key_clauses,
+									   "nestloop join",
+									   plan->lefttree,
+									   plan->righttree,
+									   outer_state,
+									   inner_state,
+									   &key_cols))
+			return nullptr;
+		if (!BuildJoinOutputCols(nest_loop->join.plan.targetlist,
+								 plan->lefttree,
+								 plan->righttree,
+								 outer_state,
+								 inner_state,
+								 &output_cols,
+								 &needs_project))
+			return nullptr;
+		if (nest_loop->join.jointype == JOIN_SEMI &&
+			ShouldBuildSmallerSide(plan->lefttree, plan->righttree) &&
+			RewriteSemiJoinVisibleInnerOutputsToOuterKeys(&output_cols,
+														 key_cols,
+														 visible_output_count))
+			build_outer_side = true;
+
+		join_filter_expr = BuildCombinedQualExpr(residual_clauses, nest_loop->join.plan.qual);
+		if (join_filter_expr != nullptr)
+		{
+			join_filter_expr = RewriteHashJoinFilterExpr(join_filter_expr,
+														 plan->lefttree,
+														 plan->righttree,
+														 outer_state,
+														 inner_state,
+														 &output_cols);
+			if (join_filter_expr == nullptr)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: nestloop filter rewrite failed");
+				return nullptr;
+			}
+		}
+
+		std::unique_ptr<VecHashJoinState> join_state = std::make_unique<VecHashJoinState>(
+			std::move(outer),
+			std::move(inner),
+			nest_loop->join.jointype,
+			build_outer_side,
+			visible_output_count,
+			std::move(output_cols),
+			std::move(key_cols));
+		VecHashJoinState *join_state_ptr = join_state.get();
+		current_state = std::move(join_state);
+
+		if (join_filter_expr != nullptr)
+		{
+			auto program = std::make_unique<VecExprProgram>();
+
+			CompileExpr(join_filter_expr, *program, true, estate);
+			AdjustProgramVarScales(program.get(), current_state.get());
+			if (program->get_final_res_idx() < 0)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: nestloop filter expression compilation failed");
+				return nullptr;
+			}
+			if (nest_loop->join.jointype == JOIN_SEMI)
+				join_state_ptr->set_join_filter_program(std::move(program));
+			else
+			{
+				current_state = std::make_unique<VecFilterState>(std::move(current_state), std::move(program));
+				plan_qual_already_applied = true;
+			}
+		}
+		if (needs_project)
+		{
+			current_state = BuildJoinProject(std::move(current_state),
+											 nest_loop->join.plan.targetlist,
+											 plan->lefttree,
+											 plan->righttree,
+											 outer_state,
+											 inner_state,
+											 &output_cols,
+											 estate);
+			if (!current_state)
+				return nullptr;
+		}
 	} else if (IsA(plan, HashJoin)) {
 		HashJoin *hash_join = (HashJoin *) plan;
 		Hash *hash_node;
+		Plan *outer_plan;
+		Plan *inner_plan;
 		List *hash_key_clauses = NIL;
 		List *hash_residual_clauses = NIL;
 		Expr *join_filter_expr = nullptr;
@@ -4645,13 +5845,17 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		std::unique_ptr<VecPlanState> inner;
 		VecPlanState *outer_state = nullptr;
 		VecPlanState *inner_state = nullptr;
+		bool build_outer_side = false;
+		int visible_output_count = CountVisibleTargetEntries(hash_join->join.plan.targetlist);
 
 			if (hash_join->join.jointype != JOIN_INNER &&
+				hash_join->join.jointype != JOIN_LEFT &&
+				hash_join->join.jointype != JOIN_RIGHT &&
 				hash_join->join.jointype != JOIN_ANTI &&
 				hash_join->join.jointype != JOIN_RIGHT_ANTI)
 			{
 				if (pg_volvec_trace_hooks)
-					elog(LOG, "pg_volvec: hash join only supports inner/anti/right-anti joins");
+					elog(LOG, "pg_volvec: hash join only supports inner/left/right/anti/right-anti joins");
 				return nullptr;
 			}
 			if (!IsA(plan->righttree, Hash))
@@ -4661,15 +5865,25 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 				return nullptr;
 			}
 			hash_node = (Hash *) plan->righttree;
+			outer_plan = plan->lefttree;
+			inner_plan = hash_node->plan.lefttree;
+			build_outer_side = ShouldSwapInnerJoinBuildSides(hash_join->join.jointype,
+															 outer_plan,
+															 inner_plan);
+			if (build_outer_side && pg_volvec_trace_hooks)
+				elog(LOG,
+					 "pg_volvec: building hash table from outer side (outer_rows=%.0f inner_rows=%.0f)",
+					 outer_plan->plan_rows,
+					 inner_plan->plan_rows);
 			PartitionJoinClauses(hash_join->hashclauses, &hash_key_clauses, &hash_residual_clauses);
 			BuildBinaryJoinChildRequiredAttrs(&hash_join->join.plan,
 											  (Node *) hash_join->hashclauses,
-											  plan->lefttree,
-											  (Plan *) hash_node,
+											  outer_plan,
+											  inner_plan,
 											  &outer_required_attrs,
 											  &inner_required_attrs);
-			outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false);
-			inner = ExecInitVecPlanInternal(hash_node->plan.lefttree, estate, inner_required_attrs, false);
+			outer = ExecInitVecPlanInternal(outer_plan, estate, outer_required_attrs, false);
+			inner = ExecInitVecPlanInternal(inner_plan, estate, inner_required_attrs, false);
 			if (!outer || !inner)
 			{
 			if (pg_volvec_trace_hooks)
@@ -4681,15 +5895,15 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		inner_state = inner.get();
 		if (!ExtractJoinKeysFromClauses(hash_key_clauses,
 									   "hash join",
-									   plan->lefttree,
-									   (Plan *) hash_node,
+									   outer_plan,
+									   inner_plan,
 									   outer_state,
 									   inner_state,
 									   &key_cols))
 			return nullptr;
 		if (!BuildJoinOutputCols(hash_join->join.plan.targetlist,
-								 plan->lefttree,
-								 (Plan *) hash_node,
+								 outer_plan,
+								 inner_plan,
 								 outer_state,
 								 inner_state,
 								 &output_cols,
@@ -4708,17 +5922,10 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		}
 			if (join_filter_expr != nullptr)
 			{
-				if (hash_join->join.jointype == JOIN_ANTI ||
-					hash_join->join.jointype == JOIN_RIGHT_ANTI)
-				{
-					if (pg_volvec_trace_hooks)
-						elog(LOG, "pg_volvec: anti hash join does not yet support extra join filters");
-					return nullptr;
-				}
 				use_lookup_filter =
 					TryBuildCorrelatedLookupFilterSpec(join_filter_expr,
-												   plan->lefttree,
-												   (Plan *) hash_node,
+												   outer_plan,
+												   inner_plan,
 												   outer_state,
 												   inner_state,
 												   &output_cols,
@@ -4731,8 +5938,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 			else
 			{
 				join_filter_expr = RewriteHashJoinFilterExpr(join_filter_expr,
-															 plan->lefttree,
-															 (Plan *) hash_node,
+															 outer_plan,
+															 inner_plan,
 															 outer_state,
 															 inner_state,
 															 &output_cols);
@@ -4748,6 +5955,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 			{
 				for (const auto &output_col : output_cols)
 				{
+					if (output_col.output_resno > visible_output_count)
+						continue;
 					if (output_col.side != VecJoinSide::Outer)
 					{
 						if (pg_volvec_trace_hooks)
@@ -4760,6 +5969,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 			{
 				for (const auto &output_col : output_cols)
 				{
+					if (output_col.output_resno > visible_output_count)
+						continue;
 					if (output_col.side != VecJoinSide::Inner)
 					{
 						if (pg_volvec_trace_hooks)
@@ -4768,10 +5979,25 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 					}
 				}
 			}
-			current_state = std::make_unique<VecHashJoinState>(std::move(outer), std::move(inner),
-															   hash_join->join.jointype,
-															   std::move(output_cols),
-															   std::move(key_cols));
+			if (hash_join->join.jointype == JOIN_ANTI)
+			{
+				build_outer_side = true;
+				if (pg_volvec_trace_hooks)
+					elog(LOG,
+						 "pg_volvec: anti hash join building hash table from outer side (outer_rows=%.0f inner_rows=%.0f)",
+						 outer_plan->plan_rows,
+						 inner_plan->plan_rows);
+			}
+			std::unique_ptr<VecHashJoinState> join_state = std::make_unique<VecHashJoinState>(
+				std::move(outer),
+				std::move(inner),
+				hash_join->join.jointype,
+				build_outer_side,
+				visible_output_count,
+				std::move(output_cols),
+				std::move(key_cols));
+			VecHashJoinState *join_state_ptr = join_state.get();
+			current_state = std::move(join_state);
 		if (use_lookup_filter)
 		{
 			current_state = std::make_unique<VecLookupProjectState>(
@@ -4797,15 +6023,21 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 					elog(LOG, "pg_volvec: hash join filter expression compilation failed");
 				return nullptr;
 			}
-			current_state = std::make_unique<VecFilterState>(std::move(current_state), std::move(program));
-			plan_qual_already_applied = true;
+			if (hash_join->join.jointype == JOIN_ANTI ||
+				hash_join->join.jointype == JOIN_RIGHT_ANTI)
+				join_state_ptr->set_join_filter_program(std::move(program));
+			else
+			{
+				current_state = std::make_unique<VecFilterState>(std::move(current_state), std::move(program));
+				plan_qual_already_applied = true;
+			}
 		}
 		if (needs_project)
 		{
 			current_state = BuildJoinProject(std::move(current_state),
 											 hash_join->join.plan.targetlist,
-											 plan->lefttree,
-											 (Plan *) hash_node,
+											 outer_plan,
+											 inner_plan,
 											 outer_state,
 											 inner_state,
 											 &output_cols,
@@ -4885,6 +6117,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		current_state = std::make_unique<VecHashJoinState>(std::move(outer),
 														   std::move(inner),
 														   JOIN_INNER,
+														   false,
+														   CountVisibleTargetEntries(merge_join->join.plan.targetlist),
 														   std::move(output_cols),
 														   std::move(key_cols));
 		if (join_filter_expr != nullptr)
@@ -4939,6 +6173,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		}
 		if (IsA(plan, SeqScan))
 		{
+			CorrelatedLookupProjectSpec lookup_project_spec;
+
 			use_lookup_filter =
 				TryBuildLookupMembershipFilterSpec(combined_qual,
 												 current_state.get(),
@@ -4955,6 +6191,25 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 					lookup_filter_spec.lookup_key_meta,
 					lookup_filter_spec.negate);
 				combined_qual = lookup_filter_spec.residual_expr;
+			}
+			if (combined_qual != nullptr &&
+				TryBuildPlanCorrelatedLookupProjectSpec(combined_qual,
+													 current_state.get(),
+													 estate,
+													 &lookup_project_spec))
+			{
+				current_state = std::make_unique<VecLookupProjectStateMultiKey>(
+					std::move(current_state),
+					std::move(lookup_project_spec.lookup_state),
+					lookup_project_spec.num_keys,
+					lookup_project_spec.input_key_cols,
+					lookup_project_spec.input_key_metas,
+					lookup_project_spec.lookup_key_cols,
+					lookup_project_spec.lookup_key_metas,
+					lookup_project_spec.lookup_value_col,
+					lookup_project_spec.output_resno,
+					lookup_project_spec.output_meta);
+				combined_qual = lookup_project_spec.rewritten_expr;
 			}
 		}
 		if (combined_qual != nullptr)

@@ -17,6 +17,47 @@ extern bool pg_volvec_trace_hooks;
 namespace pg_volvec
 {
 
+static const char *
+VecOpCodeName(VecOpCode opcode)
+{
+	switch (opcode)
+	{
+		case VecOpCode::EEOP_VAR: return "VAR";
+		case VecOpCode::EEOP_CONST: return "CONST";
+		case VecOpCode::EEOP_FLOAT8_ADD: return "FLOAT8_ADD";
+		case VecOpCode::EEOP_FLOAT8_SUB: return "FLOAT8_SUB";
+		case VecOpCode::EEOP_FLOAT8_MUL: return "FLOAT8_MUL";
+		case VecOpCode::EEOP_INT64_ADD: return "INT64_ADD";
+		case VecOpCode::EEOP_INT64_SUB: return "INT64_SUB";
+		case VecOpCode::EEOP_INT64_MUL: return "INT64_MUL";
+		case VecOpCode::EEOP_INT64_DIV_FLOAT8: return "INT64_DIV_FLOAT8";
+		case VecOpCode::EEOP_FLOAT8_LT: return "FLOAT8_LT";
+		case VecOpCode::EEOP_FLOAT8_GT: return "FLOAT8_GT";
+		case VecOpCode::EEOP_FLOAT8_LE: return "FLOAT8_LE";
+		case VecOpCode::EEOP_FLOAT8_GE: return "FLOAT8_GE";
+		case VecOpCode::EEOP_INT64_LT: return "INT64_LT";
+		case VecOpCode::EEOP_INT64_GT: return "INT64_GT";
+		case VecOpCode::EEOP_INT64_LE: return "INT64_LE";
+		case VecOpCode::EEOP_INT64_GE: return "INT64_GE";
+		case VecOpCode::EEOP_INT64_EQ: return "INT64_EQ";
+		case VecOpCode::EEOP_INT64_NE: return "INT64_NE";
+		case VecOpCode::EEOP_DATE_LT: return "DATE_LT";
+		case VecOpCode::EEOP_DATE_LE: return "DATE_LE";
+		case VecOpCode::EEOP_DATE_GT: return "DATE_GT";
+		case VecOpCode::EEOP_DATE_GE: return "DATE_GE";
+		case VecOpCode::EEOP_DATE_PART_YEAR: return "DATE_PART_YEAR";
+		case VecOpCode::EEOP_AND: return "AND";
+		case VecOpCode::EEOP_OR: return "OR";
+		case VecOpCode::EEOP_INT64_CASE: return "INT64_CASE";
+		case VecOpCode::EEOP_FLOAT8_CASE: return "FLOAT8_CASE";
+		case VecOpCode::EEOP_STR_EQ: return "STR_EQ";
+		case VecOpCode::EEOP_STR_NE: return "STR_NE";
+		case VecOpCode::EEOP_STR_PREFIX_LIKE: return "STR_PREFIX_LIKE";
+		case VecOpCode::EEOP_QUAL: return "QUAL";
+		default: return "UNKNOWN";
+	}
+}
+
 static Expr *
 StripImplicitNodes(Expr *expr)
 {
@@ -365,6 +406,57 @@ RescaleInt64Value(int64_t value, int from_scale, int to_scale)
 	return quotient;
 }
 
+static NumericWideInt
+RescaleInt64ValueWide(int64_t value, int from_scale, int to_scale)
+{
+	if (from_scale == to_scale)
+		return WideIntFromInt64(value);
+
+	if (from_scale < to_scale)
+	{
+		NumericWideInt widened = WideIntFromInt64(value);
+		NumericWideInt factor = WideIntFromInt64(Pow10Int64(to_scale - from_scale));
+
+		return WideIntMul(widened, factor);
+	}
+
+	return WideIntFromInt64(RescaleInt64Value(value, from_scale, to_scale));
+}
+
+static bool
+StepHasWideConst(const VecExprStep *step)
+{
+	return step != nullptr &&
+		step->opcode == VecOpCode::EEOP_CONST &&
+		step->d.constant.has_wide_i128;
+}
+
+static NumericWideInt
+StepWideConstValue(const VecExprStep *step)
+{
+	if (!StepHasWideConst(step))
+		return WideIntFromInt64(step != nullptr ? step->d.constant.i64val : 0);
+	return MakeWideIntBits(step->d.constant.wide_lo,
+						   (uint64_t) step->d.constant.wide_hi);
+}
+
+static NumericWideInt
+RescaleOperandForCompare(const VecExprStep *step,
+						 int64_t reg_value,
+						 int from_scale,
+						 int to_scale)
+{
+	NumericWideInt value;
+
+	if (StepHasWideConst(step))
+		value = StepWideConstValue(step);
+	else
+		value = WideIntFromInt64(reg_value);
+	if (from_scale >= to_scale)
+		return value;
+	return RescaleWideIntUp(value, to_scale - from_scale);
+}
+
 static int64_t
 ScaleFloatToInt64(double value, int scale)
 {
@@ -431,6 +523,9 @@ AppendDateConstStep(VecExprProgram &program, int32_t date_val)
 	step.opcode = VecOpCode::EEOP_CONST;
 	step.res_idx = res_idx;
 	step.d.constant.isnull = false;
+	step.d.constant.has_wide_i128 = false;
+	step.d.constant.wide_lo = 0;
+	step.d.constant.wide_hi = 0;
 	step.d.constant.ival = date_val;
 	step.d.constant.i64val = (int64_t) date_val;
 	step.d.constant.fval = (double) date_val;
@@ -704,6 +799,9 @@ CompileScalarArrayExpr(ScalarArrayOpExpr *array_expr,
 		step.d.constant.fval = 0.0;
 		step.d.constant.i64val = array_expr->useOr ? 0 : 1;
 		step.d.constant.ival = array_expr->useOr ? 0 : 1;
+		step.d.constant.has_wide_i128 = true;
+		step.d.constant.wide_lo = WideIntLow64(WideIntFromInt64(step.d.constant.i64val));
+		step.d.constant.wide_hi = WideIntHigh64(WideIntFromInt64(step.d.constant.i64val));
 		program.steps.push_back(step);
 		return res_idx;
 	}
@@ -788,6 +886,7 @@ ResolveBinaryOpcode(const char *opname, Oid left_type, Oid right_type, VecOpCode
 		else if (strcmp(opname, ">") == 0) *opcode = VecOpCode::EEOP_INT64_GT;
 		else if (strcmp(opname, ">=") == 0) *opcode = VecOpCode::EEOP_INT64_GE;
 		else if (strcmp(opname, "=") == 0) *opcode = VecOpCode::EEOP_INT64_EQ;
+		else if (strcmp(opname, "<>") == 0) *opcode = VecOpCode::EEOP_INT64_NE;
 		else return false;
 		return true;
 	}
@@ -796,6 +895,7 @@ ResolveBinaryOpcode(const char *opname, Oid left_type, Oid right_type, VecOpCode
 	{
 		if (strcmp(opname, "<") == 0) *opcode = VecOpCode::EEOP_DATE_LT;
 		else if (strcmp(opname, "<=") == 0) *opcode = VecOpCode::EEOP_DATE_LE;
+		else if (strcmp(opname, ">") == 0) *opcode = VecOpCode::EEOP_DATE_GT;
 		else if (strcmp(opname, ">=") == 0) *opcode = VecOpCode::EEOP_DATE_GE;
 		else return false;
 		return true;
@@ -994,8 +1094,23 @@ VecExprProgram::try_compile_jit()
 	if (!pg_volvec_try_compile_jit_expr(this, &jit_func, (JitContext **) &jit_context, &fr))
 	{
 		if (pg_volvec_trace_hooks)
+		{
 			elog(LOG, "pg_volvec: expr JIT compile skipped or failed (steps=%zu, reason=%s)",
 				 steps.size(), fr != nullptr ? fr : "unknown");
+			for (size_t i = 0; i < steps.size(); i++)
+			{
+				const auto &step = steps[i];
+
+				elog(LOG,
+					 "pg_volvec: expr JIT step[%zu] opcode=%s res=%d left=%d right=%d scale=%d",
+					 i,
+					 VecOpCodeName(step.opcode),
+					 step.res_idx,
+					 step.d.op.left,
+					 step.d.op.right,
+					 get_register_scale(step.res_idx));
+			}
+		}
 		jit_func = nullptr;
 	}
 	else if (pg_volvec_trace_hooks)
@@ -1181,6 +1296,9 @@ PopulateConstStep(VecExprProgram &program,
 	step->d.constant.fval = 0.0;
 	step->d.constant.i64val = 0;
 	step->d.constant.ival = 0;
+	step->d.constant.has_wide_i128 = false;
+	step->d.constant.wide_lo = 0;
+	step->d.constant.wide_hi = 0;
 
 	if (!constisnull)
 	{
@@ -1191,25 +1309,64 @@ PopulateConstStep(VecExprProgram &program,
 		else if (consttype == NUMERICOID)
 		{
 			int scale = DEFAULT_NUMERIC_SCALE;
+			int exact_scale;
+			double fval = 0.0;
+			bool decoded = false;
+			bool wide_decoded = false;
+			NumericWideInt wide_value = 0;
 
 			if (IsValidNumericTypmod(consttypmod))
 				scale = ClampTrackedScale(GetNumericScaleFromTypmod(consttypmod));
 			else if (DatumGetPointer(constvalue) != nullptr)
 				scale = ClampTrackedScale(VolVecNumericDscale(DatumGetPointer(constvalue)));
-			if (!TryFastNumericToScaledInt64(constvalue, scale, &step->d.constant.i64val))
+			exact_scale = scale;
+			if (TryFastNumericToScaledWideInt(constvalue, exact_scale, &wide_value))
 			{
-				double fval = DatumGetFloat8(DirectFunctionCall1(numeric_float8_no_overflow, constvalue));
-				step->d.constant.i64val = ScaleFloatToInt64(fval, scale);
-				step->d.constant.fval = fval;
+				wide_decoded = true;
+				step->d.constant.has_wide_i128 = true;
+				step->d.constant.wide_lo = WideIntLow64(wide_value);
+				step->d.constant.wide_hi = WideIntHigh64(wide_value);
+				if (WideIntFitsInt64(wide_value))
+				{
+					step->d.constant.i64val = (int64_t) wide_value;
+					decoded = true;
+				}
 			}
-			else
-				step->d.constant.fval = (double) step->d.constant.i64val / (double) Pow10Int64(scale);
+			for (int candidate_scale = Min(exact_scale, 18); !wide_decoded && !decoded && candidate_scale >= 0; candidate_scale--)
+			{
+				if (!TryFastNumericToScaledInt64(constvalue, candidate_scale, &step->d.constant.i64val))
+					continue;
+				scale = candidate_scale;
+				decoded = true;
+				step->d.constant.has_wide_i128 = true;
+				step->d.constant.wide_lo = WideIntLow64(WideIntFromInt64(step->d.constant.i64val));
+				step->d.constant.wide_hi = WideIntHigh64(WideIntFromInt64(step->d.constant.i64val));
+				break;
+			}
+			fval = DatumGetFloat8(DirectFunctionCall1(numeric_float8_no_overflow, constvalue));
+			if (!decoded && !wide_decoded)
+			{
+				scale = 0;
+				step->d.constant.i64val = ScaleFloatToInt64(fval, scale);
+				if (!step->d.constant.has_wide_i128)
+				{
+					step->d.constant.has_wide_i128 = true;
+					step->d.constant.wide_lo = WideIntLow64(WideIntFromInt64(step->d.constant.i64val));
+					step->d.constant.wide_hi = WideIntHigh64(WideIntFromInt64(step->d.constant.i64val));
+				}
+			}
+			if (wide_decoded)
+				scale = exact_scale;
+			step->d.constant.fval = fval;
 			program.set_register_scale(step->res_idx, scale);
 		}
 		else if (consttype == INT8OID)
 		{
 			step->d.constant.i64val = DatumGetInt64(constvalue);
 			step->d.constant.fval = (double) step->d.constant.i64val;
+			step->d.constant.has_wide_i128 = true;
+			step->d.constant.wide_lo = WideIntLow64(WideIntFromInt64(step->d.constant.i64val));
+			step->d.constant.wide_hi = WideIntHigh64(WideIntFromInt64(step->d.constant.i64val));
 		}
 		else if (consttype == DATEOID)
 		{
@@ -1495,14 +1652,10 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 				step.opcode = VecOpCode::EEOP_DATE_LT;
 			else if (strcmp(opname, "<=") == 0)
 				step.opcode = VecOpCode::EEOP_DATE_LE;
+			else if (strcmp(opname, ">") == 0)
+				step.opcode = VecOpCode::EEOP_DATE_GT;
 			else if (strcmp(opname, ">=") == 0)
 				step.opcode = VecOpCode::EEOP_DATE_GE;
-			else if (strcmp(opname, ">") == 0)
-			{
-				step.opcode = VecOpCode::EEOP_DATE_LT;
-				step.d.op.left = right;
-				step.d.op.right = left;
-			}
 			else
 				return -1;
 
@@ -1581,6 +1734,14 @@ CompileExpr(Expr *expr, VecExprProgram &program, bool is_filter, EState *estate)
 void
 VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 {
+	const VecExprStep *reg_defs[MAX_REGISTERS] = {0};
+
+	for (const auto &step : steps)
+	{
+		if (step.res_idx >= 0 && step.res_idx < MAX_REGISTERS)
+			reg_defs[step.res_idx] = &step;
+	}
+
 	if (jit_func)
 	{
 		uint32_t active_count = chunk.has_selection ? chunk.sel.count : chunk.count;
@@ -1596,6 +1757,7 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 		chunk.get_string_ptrs(col_str);
 		chunk.get_null_ptrs(col_nulls);
 		jit_func(active_count, col_f8, col_i64, col_i32, col_str, col_nulls,
+				 chunk.string_arena.data(),
 				 &registers_f8[final_res_idx * DEFAULT_CHUNK_SIZE],
 				 &registers_i64[final_res_idx * DEFAULT_CHUNK_SIZE],
 				 &registers_i32[final_res_idx * DEFAULT_CHUNK_SIZE],
@@ -1732,22 +1894,26 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				for (int i = 0; i < chunk.count; i++)
 				{
 					int scale = Max(left_scale, right_scale);
+					NumericWideInt left_val;
+					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] =
-						RescaleInt64Value(registers_i64[l + i], left_scale, scale) <
-						RescaleInt64Value(registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
+					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					registers_i32[res + i] = left_val < right_val;
 				}
 				break;
 			case VecOpCode::EEOP_INT64_LE:
 				for (int i = 0; i < chunk.count; i++)
 				{
 					int scale = Max(left_scale, right_scale);
+					NumericWideInt left_val;
+					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] =
-						RescaleInt64Value(registers_i64[l + i], left_scale, scale) <=
-						RescaleInt64Value(registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
+					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					registers_i32[res + i] = left_val <= right_val;
 				}
 				break;
 			case VecOpCode::EEOP_FLOAT8_LT:
@@ -1792,6 +1958,13 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					registers_i32[res + i] = (registers_i32[l + i] < registers_i32[r + i]);
 				}
 				break;
+			case VecOpCode::EEOP_DATE_GT:
+				for (int i = 0; i < chunk.count; i++)
+				{
+					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
+					registers_i32[res + i] = (registers_i32[l + i] > registers_i32[r + i]);
+				}
+				break;
 			case VecOpCode::EEOP_DATE_GE:
 				for (int i = 0; i < chunk.count; i++)
 				{
@@ -1811,33 +1984,43 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				for (int i = 0; i < chunk.count; i++)
 				{
 					int scale = Max(left_scale, right_scale);
+					NumericWideInt left_val;
+					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] =
-						RescaleInt64Value(registers_i64[l + i], left_scale, scale) >
-						RescaleInt64Value(registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
+					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					registers_i32[res + i] = left_val > right_val;
 				}
 				break;
 			case VecOpCode::EEOP_INT64_GE:
 				for (int i = 0; i < chunk.count; i++)
 				{
 					int scale = Max(left_scale, right_scale);
+					NumericWideInt left_val;
+					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] =
-						RescaleInt64Value(registers_i64[l + i], left_scale, scale) >=
-						RescaleInt64Value(registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
+					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					registers_i32[res + i] = left_val >= right_val;
 				}
 				break;
 			case VecOpCode::EEOP_INT64_EQ:
+			case VecOpCode::EEOP_INT64_NE:
 				for (int i = 0; i < chunk.count; i++)
 				{
 					int scale = Max(left_scale, right_scale);
+					NumericWideInt left_val;
+					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
+					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
+					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
 					registers_i32[res + i] =
-						RescaleInt64Value(registers_i64[l + i], left_scale, scale) ==
-						RescaleInt64Value(registers_i64[r + i], right_scale, scale);
+						(step.opcode == VecOpCode::EEOP_INT64_EQ) ?
+						(left_val == right_val) :
+						(left_val != right_val);
 				}
 				break;
 			case VecOpCode::EEOP_AND:

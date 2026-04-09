@@ -1,8 +1,11 @@
 #include "postgres.h"
+#include "catalog/catalog.h"
 #include "utils/hsearch.h"
 #include "state.h"
 #include "execute.h"
 #include "nodes/plannodes.h"
+#include "parser/parsetree.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
 /* Definition of PgVolVecQueryState for C code */
@@ -78,42 +81,90 @@ pg_volvec_close_query_state(PgVolVecQueryState *state)
  * RELAXED VERSION: Support Agg and SeqScan.
  */
 static bool
-is_supported_plan(Plan *plan)
+plan_uses_supported_relations(Plan *plan, PlannedStmt *plannedstmt)
 {
 	if (plan == NULL)
 		return false;
 
 	if (IsA(plan, SeqScan))
-		return plan->lefttree == NULL && plan->righttree == NULL;
+	{
+		SeqScan *scan = (SeqScan *) plan;
+		RangeTblEntry *rte;
+
+		if (plannedstmt == NULL ||
+			scan->scan.scanrelid <= 0 ||
+			scan->scan.scanrelid > list_length(plannedstmt->rtable))
+			return false;
+		rte = rt_fetch(scan->scan.scanrelid, plannedstmt->rtable);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+			return false;
+		if (rte->relid == InvalidOid ||
+			IsCatalogRelationOid(rte->relid) ||
+			IsCatalogNamespace(get_rel_namespace(rte->relid)))
+			return false;
+		return true;
+	}
+
+	if (IsA(plan, SubqueryScan))
+		return ((SubqueryScan *) plan)->subplan != NULL &&
+			   plan_uses_supported_relations(((SubqueryScan *) plan)->subplan, plannedstmt);
+
+	return plan_uses_supported_relations(plan->lefttree, plannedstmt) &&
+		   (plan->righttree == NULL || plan_uses_supported_relations(plan->righttree, plannedstmt));
+}
+
+static bool
+is_supported_plan(Plan *plan, PlannedStmt *plannedstmt)
+{
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, SeqScan))
+		return plan->lefttree == NULL &&
+			   plan->righttree == NULL &&
+			   plan_uses_supported_relations(plan, plannedstmt);
 
 	if (IsA(plan, Hash))
 		return plan->lefttree != NULL &&
 			   plan->righttree == NULL &&
-			   is_supported_plan(plan->lefttree);
+			   is_supported_plan(plan->lefttree, plannedstmt);
 
 	if (IsA(plan, HashJoin))
 		return plan->lefttree != NULL &&
 			   plan->righttree != NULL &&
 			   IsA(plan->righttree, Hash) &&
-			   is_supported_plan(plan->lefttree) &&
-			   is_supported_plan(plan->righttree);
+			   is_supported_plan(plan->lefttree, plannedstmt) &&
+			   is_supported_plan(plan->righttree, plannedstmt);
+
+	if (IsA(plan, NestLoop))
+		return ((((Join *) plan)->jointype == JOIN_INNER) ||
+				(((Join *) plan)->jointype == JOIN_SEMI)) &&
+			   plan->lefttree != NULL &&
+			   plan->righttree != NULL &&
+			   is_supported_plan(plan->lefttree, plannedstmt) &&
+			   is_supported_plan(plan->righttree, plannedstmt);
 
 	if (IsA(plan, MergeJoin))
 		return ((Join *) plan)->jointype == JOIN_INNER &&
 			   ((MergeJoin *) plan)->mergeclauses != NIL &&
 			   plan->lefttree != NULL &&
 			   plan->righttree != NULL &&
-			   is_supported_plan(plan->lefttree) &&
-			   is_supported_plan(plan->righttree);
+			   is_supported_plan(plan->lefttree, plannedstmt) &&
+			   is_supported_plan(plan->righttree, plannedstmt);
 
 	if (IsA(plan, SubqueryScan))
 		return ((SubqueryScan *) plan)->subplan != NULL &&
-			   is_supported_plan(((SubqueryScan *) plan)->subplan);
+			   is_supported_plan(((SubqueryScan *) plan)->subplan, plannedstmt);
+
+	if (IsA(plan, Material))
+		return plan->lefttree != NULL &&
+			   plan->righttree == NULL &&
+			   is_supported_plan(plan->lefttree, plannedstmt);
 
 	if (IsA(plan, Agg) || IsA(plan, Sort) || IsA(plan, Limit))
 		return plan->lefttree != NULL &&
 			   plan->righttree == NULL &&
-			   is_supported_plan(plan->lefttree);
+			   is_supported_plan(plan->lefttree, plannedstmt);
 
 	return false;
 }
@@ -124,7 +175,7 @@ pg_volvec_try_build_query_state(QueryDesc *queryDesc, int eflags)
 	PgVolVecQueryState *state;
 	Plan *plan = queryDesc->plannedstmt->planTree;
 
-	if (is_supported_plan(plan))
+	if (is_supported_plan(plan, queryDesc->plannedstmt))
 	{
 		state = (PgVolVecQueryState *) palloc0(sizeof(PgVolVecQueryState));
 		state->context = AllocSetContextCreate(CurrentMemoryContext,

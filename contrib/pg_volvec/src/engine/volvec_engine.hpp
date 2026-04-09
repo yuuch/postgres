@@ -40,6 +40,25 @@ static constexpr int VOLVEC_NBASE = 10000;
 
 #if defined(__SIZEOF_INT128__)
 using NumericWideInt = __int128_t;
+
+static inline NumericWideInt
+MakeWideIntBits(uint64_t lo, uint64_t hi)
+{
+	return (((NumericWideInt) ((__int128_t) ((int64_t) hi))) << 64) |
+		(NumericWideInt) lo;
+}
+
+static inline uint64_t
+WideIntLow64(NumericWideInt value)
+{
+	return (uint64_t) value;
+}
+
+static inline int64_t
+WideIntHigh64(NumericWideInt value)
+{
+	return (int64_t) (((__int128_t) value) >> 64);
+}
 #else
 struct NumericWideInt
 {
@@ -57,6 +76,18 @@ static inline NumericWideInt
 MakeWideIntBits(uint64_t lo, uint64_t hi)
 {
 	return NumericWideInt(lo, (int64_t) hi);
+}
+
+static inline uint64_t
+WideIntLow64(NumericWideInt value)
+{
+	return value.lo;
+}
+
+static inline int64_t
+WideIntHigh64(NumericWideInt value)
+{
+	return value.hi;
 }
 
 static inline void
@@ -212,6 +243,38 @@ static inline NumericWideInt
 WideIntMul(NumericWideInt left, NumericWideInt right)
 {
 	return left * right;
+}
+
+static inline NumericWideInt
+RescaleWideIntUp(NumericWideInt value, int delta_scale)
+{
+	static const int64_t kPowers[] = {
+		INT64CONST(1),
+		INT64CONST(10),
+		INT64CONST(100),
+		INT64CONST(1000),
+		INT64CONST(10000),
+		INT64CONST(100000),
+		INT64CONST(1000000),
+		INT64CONST(10000000),
+		INT64CONST(100000000),
+		INT64CONST(1000000000),
+		INT64CONST(10000000000),
+		INT64CONST(100000000000),
+		INT64CONST(1000000000000),
+		INT64CONST(10000000000000),
+		INT64CONST(100000000000000),
+		INT64CONST(1000000000000000),
+		INT64CONST(10000000000000000),
+		INT64CONST(100000000000000000),
+		INT64CONST(1000000000000000000)
+	};
+
+	if (delta_scale <= 0)
+		return value;
+	if (delta_scale >= (int) lengthof(kPowers))
+		elog(ERROR, "pg_volvec rescale delta %d exceeds supported range", delta_scale);
+	return WideIntMul(value, WideIntFromInt64(kPowers[delta_scale]));
 }
 
 static inline int
@@ -392,6 +455,81 @@ TryFastNumericToScaledInt64(Datum value, int target_scale, int64_t *out)
 	return true;
 }
 
+static inline bool
+TryFastNumericToScaledWideInt(Datum value, int target_scale, NumericWideInt *out)
+{
+	const void *datum_ptr = DatumGetPointer(value);
+	const int16 *digits;
+	NumericWideInt accum = 0;
+	int ndigits;
+	int weight;
+	int remaining_scale;
+	int processed_groups;
+	int i;
+	NumericWideInt scale_factor = 1;
+
+	if (out == nullptr || datum_ptr == nullptr)
+		return false;
+	if (VolVecNumericIsSpecial(datum_ptr))
+		return false;
+	if (target_scale < 0 || target_scale > 18)
+		return false;
+
+	digits = VolVecNumericDigits(datum_ptr);
+	ndigits = VolVecNumericNDigits(datum_ptr);
+	weight = VolVecNumericWeight(datum_ptr);
+
+	for (i = 0; i < target_scale; i++)
+		scale_factor *= WideIntFromInt64(10);
+
+	for (i = 0; i <= weight; i++)
+	{
+		int16 digit = 0;
+
+		if (i >= 0 && i < ndigits)
+			digit = digits[i];
+		accum *= WideIntFromInt64(VOLVEC_NBASE);
+		accum += WideIntFromInt64(digit);
+	}
+
+	accum *= scale_factor;
+	remaining_scale = target_scale;
+	processed_groups = (target_scale + VOLVEC_DEC_DIGITS - 1) / VOLVEC_DEC_DIGITS;
+
+	for (i = 0; i < processed_groups; i++)
+	{
+		int group_exp = -1 - i;
+		int digit_index = weight - group_exp;
+		int16 digit = (digit_index >= 0 && digit_index < ndigits) ? digits[digit_index] : 0;
+		int take = Min(remaining_scale, VOLVEC_DEC_DIGITS);
+		int drop = VOLVEC_DEC_DIGITS - take;
+		int64_t divisor = 1;
+		int64_t contrib;
+
+		for (int j = 0; j < drop; j++)
+			divisor *= 10;
+		if (digit % divisor != 0)
+			return false;
+		contrib = digit / divisor;
+		for (int j = 0; j < remaining_scale - take; j++)
+			contrib *= 10;
+		accum += WideIntFromInt64(contrib);
+		remaining_scale -= take;
+	}
+
+	for (i = Max(weight + 1 + processed_groups, 0); i < ndigits; i++)
+	{
+		if (digits[i] != 0)
+			return false;
+	}
+
+	if (VolVecNumericNegative(datum_ptr))
+		accum = -accum;
+
+	*out = accum;
+	return true;
+}
+
 class PgMemoryContextObject
 {
 public:
@@ -470,6 +608,25 @@ using VolVecHashMap = std::unordered_map<Key, Value, Hash, KeyEqual,
 
 struct SelectionVector { uint16_t row_ids[DEFAULT_CHUNK_SIZE]; uint16_t count; void clear() { count = 0; } };
 struct VecStringRef { uint32_t len; uint32_t offset; uint64_t prefix; };
+static constexpr uint32_t kVecStringInlineOffset = UINT32_MAX;
+
+static inline bool
+VecStringRefIsInline(const VecStringRef &ref)
+{
+	return ref.len > 0 && ref.len <= 8 && ref.offset == kVecStringInlineOffset;
+}
+
+static inline const char *
+VecStringRefDataPtr(const VecStringRef &ref, const char *arena_base)
+{
+	if (ref.len == 0)
+		return "";
+	if (VecStringRefIsInline(ref))
+		return reinterpret_cast<const char *>(&ref.prefix);
+	if (arena_base == nullptr)
+		return nullptr;
+	return arena_base + ref.offset;
+}
 
 enum class VecOutputStorageKind : uint8_t {
 	Int32,
@@ -529,16 +686,19 @@ struct alignas(16) DataChunk {
 
 		if (len == 0 || data == nullptr)
 			return ref;
+		memcpy(&ref.prefix, data, len > 8 ? 8 : len);
+		if (len <= 8)
+		{
+			ref.offset = kVecStringInlineOffset;
+			return ref;
+		}
 		ref.offset = (uint32_t) string_arena.size();
 		string_arena.insert(string_arena.end(), data, data + len);
-		memcpy(&ref.prefix, data, len > 8 ? 8 : len);
 		return ref;
 	}
 	const char *get_string_ptr(const VecStringRef &ref) const
 	{
-		if (ref.len == 0)
-			return "";
-		return string_arena.data() + ref.offset;
+		return VecStringRefDataPtr(ref, string_arena.data());
 	}
 	void get_double_ptrs(double** out) { for(int i=0; i<16; i++) out[i] = double_columns[i]; }
 	void get_int64_ptrs(int64_t** out) { for(int i=0; i<16; i++) out[i] = int64_columns[i]; }
@@ -598,8 +758,10 @@ enum class VecOpCode {
 	EEOP_INT64_LE,
 	EEOP_INT64_GE,
 	EEOP_INT64_EQ,
+	EEOP_INT64_NE,
 	EEOP_DATE_LT,
 	EEOP_DATE_LE,
+	EEOP_DATE_GT,
 	EEOP_DATE_GE,
 	EEOP_DATE_PART_YEAR,
 	EEOP_INT32_EQ,
@@ -620,13 +782,21 @@ struct VecExprStep {
 	int res_idx;
 	union {
 		struct { int att_idx; Oid type; } var;
-		struct { double fval; int64_t i64val; int32_t ival; bool isnull; } constant;
+		struct {
+			double fval;
+			int64_t i64val;
+			int32_t ival;
+			bool isnull;
+			bool has_wide_i128;
+			uint64_t wide_lo;
+			int64_t wide_hi;
+		} constant;
 		struct { int left; int right; } op;
 		struct { int cond; int if_true; int if_false; } ternary;
 		struct { int att_idx; uint32_t len; uint32_t offset; uint64_t prefix; Oid type; } str_prefix;
 	} d;
 	};
-typedef void (*VecExprJitFunc)(uint32_t count, double** col_f8, int64_t** col_i64, int32_t** col_i32, VecStringRef** col_str, uint8_t** col_nulls, double* res_f8, int64_t* res_i64, int32_t* res_i32, uint8_t* res_nulls, uint16_t* sel, bool has_sel);
+typedef void (*VecExprJitFunc)(uint32_t count, double** col_f8, int64_t** col_i64, int32_t** col_i32, VecStringRef** col_str, uint8_t** col_nulls, const char *string_arena_base, double* res_f8, int64_t* res_i64, int32_t* res_i32, uint8_t* res_nulls, uint16_t* sel, bool has_sel);
 
 class VecExprProgram : public PgMemoryContextObject {
 public:
@@ -856,6 +1026,45 @@ struct VecLookupScalarValue {
 using VecLookupScalarHashTable =
 	VolVecHashMap<VecLookupScalarKey, VecLookupScalarValue, VecLookupScalarKeyHash>;
 
+static constexpr int kMaxLookupKeys = 4;
+
+struct VecLookupCompositeKey {
+	int64_t values[kMaxLookupKeys] = {0, 0, 0, 0};
+	uint8_t num_keys = 0;
+	uint8_t is_null = 0;
+
+	bool operator==(const VecLookupCompositeKey &other) const
+	{
+		if (num_keys != other.num_keys || is_null != other.is_null)
+			return false;
+		if (is_null)
+			return true;
+		for (int i = 0; i < num_keys; i++)
+		{
+			if (values[i] != other.values[i])
+				return false;
+		}
+		return true;
+	}
+};
+
+struct VecLookupCompositeKeyHash {
+	std::size_t operator()(const VecLookupCompositeKey &key) const
+	{
+		std::size_t h = std::hash<uint8_t>{}(key.num_keys);
+
+		h ^= std::hash<uint8_t>{}(key.is_null) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		if (key.is_null)
+			return h;
+		for (int i = 0; i < key.num_keys; i++)
+			h ^= std::hash<int64_t>{}(key.values[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		return h;
+	}
+};
+
+using VecLookupCompositeHashTable =
+	VolVecHashMap<VecLookupCompositeKey, VecLookupScalarValue, VecLookupCompositeKeyHash>;
+
 class VecLookupProjectState : public VecPlanState {
 public:
 	VecLookupProjectState(std::unique_ptr<VecPlanState> left,
@@ -886,6 +1095,44 @@ private:
 	VecOutputColMeta input_key_meta_;
 	uint16_t lookup_key_col_;
 	VecOutputColMeta lookup_key_meta_;
+	uint16_t lookup_value_col_;
+	int output_resno_;
+	VecOutputColMeta output_meta_;
+	bool lookup_built_;
+};
+
+class VecLookupProjectStateMultiKey : public VecPlanState {
+public:
+	VecLookupProjectStateMultiKey(std::unique_ptr<VecPlanState> left,
+								  std::unique_ptr<VecPlanState> lookup_source,
+								  int num_keys,
+								  const uint16_t *input_key_cols,
+								  const VecOutputColMeta *input_key_metas,
+								  const uint16_t *lookup_key_cols,
+								  const VecOutputColMeta *lookup_key_metas,
+								  uint16_t lookup_value_col,
+								  int output_resno,
+								  VecOutputColMeta output_meta);
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+private:
+	bool build_lookup();
+	bool extract_lookup_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
+							int row,
+							const uint16_t *cols,
+							const VecOutputColMeta *metas,
+							VecLookupCompositeKey *key) const;
+
+	std::unique_ptr<VecPlanState> left_;
+	std::unique_ptr<VecPlanState> lookup_source_;
+	MemoryContext memory_context_;
+	VecLookupCompositeHashTable lookup_table_;
+	DataChunk<DEFAULT_CHUNK_SIZE> lookup_chunk_;
+	int num_keys_;
+	uint16_t input_key_cols_[kMaxLookupKeys];
+	VecOutputColMeta input_key_metas_[kMaxLookupKeys];
+	uint16_t lookup_key_cols_[kMaxLookupKeys];
+	VecOutputColMeta lookup_key_metas_[kMaxLookupKeys];
 	uint16_t lookup_value_col_;
 	int output_resno_;
 	VecOutputColMeta output_meta_;
@@ -1010,11 +1257,14 @@ public:
 	VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 					 std::unique_ptr<VecPlanState> inner,
 					 JoinType jointype,
+					 bool build_outer_side,
+					 int visible_output_count,
 					 VolVecVector<VecJoinOutputCol> output_cols,
 					 VolVecVector<VecHashJoinKeyCol> key_cols);
 	~VecHashJoinState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+	void set_join_filter_program(std::unique_ptr<VecExprProgram> program);
 	private:
 		struct VecHashEntry {
 			uint32_t hash;
@@ -1038,10 +1288,13 @@ public:
 		uint32_t hash_key(const VecHashJoinKey &key) const;
 		bool read_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk, bool inner_side, int row, VecHashJoinKey *key) const;
 		bool keys_equal(const VecHashJoinKey &left, const VecHashJoinKey &right) const;
+		bool candidate_passes_join_filter(const DataChunk<DEFAULT_CHUNK_SIZE> &outer_src, int outer_row,
+										  const DataChunk<DEFAULT_CHUNK_SIZE> &inner_src, int inner_row);
 
 		std::unique_ptr<VecPlanState> outer_;
 		std::unique_ptr<VecPlanState> inner_;
 		JoinType jointype_;
+		int visible_output_count_;
 		MemoryContext memory_context_;
 		VolVecVector<VecJoinOutputCol> output_cols_;
 		VolVecVector<VecHashJoinKeyCol> key_cols_;
@@ -1059,6 +1312,14 @@ public:
 	VolVecVector<uint16_t> next_probe_sel_;
 	bool inner_built_;
 	bool probe_batch_ready_;
+	bool probe_input_exhausted_;
+	bool build_outer_side_;
+	std::unique_ptr<VecExprProgram> join_filter_program_;
+	DataChunk<DEFAULT_CHUNK_SIZE> join_filter_chunk_;
+	bool semi_build_marked_;
+	uint32_t semi_build_emit_pos_;
+	bool anti_build_marked_;
+	uint32_t anti_build_emit_pos_;
 	bool right_anti_marked_;
 	uint16_t anti_outer_pos_;
 	uint32_t right_anti_emit_pos_;
@@ -1101,17 +1362,20 @@ struct VecSortKeyLane {
 
 		if (len == 0 || data == nullptr)
 			return ref;
+		memcpy(&ref.prefix, data, len > 8 ? 8 : len);
+		if (len <= 8)
+		{
+			ref.offset = kVecStringInlineOffset;
+			return ref;
+		}
 		ref.offset = (uint32_t) string_arena.size();
 		string_arena.insert(string_arena.end(), data, data + len);
-		memcpy(&ref.prefix, data, len > 8 ? 8 : len);
 		return ref;
 	}
 
 	const char *get_string_ptr(const VecStringRef &ref) const
 	{
-		if (ref.len == 0)
-			return "";
-		return string_arena.data() + ref.offset;
+		return VecStringRefDataPtr(ref, string_arena.data());
 	}
 };
 

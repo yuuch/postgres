@@ -1,6 +1,6 @@
 # pg_volvec TPC-H Roadmap
 
-This document describes a realistic path from the current `pg_volvec` prototype to broader TPC-H coverage. It is grounded in the local `~/data/pg_tpch` verification state as of April 3, 2026.
+This document describes a realistic path from the current `pg_volvec` prototype to broader TPC-H coverage and better performance on the validated set. It is grounded in the local `~/data/pg_tpch` verification state as of April 8, 2026.
 
 ## Current Baseline
 
@@ -10,6 +10,7 @@ This document describes a realistic path from the current `pg_volvec` prototype 
   - `SeqScan -> optional qual -> Agg`
   - `Limit -> Sort -> Agg`
   - inner `HashJoin` chains
+  - first-cut hash-backed right/left outer join family
   - `SubqueryScan`
   - `MergeJoin`-planned shapes through a temporary hash-backed fallback
   - current Q22-style right-anti-planned shapes through a hash-backed fallback
@@ -25,6 +26,7 @@ This document describes a realistic path from the current `pg_volvec` prototype 
   - Q10
   - Q11
   - Q12
+  - Q13
   - Q14
   - Q15
   - Q16
@@ -34,6 +36,7 @@ This document describes a realistic path from the current `pg_volvec` prototype 
 - Offloaded with narrower validation so far:
   - Q2
   - Q17
+  - Q21
 - Verified capabilities:
   - vectorized `SeqScan`, `Filter`, grouped `Agg`
   - first-cut vectorized in-memory `Sort`
@@ -69,14 +72,14 @@ These numbers are local engineering checkpoints, not broad claims:
 
 ### Main current limitations
 
-- No true outer join support
+- Outer join support is currently limited to the validated Q13-style hash right/left subset
 - No true nested-loop-based semi / anti join execution
 - No broad `count(distinct ...)` coverage beyond the current validated scalar-key cases
 - No `Materialize` or broader plan-node coverage around rescan-heavy shapes
 - No direct aggregate fusion of `sum(expr)` / `avg(expr)`
 - Current `Sort` is still a first-cut single-run in-memory implementation
 - `MergeJoin` is still executed through a hash-backed fallback, not a true merge kernel
-- Q13 and Q21 are currently blocked by the live `tpch` schema missing columns in `orders` / `customer`
+- Q21 can now offload and complete in the local prototype, but it is not a near-term executor milestone because the current many-table join plus sublink shape is dominated by PostgreSQL planner quality
 
 ## Roadmap Principles
 
@@ -84,6 +87,7 @@ These numbers are local engineering checkpoints, not broad claims:
 2. Keep fallback to native PostgreSQL safe and boring.
 3. Favor specialization of the hot single-table path before broadening plan coverage.
 4. Only add features that actually help TPC-H. For example, window functions are not on the critical path because TPC-H does not require them.
+5. When a query is mainly limited by PostgreSQL planning quality, prefer planner-aware offload heuristics or validation notes over deeper executor work.
 
 ## Phase 1: Finish The Current Multi-Query Core
 
@@ -104,31 +108,34 @@ Turn the current working wave into a cleaner, better-instrumented base before th
 - Makes Q1/Q6/Q14/Q12-style paths more stable and easier to extend.
 - Reduces the amount of one-off query-specific cleanup before the next wave.
 
-## Phase 2: Q20 And Schema Repair
+## Phase 2: Performance, Validation, And Planner-Aware Triage
 
 ### Goal
 
-Unlock the next practical query family after the current validated set, and remove environment blockers for the remaining outer-join wave.
+Make the validated set faster, easier to benchmark, and easier to reason about before taking on more executor complexity.
 
 ### Why this is next
 
-Q18 is already done. The next real query gap is Q20, whose remaining blockers are now narrow enough to name precisely:
+The current prototype already covers most of the practically reachable local TPCH set. The highest-value next work is therefore no longer a single uncovered query. It is:
 
-- a hash-backed `Nested Loop` / `Semi Join` execution path, or a real vectorized nested-loop family
-- multi-key correlated scalar lookup because the scalar subquery depends on both `ps_partkey` and `ps_suppkey`
-
-In parallel, Q13 and Q21 cannot be used as honest executor milestones until the local `tpch` schema is repaired.
+- improving the performance of the already verified set
+- closing the remaining validation gaps for Q2 / Q17
+- keeping Q21 documented as an offloaded-but-deprioritized shape whose local pain point is planner quality rather than a missing executor primitive
 
 ### Tasks
 
-- [ ] Add a hash-backed `Nested Loop` / `Semi Join` path suitable for Q20, or a real vectorized nested-loop family.
-- [ ] Extend correlated scalar lookup to multi-key correlation.
-- [ ] Repair the local `orders` / `customer` TPCH schema so Q13 and Q21 are meaningful targets again.
+- [ ] Add a repeatable correctness and benchmark harness for the verified query set.
+- [ ] Keep improving Q1 / Q6 / Q10 / Q12 / Q14 performance where flame graphs still show value.
+- [ ] Close the remaining full-diff validation gap for Q2 / Q17 where practical.
+- [ ] Add planner-aware offload heuristics so obviously bad partial-offload shapes can stay on native PostgreSQL.
+- [ ] Re-validate Q13 as join/filter rewrites expand.
+- [ ] Keep Q21 documented as a parked query shape unless a future planner or rewrite path makes it a better executor target.
 
 ### TPC-H impact
 
-- Q20 becomes the next concrete query unlock.
-- Q13 / Q21 stop being blocked by environment drift.
+- Makes the validated set more useful as an engineering platform.
+- Turns Q2 / Q17 into cleanly closed cases instead of permanent “almost done” entries.
+- Avoids over-investing in a Q21 path whose local bottleneck is primarily planning quality.
 
 ## Phase 3: Outer Join And Distinct Wave
 
@@ -138,9 +145,9 @@ Unlock the remaining families blocked mainly by outer joins, distinct, and anti-
 
 ### Candidate queries
 
-- Q13
-- Q20
-- Q21
+- residual hard cases in richer semi/anti join compositions
+- broader distinct-heavy shapes
+- Q21 only if a future planner shape or rewrite makes it a better executor target
 
 ### Required features
 
@@ -162,7 +169,7 @@ Queries like Q19 are easy to underestimate. The main problem is not just the joi
 ### Candidate queries
 
 - Q19
-- residual hard cases inside Q16 / Q20 / Q21
+- residual hard cases inside Q16 and later semi/anti join work
 
 ### Required features
 
@@ -186,7 +193,7 @@ Close the remaining gaps after Q18, outer joins, distinct, and stronger subquery
 
 - Q2 full native diff closure on the live dataset
 - Q17 full native TPCH-side diff closure
-- residual hard cases after Q20 / Q13 / Q21
+- residual hard cases after Q13 and the remaining semi/anti wave
 
 ## Cross-Cutting Priorities
 
@@ -228,10 +235,11 @@ These may matter later, but they should not distort the near-term roadmap:
 
 ## Recommended Next Step
 
-If work resumes immediately after this document, the highest-value next milestone is Q20:
+If work resumes immediately after this document, the highest-value next milestone is performance and validation discipline on the already supported set:
 
-1. add a hash-backed `Nested Loop` / `Semi Join` path, or a real vectorized nested-loop family
-2. extend correlated scalar lookup to multi-key correlation
-3. repair the local TPCH schema so Q13 and Q21 stop being blocked by environment drift
+1. build the repeatable benchmark and correctness harness for the verified queries
+2. keep optimizing the hottest validated paths, especially Q1 / Q6 / Q10 / Q12 / Q14
+3. close the remaining validation gaps for Q2 / Q17
+4. treat Q21 as a planner-quality warning sign, not as the default next executor project
 
-That ordering stays close to the next real query unlock instead of drifting into abstract executor work.
+That ordering keeps engineering effort tied to measurable wins instead of overfitting the executor to one especially poor local plan.

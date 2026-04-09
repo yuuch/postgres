@@ -21,6 +21,7 @@ extern "C" {
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <vector>
 
@@ -153,6 +154,107 @@ pg_volvec_i128_const(LLVMTypeRef type_i128, int64_t value)
 	return LLVMConstInt(type_i128, (uint64_t) value, true);
 }
 
+static inline LLVMValueRef
+pg_volvec_i128_const_bits(LLVMTypeRef type_i128, uint64_t lo, uint64_t hi)
+{
+	uint64_t words[2];
+
+	words[0] = lo;
+	words[1] = hi;
+	return LLVMConstIntOfArbitraryPrecision(type_i128, 2, words);
+}
+
+static inline LLVMValueRef
+pg_volvec_l_ptr_const(LLVMTypeRef type_sizet, void *ptr, LLVMTypeRef type)
+{
+	LLVMValueRef c = LLVMConstInt(type_sizet, (uintptr_t) ptr, false);
+
+	return LLVMConstIntToPtr(c, type);
+}
+
+static uint32_t
+pg_volvec_jit_trim_bpchar_length(const char *data, uint32_t len)
+{
+	while (len > 0 && data[len - 1] == ' ')
+		len--;
+	return len;
+}
+
+extern "C" bool pg_volvec_jit_string_const_match_ref(const VecStringRef *ref,
+														const char *arena_base,
+														const char *match,
+														uint32_t match_len,
+														Oid string_type,
+														bool prefix_like);
+
+extern "C" bool
+pg_volvec_jit_string_const_match_ref(const VecStringRef *ref,
+									 const char *arena_base,
+									 const char *match,
+									 uint32_t match_len,
+									 Oid string_type,
+									 bool prefix_like)
+{
+	const char *lhs;
+	uint64_t mask = 0;
+
+	if (ref == nullptr)
+		return false;
+	if (match_len > 0)
+		mask = (match_len >= 8) ? UINT64_MAX : ((UINT64CONST(1) << (match_len * 8)) - 1);
+	if (match_len > 0)
+	{
+		uint64_t rhs_prefix = 0;
+
+		memcpy(&rhs_prefix, match, match_len > 8 ? 8 : match_len);
+		if ((ref->prefix & mask) != (rhs_prefix & mask))
+			return false;
+	}
+
+	if (prefix_like)
+	{
+		if (ref->len < match_len)
+			return false;
+		if (match_len <= 8)
+			return true;
+		lhs = VecStringRefDataPtr(*ref, arena_base);
+		return lhs != nullptr && memcmp(lhs, match, match_len) == 0;
+	}
+
+	lhs = VecStringRefDataPtr(*ref, arena_base);
+	if (lhs == nullptr)
+		return false;
+
+	if (string_type == BPCHAROID)
+	{
+		uint32_t lhs_len = pg_volvec_jit_trim_bpchar_length(lhs, ref->len);
+		uint32_t rhs_len = pg_volvec_jit_trim_bpchar_length(match, match_len);
+
+		if (lhs_len != rhs_len)
+			return false;
+		return lhs_len == 0 || memcmp(lhs, match, lhs_len) == 0;
+	}
+
+	if (ref->len != match_len)
+		return false;
+	if (match_len <= 8)
+		return true;
+	return memcmp(lhs, match, match_len) == 0;
+}
+
+static bool
+pg_volvec_const_step_requires_wide_i128(const VecExprStep &step)
+{
+	int64_t expected_hi;
+
+	if (step.opcode != VecOpCode::EEOP_CONST || !step.d.constant.has_wide_i128)
+		return false;
+
+	expected_hi = (step.d.constant.i64val < 0) ? -1 : 0;
+	return step.d.constant.wide_lo != (uint64_t) step.d.constant.i64val ||
+		(int64_t) step.d.constant.wide_hi != expected_hi;
+}
+
 struct ExprJitColumnBases
 {
 	std::array<LLVMValueRef, kMaxDeformTargets> f8;
@@ -184,6 +286,7 @@ pg_volvec_expr_opcode_supported(VecOpCode opcode)
 		case VecOpCode::EEOP_INT64_ADD:
 		case VecOpCode::EEOP_INT64_SUB:
 		case VecOpCode::EEOP_INT64_MUL:
+		case VecOpCode::EEOP_INT64_DIV_FLOAT8:
 		case VecOpCode::EEOP_FLOAT8_LT:
 		case VecOpCode::EEOP_FLOAT8_GT:
 		case VecOpCode::EEOP_FLOAT8_LE:
@@ -193,8 +296,10 @@ pg_volvec_expr_opcode_supported(VecOpCode opcode)
 		case VecOpCode::EEOP_INT64_LE:
 		case VecOpCode::EEOP_INT64_GE:
 		case VecOpCode::EEOP_INT64_EQ:
+		case VecOpCode::EEOP_INT64_NE:
 		case VecOpCode::EEOP_DATE_LT:
 		case VecOpCode::EEOP_DATE_LE:
+		case VecOpCode::EEOP_DATE_GT:
 		case VecOpCode::EEOP_DATE_GE:
 		case VecOpCode::EEOP_AND:
 		case VecOpCode::EEOP_OR:
@@ -342,6 +447,57 @@ pg_volvec_build_rescale_int64(LLVMBuilderRef b,
 }
 
 static LLVMValueRef
+pg_volvec_build_rescale_compare_i128(LLVMBuilderRef b,
+									 LLVMTypeRef type_i128,
+									 LLVMValueRef value,
+									 int from_scale,
+									 int to_scale)
+{
+	LLVMValueRef widened = LLVMBuildSExt(b, value, type_i128, "");
+
+	if (from_scale >= to_scale)
+		return widened;
+
+	return LLVMBuildMul(b,
+						widened,
+						pg_volvec_i128_const(type_i128,
+											 pg_volvec_jit_pow10_int64(to_scale - from_scale)),
+						"");
+}
+
+static LLVMValueRef
+pg_volvec_build_rescale_compare_operand_i128(LLVMBuilderRef b,
+											 LLVMTypeRef type_i128,
+											 const VecExprStep *step,
+											 LLVMValueRef value,
+											 int from_scale,
+											 int to_scale)
+{
+	LLVMValueRef widened;
+
+	if (step != nullptr &&
+		step->opcode == VecOpCode::EEOP_CONST &&
+		step->d.constant.has_wide_i128)
+	{
+		widened = pg_volvec_i128_const_bits(type_i128,
+											 step->d.constant.wide_lo,
+											 (uint64_t) step->d.constant.wide_hi);
+	}
+	else
+	{
+		return pg_volvec_build_rescale_compare_i128(b, type_i128, value,
+													 from_scale, to_scale);
+	}
+	if (from_scale >= to_scale)
+		return widened;
+	return LLVMBuildMul(b,
+						widened,
+						pg_volvec_i128_const(type_i128,
+											 pg_volvec_jit_pow10_int64(to_scale - from_scale)),
+						"");
+}
+
+static LLVMValueRef
 pg_volvec_build_i32_truthy(LLVMBuilderRef b,
 						   LLVMTypeRef type_i32,
 						   LLVMValueRef is_null,
@@ -425,9 +581,12 @@ pg_volvec_emit_string_const_match(LLVMBuilderRef b,
 									LLVMTypeRef type_i8,
 									LLVMTypeRef type_i32,
 									LLVMTypeRef type_i64,
+									LLVMTypeRef type_sizet,
 									LLVMTypeRef type_stringref,
 									LLVMValueRef string_base,
+									LLVMValueRef string_arena_base,
 									LLVMValueRef row_idx_ext,
+									const VecExprProgram *program,
 									const VecExprStep &step)
 {
 	LLVMValueRef ref_ptr;
@@ -440,13 +599,43 @@ pg_volvec_emit_string_const_match(LLVMBuilderRef b,
 
 	if (string_base == nullptr)
 		return nullptr;
-	if (step.d.str_prefix.offset != UINT32_MAX)
-		return nullptr;
 
 	ref_ptr = LLVMBuildGEP2(b, type_stringref, string_base, &row_idx_ext, 1, "");
 	ref_val = LLVMBuildLoad2(b, type_stringref, ref_ptr, "");
 	ref_len = LLVMBuildExtractValue(b, ref_val, 0, "str_len");
 	ref_prefix = LLVMBuildExtractValue(b, ref_val, 2, "str_prefix");
+
+	if (step.d.str_prefix.offset != UINT32_MAX)
+	{
+		LLVMTypeRef helper_arg_types[6] = {
+			l_ptr(type_stringref),
+			l_ptr(type_i8),
+			l_ptr(type_i8),
+			type_i32,
+			type_i32,
+			type_i1
+		};
+		LLVMTypeRef helper_ty =
+			LLVMFunctionType(type_i1, helper_arg_types, lengthof(helper_arg_types), 0);
+		const char *match_ptr = program->get_string_const_ptr(step.d.str_prefix.offset);
+		LLVMValueRef v_helper =
+			pg_volvec_l_ptr_const(type_sizet,
+								  reinterpret_cast<void *>(&pg_volvec_jit_string_const_match_ref),
+								  l_ptr(helper_ty));
+		LLVMValueRef args[6];
+
+		if (match_ptr == nullptr)
+			return nullptr;
+
+		args[0] = ref_ptr;
+		args[1] = string_arena_base;
+		args[2] = pg_volvec_l_ptr_const(type_sizet, const_cast<char *>(match_ptr), l_ptr(type_i8));
+		args[3] = pg_volvec_i32_const(type_i32, match_len);
+		args[4] = pg_volvec_i32_const(type_i32, (int32_t) step.d.str_prefix.type);
+		args[5] = LLVMConstInt(type_i1, step.opcode == VecOpCode::EEOP_STR_PREFIX_LIKE, false);
+		return LLVMBuildCall2(b, helper_ty, v_helper, args, lengthof(args), "str_match");
+	}
+
 	if (match_len > 0)
 		mask = (match_len >= 8) ? UINT64_MAX : ((UINT64CONST(1) << (match_len * 8)) - 1);
 	if (match_len == 0)
@@ -522,10 +711,12 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 						LLVMTypeRef type_i32,
 						LLVMTypeRef type_i64,
 						LLVMTypeRef type_i128,
+						LLVMTypeRef type_sizet,
 						LLVMTypeRef type_stringref,
 						LLVMTypeRef type_double,
 						const VecExprProgram *program,
 						const ExprJitColumnBases &bases,
+						LLVMValueRef v_string_arena_base,
 						LLVMValueRef v_row_idx_ext,
 						LLVMValueRef v_store_idx_ext,
 						LLVMValueRef v_res_f8,
@@ -537,6 +728,13 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 	std::vector<LLVMValueRef> reg_i64(program->max_reg_idx, nullptr);
 	std::vector<LLVMValueRef> reg_i32(program->max_reg_idx, nullptr);
 	std::vector<LLVMValueRef> reg_null(program->max_reg_idx, nullptr);
+	std::vector<const VecExprStep *> reg_defs(program->max_reg_idx, nullptr);
+
+	for (const auto &step : program->steps)
+	{
+		if (step.res_idx >= 0 && step.res_idx < program->max_reg_idx)
+			reg_defs[step.res_idx] = &step;
+	}
 
 	for (const auto &step : program->steps)
 	{
@@ -584,12 +782,17 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 				}
 				else
 				{
+					LLVMValueRef value_i32;
+
 					if (bases.i32[att] == nullptr)
 						return false;
-					reg_i32[res] = LLVMBuildLoad2(
+					value_i32 = LLVMBuildLoad2(
 						b, type_i32,
 						LLVMBuildGEP2(b, type_i32, bases.i32[att], &v_row_idx_ext, 1, ""),
 						"");
+					reg_i32[res] = value_i32;
+					if (step.d.var.type == INT2OID || step.d.var.type == INT4OID)
+						reg_i64[res] = LLVMBuildSExt(b, value_i32, type_i64, "");
 				}
 				break;
 			}
@@ -689,11 +892,35 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 					b, LLVMBuildMul(b, wide_left, wide_right, ""), type_i64, "");
 				break;
 			}
+			case VecOpCode::EEOP_INT64_DIV_FLOAT8:
+			{
+				LLVMValueRef left_val;
+				LLVMValueRef right_val;
+
+				if (!reg_null[l] || !reg_null[r] || !reg_i64[l] || !reg_i64[r])
+					return false;
+				reg_null[res] = LLVMBuildOr(b, reg_null[l], reg_null[r], "");
+				left_val = LLVMBuildSIToFP(b, reg_i64[l], type_double, "");
+				right_val = LLVMBuildSIToFP(b, reg_i64[r], type_double, "");
+				if (left_scale > 0)
+					left_val = LLVMBuildFDiv(
+						b, left_val,
+						LLVMConstReal(type_double, (double) pg_volvec_jit_pow10_int64(left_scale)),
+						"");
+				if (right_scale > 0)
+					right_val = LLVMBuildFDiv(
+						b, right_val,
+						LLVMConstReal(type_double, (double) pg_volvec_jit_pow10_int64(right_scale)),
+						"");
+				reg_f8[res] = LLVMBuildFDiv(b, left_val, right_val, "");
+				break;
+			}
 			case VecOpCode::EEOP_INT64_LT:
 			case VecOpCode::EEOP_INT64_LE:
 			case VecOpCode::EEOP_INT64_GT:
 			case VecOpCode::EEOP_INT64_GE:
 			case VecOpCode::EEOP_INT64_EQ:
+			case VecOpCode::EEOP_INT64_NE:
 			{
 				LLVMIntPredicate pred;
 				LLVMValueRef left_val;
@@ -704,10 +931,10 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 					return false;
 
 				cmp_scale = Max(left_scale, right_scale);
-				left_val = pg_volvec_build_rescale_int64(b, type_i64, type_i128, reg_i64[l],
-														 left_scale, cmp_scale);
-				right_val = pg_volvec_build_rescale_int64(b, type_i64, type_i128, reg_i64[r],
-														  right_scale, cmp_scale);
+				left_val = pg_volvec_build_rescale_compare_operand_i128(
+					b, type_i128, reg_defs[l], reg_i64[l], left_scale, cmp_scale);
+				right_val = pg_volvec_build_rescale_compare_operand_i128(
+					b, type_i128, reg_defs[r], reg_i64[r], right_scale, cmp_scale);
 				reg_null[res] = LLVMBuildOr(b, reg_null[l], reg_null[r], "");
 				pred = LLVMIntSLT;
 				if (step.opcode == VecOpCode::EEOP_INT64_LE)
@@ -718,12 +945,15 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 					pred = LLVMIntSGE;
 				else if (step.opcode == VecOpCode::EEOP_INT64_EQ)
 					pred = LLVMIntEQ;
+				else if (step.opcode == VecOpCode::EEOP_INT64_NE)
+					pred = LLVMIntNE;
 				reg_i32[res] = LLVMBuildZExt(
 					b, LLVMBuildICmp(b, pred, left_val, right_val, ""), type_i32, "");
 				break;
 			}
 			case VecOpCode::EEOP_DATE_LT:
 			case VecOpCode::EEOP_DATE_LE:
+			case VecOpCode::EEOP_DATE_GT:
 			case VecOpCode::EEOP_DATE_GE:
 			{
 				LLVMIntPredicate pred = LLVMIntSLT;
@@ -733,6 +963,8 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 				reg_null[res] = LLVMBuildOr(b, reg_null[l], reg_null[r], "");
 				if (step.opcode == VecOpCode::EEOP_DATE_LE)
 					pred = LLVMIntSLE;
+				else if (step.opcode == VecOpCode::EEOP_DATE_GT)
+					pred = LLVMIntSGT;
 				else if (step.opcode == VecOpCode::EEOP_DATE_GE)
 					pred = LLVMIntSGE;
 				reg_i32[res] = LLVMBuildZExt(
@@ -812,9 +1044,9 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 								   ""),
 					type_i1,
 					"");
-					matches = pg_volvec_emit_string_const_match(
-					b, type_i1, type_i8, type_i32, type_i64, type_stringref,
-					bases.str[att], v_row_idx_ext, step);
+				matches = pg_volvec_emit_string_const_match(
+					b, type_i1, type_i8, type_i32, type_i64, type_sizet, type_stringref,
+					bases.str[att], v_string_arena_base, v_row_idx_ext, program, step);
 				if (matches == nullptr)
 					return false;
 				if (step.opcode == VecOpCode::EEOP_STR_NE)
@@ -871,24 +1103,26 @@ compile_expr_to_jit(LLVMJitContext *context,
 	LLVMTypeRef type_i32 = LLVMInt32TypeInContext(lc);
 	LLVMTypeRef type_i64 = LLVMInt64TypeInContext(lc);
 	LLVMTypeRef type_i128 = LLVMIntTypeInContext(lc, 128);
+	LLVMTypeRef type_sizet = LLVMIntTypeInContext(lc, sizeof(size_t) * 8);
 	LLVMTypeRef type_double = LLVMDoubleTypeInContext(lc);
 	LLVMTypeRef type_stringref_members[3] = {type_i32, type_i32, type_i64};
 	LLVMTypeRef type_stringref = LLVMStructTypeInContext(lc, type_stringref_members, 3, false);
-	LLVMTypeRef param_types[12];
+	LLVMTypeRef param_types[13];
 	param_types[0] = type_i32;
 	param_types[1] = l_ptr(l_ptr(type_double));
 	param_types[2] = l_ptr(l_ptr(type_i64));
 	param_types[3] = l_ptr(l_ptr(type_i32));
 	param_types[4] = l_ptr(l_ptr(type_stringref));
 	param_types[5] = l_ptr(l_ptr(type_i8));
-	param_types[6] = l_ptr(type_double);
-	param_types[7] = l_ptr(type_i64);
-	param_types[8] = l_ptr(type_i32);
-	param_types[9] = l_ptr(type_i8);
-	param_types[10] = l_ptr(type_i16);
-	param_types[11] = type_i1;
+	param_types[6] = l_ptr(type_i8);
+	param_types[7] = l_ptr(type_double);
+	param_types[8] = l_ptr(type_i64);
+	param_types[9] = l_ptr(type_i32);
+	param_types[10] = l_ptr(type_i8);
+	param_types[11] = l_ptr(type_i16);
+	param_types[12] = type_i1;
 
-	LLVMTypeRef func_sig = LLVMFunctionType(LLVMVoidTypeInContext(lc), param_types, 12, 0);
+	LLVMTypeRef func_sig = LLVMFunctionType(LLVMVoidTypeInContext(lc), param_types, 13, 0);
 	LLVMValueRef v_func = LLVMAddFunction(mod, funcname, func_sig);
 	LLVMValueRef v_count = LLVMGetParam(v_func, 0);
 	LLVMValueRef v_col_f8 = LLVMGetParam(v_func, 1);
@@ -896,12 +1130,13 @@ compile_expr_to_jit(LLVMJitContext *context,
 	LLVMValueRef v_col_i32 = LLVMGetParam(v_func, 3);
 	LLVMValueRef v_col_str = LLVMGetParam(v_func, 4);
 	LLVMValueRef v_col_nulls = LLVMGetParam(v_func, 5);
-	LLVMValueRef v_res_f8 = LLVMGetParam(v_func, 6);
-	LLVMValueRef v_res_i64 = LLVMGetParam(v_func, 7);
-	LLVMValueRef v_res_i32 = LLVMGetParam(v_func, 8);
-	LLVMValueRef v_res_nulls = LLVMGetParam(v_func, 9);
-	LLVMValueRef v_sel = LLVMGetParam(v_func, 10);
-	LLVMValueRef v_has_sel = LLVMGetParam(v_func, 11);
+	LLVMValueRef v_string_arena_base = LLVMGetParam(v_func, 6);
+	LLVMValueRef v_res_f8 = LLVMGetParam(v_func, 7);
+	LLVMValueRef v_res_i64 = LLVMGetParam(v_func, 8);
+	LLVMValueRef v_res_i32 = LLVMGetParam(v_func, 9);
+	LLVMValueRef v_res_nulls = LLVMGetParam(v_func, 10);
+	LLVMValueRef v_sel = LLVMGetParam(v_func, 11);
+	LLVMValueRef v_has_sel = LLVMGetParam(v_func, 12);
 	ExprJitColumnBases bases;
 	LLVMBasicBlockRef b_entry;
 	LLVMBasicBlockRef b_dense_cond;
@@ -915,6 +1150,11 @@ compile_expr_to_jit(LLVMJitContext *context,
 
 	for (const auto &step : program->steps)
 	{
+		if (pg_volvec_const_step_requires_wide_i128(step))
+		{
+			LLVMDisposeBuilder(b);
+			return nullptr;
+		}
 		if (!pg_volvec_expr_opcode_supported(step.opcode))
 		{
 			LLVMDisposeBuilder(b);
@@ -949,8 +1189,9 @@ compile_expr_to_jit(LLVMJitContext *context,
 		LLVMValueRef v_dense_next;
 
 		if (!pg_volvec_emit_expr_row(b, type_i1, type_i8, type_i32, type_i64, type_i128,
+									 type_sizet,
 									 type_stringref,
-									 type_double, program, bases, v_dense_idx_ext,
+									 type_double, program, bases, v_string_arena_base, v_dense_idx_ext,
 									 v_dense_idx_ext, v_res_f8, v_res_i64, v_res_i32,
 									 v_res_nulls))
 		{
@@ -982,8 +1223,9 @@ compile_expr_to_jit(LLVMJitContext *context,
 		LLVMValueRef v_selected_next;
 
 		if (!pg_volvec_emit_expr_row(b, type_i1, type_i8, type_i32, type_i64, type_i128,
+									 type_sizet,
 									 type_stringref,
-									 type_double, program, bases, v_row_idx_ext,
+									 type_double, program, bases, v_string_arena_base, v_row_idx_ext,
 									 v_row_idx_ext, v_res_f8, v_res_i64, v_res_i32,
 									 v_res_nulls))
 		{
