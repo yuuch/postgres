@@ -47,18 +47,18 @@ Offloaded with narrower validation:
 
 ## TPC-H Timing Snapshot
 
-The chart below uses the latest locally recorded timing per query on the developer machine, with parallel query disabled in the session.
+The chart below compares PostgreSQL, `pg_duckdb`, and `pg_volvec` on all 22 TPC-H queries using a single fair benchmark sweep on the developer machine.
 
-- `Q21` is intentionally omitted.
+- All three engines come from the `2026-04-09` full-suite rerun.
+- Each point is the median of 3 runs.
+- PostgreSQL parallel query is disabled in-session for all three engines.
 - `TIMEOUT` is plotted as `180s`.
-- For most queries the data comes from the latest full-suite sweep on `2026-04-08`.
-- `Q6`, `Q14`, `Q15`, and `Q19` use newer `2026-04-09` alternating-run medians after the latest string / expr-JIT fixes.
 
 Quick read:
 
-- Across the 18 direct `OK vs OK` comparisons, `pg_volvec` is faster on all 18.
-- The geometric mean speedup on those direct comparisons is about `1.50x`.
-- `Q17` and `Q20` still hit the `180s` native cap locally, while `pg_volvec` finishes them.
+- Across the 18 direct `OK vs OK vs OK` comparisons, `pg_volvec` is fastest on 13 and `pg_duckdb` is fastest on 5.
+- The geometric mean speedup versus native PostgreSQL on those direct comparisons is about `1.72x` for `pg_volvec` and `1.22x` for `pg_duckdb`.
+- Native PostgreSQL hits the `180s` cap on `Q2`, `Q17`, `Q20`, and `Q21`; `pg_volvec` still times out on `Q2`; `pg_duckdb` completes all 22 in this sweep.
 
 ![TPC-H timing comparison](tpch_perf_snapshot.svg)
 

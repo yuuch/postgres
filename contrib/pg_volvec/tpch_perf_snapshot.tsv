@@ -1,22 +1,23 @@
-query	native_seconds	volvec_seconds	source
-q1	22.941	6.048	2026-04-08 full sweep
-q2	180.000	180.000	2026-04-08 full sweep timeout cap
-q3	8.627	5.939	2026-04-08 full sweep
-q4	16.508	11.341	2026-04-08 full sweep
-q5	8.123	5.832	2026-04-08 full sweep
-q6	4.860	4.830	2026-04-09 alternating median
-q7	7.333	5.512	2026-04-08 full sweep
-q8	8.410	6.156	2026-04-08 full sweep
-q9	18.750	13.840	2026-04-08 full sweep
-q10	8.672	6.464	2026-04-08 full sweep
-q11	1.112	0.922	2026-04-08 full sweep
-q12	8.315	5.467	2026-04-08 full sweep
-q13	11.288	5.508	2026-04-08 full sweep
-q14	5.100	5.020	2026-04-09 alternating median
-q15	9.940	9.830	2026-04-09 alternating median
-q16	4.074	1.725	2026-04-08 full sweep
-q17	180.000	14.808	2026-04-08 full sweep timeout cap
-q18	45.517	21.732	2026-04-08 full sweep
-q19	5.700	5.110	2026-04-09 alternating median
-q20	180.000	58.487	2026-04-08 full sweep timeout cap
-q22	3.224	1.751	2026-04-08 full sweep
+query	pg_seconds	pg_status	pg_duckdb_seconds	pg_duckdb_status	pg_volvec_seconds	pg_volvec_status	pg_source	pg_duckdb_source	pg_volvec_source
+q1	21.897	ok	16.242	ok	5.072	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q2	180	timeout	2.1	ok	180	timeout	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q3	22.877	ok	7.966	ok	8.519	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q4	11.313	ok	6.967	ok	7.437	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q5	5.709	ok	10.247	ok	3.653	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q6	3.219	ok	4.583	ok	2.69	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q7	5.975	ok	7.192	ok	3.929	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q8	7.032	ok	12.022	ok	4.042	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q9	18.14	ok	16.312	ok	13.001	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q10	7.713	ok	6.796	ok	5.225	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q11	1.119	ok	1.865	ok	0.908	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q12	8.351	ok	6.677	ok	3.907	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q13	11.033	ok	3.246	ok	5.249	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q14	3.883	ok	3.735	ok	2.96	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q15	4.216	ok	3.382	ok	4.197	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q16	3.885	ok	1.151	ok	2.024	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q17	180	timeout	15.752	ok	12.71	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q18	28.397	ok	14.382	ok	12.197	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q19	5.402	ok	8.069	ok	4.179	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q20	180	timeout	5.338	ok	12.286	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q21	180	timeout	18.676	ok	8.608	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)
+q22	2.654	ok	1.735	ok	1.168	ok	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)	2026-04-09 fair full-suite median (3 runs, PG parallel off)

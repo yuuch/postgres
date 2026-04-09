@@ -58,6 +58,31 @@ scaled_avg_to_numeric(int64_t scaled_sum, int scale, int64_t count)
 	return NumericGetDatum(numeric_div_safe(sum_numeric, count_numeric, nullptr));
 }
 
+static Datum
+vec_stringref_to_text_datum(const pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_SIZE> *batch,
+							const pg_volvec::VecStringRef &ref)
+{
+	if (ref.len == 0)
+		return PointerGetDatum(cstring_to_text_with_len("", 0));
+
+	if (pg_volvec::VecStringRefIsInline(ref))
+	{
+		char inline_buf[8];
+		memcpy(inline_buf, &ref.prefix, ref.len);
+		return PointerGetDatum(cstring_to_text_with_len(inline_buf, ref.len));
+	}
+
+	if (ref.offset == pg_volvec::kVecStringInlineOffset)
+		elog(ERROR, "pg_volvec invalid inline string reference with length %u", ref.len);
+
+	if (batch == nullptr || ref.offset > batch->string_arena.size() ||
+		ref.len > batch->string_arena.size() - ref.offset)
+		elog(ERROR, "pg_volvec invalid string arena reference (offset=%u len=%u arena=%zu)",
+			 ref.offset, ref.len, batch ? batch->string_arena.size() : 0);
+
+	return PointerGetDatum(cstring_to_text_with_len(batch->string_arena.data() + ref.offset, ref.len));
+}
+
 extern "C" {
 
 bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *state_ptr,
@@ -109,8 +134,7 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 								slot->tts_values[j] = Int64GetDatum(batch->int64_columns[j][i]);
 							} else if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID) {
 								const pg_volvec::VecStringRef &ref = batch->string_columns[j][i];
-								slot->tts_values[j] =
-									PointerGetDatum(cstring_to_text_with_len(batch->get_string_ptr(ref), ref.len));
+								slot->tts_values[j] = vec_stringref_to_text_datum(batch, ref);
 							} else {
 							slot->tts_values[j] = Int32GetDatum(batch->int32_columns[j][i]);
 							}
