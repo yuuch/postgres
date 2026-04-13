@@ -18,6 +18,13 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static bool pg_volvec_enabled = true;
 bool pg_volvec_trace_hooks = false;
 bool pg_volvec_jit_deform = true;
+bool pg_volvec_disable_jit_for_parallel_worker = false;
+bool pg_volvec_parallel = false;
+int pg_volvec_parallel_max_workers = 4;
+int pg_volvec_parallel_morsel_nblocks = 128;
+int pg_volvec_parallel_min_relation_blocks = 1024;
+bool pg_volvec_parallel_leader_participation = true;
+bool pg_volvec_parallel_experimental_hash_pipeline = false;
 
 static void pg_volvec_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_volvec_ExecutorRun(QueryDesc *queryDesc,
@@ -59,6 +66,78 @@ _PG_init(void)
 							 NULL,
 							 &pg_volvec_jit_deform,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("pg_volvec.parallel",
+							 "Enable experimental morsel-driven parallel lowering inside pg_volvec.",
+							 NULL,
+							 &pg_volvec_parallel,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomIntVariable("pg_volvec.parallel_max_workers",
+							"Maximum number of experimental pg_volvec parallel workers.",
+							NULL,
+							&pg_volvec_parallel_max_workers,
+							4,
+							0,
+							1024,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_volvec.parallel_morsel_nblocks",
+							"Block range size used for experimental pg_volvec morsel scheduling.",
+							NULL,
+							&pg_volvec_parallel_morsel_nblocks,
+							128,
+							1,
+							1048576,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_volvec.parallel_min_relation_blocks",
+							"Minimum relation size in blocks before experimental pg_volvec parallel lowering is considered.",
+							NULL,
+							&pg_volvec_parallel_min_relation_blocks,
+							1024,
+							0,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("pg_volvec.parallel_leader_participation",
+							 "Allow the leader to participate in experimental pg_volvec morsel execution.",
+							 NULL,
+							 &pg_volvec_parallel_leader_participation,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("pg_volvec.parallel_experimental_hash_pipeline",
+							 "Enable the experimental leader-only HashBuild->Finalize->Probe pipeline DAG path.",
+							 NULL,
+							 &pg_volvec_parallel_experimental_hash_pipeline,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL,

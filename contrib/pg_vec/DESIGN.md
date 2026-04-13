@@ -136,6 +136,13 @@ The current implementation is intentionally narrower than the final design:
 - input filters now have a typed fast path for conjunctive
   `column-vs-constant` comparisons, with interpreter fallback for more complex
   boolean shapes
+- as of March 31, 2026, all in-tree self-contained fixtures `q1..q22` plus
+  `plain_expr` run to completion on the local 19devel instance
+- as of March 31, 2026, the same self-contained `q1..q22` sweep completes
+  without any `pg_vec: fallback to standard executor` warnings
+- `pg_vec` now auto-raises too-small session `max_stack_depth` settings to
+  `7MB` before translation on this machine, which removes the remaining
+  default-stack fallback cases such as `Q8` and `Q14`
 
 As of the current implementation:
 
@@ -150,6 +157,28 @@ As of the current implementation:
   grouped top-N / grouped aggregate path
 - `Q11` now runs after lowering aggregate `HAVING` clauses into a post-agg
   filter IR and resolving uncorrelated scalar `InitPlan` values into constants
+- `Q15` now runs after normalizing join/project boundary `Var` slots to the
+  real underlying input attnos and keeping the scalar `MAX(total_revenue)`
+  subquery on the derived revenue relation in the post-agg filter path
+- `Q13` now runs after preserving derived-aggregate `Agg` boundaries during
+  translation, teaching the executor to treat a single derived grouped input
+  as a materialized stream instead of a base-relation scan, and widening
+  string `LIKE` lowering/execution to cover generic TPC-H `LIKE/NOT LIKE`
+  patterns
+- `Q18` now runs after accepting direct derived grouped-aggregate join inputs,
+  lowering grouped-subquery `HAVING` into the derived post-agg filter path,
+  and preserving grouped-input sort keys for `Limit -> GroupAggregate -> Sort`
+  planner shapes
+- `Q22` now runs after adding a dedicated substring-prefix expression,
+  preserving high-scale scalar `AVG(...)` constants for numeric compares, and
+  accepting single-join anti-join planner shapes
+- `Q2` now runs after flattening bushy nested-loop inner-join trees into the
+  existing left-deep join IR using per-qual owner-plan context, which also
+  makes the correlated scalar `MIN(...)` rewrite lower against the generic
+  project path
+- `Q2`'s correlated `MIN(...)` rewrite also initializes the derived grouped
+  subplan expression roots correctly, so the nested grouped input executes on
+  `pg_vec` instead of tripping a runtime grouped-key decode fallback
 - the `Q19` fix required lowering residual join predicates from `Join.joinqual`
   instead of only looking at `Plan.qual`
 - the live planner path for `Q3` required accepting top
@@ -160,8 +189,8 @@ As of the current implementation:
   executor
 - the current derived-expression coverage now includes flattened derived-table
   shapes such as `Q8` and contains-`LIKE` arithmetic shapes such as `Q9`
-- the next large semantic gap is derived aggregate inputs and non-aggregate
-  top plans such as `Q15` and `Q18`
+- the remaining gap is no longer SQL coverage but performance and execution
+  quality on the already-supported TPC-H shapes
 
 ## Why C + C++ Is The Right Split
 
@@ -1061,6 +1090,11 @@ The current status against that plan is:
 - step 4 is in progress
   - a minimal two-input inner join plus aggregate path exists
   - the current regression shapes `q12`, `q14`, and `q19` are covered
+- step 5 is partially done
+  - semi/anti join lowering covers `Q4`, `Q16`, `Q18`, `Q21`, and `Q22`
+- step 7 is partially done
+  - left join is covered for `Q13`
+  - grouped `COUNT(DISTINCT int32)` is covered for `Q16`
   - broader live TPCH join/lowering coverage still needs work
 - steps 5 through 7 have not started yet as full features
 

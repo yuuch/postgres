@@ -20,6 +20,20 @@ extern "C" {
 
 namespace pg_vec {
 
+static inline LLVMValueRef
+pg_vec_l_sizet_const(LLVMTypeRef type_sizet, size_t i)
+{
+	return LLVMConstInt(type_sizet, i, false);
+}
+
+static inline LLVMValueRef
+pg_vec_l_ptr_const(LLVMTypeRef type_sizet, void *ptr, LLVMTypeRef type)
+{
+	LLVMValueRef c = LLVMConstInt(type_sizet, (uintptr_t) ptr, false);
+
+	return LLVMConstIntToPtr(c, type);
+}
+
 static bool
 pg_vec_jit_deform_supported(TupleDesc desc,
 							  const DeformProgram *program,
@@ -190,6 +204,9 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 	LLVMTypeRef type_i8;
 	LLVMTypeRef type_i32;
 	LLVMTypeRef type_i64;
+	LLVMTypeRef type_sizet;
+	LLVMTypeRef struct_heap_tuple_data;
+	LLVMTypeRef struct_heap_tuple_header_data;
 	LLVMTypeRef skip_fn_args[3];
 	LLVMTypeRef decimal_fn_args[4];
 	LLVMTypeRef bpchar1_fn_args[4];
@@ -204,8 +221,18 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 	type_i8 = LLVMInt8TypeInContext(lc);
 	type_i32 = LLVMInt32TypeInContext(lc);
 	type_i64 = LLVMInt64TypeInContext(lc);
+	type_sizet = llvm_pg_var_type("TypeSizeT");
+	struct_heap_tuple_data = llvm_pg_var_type("StructHeapTupleData");
+	struct_heap_tuple_header_data = llvm_pg_var_type("StructHeapTupleHeaderData");
+	if (type_sizet == nullptr ||
+		struct_heap_tuple_data == nullptr ||
+		struct_heap_tuple_header_data == nullptr)
+	{
+		LLVMDisposeBuilder(b);
+		return nullptr;
+	}
 
-	param_types[0] = l_ptr(StructHeapTupleData);
+	param_types[0] = l_ptr(struct_heap_tuple_data);
 	param_types[1] = l_ptr(l_ptr(type_i8));
 	param_types[2] = l_ptr(l_ptr(type_i8));
 	param_types[3] = type_i32;
@@ -218,48 +245,57 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 	v_row_idx = LLVMGetParam(v_func, 3);
 
 	skip_fn_args[0] = l_ptr(type_i8);
-	skip_fn_args[1] = TypeSizeT;
+	skip_fn_args[1] = type_sizet;
 	skip_fn_args[2] = type_i8;
 	decimal_fn_args[0] = l_ptr(type_i8);
-	decimal_fn_args[1] = TypeSizeT;
+	decimal_fn_args[1] = type_sizet;
 	decimal_fn_args[2] = type_i8;
 	decimal_fn_args[3] = l_ptr(type_i64);
 	bpchar1_fn_args[0] = l_ptr(type_i8);
-	bpchar1_fn_args[1] = TypeSizeT;
+	bpchar1_fn_args[1] = type_sizet;
 	bpchar1_fn_args[2] = type_i8;
 	bpchar1_fn_args[3] = l_ptr(type_i8);
 
-	skip_fn_ty = LLVMFunctionType(TypeSizeT, skip_fn_args, 3, 0);
-	decimal_fn_ty = LLVMFunctionType(TypeSizeT, decimal_fn_args, 4, 0);
-	bpchar1_fn_ty = LLVMFunctionType(TypeSizeT, bpchar1_fn_args, 4, 0);
-	v_skip_varlena_fn = l_ptr_const(reinterpret_cast<void *>(&pg_vec_jit_skip_varlena),
-									l_ptr(skip_fn_ty));
-	v_decimal64_fn = l_ptr_const(reinterpret_cast<void *>(&pg_vec_jit_store_decimal64_s2),
-								 l_ptr(decimal_fn_ty));
-	v_bpchar1_fn = l_ptr_const(reinterpret_cast<void *>(&pg_vec_jit_store_bpchar1),
-							   l_ptr(bpchar1_fn_ty));
+	skip_fn_ty = LLVMFunctionType(type_sizet, skip_fn_args, 3, 0);
+	decimal_fn_ty = LLVMFunctionType(type_sizet, decimal_fn_args, 4, 0);
+	bpchar1_fn_ty = LLVMFunctionType(type_sizet, bpchar1_fn_args, 4, 0);
+	v_skip_varlena_fn =
+		pg_vec_l_ptr_const(type_sizet,
+						   reinterpret_cast<void *>(&pg_vec_jit_skip_varlena),
+						   l_ptr(skip_fn_ty));
+	v_decimal64_fn =
+		pg_vec_l_ptr_const(type_sizet,
+						   reinterpret_cast<void *>(&pg_vec_jit_store_decimal64_s2),
+						   l_ptr(decimal_fn_ty));
+	v_bpchar1_fn =
+		pg_vec_l_ptr_const(type_sizet,
+						   reinterpret_cast<void *>(&pg_vec_jit_store_bpchar1),
+						   l_ptr(bpchar1_fn_ty));
 
 	b_entry = LLVMAppendBasicBlockInContext(lc, v_func, "entry");
 	LLVMPositionBuilderAtEnd(b, b_entry);
 	(void) v_col_nulls;
 
-	v_offp = LLVMBuildAlloca(b, TypeSizeT, "offp");
-	LLVMBuildStore(b, l_sizet_const(0), v_offp);
+	v_offp = LLVMBuildAlloca(b, type_sizet, "offp");
+	LLVMBuildStore(b, pg_vec_l_sizet_const(type_sizet, 0), v_offp);
 
 	v_tdata_gep = LLVMBuildStructGEP2(b,
-									 StructHeapTupleData,
+									 struct_heap_tuple_data,
 									 v_tuple,
 									 FIELDNO_HEAPTUPLEDATA_DATA,
 									 "t_data_gep");
-	v_tdata = LLVMBuildLoad2(b, l_ptr(StructHeapTupleHeaderData), v_tdata_gep, "t_data");
+	v_tdata = LLVMBuildLoad2(b,
+							 l_ptr(struct_heap_tuple_header_data),
+							 v_tdata_gep,
+							 "t_data");
 
 	v_hoff_gep = LLVMBuildStructGEP2(b,
-									 StructHeapTupleHeaderData,
+									 struct_heap_tuple_header_data,
 									 v_tdata,
 									 FIELDNO_HEAPTUPLEHEADERDATA_HOFF,
 									 "t_hoff_gep");
 	v_hoff = LLVMBuildLoad2(b, type_i8, v_hoff_gep, "t_hoff");
-	v_hoff_sizet = LLVMBuildZExt(b, v_hoff, TypeSizeT, "t_hoff_sizet");
+	v_hoff_sizet = LLVMBuildZExt(b, v_hoff, type_sizet, "t_hoff_sizet");
 	v_tupdata_base = LLVMBuildGEP2(b,
 									  type_i8,
 									  LLVMBuildBitCast(b,
@@ -273,7 +309,7 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 	for (int att_index = 0; att_index <= program->last_att_index; att_index++)
 	{
 		CompactAttribute *att = TupleDescCompactAttr(desc, att_index);
-		LLVMValueRef v_off = LLVMBuildLoad2(b, TypeSizeT, v_offp, "off");
+		LLVMValueRef v_off = LLVMBuildLoad2(b, type_sizet, v_offp, "off");
 		bool		is_target = target_idx < program->ntargets &&
 			program->targets[target_idx].att_index == att_index;
 
@@ -356,8 +392,8 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 			LLVMValueRef v_aligned_off =
 				LLVMBuildAnd(b,
 							 LLVMBuildAdd(b, v_off,
-										  l_sizet_const(att->attalignby - 1), ""),
-							 l_sizet_const(~((Size) att->attalignby - 1)),
+										  pg_vec_l_sizet_const(type_sizet, att->attalignby - 1), ""),
+							 pg_vec_l_sizet_const(type_sizet, ~((Size) att->attalignby - 1)),
 							 "aligned_off");
 
 			LLVMBuildStore(b, v_aligned_off, v_offp);
@@ -423,7 +459,7 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 		}
 
 		LLVMBuildStore(b,
-					 LLVMBuildAdd(b, v_off, l_sizet_const(att->attlen), ""),
+					 LLVMBuildAdd(b, v_off, pg_vec_l_sizet_const(type_sizet, att->attlen), ""),
 					 v_offp);
 	}
 

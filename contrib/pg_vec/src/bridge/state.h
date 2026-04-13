@@ -22,5 +22,8 @@ void pg_vec_register_state(QueryDesc *queryDesc, PgVecQueryState *state);
 void pg_vec_unregister_state(QueryDesc *queryDesc);
 PgVecQueryState *pg_vec_try_build_query_state(QueryDesc *queryDesc, int eflags);
 void pg_vec_close_query_state(PgVecQueryState *state);
+bool pg_vec_translation_guard_active(void);
+void pg_vec_push_translation_guard(void);
+void pg_vec_pop_translation_guard(void);
 
 #endif

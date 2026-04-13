@@ -2,7 +2,9 @@ extern "C" {
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/table.h"
 #include "access/tableam.h"
+#include "executor/nodeSubplan.h"
 #ifdef USE_LLVM
 #include "jit/llvmjit.h"
 #endif
@@ -21,6 +23,7 @@ extern "C" {
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pg_vec
@@ -46,6 +49,7 @@ struct ExecDataChunk : public DataChunkHeader<kExecChunkCapacity>
 	std::int32_t int32_values[PG_VEC_MAX_SCAN_COLUMNS][kExecChunkCapacity];
 	std::int32_t date32_values[PG_VEC_MAX_SCAN_COLUMNS][kExecChunkCapacity];
 	std::int64_t decimal64_values[PG_VEC_MAX_SCAN_COLUMNS][kExecChunkCapacity];
+	__int128	decimal128_values[PG_VEC_MAX_SCAN_COLUMNS][kExecChunkCapacity];
 	char		char1_values[PG_VEC_MAX_SCAN_COLUMNS][kExecChunkCapacity];
 	PgVecStringRef string_refs[PG_VEC_MAX_SCAN_COLUMNS][kExecChunkCapacity];
 	PgVecStringArena string_arenas[PG_VEC_MAX_SCAN_COLUMNS];
@@ -114,6 +118,13 @@ struct GroupKeyHash
 	std::size_t operator()(const GroupKey &key) const;
 };
 
+struct DistinctAggState
+{
+	bool enabled;
+	std::unordered_set<std::int32_t> plain_values;
+	std::vector<std::unordered_set<std::int32_t>> grouped_values;
+};
+
 struct MaterializedInput
 {
 	const PgVecInputSpec *spec;
@@ -121,6 +132,7 @@ struct MaterializedInput
 	std::vector<std::int32_t> int32_columns[PG_VEC_MAX_SCAN_COLUMNS];
 	std::vector<std::int32_t> date32_columns[PG_VEC_MAX_SCAN_COLUMNS];
 	std::vector<std::int64_t> decimal64_columns[PG_VEC_MAX_SCAN_COLUMNS];
+	std::vector<__int128> decimal128_columns[PG_VEC_MAX_SCAN_COLUMNS];
 	std::vector<char> char1_columns[PG_VEC_MAX_SCAN_COLUMNS];
 	std::vector<PgVecStringRef> string_columns[PG_VEC_MAX_SCAN_COLUMNS];
 	std::vector<uint8_t> late_cached[PG_VEC_MAX_SCAN_COLUMNS];
@@ -152,6 +164,7 @@ struct ExecInputCursor
 	Relation	rel;
 	Snapshot	snapshot;
 	uint32_t	late_mask;
+	bool		null_row;
 	const ExecDataChunk *chunk;
 	const MaterializedInput *materialized;
 	std::uint16_t chunk_row;
@@ -162,6 +175,7 @@ struct ExecInputCursor
 	std::int32_t late_int32_values[PG_VEC_MAX_SCAN_COLUMNS];
 	std::int32_t late_date32_values[PG_VEC_MAX_SCAN_COLUMNS];
 	std::int64_t late_decimal64_values[PG_VEC_MAX_SCAN_COLUMNS];
+	__int128	late_decimal128_values[PG_VEC_MAX_SCAN_COLUMNS];
 	char		late_char1_values[PG_VEC_MAX_SCAN_COLUMNS];
 	PgVecStringRef late_string_values[PG_VEC_MAX_SCAN_COLUMNS];
 	PgVecStringArena late_string_arenas[PG_VEC_MAX_SCAN_COLUMNS];
@@ -212,10 +226,17 @@ struct BoundJoinFilterProgram
 };
 
 static ExecDataChunk *allocate_exec_chunk(const PgVecInputSpec *spec);
+static bool eval_expr_to_int128(const PgVecExprProgram &program,
+								   int node_idx,
+								   const EvalContext &ctx,
+								   __int128 *out);
 static bool copy_string_ref_between_arenas(const PgVecStringRef &src,
 											 const PgVecStringArena *src_arena,
 											 PgVecStringArena *dst_arena,
 											 PgVecStringRef *dst);
+static bool copy_string_const_into_arena(const PgVecStringConst &src,
+										  PgVecStringArena *dst_arena,
+										  PgVecStringRef *dst);
 
 bool
 GroupKey::operator==(const GroupKey &other) const
@@ -242,6 +263,12 @@ GroupKey::operator==(const GroupKey &other) const
 				if (values[i].decimal64_s2 != other.values[i].decimal64_s2)
 					return false;
 				break;
+			case PG_VEC_SCALAR_DECIMAL128_S2:
+			case PG_VEC_SCALAR_DECIMAL128_S4:
+			case PG_VEC_SCALAR_DECIMAL128_S6:
+				if (values[i].decimal128 != other.values[i].decimal128)
+					return false;
+				break;
 			case PG_VEC_SCALAR_CHAR1:
 				if (values[i].char1 != other.values[i].char1)
 					return false;
@@ -250,8 +277,6 @@ GroupKey::operator==(const GroupKey &other) const
 				if (string_const_compare(values[i].string128, other.values[i].string128) != 0)
 					return false;
 				break;
-			case PG_VEC_SCALAR_DECIMAL128_S4:
-			case PG_VEC_SCALAR_DECIMAL128_S6:
 			case PG_VEC_SCALAR_INVALID:
 			default:
 				return false;
@@ -281,6 +306,16 @@ GroupKeyHash::operator()(const GroupKey &key) const
 			case PG_VEC_SCALAR_DECIMAL64_S2:
 				hash ^= static_cast<std::size_t>(key.values[i].decimal64_s2);
 				break;
+			case PG_VEC_SCALAR_DECIMAL128_S2:
+			case PG_VEC_SCALAR_DECIMAL128_S4:
+			case PG_VEC_SCALAR_DECIMAL128_S6:
+			{
+				unsigned __int128 value =
+					static_cast<unsigned __int128>(key.values[i].decimal128);
+				hash ^= static_cast<std::size_t>(value);
+				hash ^= static_cast<std::size_t>(value >> 64);
+				break;
+			}
 			case PG_VEC_SCALAR_CHAR1:
 				hash ^= static_cast<unsigned char>(key.values[i].char1);
 				break;
@@ -295,8 +330,6 @@ GroupKeyHash::operator()(const GroupKey &key) const
 						0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
 				break;
 			}
-			case PG_VEC_SCALAR_DECIMAL128_S4:
-			case PG_VEC_SCALAR_DECIMAL128_S6:
 			case PG_VEC_SCALAR_INVALID:
 			default:
 				break;
@@ -325,6 +358,31 @@ copy_string_ref_between_arenas(const PgVecStringRef &src,
 							   &dst->tail_offset);
 }
 
+static bool
+copy_string_const_into_arena(const PgVecStringConst &src,
+							 PgVecStringArena *dst_arena,
+							 PgVecStringRef *dst)
+{
+	uint64 prefix = 0;
+	std::size_t prefix_len =
+		std::min<std::size_t>(src.len, PG_VEC_STRING_PREFIX_BYTES);
+
+	std::memcpy(&prefix, src.bytes, prefix_len);
+	dst->len = src.len;
+	dst->flags = 0;
+	dst->prefix = prefix;
+	if (src.len <= PG_VEC_STRING_PREFIX_BYTES)
+	{
+		dst->tail_offset = kStringNoTailOffset;
+		return true;
+	}
+
+	return string_arena_append(dst_arena,
+							   src.bytes + PG_VEC_STRING_PREFIX_BYTES,
+							   src.len - PG_VEC_STRING_PREFIX_BYTES,
+							   &dst->tail_offset);
+}
+
 void
 MaterializedInput::append_row(const ExecDataChunk &chunk, std::uint16_t row)
 {
@@ -347,6 +405,11 @@ MaterializedInput::append_row(const ExecDataChunk &chunk, std::uint16_t row)
 			case PG_VEC_SCALAR_DECIMAL64_S2:
 				decimal64_columns[col_idx].push_back(chunk.decimal64_values[col_idx][row]);
 				break;
+			case PG_VEC_SCALAR_DECIMAL128_S2:
+			case PG_VEC_SCALAR_DECIMAL128_S4:
+			case PG_VEC_SCALAR_DECIMAL128_S6:
+				decimal128_columns[col_idx].push_back(chunk.decimal128_values[col_idx][row]);
+				break;
 			case PG_VEC_SCALAR_CHAR1:
 				char1_columns[col_idx].push_back(chunk.char1_values[col_idx][row]);
 				break;
@@ -362,8 +425,6 @@ MaterializedInput::append_row(const ExecDataChunk &chunk, std::uint16_t row)
 				string_columns[col_idx].push_back(copied);
 				break;
 			}
-			case PG_VEC_SCALAR_DECIMAL128_S4:
-			case PG_VEC_SCALAR_DECIMAL128_S6:
 			case PG_VEC_SCALAR_INVALID:
 			default:
 				elog(ERROR, "pg_vec: unsupported materialized scalar kind %d",
@@ -398,14 +459,17 @@ MaterializedInput::reserve_rows(std::size_t nrows)
 			case PG_VEC_SCALAR_DECIMAL64_S2:
 				decimal64_columns[col_idx].reserve(nrows);
 				break;
+			case PG_VEC_SCALAR_DECIMAL128_S2:
+			case PG_VEC_SCALAR_DECIMAL128_S4:
+			case PG_VEC_SCALAR_DECIMAL128_S6:
+				decimal128_columns[col_idx].reserve(nrows);
+				break;
 			case PG_VEC_SCALAR_CHAR1:
 				char1_columns[col_idx].reserve(nrows);
 				break;
 			case PG_VEC_SCALAR_STRING128:
 				string_columns[col_idx].reserve(nrows);
 				break;
-			case PG_VEC_SCALAR_DECIMAL128_S4:
-			case PG_VEC_SCALAR_DECIMAL128_S6:
 			case PG_VEC_SCALAR_INVALID:
 			default:
 				elog(ERROR, "pg_vec: unsupported materialized scalar kind %d",
@@ -424,7 +488,8 @@ init_materialized_eval_context(const PgVecScanFilterAggExecParams *params,
 		ctx->inputs[input_id].spec = &params->inputs[input_id];
 		ctx->inputs[input_id].rel = params->rels[input_id];
 		ctx->inputs[input_id].snapshot = params->snapshot;
-		ctx->inputs[input_id].late_mask = inputs[input_id].late_mask;
+	ctx->inputs[input_id].late_mask = inputs[input_id].late_mask;
+		ctx->inputs[input_id].null_row = false;
 		ctx->inputs[input_id].chunk = nullptr;
 		ctx->inputs[input_id].materialized = &inputs[input_id];
 		ctx->inputs[input_id].chunk_row = 0;
@@ -474,6 +539,7 @@ cursor_bind_chunk(ExecInputCursor *cursor,
 	cursor->rel = rel;
 	cursor->snapshot = snapshot;
 	cursor->late_mask = late_mask;
+	cursor->null_row = false;
 	cursor->chunk = chunk;
 	cursor->materialized = nullptr;
 	cursor->materialized_row = 0;
@@ -492,6 +558,7 @@ cursor_bind_materialized(ExecInputCursor *cursor,
 	cursor->rel = rel;
 	cursor->snapshot = snapshot;
 	cursor->late_mask = late_mask;
+	cursor->null_row = false;
 	cursor->chunk = nullptr;
 	cursor->materialized = materialized;
 	cursor->chunk_row = 0;
@@ -502,6 +569,7 @@ static void
 cursor_set_chunk_row(ExecInputCursor *cursor, std::uint16_t row)
 {
 	cursor_reset_late_state(cursor);
+	cursor->null_row = false;
 	cursor->chunk_row = row;
 }
 
@@ -509,7 +577,15 @@ static void
 cursor_set_materialized_row(ExecInputCursor *cursor, std::size_t row)
 {
 	cursor_reset_late_state(cursor);
+	cursor->null_row = false;
 	cursor->materialized_row = row;
+}
+
+static void
+cursor_set_null_row(ExecInputCursor *cursor)
+{
+	cursor_reset_late_state(cursor);
+	cursor->null_row = true;
 }
 
 static bool
@@ -517,6 +593,8 @@ cursor_current_tid(const ExecInputCursor &cursor, ItemPointerData *tid)
 {
 	if (cursor.materialized != nullptr)
 	{
+		if (cursor.null_row)
+			return false;
 		if (cursor.materialized_row >= cursor.materialized->tids.size())
 			return false;
 		*tid = cursor.materialized->tids[cursor.materialized_row];
@@ -652,6 +730,37 @@ cursor_fetch_late_column(ExecInputCursor *cursor,
 					return false;
 			}
 			break;
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+		{
+			int scale = 2;
+			int64 scaled = 0;
+
+			if (scalar_kind == PG_VEC_SCALAR_DECIMAL128_S4)
+				scale = 4;
+			else if (scalar_kind == PG_VEC_SCALAR_DECIMAL128_S6)
+				scale = 6;
+
+			if (!numeric_varlena_to_scaled_int64(DatumGetPointer(value),
+												 scale,
+												 &scaled))
+				return false;
+			if (cursor->materialized != nullptr)
+			{
+				MaterializedInput *mat = const_cast<MaterializedInput *>(cursor->materialized);
+
+				if (mat->decimal128_columns[column_idx].size() < mat->row_count)
+					mat->decimal128_columns[column_idx].resize(mat->row_count);
+				mat->decimal128_columns[column_idx][row_idx] = scaled;
+				mat->late_cached[column_idx][row_idx] = 1;
+			}
+			else
+			{
+				cursor->late_decimal128_values[column_idx] = scaled;
+			}
+			break;
+		}
 		case PG_VEC_SCALAR_CHAR1:
 			if (cursor->materialized != nullptr)
 			{
@@ -698,8 +807,6 @@ cursor_fetch_late_column(ExecInputCursor *cursor,
 			}
 			break;
 		}
-		case PG_VEC_SCALAR_DECIMAL128_S4:
-		case PG_VEC_SCALAR_DECIMAL128_S6:
 		case PG_VEC_SCALAR_INVALID:
 		default:
 			return false;
@@ -830,6 +937,7 @@ mark_expr_usage(const PgVecInputSpec inputs[PG_VEC_MAX_INPUTS],
 								 usage_maps[node.column.input_id]);
 			return;
 		case PG_VEC_EXPR_EXTRACT_YEAR:
+		case PG_VEC_EXPR_SUBSTRING_PREFIX2:
 			mark_expr_usage(inputs, expr, node.left, usage, usage_maps);
 			return;
 		case PG_VEC_EXPR_ADD:
@@ -945,6 +1053,9 @@ build_single_join_late_masks(const PgVecScanFilterAggExecParams *params,
 	for (int input_id = 0; input_id < params->ninputs; input_id++)
 	{
 		const PgVecInputSpec &input = params->inputs[input_id];
+
+		if (input.kind == PG_VEC_INPUT_DERIVED_GROUPED_AGG)
+			continue;
 
 		for (int col_idx = 0; col_idx < input.ncolumns; col_idx++)
 		{
@@ -1075,7 +1186,11 @@ bind_compare_clause(const PgVecInputSpec *input,
 	else if (lhs_expr.kind == PG_VEC_EXPR_CONST &&
 			 rhs_expr.kind == PG_VEC_EXPR_COLUMN &&
 			 qual.op != PG_VEC_OP_PREFIX_LIKE &&
-			 qual.op != PG_VEC_OP_CONTAINS_LIKE)
+			 qual.op != PG_VEC_OP_CONTAINS_LIKE &&
+			 qual.op != PG_VEC_OP_NOT_PREFIX_LIKE &&
+			 qual.op != PG_VEC_OP_NOT_CONTAINS_LIKE &&
+			 qual.op != PG_VEC_OP_SQL_LIKE &&
+			 qual.op != PG_VEC_OP_NOT_SQL_LIKE)
 	{
 		op = reverse_filter_op(qual.op);
 		if (op == PG_VEC_OP_INVALID)
@@ -1094,7 +1209,11 @@ bind_compare_clause(const PgVecInputSpec *input,
 		return false;
 
 	if ((op == PG_VEC_OP_PREFIX_LIKE ||
-		 op == PG_VEC_OP_CONTAINS_LIKE) &&
+		 op == PG_VEC_OP_CONTAINS_LIKE ||
+		 op == PG_VEC_OP_NOT_PREFIX_LIKE ||
+		 op == PG_VEC_OP_NOT_CONTAINS_LIKE ||
+		 op == PG_VEC_OP_SQL_LIKE ||
+		 op == PG_VEC_OP_NOT_SQL_LIKE) &&
 		column_expr->column.scalar_kind != PG_VEC_SCALAR_STRING128)
 		return false;
 
@@ -1394,7 +1513,11 @@ bind_join_compare_clause(const PgVecScanFilterAggExecParams *params,
 	else if (lhs_expr.kind == PG_VEC_EXPR_CONST &&
 			 rhs_expr.kind == PG_VEC_EXPR_COLUMN &&
 			 qual.op != PG_VEC_OP_PREFIX_LIKE &&
-			 qual.op != PG_VEC_OP_CONTAINS_LIKE)
+			 qual.op != PG_VEC_OP_CONTAINS_LIKE &&
+			 qual.op != PG_VEC_OP_NOT_PREFIX_LIKE &&
+			 qual.op != PG_VEC_OP_NOT_CONTAINS_LIKE &&
+			 qual.op != PG_VEC_OP_SQL_LIKE &&
+			 qual.op != PG_VEC_OP_NOT_SQL_LIKE)
 	{
 		op = reverse_filter_op(qual.op);
 		if (op == PG_VEC_OP_INVALID)
@@ -1413,7 +1536,11 @@ bind_join_compare_clause(const PgVecScanFilterAggExecParams *params,
 		return false;
 
 	if ((op == PG_VEC_OP_PREFIX_LIKE ||
-		 op == PG_VEC_OP_CONTAINS_LIKE) &&
+		 op == PG_VEC_OP_CONTAINS_LIKE ||
+		 op == PG_VEC_OP_NOT_PREFIX_LIKE ||
+		 op == PG_VEC_OP_NOT_CONTAINS_LIKE ||
+		 op == PG_VEC_OP_SQL_LIKE ||
+		 op == PG_VEC_OP_NOT_SQL_LIKE) &&
 		column_expr->column.scalar_kind != PG_VEC_SCALAR_STRING128)
 		return false;
 
@@ -1601,20 +1728,13 @@ public:
 														   &jit_func,
 														   &jit_context,
 														   &failure_reason))
-			{
-				deformer_.set_jit_func(jit_func);
-				filter_applied_in_deformer_ = false;
-				jit_context_ = jit_context;
-				elog(WARNING, "pg_vec: JIT deform enabled for input with %d targets",
-					 program_.ntargets);
+				{
+					deformer_.set_jit_func(jit_func);
+					filter_applied_in_deformer_ = false;
+					jit_context_ = jit_context;
+				}
 			}
-			else
-				elog(WARNING, "pg_vec: JIT deform not used: %s",
-					 failure_reason != nullptr ? failure_reason : "unknown reason");
 		}
-		else if (enable_jit_deform)
-			elog(WARNING, "pg_vec: JIT deform not used: late materialization is active");
-	}
 
 	~HeapDataChunkScanner()
 	{
@@ -1745,7 +1865,26 @@ private:
 				return false;
 			case AppendTupleResult::kError:
 			default:
-				elog(ERROR, "pg_vec: failed to deform tuple into DataChunk");
+			{
+				int attno0 = (input_ != nullptr && input_->ncolumns > 0) ? input_->columns[0].attno : -1;
+				int attno1 = (input_ != nullptr && input_->ncolumns > 1) ? input_->columns[1].attno : -1;
+				int attno2 = (input_ != nullptr && input_->ncolumns > 2) ? input_->columns[2].attno : -1;
+				int attno3 = (input_ != nullptr && input_->ncolumns > 3) ? input_->columns[3].attno : -1;
+
+				release_current_page();
+				elog(ERROR,
+					 "pg_vec: failed to deform tuple into DataChunk for relation \"%s\" (natts=%d, last_att_index=%d, ntargets=%d, ncolumns=%d, late_mask=%u, attnos=[%d,%d,%d,%d])",
+					 RelationGetRelationName(rel_),
+					 (int) HeapTupleHeaderGetNatts(tuple.t_data),
+					 program_.last_att_index,
+					 program_.ntargets,
+					 input_ != nullptr ? input_->ncolumns : -1,
+					 late_mask_,
+					 attno0,
+					 attno1,
+					 attno2,
+					 attno3);
+			}
 		}
 	}
 
@@ -1769,6 +1908,39 @@ compare_string(const PgVecStringConst &lhs, const PgVecStringConst &rhs)
 	return string_const_compare(lhs, rhs);
 }
 
+static int
+scalar_numeric_scale(PgVecScalarKind scalar_kind)
+{
+	switch (scalar_kind)
+	{
+		case PG_VEC_SCALAR_DECIMAL64_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+			return 2;
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+			return 4;
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+			return 6;
+		case PG_VEC_SCALAR_INT32:
+		case PG_VEC_SCALAR_DATE32:
+		case PG_VEC_SCALAR_CHAR1:
+		case PG_VEC_SCALAR_STRING128:
+		case PG_VEC_SCALAR_INVALID:
+		default:
+			return -1;
+	}
+}
+
+static __int128
+scale_numeric_value(__int128 value, int scale_delta)
+{
+	while (scale_delta > 0)
+	{
+		value *= 10;
+		scale_delta--;
+	}
+	return value;
+}
+
 template <typename T>
 static bool
 compare_value(T lhs, T rhs, PgVecFilterOp op)
@@ -1789,10 +1961,43 @@ compare_value(T lhs, T rhs, PgVecFilterOp op)
 			return lhs >= rhs;
 		case PG_VEC_OP_PREFIX_LIKE:
 		case PG_VEC_OP_CONTAINS_LIKE:
+		case PG_VEC_OP_NOT_PREFIX_LIKE:
+		case PG_VEC_OP_NOT_CONTAINS_LIKE:
+		case PG_VEC_OP_SQL_LIKE:
+		case PG_VEC_OP_NOT_SQL_LIKE:
 		case PG_VEC_OP_INVALID:
 		default:
 			return false;
 	}
+}
+
+static bool
+compare_numeric_expr_values(const PgVecExprProgram &exprs,
+							   int lhs_expr,
+							   int rhs_expr,
+							   const EvalContext &ctx,
+							   PgVecFilterOp op)
+{
+	__int128 lhs_value;
+	__int128 rhs_value;
+	int lhs_scale;
+	int rhs_scale;
+
+	if (!eval_expr_to_int128(exprs, lhs_expr, ctx, &lhs_value) ||
+		!eval_expr_to_int128(exprs, rhs_expr, ctx, &rhs_value))
+		return false;
+
+	lhs_scale = scalar_numeric_scale(exprs.nodes[lhs_expr].scalar_kind);
+	rhs_scale = scalar_numeric_scale(exprs.nodes[rhs_expr].scalar_kind);
+	if (lhs_scale >= 0 && rhs_scale >= 0 && lhs_scale != rhs_scale)
+	{
+		if (lhs_scale < rhs_scale)
+			lhs_value = scale_numeric_value(lhs_value, rhs_scale - lhs_scale);
+		else
+			rhs_value = scale_numeric_value(rhs_value, lhs_scale - rhs_scale);
+	}
+
+	return compare_value(lhs_value, rhs_value, op);
 }
 
 struct StringCursorValue
@@ -1815,6 +2020,8 @@ cursor_get_int32(const ExecInputCursor &cursor, AttrNumber attno, std::int32_t *
 {
 	int			column_idx;
 
+	if (cursor.null_row)
+		return false;
 	if (!cursor_get_column_index(cursor, attno, &column_idx))
 		return false;
 
@@ -1841,6 +2048,8 @@ cursor_get_date32(const ExecInputCursor &cursor, AttrNumber attno, std::int32_t 
 {
 	int			column_idx;
 
+	if (cursor.null_row)
+		return false;
 	if (!cursor_get_column_index(cursor, attno, &column_idx))
 		return false;
 
@@ -1867,6 +2076,8 @@ cursor_get_decimal64(const ExecInputCursor &cursor, AttrNumber attno, std::int64
 {
 	int			column_idx;
 
+	if (cursor.null_row)
+		return false;
 	if (!cursor_get_column_index(cursor, attno, &column_idx))
 		return false;
 
@@ -1889,10 +2100,40 @@ cursor_get_decimal64(const ExecInputCursor &cursor, AttrNumber attno, std::int64
 }
 
 static bool
+cursor_get_decimal128(const ExecInputCursor &cursor, AttrNumber attno, __int128 *out)
+{
+	int			column_idx;
+
+	if (cursor.null_row)
+		return false;
+	if (!cursor_get_column_index(cursor, attno, &column_idx))
+		return false;
+
+	if ((cursor.late_mask & (static_cast<uint32_t>(1) << column_idx)) != 0)
+	{
+		if (!cursor_fetch_late_column(const_cast<ExecInputCursor *>(&cursor), column_idx))
+			return false;
+		if (cursor.materialized != nullptr)
+			*out = cursor.materialized->decimal128_columns[column_idx][cursor.materialized_row];
+		else
+			*out = cursor.late_decimal128_values[column_idx];
+		return true;
+	}
+
+	if (cursor.materialized != nullptr)
+		*out = cursor.materialized->decimal128_columns[column_idx][cursor.materialized_row];
+	else
+		*out = cursor.chunk->decimal128_values[column_idx][cursor.chunk_row];
+	return true;
+}
+
+static bool
 cursor_get_char1(const ExecInputCursor &cursor, AttrNumber attno, char *out)
 {
 	int			column_idx;
 
+	if (cursor.null_row)
+		return false;
 	if (!cursor_get_column_index(cursor, attno, &column_idx))
 		return false;
 
@@ -1921,6 +2162,8 @@ cursor_get_string_ref(const ExecInputCursor &cursor,
 {
 	int			column_idx;
 
+	if (cursor.null_row)
+		return false;
 	if (!cursor_get_column_index(cursor, attno, &column_idx))
 		return false;
 
@@ -1959,6 +2202,8 @@ cursor_get_int32_by_index(const ExecInputCursor &cursor,
 						   int column_idx,
 						   std::int32_t *out)
 {
+	if (cursor.null_row)
+		return false;
 	if ((cursor.late_mask & (static_cast<uint32_t>(1) << column_idx)) != 0)
 	{
 		if (!cursor_fetch_late_column(const_cast<ExecInputCursor *>(&cursor), column_idx))
@@ -1981,6 +2226,8 @@ cursor_get_date32_by_index(const ExecInputCursor &cursor,
 						   int column_idx,
 						   std::int32_t *out)
 {
+	if (cursor.null_row)
+		return false;
 	if ((cursor.late_mask & (static_cast<uint32_t>(1) << column_idx)) != 0)
 	{
 		if (!cursor_fetch_late_column(const_cast<ExecInputCursor *>(&cursor), column_idx))
@@ -2003,6 +2250,8 @@ cursor_get_decimal64_by_index(const ExecInputCursor &cursor,
 							  int column_idx,
 							  std::int64_t *out)
 {
+	if (cursor.null_row)
+		return false;
 	if ((cursor.late_mask & (static_cast<uint32_t>(1) << column_idx)) != 0)
 	{
 		if (!cursor_fetch_late_column(const_cast<ExecInputCursor *>(&cursor), column_idx))
@@ -2021,10 +2270,36 @@ cursor_get_decimal64_by_index(const ExecInputCursor &cursor,
 }
 
 static bool
+cursor_get_decimal128_by_index(const ExecInputCursor &cursor,
+							   int column_idx,
+							   __int128 *out)
+{
+	if (cursor.null_row)
+		return false;
+	if ((cursor.late_mask & (static_cast<uint32_t>(1) << column_idx)) != 0)
+	{
+		if (!cursor_fetch_late_column(const_cast<ExecInputCursor *>(&cursor), column_idx))
+			return false;
+		if (cursor.materialized != nullptr)
+			*out = cursor.materialized->decimal128_columns[column_idx][cursor.materialized_row];
+		else
+			*out = cursor.late_decimal128_values[column_idx];
+		return true;
+	}
+	if (cursor.materialized != nullptr)
+		*out = cursor.materialized->decimal128_columns[column_idx][cursor.materialized_row];
+	else
+		*out = cursor.chunk->decimal128_values[column_idx][cursor.chunk_row];
+	return true;
+}
+
+static bool
 cursor_get_char1_by_index(const ExecInputCursor &cursor,
 						  int column_idx,
 						  char *out)
 {
+	if (cursor.null_row)
+		return false;
 	if ((cursor.late_mask & (static_cast<uint32_t>(1) << column_idx)) != 0)
 	{
 		if (!cursor_fetch_late_column(const_cast<ExecInputCursor *>(&cursor), column_idx))
@@ -2047,6 +2322,8 @@ cursor_get_string_ref_by_index(const ExecInputCursor &cursor,
 								  int column_idx,
 								  StringCursorValue *out)
 {
+	if (cursor.null_row)
+		return false;
 	if ((cursor.late_mask & (static_cast<uint32_t>(1) << column_idx)) != 0)
 	{
 		if (!cursor_fetch_late_column(const_cast<ExecInputCursor *>(&cursor), column_idx))
@@ -2112,6 +2389,17 @@ column_value_to_int128(const EvalContext &ctx,
 			*out = value;
 			return true;
 		}
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+		{
+			__int128 value;
+
+			if (!cursor_get_decimal128(cursor, column.attno, &value))
+				return false;
+			*out = value;
+			return true;
+		}
 		case PG_VEC_SCALAR_CHAR1:
 		{
 			char		value;
@@ -2122,8 +2410,6 @@ column_value_to_int128(const EvalContext &ctx,
 			return true;
 		}
 		case PG_VEC_SCALAR_STRING128:
-		case PG_VEC_SCALAR_DECIMAL128_S6:
-		case PG_VEC_SCALAR_DECIMAL128_S4:
 		case PG_VEC_SCALAR_INVALID:
 		default:
 			return false;
@@ -2162,6 +2448,16 @@ eval_bound_join_clause(const BoundJoinFilterClause &clause,
 				return false;
 			return compare_value(value, clause.constant.decimal64_s2, clause.op);
 		}
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+		{
+			__int128 value;
+
+			if (!cursor_get_decimal128_by_index(cursor, clause.column_idx, &value))
+				return false;
+			return compare_value(value, clause.constant.decimal128, clause.op);
+		}
 		case PG_VEC_SCALAR_CHAR1:
 		{
 			char value;
@@ -2184,13 +2480,27 @@ eval_bound_join_clause(const BoundJoinFilterClause &clause,
 				return string_ref_contains_const(*value.ref,
 												  value.arena,
 												  clause.constant.string128);
+			if (clause.op == PG_VEC_OP_NOT_PREFIX_LIKE)
+				return !string_ref_starts_with_const(*value.ref,
+													  value.arena,
+													  clause.constant.string128);
+			if (clause.op == PG_VEC_OP_NOT_CONTAINS_LIKE)
+				return !string_ref_contains_const(*value.ref,
+												   value.arena,
+												   clause.constant.string128);
+			if (clause.op == PG_VEC_OP_SQL_LIKE)
+				return string_ref_matches_like_const(*value.ref,
+													 value.arena,
+													 clause.constant.string128);
+			if (clause.op == PG_VEC_OP_NOT_SQL_LIKE)
+				return !string_ref_matches_like_const(*value.ref,
+													  value.arena,
+													  clause.constant.string128);
 			return string_ref_compare_value(*value.ref,
 											 value.arena,
 											 clause.constant.string128,
 											 clause.op);
 		}
-		case PG_VEC_SCALAR_DECIMAL128_S4:
-		case PG_VEC_SCALAR_DECIMAL128_S6:
 		case PG_VEC_SCALAR_INVALID:
 		default:
 			return false;
@@ -2253,13 +2563,93 @@ const_value_to_int128(const PgVecConstValue &constant,
 			return true;
 		case PG_VEC_SCALAR_DECIMAL64_S2:
 		case PG_VEC_SCALAR_DECIMAL128_S2:
+			*out = constant.decimal64_s2;
+			return true;
 		case PG_VEC_SCALAR_DECIMAL128_S4:
 		case PG_VEC_SCALAR_DECIMAL128_S6:
-			*out = constant.decimal64_s2;
+			*out = constant.decimal128;
 			return true;
 		case PG_VEC_SCALAR_CHAR1:
 			*out = static_cast<unsigned char>(constant.char1);
 			return true;
+		case PG_VEC_SCALAR_STRING128:
+		case PG_VEC_SCALAR_INVALID:
+		default:
+			return false;
+	}
+}
+
+static bool
+fetch_param_exec_to_int128(const PgVecScanFilterAggExecParams *params,
+						   int param_id,
+						   PgVecScalarKind scalar_kind,
+						   __int128 *out,
+						   bool *isnull)
+{
+	ParamExecData *prm;
+	ExprContext *econtext;
+
+	if (params == nullptr || params->estate == nullptr ||
+		param_id < 0 ||
+		param_id >= list_length(params->estate->es_plannedstmt->paramExecTypes))
+		return false;
+
+	prm = &params->estate->es_param_exec_vals[param_id];
+	if (prm->execPlan != nullptr)
+	{
+		econtext = GetPerTupleExprContext(params->estate);
+		ExecSetParamPlan((SubPlanState *) prm->execPlan, econtext);
+	}
+
+	*isnull = prm->isnull;
+	if (*isnull)
+		return true;
+
+	switch (scalar_kind)
+	{
+		case PG_VEC_SCALAR_INT32:
+			*out = DatumGetInt32(prm->value);
+			return true;
+		case PG_VEC_SCALAR_DATE32:
+			*out = DatumGetDateADT(prm->value);
+			return true;
+		case PG_VEC_SCALAR_DECIMAL64_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+		{
+			int64 scaled;
+
+			if (!numeric_varlena_to_scaled_int64(DatumGetPointer(prm->value), 2, &scaled))
+				return false;
+			*out = scaled;
+			return true;
+		}
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		{
+			int64 scaled;
+
+			if (!numeric_varlena_to_scaled_int64(DatumGetPointer(prm->value), 4, &scaled))
+				return false;
+			*out = scaled;
+			return true;
+		}
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+		{
+			int64 scaled;
+
+			if (!numeric_varlena_to_scaled_int64(DatumGetPointer(prm->value), 6, &scaled))
+				return false;
+			*out = scaled;
+			return true;
+		}
+		case PG_VEC_SCALAR_CHAR1:
+		{
+			text *txt = DatumGetTextPP(prm->value);
+
+			if (VARSIZE_ANY_EXHDR(txt) < 1)
+				return false;
+			*out = static_cast<unsigned char>(*VARDATA_ANY(txt));
+			return true;
+		}
 		case PG_VEC_SCALAR_STRING128:
 		case PG_VEC_SCALAR_INVALID:
 		default:
@@ -2337,6 +2727,7 @@ struct StringEvalValue
 	bool is_const;
 	const PgVecStringConst *const_value;
 	StringCursorValue ref_value;
+	PgVecStringConst owned_value;
 };
 
 static bool
@@ -2367,6 +2758,40 @@ eval_expr_to_string_value(const PgVecExprProgram &program,
 			out->is_const = true;
 			out->const_value = &expr.constant.string128;
 			return true;
+
+		case PG_VEC_EXPR_SUBSTRING_PREFIX2:
+		{
+			StringEvalValue base_value{};
+
+			if (!eval_expr_to_string_value(program, expr.left, ctx, &base_value))
+				return false;
+
+			out->is_const = true;
+			out->const_value = &out->owned_value;
+			if (base_value.is_const)
+			{
+				out->owned_value.len =
+					base_value.const_value->len < 2 ? base_value.const_value->len : 2;
+				if (out->owned_value.len > 0)
+					memcpy(out->owned_value.bytes,
+						   base_value.const_value->bytes,
+						   out->owned_value.len);
+			}
+			else
+			{
+				out->owned_value.len =
+					base_value.ref_value.ref->len < 2 ? base_value.ref_value.ref->len : 2;
+				for (uint16_t idx = 0; idx < out->owned_value.len; idx++)
+					out->owned_value.bytes[idx] =
+						string_ref_byte_at(*base_value.ref_value.ref,
+										   base_value.ref_value.arena,
+										   idx);
+			}
+			memset(out->owned_value.bytes + out->owned_value.len,
+				   0,
+				   PG_VEC_INLINE_STRING_MAX - out->owned_value.len);
+			return true;
+		}
 
 		case PG_VEC_EXPR_EXTRACT_YEAR:
 		case PG_VEC_EXPR_ADD:
@@ -2429,8 +2854,6 @@ eval_qual(const PgVecFilterSpec &filter,
 		  int qual_idx,
 		  const EvalContext &ctx)
 	{
-		__int128	lhs_value;
-		__int128	rhs_value;
 		StringEvalValue lhs_string{};
 		StringEvalValue rhs_string{};
 
@@ -2455,6 +2878,47 @@ eval_qual(const PgVecFilterSpec &filter,
 						!eval_expr_to_string_value(filter.exprs, qual.rhs_expr, ctx, &rhs_string))
 						return false;
 					return string_eval_contains(lhs_string, rhs_string);
+				}
+				if (qual.op == PG_VEC_OP_NOT_PREFIX_LIKE)
+				{
+					if (!eval_expr_to_string_value(filter.exprs, qual.lhs_expr, ctx, &lhs_string) ||
+						!eval_expr_to_string_value(filter.exprs, qual.rhs_expr, ctx, &rhs_string))
+						return false;
+					return !string_eval_starts_with(lhs_string, rhs_string);
+				}
+				if (qual.op == PG_VEC_OP_NOT_CONTAINS_LIKE)
+				{
+					if (!eval_expr_to_string_value(filter.exprs, qual.lhs_expr, ctx, &lhs_string) ||
+						!eval_expr_to_string_value(filter.exprs, qual.rhs_expr, ctx, &rhs_string))
+						return false;
+					return !string_eval_contains(lhs_string, rhs_string);
+				}
+				if (qual.op == PG_VEC_OP_SQL_LIKE || qual.op == PG_VEC_OP_NOT_SQL_LIKE)
+				{
+					PgVecStringConst lhs_tmp;
+					bool matched;
+
+					if (!eval_expr_to_string_value(filter.exprs, qual.lhs_expr, ctx, &lhs_string) ||
+						!eval_expr_to_string_value(filter.exprs, qual.rhs_expr, ctx, &rhs_string) ||
+						!rhs_string.is_const)
+						return false;
+
+					if (lhs_string.is_const)
+						matched = payload_matches_like_pattern(lhs_string.const_value->bytes,
+															   lhs_string.const_value->len,
+															   rhs_string.const_value->bytes,
+															   rhs_string.const_value->len);
+					else if (string_ref_copy_to_const(*lhs_string.ref_value.ref,
+													  lhs_string.ref_value.arena,
+													  &lhs_tmp))
+						matched = payload_matches_like_pattern(lhs_tmp.bytes,
+															   lhs_tmp.len,
+															   rhs_string.const_value->bytes,
+															   rhs_string.const_value->len);
+					else
+						return false;
+
+					return (qual.op == PG_VEC_OP_SQL_LIKE) ? matched : !matched;
 				}
 
 				if (filter.exprs.nodes[qual.lhs_expr].scalar_kind == PG_VEC_SCALAR_STRING128)
@@ -2482,16 +2946,21 @@ eval_qual(const PgVecFilterSpec &filter,
 							return cmp >= 0;
 						case PG_VEC_OP_PREFIX_LIKE:
 						case PG_VEC_OP_CONTAINS_LIKE:
+						case PG_VEC_OP_NOT_PREFIX_LIKE:
+						case PG_VEC_OP_NOT_CONTAINS_LIKE:
+						case PG_VEC_OP_SQL_LIKE:
+						case PG_VEC_OP_NOT_SQL_LIKE:
 						case PG_VEC_OP_INVALID:
 						default:
 							return false;
 					}
 				}
 
-			if (!eval_expr_to_int128(filter.exprs, qual.lhs_expr, ctx, &lhs_value) ||
-				!eval_expr_to_int128(filter.exprs, qual.rhs_expr, ctx, &rhs_value))
-				return false;
-			return compare_value(lhs_value, rhs_value, qual.op);
+			return compare_numeric_expr_values(filter.exprs,
+											 qual.lhs_expr,
+											 qual.rhs_expr,
+											 ctx,
+											 qual.op);
 
 		case PG_VEC_QUAL_AND:
 			return eval_qual(filter, qual.left, ctx) &&
@@ -2547,6 +3016,22 @@ eval_bound_filter_clause_row(const BoundFilterClause &clause,
 				return string_ref_contains_const(chunk.string_refs[clause.dst_col][row],
 												  &chunk.string_arenas[clause.dst_col],
 												  clause.constant.string128);
+			if (clause.op == PG_VEC_OP_NOT_PREFIX_LIKE)
+				return !string_ref_starts_with_const(chunk.string_refs[clause.dst_col][row],
+													  &chunk.string_arenas[clause.dst_col],
+													  clause.constant.string128);
+			if (clause.op == PG_VEC_OP_NOT_CONTAINS_LIKE)
+				return !string_ref_contains_const(chunk.string_refs[clause.dst_col][row],
+												   &chunk.string_arenas[clause.dst_col],
+												   clause.constant.string128);
+			if (clause.op == PG_VEC_OP_SQL_LIKE)
+				return string_ref_matches_like_const(chunk.string_refs[clause.dst_col][row],
+													 &chunk.string_arenas[clause.dst_col],
+													 clause.constant.string128);
+			if (clause.op == PG_VEC_OP_NOT_SQL_LIKE)
+				return !string_ref_matches_like_const(chunk.string_refs[clause.dst_col][row],
+													  &chunk.string_arenas[clause.dst_col],
+													  clause.constant.string128);
 			return string_ref_compare_value(chunk.string_refs[clause.dst_col][row],
 											 &chunk.string_arenas[clause.dst_col],
 											 clause.constant.string128,
@@ -2661,6 +3146,28 @@ agg_input_scalar_kind(const PgVecAggCall &agg)
 	return agg.expr.nodes[agg.expr.root].scalar_kind;
 }
 
+static bool
+agg_has_distinct(const PgVecAggSpec *agg_spec)
+{
+	for (int agg_idx = 0; agg_idx < agg_spec->naggs; agg_idx++)
+	{
+		if (agg_spec->aggs[agg_idx].distinct)
+			return true;
+	}
+
+	return false;
+}
+
+static void
+init_distinct_states(const PgVecAggSpec *agg_spec,
+					 std::vector<DistinctAggState> *distinct_states)
+{
+	distinct_states->clear();
+	distinct_states->resize(agg_spec->naggs);
+	for (int agg_idx = 0; agg_idx < agg_spec->naggs; agg_idx++)
+		(*distinct_states)[agg_idx].enabled = agg_spec->aggs[agg_idx].distinct;
+}
+
 static void
 init_exec_row(const PgVecAggSpec *agg_spec, PgVecExecRow *row)
 {
@@ -2697,6 +3204,13 @@ advance_agg_state(const PgVecAggCall &agg,
 	switch (agg.kind)
 	{
 		case PG_VEC_AGG_COUNT:
+			if (!agg.star_arg)
+			{
+				if (agg.expr.root < 0)
+					return;
+				if (!eval_expr_to_int128(agg.expr, agg.expr.root, ctx, &expr_value))
+					return;
+			}
 			state->count++;
 			state->isnull = false;
 			return;
@@ -2762,10 +3276,46 @@ advance_agg_state(const PgVecAggCall &agg,
 static void
 accumulate_row_aggs(const PgVecScanFilterAggExecParams *params,
 					const EvalContext &ctx,
-					PgVecExecRow *agg_row)
+					PgVecExecRow *agg_row,
+					std::vector<DistinctAggState> *distinct_states,
+					std::size_t group_pos,
+					bool grouped)
 {
 	for (int agg_idx = 0; agg_idx < params->agg.naggs; agg_idx++)
-		advance_agg_state(params->agg.aggs[agg_idx], ctx, &agg_row->aggs[agg_idx]);
+	{
+		const PgVecAggCall &agg_call = params->agg.aggs[agg_idx];
+
+		if (agg_call.distinct)
+		{
+			__int128 expr_value = 0;
+			DistinctAggState &distinct_state = (*distinct_states)[agg_idx];
+
+			if (!agg_filter_matches(agg_call, ctx))
+				continue;
+			if (!eval_expr_to_int128(agg_call.expr,
+									 agg_call.expr.root,
+									 ctx,
+									 &expr_value))
+				continue;
+
+			if (grouped)
+			{
+				if (group_pos >= distinct_state.grouped_values.size())
+					distinct_state.grouped_values.resize(group_pos + 1);
+				if (!distinct_state.grouped_values[group_pos]
+						 .insert((std::int32_t) expr_value)
+						 .second)
+					continue;
+			}
+			else
+			{
+				if (!distinct_state.plain_values.insert((std::int32_t) expr_value).second)
+					continue;
+			}
+		}
+
+		advance_agg_state(agg_call, ctx, &agg_row->aggs[agg_idx]);
+	}
 }
 
 static int
@@ -2782,6 +3332,10 @@ compare_group_key_values(const PgVecConstValue &lhs,
 		case PG_VEC_SCALAR_DECIMAL64_S2:
 			return (lhs.decimal64_s2 > rhs.decimal64_s2) -
 				(lhs.decimal64_s2 < rhs.decimal64_s2);
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+			return (lhs.decimal128 > rhs.decimal128) - (lhs.decimal128 < rhs.decimal128);
 		case PG_VEC_SCALAR_CHAR1:
 		{
 			unsigned char lhs_char = static_cast<unsigned char>(lhs.char1);
@@ -2791,8 +3345,6 @@ compare_group_key_values(const PgVecConstValue &lhs,
 		}
 		case PG_VEC_SCALAR_STRING128:
 			return compare_string(lhs.string128, rhs.string128);
-		case PG_VEC_SCALAR_DECIMAL128_S6:
-		case PG_VEC_SCALAR_DECIMAL128_S4:
 		case PG_VEC_SCALAR_INVALID:
 		default:
 			elog(ERROR, "pg_vec: unsupported group key scalar kind %d",
@@ -2987,6 +3539,13 @@ eval_post_agg_output_expr_to_int128(const PgVecScanFilterAggExecParams *params,
 			*isnull = false;
 			return const_value_to_int128(node->constant, node->scalar_kind, out);
 
+		case PG_VEC_OUTPUT_EXPR_PARAM:
+			return fetch_param_exec_to_int128(params,
+											  node->index,
+											  node->scalar_kind,
+											  out,
+											  isnull);
+
 		case PG_VEC_OUTPUT_EXPR_ADD:
 		case PG_VEC_OUTPUT_EXPR_SUB:
 			if (!eval_post_agg_output_expr_to_int128(params,
@@ -3051,6 +3610,40 @@ eval_post_agg_output_expr_to_string(const PgVecScanFilterAggExecParams *params,
 			*isnull = false;
 			return true;
 
+		case PG_VEC_OUTPUT_EXPR_PARAM:
+		{
+			static PgVecStringConst param_string;
+			ParamExecData *prm;
+			text *txt;
+
+			if (params == nullptr || params->estate == nullptr ||
+				node->index < 0 ||
+				node->index >= list_length(params->estate->es_plannedstmt->paramExecTypes))
+				return false;
+
+			prm = &params->estate->es_param_exec_vals[node->index];
+			if (prm->execPlan != nullptr)
+			{
+				ExprContext *econtext = GetPerTupleExprContext(params->estate);
+				ExecSetParamPlan((SubPlanState *) prm->execPlan, econtext);
+			}
+			if (prm->isnull)
+			{
+				*isnull = true;
+				return true;
+			}
+			txt = DatumGetTextPP(prm->value);
+			param_string.len =
+				Min((int) VARSIZE_ANY_EXHDR(txt), PG_VEC_INLINE_STRING_MAX - 1);
+			memcpy(param_string.bytes, VARDATA_ANY(txt), param_string.len);
+			memset(param_string.bytes + param_string.len,
+				   0,
+				   PG_VEC_INLINE_STRING_MAX - param_string.len);
+			*out = &param_string;
+			*isnull = false;
+			return true;
+		}
+
 		case PG_VEC_OUTPUT_EXPR_AGGREF:
 		case PG_VEC_OUTPUT_EXPR_ADD:
 		case PG_VEC_OUTPUT_EXPR_SUB:
@@ -3081,6 +3674,10 @@ compare_post_agg_values(PgVecFilterOp op, int cmp)
 			return cmp >= 0;
 		case PG_VEC_OP_PREFIX_LIKE:
 		case PG_VEC_OP_CONTAINS_LIKE:
+		case PG_VEC_OP_NOT_PREFIX_LIKE:
+		case PG_VEC_OP_NOT_CONTAINS_LIKE:
+		case PG_VEC_OP_SQL_LIKE:
+		case PG_VEC_OP_NOT_SQL_LIKE:
 		case PG_VEC_OP_INVALID:
 		default:
 			return false;
@@ -3276,6 +3873,13 @@ eval_expr_to_const(const PgVecExprProgram &expr,
 				return false;
 			out->decimal64_s2 = static_cast<std::int64_t>(value);
 			return true;
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+			if (!eval_expr_to_int128(expr, node_idx, ctx, &value))
+				return false;
+			out->decimal128 = value;
+			return true;
 		case PG_VEC_SCALAR_CHAR1:
 			if (!eval_expr_to_int128(expr, node_idx, ctx, &value))
 				return false;
@@ -3292,8 +3896,6 @@ eval_expr_to_const(const PgVecExprProgram &expr,
 			return string_ref_copy_to_const(*string_value.ref_value.ref,
 											string_value.ref_value.arena,
 											&out->string128);
-		case PG_VEC_SCALAR_DECIMAL128_S4:
-		case PG_VEC_SCALAR_DECIMAL128_S6:
 		case PG_VEC_SCALAR_INVALID:
 		default:
 			return false;
@@ -3326,7 +3928,8 @@ static void
 accumulate_grouped_eval(const PgVecScanFilterAggExecParams *params,
 						const EvalContext &ctx,
 						std::vector<PgVecExecRow> *groups,
-						std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index)
+						std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index,
+						std::vector<DistinctAggState> *distinct_states)
 {
 	GroupKey	group_key{};
 	PgVecConstValue typed_keys[PG_VEC_MAX_GROUP_KEYS];
@@ -3355,7 +3958,12 @@ accumulate_grouped_eval(const PgVecScanFilterAggExecParams *params,
 	if (!inserted)
 		group_pos = it->second;
 
-	accumulate_row_aggs(params, ctx, &(*groups)[group_pos]);
+	accumulate_row_aggs(params,
+						ctx,
+						&(*groups)[group_pos],
+						distinct_states,
+						group_pos,
+						true);
 }
 
 static void
@@ -3373,6 +3981,274 @@ materialize_result_rows(const std::vector<PgVecExecRow> &source_rows,
 	result->rows = (PgVecExecRow *) palloc0(sizeof(PgVecExecRow) * source_rows.size());
 	for (std::size_t row_idx = 0; row_idx < source_rows.size(); row_idx++)
 		result->rows[row_idx] = source_rows[row_idx];
+}
+
+static bool
+eval_output_program_to_const(const PgVecScanFilterAggExecParams *params,
+							 const PgVecExecRow &row,
+							 const PgVecOutputExprProgram &program,
+							 PgVecConstValue *out)
+{
+	PgVecScalarKind scalar_kind;
+	bool isnull = false;
+
+	if (params == nullptr)
+		return false;
+	if (program.root < 0 || program.root >= program.nnodes)
+		return false;
+
+	scalar_kind = program.nodes[program.root].scalar_kind;
+	switch (scalar_kind)
+	{
+		case PG_VEC_SCALAR_INT32:
+		{
+			__int128 value = 0;
+
+			if (!eval_post_agg_output_expr_to_int128(params,
+													 row,
+													 program,
+													 program.root,
+													 &value,
+													 &isnull) ||
+				isnull)
+				return false;
+			out->int32_value = static_cast<std::int32_t>(value);
+			return true;
+		}
+		case PG_VEC_SCALAR_DATE32:
+		{
+			__int128 value = 0;
+
+			if (!eval_post_agg_output_expr_to_int128(params,
+													 row,
+													 program,
+													 program.root,
+													 &value,
+													 &isnull) ||
+				isnull)
+				return false;
+			out->date32 = static_cast<DateADT>(value);
+			return true;
+		}
+		case PG_VEC_SCALAR_DECIMAL64_S2:
+		case PG_VEC_SCALAR_DECIMAL128_S2:
+		{
+			__int128 value = 0;
+
+			if (!eval_post_agg_output_expr_to_int128(params,
+													 row,
+													 program,
+													 program.root,
+													 &value,
+													 &isnull) ||
+				isnull)
+				return false;
+			out->decimal64_s2 = static_cast<std::int64_t>(value);
+			return true;
+		}
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+		{
+			__int128 value = 0;
+
+			if (!eval_post_agg_output_expr_to_int128(params,
+													 row,
+													 program,
+													 program.root,
+													 &value,
+													 &isnull) ||
+				isnull)
+				return false;
+			out->decimal128 = value;
+			return true;
+		}
+		case PG_VEC_SCALAR_CHAR1:
+		{
+			__int128 value = 0;
+
+			if (!eval_post_agg_output_expr_to_int128(params,
+													 row,
+													 program,
+													 program.root,
+													 &value,
+													 &isnull) ||
+				isnull)
+				return false;
+			out->char1 = static_cast<char>(value);
+			return true;
+		}
+		case PG_VEC_SCALAR_STRING128:
+		{
+			const PgVecStringConst *value = nullptr;
+
+			if (!eval_post_agg_output_expr_to_string(params,
+													 row,
+													 program,
+													 program.root,
+													 &value,
+													 &isnull) ||
+				isnull || value == nullptr)
+				return false;
+			*out = {};
+			out->string128 = *value;
+			return true;
+		}
+		case PG_VEC_SCALAR_INVALID:
+		default:
+			return false;
+	}
+}
+
+static void
+append_derived_materialized_row(const PgVecScanFilterAggExecParams *params,
+								const PgVecInputSpec *input,
+								const PgVecExecRow &source_row,
+								MaterializedInput *materialized)
+{
+	ItemPointerData tid;
+
+	ItemPointerSetInvalid(&tid);
+	for (int col_idx = 0; col_idx < input->ncolumns; col_idx++)
+	{
+		int output_slot = input->columns[col_idx].attno - 1;
+		int output_idx;
+		PgVecConstValue value{};
+
+		if (output_slot < 0 || output_slot >= PG_VEC_MAX_OUTPUT_COLUMNS)
+			elog(ERROR, "pg_vec: invalid derived output slot %d", output_slot);
+		output_idx = input->derived.output_map[output_slot];
+		if (output_idx < 0 || output_idx >= input->derived.agg.noutputs)
+			elog(ERROR, "pg_vec: invalid derived output mapping slot=%d idx=%d",
+				 output_slot,
+				 output_idx);
+		if (!eval_output_program_to_const(params,
+										 source_row,
+										 input->derived.agg.outputs[output_idx],
+										 &value))
+			elog(ERROR, "pg_vec: failed to evaluate derived output %d",
+				 output_idx);
+
+		switch (input->columns[col_idx].scalar_kind)
+		{
+			case PG_VEC_SCALAR_INT32:
+				materialized->int32_columns[col_idx].push_back(value.int32_value);
+				break;
+			case PG_VEC_SCALAR_DATE32:
+				materialized->date32_columns[col_idx].push_back(value.date32);
+				break;
+			case PG_VEC_SCALAR_DECIMAL64_S2:
+				materialized->decimal64_columns[col_idx].push_back(value.decimal64_s2);
+				break;
+			case PG_VEC_SCALAR_DECIMAL128_S2:
+			case PG_VEC_SCALAR_DECIMAL128_S4:
+			case PG_VEC_SCALAR_DECIMAL128_S6:
+				materialized->decimal128_columns[col_idx].push_back(value.decimal128);
+				break;
+			case PG_VEC_SCALAR_CHAR1:
+				materialized->char1_columns[col_idx].push_back(value.char1);
+				break;
+			case PG_VEC_SCALAR_STRING128:
+			{
+				PgVecStringRef ref;
+
+				if (!copy_string_const_into_arena(value.string128,
+												  &materialized->string_arenas[col_idx],
+												  &ref))
+					elog(ERROR, "pg_vec: failed to copy derived string output");
+				materialized->string_columns[col_idx].push_back(ref);
+				break;
+			}
+			case PG_VEC_SCALAR_INVALID:
+			default:
+				elog(ERROR, "pg_vec: unsupported derived output scalar kind %d",
+					 (int) input->columns[col_idx].scalar_kind);
+		}
+	}
+	materialized->tids.push_back(tid);
+	materialized->row_count++;
+}
+
+static void
+materialize_derived_input(uint8 input_id,
+						  const PgVecScanFilterAggExecParams *params,
+						  MaterializedInput *materialized,
+						  PgVecScanFilterAggExecResult *result)
+{
+	const PgVecInputSpec *input = &params->inputs[input_id];
+	PgVecScanFilterAggExecParams *derived_params;
+	PgVecScanFilterAggExecResult derived_result{};
+	auto init_exec_params_from_plan =
+		[&](const PgVecPlan *plan_spec,
+			PgVecScanFilterAggExecParams *dst) -> void
+	{
+		dst->ninputs = plan_spec->ninputs;
+		dst->snapshot = params->snapshot;
+		dst->estate = params->estate;
+		dst->enable_jit_deform = params->enable_jit_deform;
+		memcpy(dst->inputs,
+			   plan_spec->inputs,
+			   sizeof(PgVecInputSpec) * plan_spec->ninputs);
+		dst->njoins = plan_spec->njoins;
+		memcpy(dst->joins,
+			   plan_spec->joins,
+			   sizeof(PgVecJoinSpec) * plan_spec->njoins);
+		dst->agg = plan_spec->agg;
+		dst->topn = plan_spec->topn;
+		for (int rel_idx = 0; rel_idx < plan_spec->ninputs; rel_idx++)
+		{
+			if (plan_spec->inputs[rel_idx].kind == PG_VEC_INPUT_RELATION)
+				dst->rels[rel_idx] = table_open(plan_spec->inputs[rel_idx].relid, NoLock);
+		}
+	};
+	auto close_exec_params_rels =
+		[](PgVecScanFilterAggExecParams *dst) -> void
+	{
+		for (int rel_idx = 0; rel_idx < dst->ninputs; rel_idx++)
+		{
+			if (dst->rels[rel_idx] != nullptr)
+				table_close(dst->rels[rel_idx], NoLock);
+		}
+	};
+
+	derived_params = reinterpret_cast<PgVecScanFilterAggExecParams *>(
+		palloc0(sizeof(PgVecScanFilterAggExecParams)));
+	if (input->derived.subplan != nullptr)
+	{
+		init_exec_params_from_plan(input->derived.subplan, derived_params);
+	}
+	else
+	{
+		Relation base_rel = table_open(input->derived.relid, NoLock);
+
+		derived_params->ninputs = 1;
+		derived_params->rels[0] = base_rel;
+		derived_params->snapshot = params->snapshot;
+		derived_params->estate = params->estate;
+		derived_params->enable_jit_deform = params->enable_jit_deform;
+		derived_params->inputs[0].kind = PG_VEC_INPUT_RELATION;
+		derived_params->inputs[0].relid = input->derived.relid;
+		derived_params->inputs[0].ncolumns = input->derived.nbase_columns;
+		memcpy(derived_params->inputs[0].columns,
+			   input->derived.base_columns,
+			   sizeof(PgVecColumnRef) * input->derived.nbase_columns);
+		derived_params->inputs[0].filter = input->derived.base_filter;
+		derived_params->njoins = 0;
+		derived_params->agg = input->derived.agg;
+	}
+	pg_vec_execute_scan_filter_agg_datachunk(derived_params, &derived_result);
+	close_exec_params_rels(derived_params);
+
+	materialized->reserve_rows(derived_result.nrows);
+	for (int row_idx = 0; row_idx < derived_result.nrows; row_idx++)
+		append_derived_materialized_row(derived_params,
+										input,
+										derived_result.rows[row_idx],
+										materialized);
+	pfree(derived_params);
+
+	result->rows_scanned += derived_result.rows_scanned;
+	result->rows_selected += derived_result.rows_selected;
+	result->chunks_scanned += derived_result.chunks_scanned;
 }
 
 static bool
@@ -3439,6 +4315,14 @@ materialize_filtered_input(uint8 input_id,
 							PgVecScanFilterAggExecResult *result,
 							uint32_t late_mask = 0)
 {
+	if (params->inputs[input_id].kind == PG_VEC_INPUT_DERIVED_GROUPED_AGG)
+	{
+		if (late_mask != 0)
+			elog(ERROR, "pg_vec: late materialization is not supported for derived inputs");
+		materialize_derived_input(input_id, params, materialized, result);
+		return;
+	}
+
 	BoundFilterProgram bound_filter = build_bound_input_filter(&params->inputs[input_id],
 																  input_id);
 	HeapDataChunkScanner scanner(params->rels[input_id],
@@ -3474,7 +4358,10 @@ materialize_filtered_input(uint8 input_id,
 static bool
 join_supports_single_int32_fast_path(const PgVecJoinSpec &join)
 {
-	return (join.kind == PG_VEC_JOIN_INNER || join.kind == PG_VEC_JOIN_SEMI) &&
+	return (join.kind == PG_VEC_JOIN_INNER ||
+			join.kind == PG_VEC_JOIN_LEFT ||
+			join.kind == PG_VEC_JOIN_SEMI ||
+			join.kind == PG_VEC_JOIN_ANTI) &&
 		join.nkeys == 1 &&
 		join.keys[0].left.scalar_kind == PG_VEC_SCALAR_INT32 &&
 		join.keys[0].right.scalar_kind == PG_VEC_SCALAR_INT32;
@@ -3489,6 +4376,28 @@ materialize_filtered_input_with_int32_hash(uint8 input_id,
 											 PgVecScanFilterAggExecResult *result,
 											 uint32_t late_mask = 0)
 {
+	if (params->inputs[input_id].kind == PG_VEC_INPUT_DERIVED_GROUPED_AGG)
+	{
+		int key_col_idx;
+
+		if (late_mask != 0)
+			elog(ERROR, "pg_vec: late materialization is not supported for derived inputs");
+		materialize_derived_input(input_id, params, materialized, result);
+		key_col_idx = scan_column_index(&params->inputs[input_id], key_attno);
+		if (key_col_idx < 0)
+			elog(ERROR, "pg_vec: failed to locate derived int32 join key attno %d in input %d",
+				 (int) key_attno,
+				 (int) input_id);
+		right_hash->reserve(materialized->row_count);
+		for (std::size_t row_idx = 0; row_idx < materialized->row_count; row_idx++)
+		{
+			std::int32_t key = materialized->int32_columns[key_col_idx][row_idx];
+
+			(*right_hash)[key].push_back(row_idx);
+		}
+		return;
+	}
+
 	BoundFilterProgram bound_filter = build_bound_input_filter(&params->inputs[input_id],
 																  input_id);
 	HeapDataChunkScanner scanner(params->rels[input_id],
@@ -3541,8 +4450,33 @@ accumulate_single_input(const PgVecScanFilterAggExecParams *params,
 						PgVecExecRow *plain_row,
 						std::vector<PgVecExecRow> *groups,
 						std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index,
+						std::vector<DistinctAggState> *distinct_states,
 						PgVecScanFilterAggExecResult *result)
 {
+	if (params->inputs[input_id].kind == PG_VEC_INPUT_DERIVED_GROUPED_AGG)
+	{
+		MaterializedInput materialized(&params->inputs[input_id], 0);
+		EvalContext eval_ctx{};
+
+		materialize_derived_input(input_id, params, &materialized, result);
+		cursor_bind_materialized(&eval_ctx.inputs[input_id],
+								 &params->inputs[input_id],
+								 params->rels[input_id],
+								 params->snapshot,
+								 0,
+								 &materialized);
+		for (std::size_t row_idx = 0; row_idx < materialized.row_count; row_idx++)
+		{
+			cursor_set_materialized_row(&eval_ctx.inputs[input_id], row_idx);
+			if (params->agg.grouped)
+				accumulate_grouped_eval(params, eval_ctx, groups, group_index, distinct_states);
+			else
+				accumulate_row_aggs(params, eval_ctx, plain_row, distinct_states, 0, false);
+		}
+		cleanup_eval_context(&eval_ctx, params->ninputs);
+		return;
+	}
+
 	BoundFilterProgram bound_filter = build_bound_input_filter(&params->inputs[input_id],
 																  input_id);
 	HeapDataChunkScanner scanner(params->rels[input_id],
@@ -3567,9 +4501,9 @@ accumulate_single_input(const PgVecScanFilterAggExecParams *params,
 		{
 			eval_ctx.inputs[input_id].chunk_row = (*chunk).sel[i];
 			if (params->agg.grouped)
-				accumulate_grouped_eval(params, eval_ctx, groups, group_index);
+				accumulate_grouped_eval(params, eval_ctx, groups, group_index, distinct_states);
 			else
-				accumulate_row_aggs(params, eval_ctx, plain_row);
+				accumulate_row_aggs(params, eval_ctx, plain_row, distinct_states, 0, false);
 		}
 		result->chunks_scanned++;
 	}
@@ -3583,22 +4517,15 @@ probe_join_chain(const PgVecScanFilterAggExecParams *params,
 				 EvalContext *eval_ctx,
 				 PgVecExecRow *plain_row,
 				 std::vector<PgVecExecRow> *groups,
-				 std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index)
+				 std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index,
+				 std::vector<DistinctAggState> *distinct_states)
 {
 	if (join_idx >= params->njoins)
 	{
-		for (int filter_join_idx = 0; filter_join_idx < params->njoins; filter_join_idx++)
-		{
-			const PgVecJoinSpec &filter_join = params->joins[filter_join_idx];
-
-			if (filter_join.filter.nnodes > 0 &&
-				!eval_qual(filter_join.filter, filter_join.filter.root, *eval_ctx))
-				return;
-		}
 		if (params->agg.grouped)
-			accumulate_grouped_eval(params, *eval_ctx, groups, group_index);
+			accumulate_grouped_eval(params, *eval_ctx, groups, group_index, distinct_states);
 		else
-			accumulate_row_aggs(params, *eval_ctx, plain_row);
+			accumulate_row_aggs(params, *eval_ctx, plain_row, distinct_states, 0, false);
 		return;
 	}
 
@@ -3612,10 +4539,30 @@ probe_join_chain(const PgVecScanFilterAggExecParams *params,
 
 		it = right_hashes[join_idx].find(key);
 		if (it == right_hashes[join_idx].end())
+		{
+			if (join.kind == PG_VEC_JOIN_ANTI || join.kind == PG_VEC_JOIN_LEFT)
+			{
+				cursor_set_null_row(&eval_ctx->inputs[join.right_input]);
+				probe_join_chain(params,
+								 join_idx + 1,
+								 inputs,
+								 right_hashes,
+								 eval_ctx,
+								 plain_row,
+								 groups,
+								 group_index,
+								 distinct_states);
+			}
 			return;
+		}
+
+		bool anti_matched = false;
+		bool left_matched = false;
 
 		for (std::size_t right_row_idx : it->second)
 		{
+			bool matched = true;
+
 			cursor_bind_materialized(&eval_ctx->inputs[join.right_input],
 									 &params->inputs[join.right_input],
 									 params->rels[join.right_input],
@@ -3625,6 +4572,20 @@ probe_join_chain(const PgVecScanFilterAggExecParams *params,
 			cursor_set_materialized_row(&eval_ctx->inputs[join.right_input],
 										right_row_idx);
 
+			if (join.filter.nnodes > 0)
+			{
+				matched = eval_qual(join.filter, join.filter.root, *eval_ctx);
+				if (!matched)
+					continue;
+			}
+
+			if (join.kind == PG_VEC_JOIN_ANTI)
+			{
+				anti_matched = true;
+				break;
+			}
+
+			left_matched = true;
 			probe_join_chain(params,
 							 join_idx + 1,
 							 inputs,
@@ -3632,10 +4593,38 @@ probe_join_chain(const PgVecScanFilterAggExecParams *params,
 							 eval_ctx,
 							 plain_row,
 							 groups,
-							 group_index);
+							 group_index,
+							 distinct_states);
 
 			if (join.kind == PG_VEC_JOIN_SEMI)
 				break;
+		}
+
+		if (join.kind == PG_VEC_JOIN_ANTI && !anti_matched)
+		{
+			cursor_set_null_row(&eval_ctx->inputs[join.right_input]);
+			probe_join_chain(params,
+							 join_idx + 1,
+							 inputs,
+							 right_hashes,
+							 eval_ctx,
+							 plain_row,
+							 groups,
+							 group_index,
+							 distinct_states);
+		}
+		else if (join.kind == PG_VEC_JOIN_LEFT && !left_matched)
+		{
+			cursor_set_null_row(&eval_ctx->inputs[join.right_input]);
+			probe_join_chain(params,
+							 join_idx + 1,
+							 inputs,
+							 right_hashes,
+							 eval_ctx,
+							 plain_row,
+							 groups,
+							 group_index,
+							 distinct_states);
 		}
 	}
 }
@@ -3645,6 +4634,7 @@ accumulate_join_chain(const PgVecScanFilterAggExecParams *params,
 					  PgVecExecRow *plain_row,
 					  std::vector<PgVecExecRow> *groups,
 					  std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index,
+					  std::vector<DistinctAggState> *distinct_states,
 					  PgVecScanFilterAggExecResult *result)
 {
 	std::vector<MaterializedInput> inputs;
@@ -3736,7 +4726,8 @@ accumulate_join_chain(const PgVecScanFilterAggExecParams *params,
 								 &eval_ctx,
 								 plain_row,
 								 groups,
-								 group_index);
+								 group_index,
+								 distinct_states);
 			}
 
 			result->chunks_scanned++;
@@ -3751,6 +4742,7 @@ accumulate_joined(const PgVecScanFilterAggExecParams *params,
 				  PgVecExecRow *plain_row,
 				  std::vector<PgVecExecRow> *groups,
 				  std::unordered_map<GroupKey, std::size_t, GroupKeyHash> *group_index,
+				  std::vector<DistinctAggState> *distinct_states,
 				  PgVecScanFilterAggExecResult *result)
 {
 	const PgVecJoinSpec &join = params->joins[0];
@@ -3818,7 +4810,6 @@ accumulate_joined(const PgVecScanFilterAggExecParams *params,
 				elog(ERROR, "pg_vec: failed to extract join build key");
 			right_hash[key].push_back(row_idx);
 		}
-
 		cursor_reset_late_state(&right_ctx.inputs[join.right_input]);
 	}
 
@@ -3897,7 +4888,19 @@ accumulate_joined(const PgVecScanFilterAggExecParams *params,
 
 				it_i32 = right_hash_i32.find(key_i32);
 				if (it_i32 == right_hash_i32.end())
+				{
+					if (join.kind == PG_VEC_JOIN_ANTI ||
+						join.kind == PG_VEC_JOIN_LEFT)
+					{
+						if (join.kind == PG_VEC_JOIN_LEFT)
+							cursor_set_null_row(&eval_ctx.inputs[join.right_input]);
+						if (params->agg.grouped)
+							accumulate_grouped_eval(params, eval_ctx, groups, group_index, distinct_states);
+						else
+							accumulate_row_aggs(params, eval_ctx, plain_row, distinct_states, 0, false);
+					}
 					continue;
+				}
 				matches = &it_i32->second;
 			}
 			else
@@ -3907,10 +4910,24 @@ accumulate_joined(const PgVecScanFilterAggExecParams *params,
 
 				it = right_hash.find(key);
 				if (it == right_hash.end())
+				{
+					if (join.kind == PG_VEC_JOIN_ANTI ||
+						join.kind == PG_VEC_JOIN_LEFT)
+					{
+						if (join.kind == PG_VEC_JOIN_LEFT)
+							cursor_set_null_row(&eval_ctx.inputs[join.right_input]);
+						if (params->agg.grouped)
+							accumulate_grouped_eval(params, eval_ctx, groups, group_index, distinct_states);
+						else
+							accumulate_row_aggs(params, eval_ctx, plain_row, distinct_states, 0, false);
+					}
 					continue;
+				}
 				matches = &it->second;
 			}
 
+			bool anti_matched = false;
+			bool left_matched = false;
 			for (std::size_t right_row_idx : *matches)
 			{
 				bool matched = true;
@@ -3937,13 +4954,36 @@ accumulate_joined(const PgVecScanFilterAggExecParams *params,
 					if (!matched)
 						continue;
 				}
+
+				if (join.kind == PG_VEC_JOIN_ANTI)
+				{
+					anti_matched = true;
+					break;
+				}
+				left_matched = true;
 				if (params->agg.grouped)
-					accumulate_grouped_eval(params, eval_ctx, groups, group_index);
+					accumulate_grouped_eval(params, eval_ctx, groups, group_index, distinct_states);
 				else
-					accumulate_row_aggs(params, eval_ctx, plain_row);
+					accumulate_row_aggs(params, eval_ctx, plain_row, distinct_states, 0, false);
 
 				if (join.kind == PG_VEC_JOIN_SEMI)
 					break;
+			}
+
+			if (join.kind == PG_VEC_JOIN_ANTI && !anti_matched)
+			{
+				if (params->agg.grouped)
+					accumulate_grouped_eval(params, eval_ctx, groups, group_index, distinct_states);
+				else
+					accumulate_row_aggs(params, eval_ctx, plain_row, distinct_states, 0, false);
+			}
+			else if (join.kind == PG_VEC_JOIN_LEFT && !left_matched)
+			{
+				cursor_set_null_row(&eval_ctx.inputs[join.right_input]);
+				if (params->agg.grouped)
+					accumulate_grouped_eval(params, eval_ctx, groups, group_index, distinct_states);
+				else
+					accumulate_row_aggs(params, eval_ctx, plain_row, distinct_states, 0, false);
 			}
 		}
 
@@ -3963,9 +5003,12 @@ pg_vec_execute_scan_filter_agg_datachunk(
 	PgVecExecRow plain_row;
 	std::vector<PgVecExecRow> grouped_rows;
 	std::unordered_map<pg_vec::GroupKey, std::size_t, pg_vec::GroupKeyHash> group_index;
+	std::vector<pg_vec::DistinctAggState> distinct_states;
 
 	std::memset(result, 0, sizeof(*result));
 	pg_vec::init_exec_row(&params->agg, &plain_row);
+	if (pg_vec::agg_has_distinct(&params->agg))
+		pg_vec::init_distinct_states(&params->agg, &distinct_states);
 
 	if (params->njoins > 1)
 	{
@@ -3973,6 +5016,7 @@ pg_vec_execute_scan_filter_agg_datachunk(
 									  &plain_row,
 									  &grouped_rows,
 									  &group_index,
+									  &distinct_states,
 									  result);
 	}
 	else if (params->njoins == 1)
@@ -3981,6 +5025,7 @@ pg_vec_execute_scan_filter_agg_datachunk(
 								  &plain_row,
 								  &grouped_rows,
 								  &group_index,
+								  &distinct_states,
 								  result);
 	}
 	else
@@ -3990,6 +5035,7 @@ pg_vec_execute_scan_filter_agg_datachunk(
 										&plain_row,
 										&grouped_rows,
 										&group_index,
+										&distinct_states,
 										result);
 	}
 

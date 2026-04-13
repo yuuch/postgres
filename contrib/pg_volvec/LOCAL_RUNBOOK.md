@@ -1,6 +1,6 @@
 # pg_volvec Local Runbook
 
-Last verified: 2026-04-03
+Last verified: 2026-04-13
 
 ## 1. 项目定位
 
@@ -238,6 +238,21 @@ lldb -p <backend_pid>
 - inner `HashJoin` 链已可 offload
 - `SubqueryScan` 已可 offload
 - `MergeJoin` 计划形状当前可通过 hash-join-backed fallback 先跑通
+
+### 2026-04-10/12 numeric 与 JIT 边界
+
+- exact numeric lowering 会根据推导出的 precision 选择寄存器宽度：precision `<= 18` 走 scaled `int64`，precision `> 18` 走 `Wide128`。
+- `Wide128`/int128 表达式目前是 correctness-first 的解释器路径，不走 expression JIT。`VecExprProgram::try_compile_jit()` 会在发现任一寄存器为 `Wide128` 时直接跳过 LLVM lowering。
+- int-like comparison expression 目前也先走解释器路径，不走 expression JIT。这个 guard 覆盖 `INT2/INT4/INT8` widening 和 scaled numeric compare；2026-04-12 用 `count(*) WHERE l_orderkey < 10` 与 Q18 `HAVING sum(l_quantity) > 300` 验证过，避免 LLVM compare lowering 误过滤或误放行。
+- ungrouped aggregate 现在会在空输入时产生默认 group：`count(*)` 输出 `0`，`SUM/AVG` 空输入输出 `NULL`，对齐 PostgreSQL 语义。
+- process-worker 并行调试中可以临时让 worker 侧跳过 expr/deform JIT；leader-only 和串行路径仍按普通 GUC 行为走 JIT。
+- Q3 当前默认可能被 PostgreSQL 的 `enable_eager_aggregate` 改成 partial/final aggregate 计划；验证当前 `pg_volvec` process-worker 路径时先 `SET enable_eager_aggregate = off;`。
+- Q4 process-worker 路径已能正确跑通。当前 lowering 会避免把 bridge-produced `HashAggregate(lineitem)` 放到 HashJoin probe 侧；实测会选择 `lineitem` 侧 aggregate source 并行执行，再把 partial state merge 回 leader 后继续跑后续 join/final aggregate。
+- Q11 process-worker 路径已能正确跑通。worker 侧 partial agg 会保留 HAVING 里的 `Aggref` partial slot，但不编译/执行依赖 InitPlan Param 的 HAVING filter；partial state merge 回 leader 后，再由原始计划里的 HAVING/Sort 继续执行。
+- Q12 process-worker 路径在 worker 侧禁用 JIT 后已能正确跑通；当前 hash join 仍是每个 worker 本地 build，建议验证时 `SET pg_volvec.parallel_leader_participation = off;`，避免 leader 抢完整个 source scan。
+- Q16 process-worker 路径已能正确跑通。当前只打开 grouped `COUNT(DISTINCT int-like)` 的 file-backed partial merge：worker 导出每组 distinct 值，leader 做 set union 后再 materialize count；不声明支持 ungrouped 或非 int-like DISTINCT。
+- Q18 process-worker 路径已重新验证正确：PG parallel 关、`pg_volvec.parallel_max_workers=4`、leader participation 关时，`pg_volvec` 与原生 PG 都返回 100 行且 tuple 对齐；本轮工程测量约 `12.69s` vs 原生 PG `26.51s`。
+- Q10/Q14 的 process-worker 坏形态现在会自动跳过：当选中的 `HashProbeSource` source blocks 很小、但依赖链里最大的 `HashBuildSource` 超过它 `4x` 时，直接回退到 leader-only/普通 vec 执行，避免每个 worker 重复构建巨大本地 hash join 子树。2026-04-13 spot check：Q14 约 `3.01s-3.11s`，Q10 约 `4.65s-4.82s`，Q17 仍能 launch `4/4` workers。
 - tuple deform JIT 可以自动装载 `llvmjit` provider，不再需要手工 `LOAD 'llvmjit'`
 - expression JIT 已真正接到执行路径里，不再只是代码里“有这个函数”
 - 第一版列式 `VecSortState` 已接上，用于 final-result in-memory sort
@@ -271,7 +286,14 @@ lldb -p <backend_pid>
 另外两条已经确认会真正 offload，但验证边界还更窄：
 
 - Q2：当前 live 数据集上的 full native diff 还没补完，因为原生查询较慢
-- Q17：TPCH 大表上已确认 offload，小表 exact check 已对齐，但 full native TPCH-side diff 还没补完
+- Q17：TPCH 大表上已确认 process-worker 并行 offload；4-worker `pg_volvec` 输出 `3295493.51285714`，与 native rewrite 参考 `3295493.512857142857` 对齐，但 full original-query native diff 仍因本地原生计划超时没有闭环
+
+2026-04-12 跳过 Q2/Q21 的 median-of-3 process-parallel benchmark 注意：
+
+- native PG 和 `pg_duckdb` 保持 `max_parallel_workers = 0`
+- `pg_volvec` 单独使用 `max_parallel_workers = 8`、`pg_volvec.parallel = on`、`pg_volvec.parallel_max_workers = 4`
+- 不要把 `max_parallel_workers = 8` 放到 `pg_duckdb` case；本地 Q1 会卡在 `ParallelFinish`，需要重启实例才能清干净
+- Q17 结果：native PG `180s timeout`，`pg_duckdb` `15.364s`，`pg_volvec` `14.601s`
 
 ### 当前计划支持边界
 
@@ -412,7 +434,7 @@ res[i] = tmp[i] * c[i]
 #### 当前多条 query 的本地 checkpoint
 
 - Q3：约 `1.45x`
-- Q4：约 `1.05x`
+- Q4：约 `1.05x`；process-worker parallel sanity run 为原生 PG `11.35s` vs `pg_volvec` `8.84s`，约 `1.28x`
 - Q6：约 `1.18x - 1.29x`
 - Q10：当前仍慢于原生，属于后续优化对象
 - Q12：在字符串 deform JIT 接回后，已从明显落后收敛到小幅领先

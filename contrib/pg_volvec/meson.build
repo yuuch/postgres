@@ -8,6 +8,7 @@ pg_volvec_sources = files(
   'src/bridge/execute.cpp',
   'src/engine/expr.cpp',
   'src/engine/executor.cpp',
+  'src/engine/parallel_runtime.cpp',
 )
 
 pg_volvec_optimize_args = [

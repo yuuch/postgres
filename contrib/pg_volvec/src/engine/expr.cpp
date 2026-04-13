@@ -12,6 +12,7 @@ extern "C" {
 #include "utils/timestamp.h"
 
 extern bool pg_volvec_trace_hooks;
+extern bool pg_volvec_disable_jit_for_parallel_worker;
 }
 
 namespace pg_volvec
@@ -289,6 +290,20 @@ IsDateLikeType(Oid type)
 	return type == DATEOID || type == TIMESTAMPOID || type == TIMESTAMPTZOID;
 }
 
+static VecOutputStorageKind
+DefaultExprVarStorageKind(Oid type)
+{
+	if (type == FLOAT8OID)
+		return VecOutputStorageKind::Double;
+	if (type == NUMERICOID)
+		return VecOutputStorageKind::NumericScaledInt64;
+	if (type == BPCHAROID || type == TEXTOID || type == VARCHAROID)
+		return VecOutputStorageKind::StringRef;
+	if (type == INT8OID)
+		return VecOutputStorageKind::Int64;
+	return VecOutputStorageKind::Int32;
+}
+
 static bool
 ExprProducesFloat8Result(Expr *expr)
 {
@@ -441,20 +456,50 @@ StepWideConstValue(const VecExprStep *step)
 }
 
 static NumericWideInt
-RescaleOperandForCompare(const VecExprStep *step,
-						 int64_t reg_value,
-						 int from_scale,
-						 int to_scale)
+ReadRegisterWideValue(const VecExprProgram &program,
+					  const VecExprStep *step,
+					  int reg_idx,
+					  int slot_idx,
+					  const int64_t *registers_i64,
+					  const int64_t *registers_i64_hi)
 {
-	NumericWideInt value;
-
 	if (StepHasWideConst(step))
-		value = StepWideConstValue(step);
-	else
-		value = WideIntFromInt64(reg_value);
+		return StepWideConstValue(step);
+	if (program.get_register_numeric_width(reg_idx) == VecNumericWidth::Wide128)
+	{
+		return MakeWideIntBits((uint64_t) registers_i64[slot_idx],
+							   (uint64_t) registers_i64_hi[slot_idx]);
+	}
+	return WideIntFromInt64(registers_i64[slot_idx]);
+}
+
+static void
+StoreRegisterWideValue(int slot_idx,
+					   NumericWideInt value,
+					   int64_t *registers_i64,
+					   int64_t *registers_i64_hi)
+{
+	registers_i64[slot_idx] = (int64_t) WideIntLow64(value);
+	registers_i64_hi[slot_idx] = (int64_t) WideIntHigh64(value);
+}
+
+static NumericWideInt
+RescaleWideValueForRegister(NumericWideInt value, int from_scale, int to_scale)
+{
 	if (from_scale >= to_scale)
 		return value;
 	return RescaleWideIntUp(value, to_scale - from_scale);
+}
+
+static NumericWideInt
+RescaleOperandForCompare(const VecExprStep *step,
+						 NumericWideInt reg_value,
+						 int from_scale,
+						 int to_scale)
+{
+	if (from_scale >= to_scale)
+		return reg_value;
+	return RescaleWideIntUp(reg_value, to_scale - from_scale);
 }
 
 static int64_t
@@ -478,6 +523,28 @@ GetNumericScaleForVar(const Var *var)
 }
 
 static int
+GetTrackedPrecisionForVar(const Var *var)
+{
+	if (var == nullptr)
+		return 0;
+	switch (var->vartype)
+	{
+		case INT2OID:
+			return 5;
+		case INT4OID:
+			return 10;
+		case INT8OID:
+			return 19;
+		case NUMERICOID:
+			if (IsValidNumericTypmod(var->vartypmod))
+				return GetNumericPrecisionFromTypmod(var->vartypmod);
+			return 0;
+		default:
+			return 0;
+	}
+}
+
+static int
 GetNumericScaleForConst(const Const *c)
 {
 	if (c == nullptr)
@@ -489,6 +556,28 @@ GetNumericScaleForConst(const Const *c)
 	if (IsValidNumericTypmod(c->consttypmod))
 		return ClampTrackedScale(GetNumericScaleFromTypmod(c->consttypmod));
 	return DEFAULT_NUMERIC_SCALE;
+}
+
+static int
+GetTrackedPrecisionForConst(const Const *c)
+{
+	if (c == nullptr)
+		return 0;
+	switch (c->consttype)
+	{
+		case INT2OID:
+			return 5;
+		case INT4OID:
+			return 10;
+		case INT8OID:
+			return 19;
+		case NUMERICOID:
+			if (IsValidNumericTypmod(c->consttypmod))
+				return GetNumericPrecisionFromTypmod(c->consttypmod);
+			return 0;
+		default:
+			return 0;
+	}
 }
 
 static int
@@ -509,6 +598,70 @@ ResolveResultScale(VecOpCode opcode, int left_scale, int right_scale)
 		default:
 			return 0;
 	}
+}
+
+static int
+ResolveResultPrecision(VecOpCode opcode,
+					   int left_precision,
+					   int left_scale,
+					   int right_precision,
+					   int right_scale,
+					   int res_scale)
+{
+	int left_integral;
+	int right_integral;
+
+	if (left_precision <= 0 || right_precision <= 0)
+		return 0;
+
+	switch (opcode)
+	{
+		case VecOpCode::EEOP_INT64_ADD:
+		case VecOpCode::EEOP_INT64_SUB:
+			left_integral = Max(left_precision - left_scale, 0);
+			right_integral = Max(right_precision - right_scale, 0);
+			return Max(left_integral, right_integral) + 1 + res_scale;
+		case VecOpCode::EEOP_INT64_MUL:
+			return left_precision + right_precision;
+		case VecOpCode::EEOP_INT64_CASE:
+			return Max(left_precision, right_precision);
+		default:
+			return 0;
+	}
+}
+
+static VecNumericWidth
+ResolveResultNumericWidth(VecOpCode opcode,
+						  VecNumericWidth left_width,
+						  VecNumericWidth right_width,
+						  int left_precision,
+						  int left_scale,
+						  int right_precision,
+						  int right_scale,
+						  int res_scale)
+{
+	int precision;
+
+	if (opcode != VecOpCode::EEOP_INT64_ADD &&
+		opcode != VecOpCode::EEOP_INT64_SUB &&
+		opcode != VecOpCode::EEOP_INT64_MUL &&
+		opcode != VecOpCode::EEOP_INT64_CASE)
+		return VecNumericWidth::None;
+
+	if (left_width == VecNumericWidth::Wide128 ||
+		right_width == VecNumericWidth::Wide128)
+		return VecNumericWidth::Wide128;
+
+	precision = ResolveResultPrecision(opcode,
+									   left_precision, left_scale,
+									   right_precision, right_scale,
+									   res_scale);
+	if (precision > 0)
+		return WidthForNumericPrecision(precision);
+	if (left_width == VecNumericWidth::Int64 &&
+		right_width == VecNumericWidth::Int64)
+		return VecNumericWidth::Int64;
+	return VecNumericWidth::None;
 }
 
 static int
@@ -542,6 +695,8 @@ AllocateResultRegister(VecExprProgram &program)
 	if (res_idx >= MAX_REGISTERS)
 		return -1;
 	program.set_register_scale(res_idx, 0);
+	program.set_register_precision(res_idx, 0);
+	program.set_register_numeric_width(res_idx, VecNumericWidth::None);
 	return res_idx;
 }
 
@@ -1065,6 +1220,7 @@ VecExprProgram::VecExprProgram()
 {
 	registers_i32 = (int32_t *) palloc(sizeof(int32_t) * MAX_REGISTERS * DEFAULT_CHUNK_SIZE);
 	registers_i64 = (int64_t *) palloc(sizeof(int64_t) * MAX_REGISTERS * DEFAULT_CHUNK_SIZE);
+	registers_i64_hi = (int64_t *) palloc(sizeof(int64_t) * MAX_REGISTERS * DEFAULT_CHUNK_SIZE);
 	registers_f8 = (double *) palloc(sizeof(double) * MAX_REGISTERS * DEFAULT_CHUNK_SIZE);
 	registers_nulls = (uint8_t *) palloc(sizeof(uint8_t) * MAX_REGISTERS * DEFAULT_CHUNK_SIZE);
 	reset_register_scales();
@@ -1074,6 +1230,7 @@ VecExprProgram::~VecExprProgram()
 {
 	pfree(registers_i32);
 	pfree(registers_i64);
+	pfree(registers_i64_hi);
 	pfree(registers_f8);
 	pfree(registers_nulls);
 #ifdef USE_LLVM
@@ -1086,8 +1243,45 @@ void
 VecExprProgram::try_compile_jit()
 {
 #ifdef USE_LLVM
-	if (jit_func != nullptr || jit_context != nullptr)
+	if (pg_volvec_disable_jit_for_parallel_worker)
+	{
+		if (pg_volvec_trace_hooks)
+			elog(LOG, "pg_volvec: expr JIT disabled in process parallel worker");
 		return;
+	}
+	for (int reg_idx = 0; reg_idx < max_reg_idx; reg_idx++)
+	{
+		if (get_register_numeric_width(reg_idx) == VecNumericWidth::Wide128)
+			return;
+	}
+		bool has_intlike_compare = false;
+		for (const auto &step : steps)
+		{
+			if (step.opcode == VecOpCode::EEOP_VAR &&
+				step.d.var.storage_kind == VecOutputStorageKind::NumericAvgPair)
+				return;
+			if (step.opcode == VecOpCode::EEOP_INT64_DIV_FLOAT8)
+				return;
+			if (step.opcode == VecOpCode::EEOP_INT64_CASE)
+				return;
+			if (step.opcode == VecOpCode::EEOP_INT64_LT ||
+				step.opcode == VecOpCode::EEOP_INT64_LE ||
+				step.opcode == VecOpCode::EEOP_INT64_GT ||
+				step.opcode == VecOpCode::EEOP_INT64_GE ||
+				step.opcode == VecOpCode::EEOP_INT64_EQ ||
+				step.opcode == VecOpCode::EEOP_INT64_NE)
+				has_intlike_compare = true;
+		}
+		/*
+		 * Keep integer/numeric comparisons on the interpreter path until the
+		 * LLVM lowering has dedicated coverage for INT2/INT4 widening and scaled
+		 * numeric comparisons. A wrong filter is far more expensive than losing
+		 * this small JIT win.
+		 */
+		if (has_intlike_compare)
+			return;
+		if (jit_func != nullptr || jit_context != nullptr)
+			return;
 	if (final_res_idx < 0)
 		return;
 	const char *fr = nullptr;
@@ -1359,6 +1553,23 @@ PopulateConstStep(VecExprProgram &program,
 				scale = exact_scale;
 			step->d.constant.fval = fval;
 			program.set_register_scale(step->res_idx, scale);
+			if (IsValidNumericTypmod(consttypmod))
+				program.set_register_precision(step->res_idx,
+											 GetNumericPrecisionFromTypmod(consttypmod));
+			else if (step->d.constant.has_wide_i128 &&
+					 !WideIntFitsInt64(MakeWideIntBits(step->d.constant.wide_lo,
+													  (uint64_t) step->d.constant.wide_hi)))
+				program.set_register_precision(step->res_idx, 19);
+			else
+				program.set_register_precision(step->res_idx,
+											 CountDecimalDigitsInt64(step->d.constant.i64val));
+			program.set_register_numeric_width(
+				step->res_idx,
+				step->d.constant.has_wide_i128 &&
+				!WideIntFitsInt64(MakeWideIntBits(step->d.constant.wide_lo,
+												  (uint64_t) step->d.constant.wide_hi)) ?
+				VecNumericWidth::Wide128 :
+				VecNumericWidth::Int64);
 		}
 		else if (consttype == INT8OID)
 		{
@@ -1367,6 +1578,8 @@ PopulateConstStep(VecExprProgram &program,
 			step->d.constant.has_wide_i128 = true;
 			step->d.constant.wide_lo = WideIntLow64(WideIntFromInt64(step->d.constant.i64val));
 			step->d.constant.wide_hi = WideIntHigh64(WideIntFromInt64(step->d.constant.i64val));
+			program.set_register_precision(step->res_idx, 19);
+			program.set_register_numeric_width(step->res_idx, VecNumericWidth::Int64);
 		}
 		else if (consttype == DATEOID)
 		{
@@ -1408,8 +1621,16 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 		step.res_idx = res_idx;
 		step.d.var.att_idx = var->varattno - 1;
 		step.d.var.type = var->vartype;
+		step.d.var.storage_kind = DefaultExprVarStorageKind(var->vartype);
+		step.d.var.storage_scale = 0;
 		if (IsInt64LikeType(var->vartype))
+		{
 			program.set_register_scale(res_idx, GetNumericScaleForVar(var));
+			program.set_register_precision(res_idx, GetTrackedPrecisionForVar(var));
+			program.set_register_numeric_width(
+				res_idx,
+				WidthForNumericPrecision(program.get_register_precision(res_idx)));
+		}
 		program.steps.push_back(step);
 		return res_idx;
 	}
@@ -1529,9 +1750,28 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 			IsInt64LikeType(exprType((Node *) case_expr->defresult)))
 		{
 			step.opcode = VecOpCode::EEOP_INT64_CASE;
-			program.set_register_scale(res_idx,
+			program.set_register_scale(
+				res_idx,
 				Max(program.get_register_scale(true_idx),
 					program.get_register_scale(false_idx)));
+			program.set_register_precision(
+				res_idx,
+				ResolveResultPrecision(step.opcode,
+									   program.get_register_precision(true_idx),
+									   program.get_register_scale(true_idx),
+									   program.get_register_precision(false_idx),
+									   program.get_register_scale(false_idx),
+									   program.get_register_scale(res_idx)));
+			program.set_register_numeric_width(
+				res_idx,
+				ResolveResultNumericWidth(step.opcode,
+										 program.get_register_numeric_width(true_idx),
+										 program.get_register_numeric_width(false_idx),
+										 program.get_register_precision(true_idx),
+										 program.get_register_scale(true_idx),
+										 program.get_register_precision(false_idx),
+										 program.get_register_scale(false_idx),
+										 program.get_register_scale(res_idx)));
 		}
 		else if (IsIntegerType(exprType((Node *) when_clause->result)) &&
 				 IsIntegerType(exprType((Node *) case_expr->defresult)))
@@ -1693,6 +1933,24 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 			ResolveResultScale(step.opcode,
 							   program.get_register_scale(left),
 							   program.get_register_scale(right)));
+		program.set_register_precision(
+			res_idx,
+			ResolveResultPrecision(step.opcode,
+								   program.get_register_precision(left),
+								   program.get_register_scale(left),
+								   program.get_register_precision(right),
+								   program.get_register_scale(right),
+								   program.get_register_scale(res_idx)));
+		program.set_register_numeric_width(
+			res_idx,
+			ResolveResultNumericWidth(step.opcode,
+									 program.get_register_numeric_width(left),
+									 program.get_register_numeric_width(right),
+									 program.get_register_precision(left),
+									 program.get_register_scale(left),
+									 program.get_register_precision(right),
+									 program.get_register_scale(right),
+									 program.get_register_scale(res_idx)));
 		program.steps.push_back(step);
 		return res_idx;
 	}
@@ -1706,6 +1964,8 @@ CompileExpr(Expr *expr, VecExprProgram &program, bool is_filter, EState *estate)
 	program.steps.clear();
 	program.max_reg_idx = 0;
 	program.reset_register_scales();
+	program.reset_register_precisions();
+	program.reset_register_numeric_widths();
 	program.clear_string_consts();
 
 	int final_res = CompileExprRecursive(expr, program, estate);
@@ -1793,15 +2053,44 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				for (int i = 0; i < chunk.count; i++)
 				{
 					registers_nulls[res + i] = chunk.nulls[att][i];
-					if (typ == FLOAT8OID)
+					if (step.d.var.storage_kind == VecOutputStorageKind::NumericAvgPair)
+					{
+						double count = chunk.double_columns[att][i];
+						int scale_delta = Max(res_scale - step.d.var.storage_scale, 0);
+						long double scaled_avg = 0.0L;
+
+						if (!registers_nulls[res + i] && count <= 0.0)
+							registers_nulls[res + i] = 1;
+						if (!registers_nulls[res + i])
+						{
+							scaled_avg = ((long double) chunk.int64_columns[att][i] *
+										  (long double) Pow10Int64(scale_delta)) /
+								(long double) count;
+							registers_i64[res + i] = (int64_t) std::llround(scaled_avg);
+							registers_i64_hi[res + i] =
+								(registers_i64[res + i] < 0) ? -1 : 0;
+							registers_f8[res + i] =
+								((double) chunk.int64_columns[att][i] /
+								 (double) Pow10Int64(step.d.var.storage_scale)) / count;
+						}
+					}
+					else if (typ == FLOAT8OID)
 						registers_f8[res + i] = chunk.double_columns[att][i];
 					else if (typ == NUMERICOID || typ == INT8OID)
+					{
 						registers_i64[res + i] = chunk.int64_columns[att][i];
+						registers_i64_hi[res + i] =
+							(chunk.int64_columns[att][i] < 0) ? -1 : 0;
+					}
 					else
 					{
 						registers_i32[res + i] = chunk.int32_columns[att][i];
 						if (IsIntegerType(typ))
+						{
 							registers_i64[res + i] = (int64_t) chunk.int32_columns[att][i];
+							registers_i64_hi[res + i] =
+								(chunk.int32_columns[att][i] < 0) ? -1 : 0;
+						}
 					}
 				}
 				break;
@@ -1809,9 +2098,12 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 			case VecOpCode::EEOP_CONST:
 				for (int i = 0; i < chunk.count; i++)
 				{
+					NumericWideInt wide_value;
+
 					registers_nulls[res + i] = (uint8_t) step.d.constant.isnull;
 					registers_f8[res + i] = step.d.constant.fval;
-					registers_i64[res + i] = step.d.constant.i64val;
+					wide_value = StepWideConstValue(&step);
+					StoreRegisterWideValue(res + i, wide_value, registers_i64, registers_i64_hi);
 					registers_i32[res + i] = step.d.constant.ival;
 				}
 				break;
@@ -1841,12 +2133,19 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				{
 					NumericWideInt left_val;
 					NumericWideInt right_val;
+					NumericWideInt result;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					left_val = WideIntFromInt64(RescaleInt64Value(registers_i64[l + i], left_scale, res_scale));
-					right_val = WideIntFromInt64(RescaleInt64Value(registers_i64[r + i], right_scale, res_scale));
-					registers_i64[res + i] = WideIntToInt64Checked(left_val + right_val,
-						"numeric add result");
+					left_val = RescaleWideValueForRegister(
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						left_scale, res_scale);
+					right_val = RescaleWideValueForRegister(
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi),
+						right_scale, res_scale);
+					result = left_val + right_val;
+					StoreRegisterWideValue(res + i, result, registers_i64, registers_i64_hi);
 				}
 				break;
 			case VecOpCode::EEOP_INT64_SUB:
@@ -1854,12 +2153,19 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				{
 					NumericWideInt left_val;
 					NumericWideInt right_val;
+					NumericWideInt result;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					left_val = WideIntFromInt64(RescaleInt64Value(registers_i64[l + i], left_scale, res_scale));
-					right_val = WideIntFromInt64(RescaleInt64Value(registers_i64[r + i], right_scale, res_scale));
-					registers_i64[res + i] = WideIntToInt64Checked(left_val - right_val,
-						"numeric subtract result");
+					left_val = RescaleWideValueForRegister(
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						left_scale, res_scale);
+					right_val = RescaleWideValueForRegister(
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi),
+						right_scale, res_scale);
+					result = left_val - right_val;
+					StoreRegisterWideValue(res + i, result, registers_i64, registers_i64_hi);
 				}
 				break;
 			case VecOpCode::EEOP_INT64_MUL:
@@ -1868,10 +2174,12 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					NumericWideInt product;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					product = WideIntMul(WideIntFromInt64(registers_i64[l + i]),
-										 WideIntFromInt64(registers_i64[r + i]));
-					registers_i64[res + i] = WideIntToInt64Checked(product,
-						"numeric multiply result");
+					product = WideIntMul(
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi));
+					StoreRegisterWideValue(res + i, product, registers_i64, registers_i64_hi);
 				}
 				break;
 			case VecOpCode::EEOP_INT64_DIV_FLOAT8:
@@ -1879,12 +2187,18 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				{
 					double left_val;
 					double right_val;
+					NumericWideInt left_wide;
+					NumericWideInt right_wide;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
 					if (registers_nulls[res + i])
 						continue;
-					left_val = (double) registers_i64[l + i] / (double) Pow10Int64(left_scale);
-					right_val = (double) registers_i64[r + i] / (double) Pow10Int64(right_scale);
+					left_wide = ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+													 l + i, registers_i64, registers_i64_hi);
+					right_wide = ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+													  r + i, registers_i64, registers_i64_hi);
+					left_val = (double) left_wide / (double) Pow10Int64(left_scale);
+					right_val = (double) right_wide / (double) Pow10Int64(right_scale);
 					if (right_val == 0.0)
 						elog(ERROR, "pg_volvec numeric division by zero");
 					registers_f8[res + i] = left_val / right_val;
@@ -1898,8 +2212,16 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
-					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.left],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						left_scale, scale);
+					right_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.right],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi),
+						right_scale, scale);
 					registers_i32[res + i] = left_val < right_val;
 				}
 				break;
@@ -1911,8 +2233,16 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
-					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.left],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						left_scale, scale);
+					right_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.right],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi),
+						right_scale, scale);
 					registers_i32[res + i] = left_val <= right_val;
 				}
 				break;
@@ -1977,7 +2307,10 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				{
 					registers_nulls[res + i] = registers_nulls[l + i];
 					if (!registers_nulls[res + i])
+					{
 						registers_i64[res + i] = ExtractYearFromDate32(registers_i32[l + i]);
+						registers_i64_hi[res + i] = (registers_i64[res + i] < 0) ? -1 : 0;
+					}
 				}
 				break;
 			case VecOpCode::EEOP_INT64_GT:
@@ -1988,8 +2321,16 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
-					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.left],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						left_scale, scale);
+					right_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.right],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi),
+						right_scale, scale);
 					registers_i32[res + i] = left_val > right_val;
 				}
 				break;
@@ -2001,8 +2342,16 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
-					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.left],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						left_scale, scale);
+					right_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.right],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi),
+						right_scale, scale);
 					registers_i32[res + i] = left_val >= right_val;
 				}
 				break;
@@ -2015,8 +2364,16 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					NumericWideInt right_val;
 
 					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					left_val = RescaleOperandForCompare(reg_defs[step.d.op.left], registers_i64[l + i], left_scale, scale);
-					right_val = RescaleOperandForCompare(reg_defs[step.d.op.right], registers_i64[r + i], right_scale, scale);
+					left_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.left],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.left], step.d.op.left,
+											 l + i, registers_i64, registers_i64_hi),
+						left_scale, scale);
+					right_val = RescaleOperandForCompare(
+						reg_defs[step.d.op.right],
+						ReadRegisterWideValue(*this, reg_defs[step.d.op.right], step.d.op.right,
+											 r + i, registers_i64, registers_i64_hi),
+						right_scale, scale);
 					registers_i32[res + i] =
 						(step.opcode == VecOpCode::EEOP_INT64_EQ) ?
 						(left_val == right_val) :
@@ -2060,11 +2417,16 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					bool cond_null = registers_nulls[c + i] != 0;
 					bool take_true = (!cond_null && registers_i32[c + i] != 0);
 					int src = take_true ? t : f;
+					int src_reg = take_true ? step.d.ternary.if_true : step.d.ternary.if_false;
 					int src_scale = take_true ? true_scale : false_scale;
+					NumericWideInt value;
 
 					registers_nulls[res + i] = registers_nulls[src + i];
-					registers_i64[res + i] =
-						RescaleInt64Value(registers_i64[src + i], src_scale, res_scale);
+					value = RescaleWideValueForRegister(
+						ReadRegisterWideValue(*this, reg_defs[src_reg], src_reg,
+											 src + i, registers_i64, registers_i64_hi),
+						src_scale, res_scale);
+					StoreRegisterWideValue(res + i, value, registers_i64, registers_i64_hi);
 				}
 				break;
 			}

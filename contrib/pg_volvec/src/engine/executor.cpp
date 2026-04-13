@@ -16,6 +16,7 @@ extern "C" {
 
 extern bool pg_volvec_jit_deform;
 extern bool pg_volvec_trace_hooks;
+extern bool pg_volvec_disable_jit_for_parallel_worker;
 }
 
 namespace pg_volvec
@@ -23,7 +24,8 @@ namespace pg_volvec
 
 static std::unique_ptr<VecPlanState>
 ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
-						  bool force_full_deform);
+						  bool force_full_deform,
+						  const ParallelWorkerContext *parallel_worker_context);
 
 static bool
 IsRewriteExprNode(Node *node)
@@ -191,6 +193,55 @@ HashStringRefForGroupKey(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
 	if (len_out != nullptr)
 		*len_out = len;
 	return HashBytes64(ptr, len);
+}
+
+static uint64_t
+HashStringBytesForGroupKey(const char *ptr, uint32_t len, Oid sql_type, uint32_t *len_out)
+{
+	if (sql_type == BPCHAROID)
+		len = TrimBpcharLengthLocal(ptr, len);
+	if (len_out != nullptr)
+		*len_out = len;
+	return HashBytes64(ptr, len);
+}
+
+static constexpr uint32 VOLVEC_GROUPED_PARTIAL_FILE_MAGIC = 0x56564750;
+static constexpr uint32 VOLVEC_GROUPED_PARTIAL_FILE_VERSION = 2;
+
+struct GroupedPartialFileHeader
+{
+	uint32 magic = VOLVEC_GROUPED_PARTIAL_FILE_MAGIC;
+	uint32 version = VOLVEC_GROUPED_PARTIAL_FILE_VERSION;
+	uint32 naggs = 0;
+	uint32 reserved = 0;
+};
+
+static bool
+BufFileWriteAllLocal(BufFile *file, const void *ptr, size_t size)
+{
+	if (file == nullptr)
+		return false;
+	BufFileWrite(file, ptr, size);
+	return true;
+}
+
+static bool
+BufFileReadAllLocal(BufFile *file, void *ptr, size_t size, bool eof_ok, bool *eof_reached = nullptr)
+{
+	size_t nread;
+
+	if (eof_reached != nullptr)
+		*eof_reached = false;
+	if (file == nullptr)
+		return false;
+	nread = BufFileReadMaybeEOF(file, ptr, size, eof_ok);
+	if (eof_ok && nread == 0)
+	{
+		if (eof_reached != nullptr)
+			*eof_reached = true;
+		return true;
+	}
+	return nread == size;
 }
 
 static inline VecStringRef
@@ -383,13 +434,16 @@ static void
 AdjustProgramVarScales(VecExprProgram *program, VecPlanState *input_state)
 {
 	bool changed = false;
+	const int avg_pair_extra_scale = 6;
 
 	if (program == nullptr || input_state == nullptr)
 		return;
 
-	for (const auto &step : program->steps)
+	for (auto &step : program->steps)
 	{
 		VecOutputColMeta meta;
+		VecOutputStorageKind old_storage;
+		int old_storage_scale;
 
 		if (step.opcode != VecOpCode::EEOP_VAR)
 			continue;
@@ -397,8 +451,24 @@ AdjustProgramVarScales(VecExprProgram *program, VecPlanState *input_state)
 			continue;
 		if (!input_state->lookup_output_col_meta(step.d.var.att_idx + 1, &meta))
 			continue;
-		if (meta.storage_kind == VecOutputStorageKind::NumericScaledInt64 ||
-			meta.storage_kind == VecOutputStorageKind::NumericAvgPair)
+		old_storage = step.d.var.storage_kind;
+		old_storage_scale = step.d.var.storage_scale;
+		step.d.var.storage_kind = meta.storage_kind;
+		step.d.var.storage_scale = meta.scale;
+		if (old_storage != step.d.var.storage_kind ||
+			old_storage_scale != step.d.var.storage_scale)
+			changed = true;
+		if (meta.storage_kind == VecOutputStorageKind::NumericAvgPair)
+		{
+			int avg_scale = Min(meta.scale + avg_pair_extra_scale, 18);
+
+			if (program->get_register_scale(step.res_idx) != avg_scale)
+			{
+				program->set_register_scale(step.res_idx, avg_scale);
+				changed = true;
+			}
+		}
+		else if (meta.storage_kind == VecOutputStorageKind::NumericScaledInt64)
 		{
 			if (program->get_register_scale(step.res_idx) != meta.scale)
 			{
@@ -487,10 +557,47 @@ CollectRequiredAttrsForPlan(Plan *plan, Bitmapset **attrs)
 	/*
 	 * Base scan targetlists are often the full physical tuple; collecting from
 	 * them defeats pruning.  Instead, collect required Vars from upper plan
-	 * nodes and scan quals only.
+	 * nodes and scan quals only, unless the SeqScan targetlist is already a
+	 * projected direct-var subset that downstream operators rely on.
 	 */
-	if (!IsA(plan, SeqScan) && plan->targetlist != NIL)
-		CollectAttrNosFromExpr((Node *) plan->targetlist, attrs);
+	if (plan->targetlist != NIL)
+	{
+		bool collect_targetlist = !IsA(plan, SeqScan);
+
+		if (!collect_targetlist)
+		{
+			ListCell *lc;
+			bool saw_visible = false;
+			bool seqscan_identity = true;
+
+			foreach(lc, plan->targetlist)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(lc);
+				Expr *expr;
+				Var *var;
+
+				if (tle->resjunk)
+					continue;
+				saw_visible = true;
+				expr = StripImplicitNodesLocal((Expr *) tle->expr);
+				if (expr == nullptr || !IsA(expr, Var))
+				{
+					seqscan_identity = false;
+					break;
+				}
+				var = (Var *) expr;
+				if (tle->resno != var->varattno)
+				{
+					seqscan_identity = false;
+					break;
+				}
+			}
+			collect_targetlist = saw_visible && !seqscan_identity;
+		}
+
+		if (collect_targetlist)
+			CollectAttrNosFromExpr((Node *) plan->targetlist, attrs);
+	}
 
 	CollectRequiredAttrsForPlan(plan->lefttree, attrs);
 	CollectRequiredAttrsForPlan(plan->righttree, attrs);
@@ -675,6 +782,32 @@ ShouldSwapInnerJoinBuildSides(JoinType jointype, Plan *outer_plan, Plan *inner_p
 }
 
 static bool
+IsProcessParallelLocalContext(const ParallelWorkerContext *parallel_worker_context)
+{
+	return parallel_worker_context != nullptr &&
+		parallel_worker_context->agg_plan_node_id >= 0;
+}
+
+static bool
+ShouldSuppressPartialAggQual(const ParallelWorkerContext *parallel_worker_context,
+							 Agg *agg)
+{
+	return IsProcessParallelLocalContext(parallel_worker_context) &&
+		agg != nullptr &&
+		agg->plan.plan_node_id == parallel_worker_context->agg_plan_node_id;
+}
+
+static bool
+HasProcessParallelTargetAggSubtree(const ParallelWorkerContext *parallel_worker_context,
+								   VecPlanState *state)
+{
+	return IsProcessParallelLocalContext(parallel_worker_context) &&
+		state != nullptr &&
+		state->find_parallel_aggregate_state_by_plan_node_id(
+			parallel_worker_context->agg_plan_node_id) != nullptr;
+}
+
+static bool
 ShouldBuildSmallerSide(Plan *outer_plan, Plan *inner_plan)
 {
 	double outer_rows;
@@ -687,6 +820,49 @@ ShouldBuildSmallerSide(Plan *outer_plan, Plan *inner_plan)
 	if (outer_rows <= 0 || inner_rows <= 0)
 		return false;
 	return outer_rows < inner_rows;
+}
+
+static Oid
+FindPlanBaseRelid(Plan *plan, EState *estate)
+{
+	if (plan == nullptr || estate == nullptr)
+		return InvalidOid;
+	if (IsA(plan, SeqScan))
+	{
+		SeqScan *sscan = (SeqScan *) plan;
+
+		return exec_rt_fetch(sscan->scan.scanrelid, estate)->relid;
+	}
+	if (IsA(plan, Hash))
+		return FindPlanBaseRelid(((Hash *) plan)->plan.lefttree, estate);
+	if (IsA(plan, Material))
+		return FindPlanBaseRelid(plan->lefttree, estate);
+	if (IsA(plan, Sort))
+		return FindPlanBaseRelid(plan->lefttree, estate);
+	if (IsA(plan, Limit))
+		return FindPlanBaseRelid(plan->lefttree, estate);
+	if (IsA(plan, Agg))
+		return FindPlanBaseRelid(plan->lefttree, estate);
+	if (IsA(plan, SubqueryScan))
+		return FindPlanBaseRelid(((SubqueryScan *) plan)->subplan, estate);
+	return InvalidOid;
+}
+
+static bool
+PlanContainsNodeId(Plan *plan, int target_plan_node_id)
+{
+	if (plan == nullptr || target_plan_node_id < 0)
+		return false;
+	if (plan->plan_node_id == target_plan_node_id)
+		return true;
+	if (IsA(plan, Hash) &&
+		PlanContainsNodeId(((Hash *) plan)->plan.lefttree, target_plan_node_id))
+		return true;
+	if (IsA(plan, SubqueryScan) &&
+		PlanContainsNodeId(((SubqueryScan *) plan)->subplan, target_plan_node_id))
+		return true;
+	return PlanContainsNodeId(plan->lefttree, target_plan_node_id) ||
+		PlanContainsNodeId(plan->righttree, target_plan_node_id);
 }
 
 static bool
@@ -903,6 +1079,18 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 			desc.is_distinct = (aggref->aggdistinct != NIL);
 			if (aggref->args != NIL) {
 				TargetEntry *arg_tle = (TargetEntry *) linitial(aggref->args);
+				Expr *compiled_arg_expr = (Expr *) arg_tle->expr;
+
+				if (node->plan.lefttree != nullptr &&
+					node->plan.lefttree->targetlist != NIL)
+				{
+					Expr *rewritten_arg_expr =
+						RewriteExprAgainstTargetList((Expr *) arg_tle->expr,
+													 node->plan.lefttree->targetlist);
+
+					if (rewritten_arg_expr != nullptr)
+						compiled_arg_expr = rewritten_arg_expr;
+				}
 				desc.arg_type = exprType((Node *) arg_tle->expr);
 				if (pg_volvec_trace_hooks && desc.is_distinct)
 				{
@@ -920,7 +1108,7 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 							 desc.arg_type);
 				}
 				desc.arg_expr = std::make_unique<VecExprProgram>();
-				CompileExpr((Expr *) arg_tle->expr, *desc.arg_expr, false);
+				CompileExpr(compiled_arg_expr, *desc.arg_expr, false);
 				AdjustProgramVarScales(desc.arg_expr.get(), left_.get());
 				if (desc.arg_expr->get_final_res_idx() >= 0)
 				{
@@ -938,9 +1126,26 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 					}
 				}
 				if (desc.arg_expr->get_final_res_idx() >= 0)
+				{
 					desc.numeric_scale = desc.arg_expr->get_register_scale(desc.arg_expr->get_final_res_idx());
+					desc.numeric_precision = desc.arg_expr->get_register_precision(desc.arg_expr->get_final_res_idx());
+					desc.numeric_width = desc.arg_expr->get_register_numeric_width(desc.arg_expr->get_final_res_idx());
+				}
 				desc.use_exact_numeric = ShouldUseExactNumericAgg(desc.arg_type) &&
 					desc.arg_expr->get_final_res_idx() >= 0;
+				/*
+				 * Exact numeric aggregate arguments currently rely on the i64 register
+				 * path carrying scaled integer values. Keep them on the interpreter path
+				 * for now until the expr JIT exact-numeric result path is fully
+				 * validated, otherwise grouped SUM/AVG can observe zeroed i64 outputs.
+				 */
+				if (desc.use_exact_numeric &&
+					desc.arg_expr->jit_context != nullptr)
+				{
+					pg_volvec_release_llvm_jit_context((JitContext *) desc.arg_expr->jit_context);
+					desc.arg_expr->jit_context = nullptr;
+					desc.arg_expr->jit_func = nullptr;
+				}
 				if (desc.use_exact_numeric)
 				{
 					if (desc.type == VecAggType::AVG)
@@ -990,8 +1195,44 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 				}
 			}
 			aggs_.push_back(std::move(desc));
-		}
-}
+			if (pg_volvec_trace_hooks)
+			{
+				const auto &trace_desc = aggs_.back();
+
+				elog(LOG,
+					 "pg_volvec: agg desc target_resno=%d type=%u output_type=%u output_storage=%u use_exact_numeric=%s numeric_scale=%d numeric_precision=%d numeric_width=%u arg_expr=%s input_col=%d group_key_pos=%d distinct=%s",
+					 trace_desc.target_resno,
+					 (unsigned) trace_desc.type,
+					 trace_desc.output_type,
+					 (unsigned) trace_desc.output_storage,
+					 trace_desc.use_exact_numeric ? "on" : "off",
+					 trace_desc.numeric_scale,
+					 trace_desc.numeric_precision,
+					 (unsigned) trace_desc.numeric_width,
+					 trace_desc.arg_expr != nullptr ? "on" : "off",
+					 trace_desc.input_col,
+					 trace_desc.group_key_pos,
+					 trace_desc.is_distinct ? "on" : "off");
+				if (trace_desc.arg_expr != nullptr)
+				{
+					for (size_t step_idx = 0; step_idx < trace_desc.arg_expr->steps.size(); step_idx++)
+					{
+						const auto &step = trace_desc.arg_expr->steps[step_idx];
+
+						elog(LOG,
+							 "pg_volvec: agg expr step[%zu] target_resno=%d opcode=%u res=%d left=%d right=%d scale=%d",
+							 step_idx,
+							 trace_desc.target_resno,
+							 (unsigned) step.opcode,
+							 step.res_idx,
+							 step.d.op.left,
+							 step.d.op.right,
+							 trace_desc.arg_expr->get_register_scale(step.res_idx));
+					}
+				}
+				}
+			}
+	}
 
 VecAggState::~VecAggState()
 {
@@ -1046,219 +1287,1243 @@ VecAggState::copy_rep_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,
 	}
 }
 
-void VecAggState::do_sink() {
-	auto batch = std::make_unique<DataChunk<DEFAULT_CHUNK_SIZE>>();
-	auto ensure_new_group = [this, &batch](VecAggGroupState *group, int row_idx)
+void
+VecAggState::export_partial_accumulator(const VecAggAccumulator *src,
+										 ParallelAggPartialAccumulator *dst) const
+{
+	if (dst == nullptr)
+		return;
+	memset(dst, 0, sizeof(*dst));
+	if (src == nullptr)
+		return;
+	dst->float_sum = src->float_sum;
+	dst->numeric_sum_lo = WideIntLow64(src->numeric_sum);
+	dst->numeric_sum_hi = WideIntHigh64(src->numeric_sum);
+	dst->numeric_max_lo = WideIntLow64(src->numeric_max);
+	dst->numeric_max_hi = WideIntHigh64(src->numeric_max);
+	dst->float_max = src->float_max;
+	dst->int64_max = src->int64_max;
+	dst->int32_max = src->int32_max;
+	dst->count = src->count;
+	dst->has_value = src->has_value ? 1 : 0;
+}
+
+bool
+VecAggState::is_supported_parallel_distinct_agg(const VecAggDesc &agg) const
+{
+	if (!agg.is_distinct)
+		return true;
+	if (agg.type != VecAggType::COUNT || agg.arg_expr == nullptr)
+		return false;
+	return agg.arg_type == INT2OID ||
+		agg.arg_type == INT4OID ||
+		agg.arg_type == INT8OID ||
+		agg.arg_type == DATEOID;
+}
+
+VecAggState::VecAggAccumulator::DistinctValueSet *
+VecAggState::ensure_distinct_value_set(VecAggAccumulator *acc) const
+{
+	MemoryContext old_context;
+
+	if (acc == nullptr)
+		return nullptr;
+	if (acc->distinct_values != nullptr)
+		return acc->distinct_values;
+	old_context = MemoryContextSwitchTo(memory_context_);
+	acc->distinct_values =
+		new VecAggAccumulator::DistinctValueSet(
+			0,
+			std::hash<int64_t>{},
+			std::equal_to<int64_t>{},
+			PgMemoryContextAllocator<std::pair<const int64_t, char>>(memory_context_));
+	MemoryContextSwitchTo(old_context);
+	return acc->distinct_values;
+}
+
+bool
+VecAggState::write_distinct_values_to_partial_file(BufFile *file,
+												   const VecAggAccumulator *acc) const
+{
+	uint32_t distinct_count = 0;
+
+	if (acc != nullptr && acc->distinct_values != nullptr)
 	{
-		DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
-			rep_chunks_.empty() ? allocate_rep_chunk() : rep_chunks_.back();
-
-		group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
-		if (rep_chunk->count >= DEFAULT_CHUNK_SIZE)
-			rep_chunk = allocate_rep_chunk();
-		group->rep_chunk_idx = (uint32_t) (rep_chunks_.size() - 1);
-		group->rep_row_idx = (uint16_t) rep_chunk->count;
-		group->has_rep_row = true;
-		copy_rep_row(*rep_chunk, rep_chunk->count, *batch, row_idx);
-		rep_chunk->count++;
-	};
-	auto update_group_accs = [this](VecAggGroupState *group, int row_idx)
+		if (acc->distinct_values->size() > UINT32_MAX)
+			return false;
+		distinct_count = (uint32_t) acc->distinct_values->size();
+	}
+	if (!BufFileWriteAllLocal(file, &distinct_count, sizeof(distinct_count)))
+		return false;
+	if (acc == nullptr || acc->distinct_values == nullptr)
+		return true;
+	for (const auto &entry : *acc->distinct_values)
 	{
-		auto &accs = group->accs;
+		int64_t value = entry.first;
 
-		if (accs.empty())
-			accs.resize(aggs_.size());
-		for (size_t a = 0; a < aggs_.size(); a++) {
-			if (aggs_[a].type == VecAggType::COUNT) {
-				if (!aggs_[a].is_distinct)
-				{
-					if (!aggs_[a].arg_expr)
-					{
-						accs[a].count++;
-						continue;
-					}
+		if (!BufFileWriteAllLocal(file, &value, sizeof(value)))
+			return false;
+	}
+	return true;
+}
 
-					int r = aggs_[a].arg_expr->final_res_idx;
+bool
+VecAggState::read_distinct_values_from_partial_file(BufFile *file,
+													VecAggAccumulator *acc) const
+{
+	VecAggAccumulator::DistinctValueSet *values;
+	uint32_t distinct_count = 0;
 
-					if (r >= 0 && !aggs_[a].arg_expr->get_nulls_reg(r)[row_idx])
-						accs[a].count++;
-					continue;
-				}
+	if (!BufFileReadAllLocal(file, &distinct_count, sizeof(distinct_count), false))
+		return false;
+	if (distinct_count == 0)
+		return true;
+	values = ensure_distinct_value_set(acc);
+	if (values == nullptr)
+		return false;
+	for (uint32_t i = 0; i < distinct_count; i++)
+	{
+		int64_t value;
+
+		if (!BufFileReadAllLocal(file, &value, sizeof(value), false))
+			return false;
+		if (values->emplace(value, 1).second)
+			acc->count++;
+	}
+	return true;
+}
+
+void
+VecAggState::merge_partial_accumulator(const ParallelAggPartialAccumulator &src,
+										size_t agg_index,
+										VecAggAccumulator *dst) const
+{
+	const VecAggDesc &agg = aggs_[agg_index];
+	NumericWideInt src_numeric = MakeWideIntBits(src.numeric_sum_lo,
+												 (uint64_t) src.numeric_sum_hi);
+	NumericWideInt src_numeric_max = MakeWideIntBits(src.numeric_max_lo,
+													 (uint64_t) src.numeric_max_hi);
+
+	if (dst == nullptr)
+		return;
+	switch (agg.type)
+	{
+		case VecAggType::COUNT:
+			dst->count += src.count;
+			break;
+		case VecAggType::SUM:
+			if (agg.use_exact_numeric)
+				dst->numeric_sum += src_numeric;
+			else
+				dst->float_sum += src.float_sum;
+			dst->count += src.count;
+			break;
+		case VecAggType::AVG:
+			if (agg.use_exact_numeric)
+				dst->numeric_sum += src_numeric;
+			else
+				dst->float_sum += src.float_sum;
+			dst->count += src.count;
+			break;
+		case VecAggType::MAX:
+			if (!src.has_value)
+				break;
+			if (!dst->has_value)
+			{
+				dst->numeric_max = src_numeric_max;
+				dst->float_max = src.float_max;
+				dst->int64_max = src.int64_max;
+				dst->int32_max = src.int32_max;
+				dst->has_value = true;
+				break;
+			}
+			if (agg.use_exact_numeric)
+				dst->numeric_max = Max(dst->numeric_max, src_numeric_max);
+			else if (agg.output_storage == VecOutputStorageKind::Int64 ||
+				agg.output_storage == VecOutputStorageKind::NumericScaledInt64 ||
+				agg.output_storage == VecOutputStorageKind::NumericAvgPair)
+				dst->int64_max = Max(dst->int64_max, src.int64_max);
+			else if (agg.output_storage == VecOutputStorageKind::Double)
+				dst->float_max = Max(dst->float_max, src.float_max);
+			else
+				dst->int32_max = Max(dst->int32_max, src.int32_max);
+			dst->has_value = true;
+			break;
+	}
+}
+
+void
+VecAggState::ensure_group_rep_row(VecAggGroupState *group,
+								  const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+								  int row_idx)
+{
+	DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+		rep_chunks_.empty() ? allocate_rep_chunk() : rep_chunks_.back();
+
+	group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+	if (rep_chunk->count >= DEFAULT_CHUNK_SIZE)
+		rep_chunk = allocate_rep_chunk();
+	group->rep_chunk_idx = (uint32_t) (rep_chunks_.size() - 1);
+	group->rep_row_idx = (uint16_t) rep_chunk->count;
+	group->has_rep_row = true;
+	copy_rep_row(*rep_chunk, rep_chunk->count, batch, row_idx);
+	rep_chunk->count++;
+}
+
+void
+VecAggState::store_group_rep_row_from_partial(VecAggGroupState *group,
+											   const ParallelAggPartialGroupEntry &entry)
+{
+	DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+		rep_chunks_.empty() ? allocate_rep_chunk() : rep_chunks_.back();
+	int rep_row;
+
+	if (group == nullptr || group->has_rep_row)
+		return;
+	if (rep_chunk->count >= DEFAULT_CHUNK_SIZE)
+		rep_chunk = allocate_rep_chunk();
+	rep_row = rep_chunk->count;
+	group->rep_chunk_idx = (uint32_t) (rep_chunks_.size() - 1);
+	group->rep_row_idx = (uint16_t) rep_row;
+	group->has_rep_row = true;
+	for (const auto &agg : aggs_)
+	{
+		int out_col = agg.target_resno - 1;
+		const ParallelAggPartialGroupKeyCol *col;
+
+		if (agg.arg_expr != nullptr || agg.group_key_pos < 0 ||
+			agg.group_key_pos >= (int) entry.num_group_cols ||
+			out_col < 0 || out_col >= 16)
+			continue;
+		col = &entry.group_cols[agg.group_key_pos];
+		rep_chunk->nulls[out_col][rep_row] = col->is_null;
+		if (col->is_null)
+			continue;
+		switch (agg.output_storage)
+		{
+			case VecOutputStorageKind::StringRef:
+			{
+				char buf[8] = {0};
+
+				if (col->string_len > sizeof(buf))
+					elog(ERROR, "pg_volvec grouped partial string key too long: %u",
+						 col->string_len);
+				memcpy(buf, &col->value_bits, col->string_len);
+				rep_chunk->string_columns[out_col][rep_row] =
+					rep_chunk->store_string_bytes(buf, col->string_len);
+				break;
+			}
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+			case VecOutputStorageKind::NumericAvgPair:
+				rep_chunk->int64_columns[out_col][rep_row] = (int64_t) col->value_bits;
+				rep_chunk->double_columns[out_col][rep_row] = (double) ((int64_t) col->value_bits);
+				break;
+			case VecOutputStorageKind::Double:
+			{
+				double value;
+
+				memcpy(&value, &col->value_bits, sizeof(value));
+				rep_chunk->double_columns[out_col][rep_row] = value;
+				break;
+			}
+			case VecOutputStorageKind::Int32:
+			default:
+				rep_chunk->int32_columns[out_col][rep_row] = (int32_t) col->value_bits;
+				break;
+		}
+	}
+	rep_chunk->count++;
+}
+
+void
+VecAggState::update_group_accumulators(VecAggGroupState *group,
+									   const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+									   int row_idx)
+{
+	auto &accs = group->accs;
+
+	if (accs.empty())
+		accs.resize(aggs_.size());
+	for (size_t a = 0; a < aggs_.size(); a++) {
+		if (aggs_[a].type == VecAggType::COUNT) {
+			if (!aggs_[a].is_distinct)
+			{
 				if (!aggs_[a].arg_expr)
-					continue;
-				int r = aggs_[a].arg_expr->final_res_idx;
-				if (r < 0 || aggs_[a].arg_expr->get_nulls_reg(r)[row_idx])
-					continue;
-
-				int64_t distinct_value;
-
-				if (aggs_[a].use_exact_numeric || aggs_[a].arg_type == INT8OID)
-					distinct_value = aggs_[a].arg_expr->get_int64_reg(r)[row_idx];
-				else if (aggs_[a].arg_type == INT4OID ||
-						 aggs_[a].arg_type == INT2OID ||
-						 aggs_[a].arg_type == DATEOID)
-					distinct_value = (int64_t) aggs_[a].arg_expr->get_int32_reg(r)[row_idx];
-				else
-					continue;
-
-				if (accs[a].distinct_values == nullptr)
-				{
-					MemoryContext old_context = MemoryContextSwitchTo(memory_context_);
-					accs[a].distinct_values =
-						new VecAggAccumulator::DistinctValueSet(
-							0,
-							std::hash<int64_t>{},
-							std::equal_to<int64_t>{},
-							PgMemoryContextAllocator<std::pair<const int64_t, char>>(memory_context_));
-					MemoryContextSwitchTo(old_context);
-				}
-				if (accs[a].distinct_values->emplace(distinct_value, 1).second)
 				{
 					accs[a].count++;
+					continue;
+				}
+
+				int r = aggs_[a].arg_expr->final_res_idx;
+
+				if (r >= 0 && !aggs_[a].arg_expr->get_nulls_reg(r)[row_idx])
+					accs[a].count++;
+				continue;
+			}
+			if (!aggs_[a].arg_expr)
+				continue;
+			int r = aggs_[a].arg_expr->final_res_idx;
+			if (r < 0 || aggs_[a].arg_expr->get_nulls_reg(r)[row_idx])
+				continue;
+
+			int64_t distinct_value;
+
+			if (aggs_[a].use_exact_numeric || aggs_[a].arg_type == INT8OID)
+				distinct_value = aggs_[a].arg_expr->get_int64_reg(r)[row_idx];
+			else if (aggs_[a].arg_type == INT4OID ||
+					 aggs_[a].arg_type == INT2OID ||
+					 aggs_[a].arg_type == DATEOID)
+				distinct_value = (int64_t) aggs_[a].arg_expr->get_int32_reg(r)[row_idx];
+			else
+				continue;
+
+			if (accs[a].distinct_values == nullptr)
+				ensure_distinct_value_set(&accs[a]);
+			if (accs[a].distinct_values->emplace(distinct_value, 1).second)
+			{
+				accs[a].count++;
+				if (pg_volvec_trace_hooks)
+				{
+					static int distinct_trace_count = 0;
+
+					if (distinct_trace_count < 20)
+					{
+						elog(LOG,
+							 "pg_volvec: distinct agg accepted value=%lld count=%lld",
+							 (long long) distinct_value,
+							 (long long) accs[a].count);
+						distinct_trace_count++;
+					}
+				}
+			}
+		}
+		else if (aggs_[a].arg_expr) {
+			int r = aggs_[a].arg_expr->final_res_idx;
+			if (r >= 0 && !aggs_[a].arg_expr->get_nulls_reg(r)[row_idx]) {
+				if (aggs_[a].type == VecAggType::MAX) {
+					if (aggs_[a].use_exact_numeric) {
+						accs[a].update_max_numeric(
+							aggs_[a].arg_expr->get_wide_int_reg_value(r, row_idx));
+					} else if (aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
+						aggs_[a].output_storage == VecOutputStorageKind::NumericScaledInt64 ||
+						aggs_[a].output_storage == VecOutputStorageKind::NumericAvgPair) {
+						const int64_t *r64 = aggs_[a].arg_expr->get_int64_reg(r);
+						accs[a].update_max_int64(r64[row_idx]);
+					} else if (aggs_[a].output_storage == VecOutputStorageKind::Double) {
+						const double *rf8 = aggs_[a].arg_expr->get_float8_reg(r);
+						accs[a].update_max_float(rf8[row_idx]);
+					} else {
+						const int32_t *r32 = aggs_[a].arg_expr->get_int32_reg(r);
+						accs[a].update_max_int32(r32[row_idx]);
+					}
+				} else if (aggs_[a].use_exact_numeric) {
+					NumericWideInt wide_value =
+						aggs_[a].arg_expr->get_wide_int_reg_value(r, row_idx);
 					if (pg_volvec_trace_hooks)
 					{
-						static int distinct_trace_count = 0;
+						static int agg_numeric_input_trace_count = 0;
 
-						if (distinct_trace_count < 20)
+						if (agg_numeric_input_trace_count < 20)
 						{
-							elog(LOG,
-								 "pg_volvec: distinct agg accepted value=%lld count=%lld",
-								 (long long) distinct_value,
-								 (long long) accs[a].count);
-							distinct_trace_count++;
-						}
-					}
-				}
-			}
-			else if (aggs_[a].arg_expr) {
-				int r = aggs_[a].arg_expr->final_res_idx;
-				if (r >= 0 && !aggs_[a].arg_expr->get_nulls_reg(r)[row_idx]) {
-					if (aggs_[a].type == VecAggType::MAX) {
-						if (aggs_[a].use_exact_numeric ||
-							aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
-							aggs_[a].output_storage == VecOutputStorageKind::NumericScaledInt64 ||
-							aggs_[a].output_storage == VecOutputStorageKind::NumericAvgPair) {
-							const int64_t *r64 = aggs_[a].arg_expr->get_int64_reg(r);
-							accs[a].update_max_int64(r64[row_idx]);
-						} else if (aggs_[a].output_storage == VecOutputStorageKind::Double) {
+							const int64_t* r64 = aggs_[a].arg_expr->get_int64_reg(r);
+							const int64_t* r64_hi = aggs_[a].arg_expr->get_int64_hi_reg(r);
 							const double *rf8 = aggs_[a].arg_expr->get_float8_reg(r);
-							accs[a].update_max_float(rf8[row_idx]);
-						} else {
-							const int32_t *r32 = aggs_[a].arg_expr->get_int32_reg(r);
-							accs[a].update_max_int32(r32[row_idx]);
+
+							elog(LOG,
+								 "pg_volvec: agg numeric input target_resno=%d row=%d reg=%d scale=%d i64_lo=%lld i64_hi=%lld f8=%.10f",
+								 aggs_[a].target_resno,
+								 row_idx,
+								 r,
+								 aggs_[a].numeric_scale,
+								 (long long) r64[row_idx],
+								 (long long) r64_hi[row_idx],
+								 rf8[row_idx]);
+							agg_numeric_input_trace_count++;
 						}
-					} else if (aggs_[a].use_exact_numeric) {
-						const int64_t* r64 = aggs_[a].arg_expr->get_int64_reg(r);
-						accs[a].update_numeric(r64[row_idx]);
-					} else {
-						double v;
-						const int64_t* r64 = aggs_[a].arg_expr->get_int64_reg(r);
-						const double* rf8 = aggs_[a].arg_expr->get_float8_reg(r);
-						if (r64[row_idx] != 0 || (rf8[row_idx] == 0.0))
-							v = (double)r64[row_idx];
-						else
-							v = rf8[row_idx];
-						accs[a].update_float(v);
 					}
+					accs[a].update_numeric(wide_value);
+				} else {
+					double v;
+					const int64_t* r64 = aggs_[a].arg_expr->get_int64_reg(r);
+					const double* rf8 = aggs_[a].arg_expr->get_float8_reg(r);
+					if (aggs_[a].output_storage == VecOutputStorageKind::Double &&
+						aggs_[a].arg_type != INT2OID &&
+						aggs_[a].arg_type != INT4OID &&
+						aggs_[a].arg_type != INT8OID &&
+						aggs_[a].arg_type != DATEOID)
+						v = rf8[row_idx];
+					else
+						v = (double)r64[row_idx];
+					accs[a].update_float(v);
 				}
 			}
 		}
-	};
-	while (left_->get_next_batch(*batch)) {
-			for (auto &agg : aggs_) if (agg.arg_expr) agg.arg_expr->evaluate(*batch);
-		int n = batch->has_selection ? batch->sel.count : batch->count;
-			for (int s = 0; s < n; s++) {
-				int i = batch->has_selection ? batch->sel.row_ids[s] : s;
-				if (use_simple_group_key_)
-				{
-					VecSimpleGroupKey key;
-					int idx = grp_col_indices_[0];
-					bool is_null = idx < 0 || idx >= 16 || batch->nulls[idx][i] != 0;
+	}
+}
 
-					key.is_null = is_null ? 1 : 0;
-					if (!is_null)
+bool
+VecAggState::configure_input_block_range(BlockNumber start_block, uint32_t nblocks)
+{
+	return left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+}
+
+void
+VecAggState::clear_input_block_range()
+{
+	if (left_ != nullptr)
+		left_->clear_source_block_range();
+}
+
+void
+VecAggState::consume_batch(DataChunk<DEFAULT_CHUNK_SIZE> &batch)
+{
+	int n;
+
+	for (auto &agg : aggs_)
+	{
+		if (agg.arg_expr)
+		{
+			agg.arg_expr->evaluate(batch);
+			if (pg_volvec_trace_hooks && agg.use_exact_numeric)
+			{
+				static int exact_numeric_batch_trace_count = 0;
+
+				if (exact_numeric_batch_trace_count < 4)
+				{
+					int trace_rows = Min(batch.count, 4);
+
+					for (int row = 0; row < trace_rows; row++)
 					{
-						if (simple_group_storage_ == VecOutputStorageKind::Int32)
-							key.value = (int64_t) batch->int32_columns[idx][i];
-						else
-							key.value = batch->int64_columns[idx][i];
+						elog(LOG,
+							 "pg_volvec: agg batch row=%d col1_i64=%lld col2_i64=%lld col1_i32=%d col2_i32=%d null1=%d null2=%d reg0=%lld reg1=%lld reg2=%lld reg3=%lld reg4=%lld",
+							 row,
+							 (long long) batch.int64_columns[1][row],
+							 (long long) batch.int64_columns[2][row],
+							 batch.int32_columns[1][row],
+							 batch.int32_columns[2][row],
+							 (int) batch.nulls[1][row],
+							 (int) batch.nulls[2][row],
+							 (long long) agg.arg_expr->get_int64_reg(0)[row],
+							 (long long) agg.arg_expr->get_int64_reg(1)[row],
+							 (long long) agg.arg_expr->get_int64_reg(2)[row],
+							 (long long) agg.arg_expr->get_int64_reg(3)[row],
+							 (long long) agg.arg_expr->get_int64_reg(4)[row]);
 					}
-					auto insert_result = simple_hash_table_.try_emplace(key);
-					auto it = insert_result.first;
-
-					if (insert_result.second)
-						ensure_new_group(&it->second, i);
-					update_group_accs(&it->second, i);
+					exact_numeric_batch_trace_count++;
 				}
+			}
+		}
+	}
+	n = batch.has_selection ? batch.sel.count : batch.count;
+	input_batches_consumed_++;
+	input_rows_consumed_ += (uint64_t) n;
+	for (int s = 0; s < n; s++) {
+		int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+		if (use_simple_group_key_)
+		{
+			VecSimpleGroupKey key;
+			int idx = grp_col_indices_[0];
+			bool is_null = idx < 0 || idx >= 16 || batch.nulls[idx][i] != 0;
+
+			key.is_null = is_null ? 1 : 0;
+			if (!is_null)
+			{
+				if (simple_group_storage_ == VecOutputStorageKind::Int32)
+					key.value = (int64_t) batch.int32_columns[idx][i];
 				else
+					key.value = batch.int64_columns[idx][i];
+			}
+			auto insert_result = simple_hash_table_.try_emplace(key);
+			auto it = insert_result.first;
+
+			if (insert_result.second)
+				ensure_group_rep_row(&it->second, batch, i);
+			update_group_accumulators(&it->second, batch, i);
+		}
+		else
+		{
+			VecGroupKey key;
+
+			key.num_cols = (int) grp_col_indices_.size();
+			if (key.num_cols > kMaxDeformTargets)
+				key.num_cols = kMaxDeformTargets;
+			for (int k = 0; k < key.num_cols; k++) {
+				int idx = grp_col_indices_[k];
+				const VecOutputColMeta &meta = grp_col_meta_[k];
+				bool is_null;
+
+				if (idx < 0 || idx >= 16)
 				{
-					VecGroupKey key;
+					key.is_null[k] = 1;
+					key.values[k] = 0;
+					key.aux[k] = 0;
+					continue;
+				}
+				is_null = batch.nulls[idx][i] != 0;
+				key.is_null[k] = is_null ? 1 : 0;
+				if (is_null)
+				{
+					key.values[k] = 0;
+					key.aux[k] = 0;
+					continue;
+				}
+				switch (meta.storage_kind)
+				{
+					case VecOutputStorageKind::StringRef:
+					{
+						uint32_t key_len = 0;
+						VecStringRef ref = batch.string_columns[idx][i];
 
-					key.num_cols = (int) grp_col_indices_.size();
-					if (key.num_cols > kMaxDeformTargets)
-						key.num_cols = kMaxDeformTargets;
-					for (int k = 0; k < key.num_cols; k++) {
-						int idx = grp_col_indices_[k];
-						const VecOutputColMeta &meta = grp_col_meta_[k];
-						bool is_null;
+						key.values[k] = HashStringRefForGroupKey(batch, ref, meta.sql_type, &key_len);
+						key.aux[k] = key_len;
+						break;
+					}
+					case VecOutputStorageKind::Int64:
+					case VecOutputStorageKind::NumericScaledInt64:
+					case VecOutputStorageKind::NumericAvgPair:
+						key.values[k] = (uint64_t) batch.int64_columns[idx][i];
+						key.aux[k] = 0;
+						break;
+					case VecOutputStorageKind::Double:
+						memcpy(&key.values[k], &batch.double_columns[idx][i], sizeof(uint64_t));
+						key.aux[k] = 0;
+						break;
+					case VecOutputStorageKind::Int32:
+					default:
+						key.values[k] = (uint64_t) (uint32_t) batch.int32_columns[idx][i];
+						key.aux[k] = 0;
+						break;
+				}
+			}
+			auto insert_result = hash_table_.try_emplace(key);
+			auto it = insert_result.first;
 
-						if (idx < 0 || idx >= 16)
+			if (insert_result.second)
+				ensure_group_rep_row(&it->second, batch, i);
+			update_group_accumulators(&it->second, batch, i);
+		}
+	}
+}
+
+void
+VecAggState::consume_left_input()
+{
+	auto batch = std::make_unique<DataChunk<DEFAULT_CHUNK_SIZE>>();
+
+	while (left_ != nullptr && left_->get_next_batch(*batch))
+		consume_batch(*batch);
+}
+
+void
+VecAggState::finish_sink()
+{
+	if (fully_scanned_)
+		return;
+	fully_scanned_ = true;
+	if (grp_col_indices_.empty() && hash_table_.empty())
+	{
+		VecGroupKey key = {};
+		auto insert_result = hash_table_.try_emplace(key);
+		auto &accs = insert_result.first->second.accs;
+
+		if (accs.empty())
+			accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+		accs.resize(aggs_.size());
+	}
+	if (use_simple_group_key_)
+		simple_it_ = simple_hash_table_.begin();
+	else
+		it_ = hash_table_.begin();
+}
+
+bool
+VecAggState::supports_parallel_partial_state() const
+{
+	if (!grp_col_indices_.empty())
+	{
+		if (grp_col_indices_.size() > VOLVEC_PARALLEL_MAX_GROUP_COLS)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG,
+					 "pg_volvec: parallel partial agg unsupported: group cols %zu exceed max %u",
+					 grp_col_indices_.size(),
+					 (unsigned) VOLVEC_PARALLEL_MAX_GROUP_COLS);
+			return false;
+		}
+		for (const auto &meta : grp_col_meta_)
+		{
+			switch (meta.storage_kind)
+			{
+				case VecOutputStorageKind::Int32:
+				case VecOutputStorageKind::Int64:
+				case VecOutputStorageKind::NumericScaledInt64:
+				case VecOutputStorageKind::StringRef:
+					break;
+				default:
+					if (pg_volvec_trace_hooks)
+						elog(LOG,
+							 "pg_volvec: parallel partial agg unsupported: group col storage kind %u",
+							 (unsigned) meta.storage_kind);
+					return false;
+			}
+		}
+	}
+	if (!grp_col_indices_.empty())
+	{
+		for (const auto &agg : aggs_)
+		{
+			if (agg.arg_expr == nullptr &&
+				agg.type != VecAggType::COUNT &&
+				agg.group_key_pos < 0)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG,
+						 "pg_volvec: parallel partial agg unsupported: grouped agg target_resno=%d has no arg expr and no group passthrough",
+						 agg.target_resno);
+				return false;
+			}
+		}
+	}
+	for (const auto &agg : aggs_)
+	{
+		if (agg.is_distinct)
+		{
+			if (grp_col_indices_.empty() ||
+				!is_supported_parallel_distinct_agg(agg))
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG,
+						 "pg_volvec: parallel partial agg unsupported: DISTINCT target_resno=%d arg_type=%u grouped=%s",
+						 agg.target_resno,
+						 agg.arg_type,
+						 grp_col_indices_.empty() ? "off" : "on");
+				return false;
+			}
+		}
+		if (agg.type != VecAggType::SUM &&
+			agg.type != VecAggType::COUNT &&
+			agg.type != VecAggType::AVG &&
+			agg.type != VecAggType::MAX)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG,
+					 "pg_volvec: parallel partial agg unsupported: agg type %u target_resno=%d",
+					 (unsigned) agg.type,
+					 agg.target_resno);
+			return false;
+		}
+		if (agg.arg_expr == nullptr &&
+			agg.type != VecAggType::COUNT &&
+			agg.group_key_pos < 0)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG,
+					 "pg_volvec: parallel partial agg unsupported: target_resno=%d has no arg expr and no group passthrough",
+					 agg.target_resno);
+			return false;
+		}
+	}
+	if (pg_volvec_trace_hooks)
+		elog(LOG,
+			 "pg_volvec: parallel partial agg supported (groups=%zu aggs=%zu file_backed=%s plan_node_id=%d)",
+			 grp_col_indices_.size(),
+			 aggs_.size(),
+			 uses_file_backed_parallel_partial_state() ? "on" : "off",
+			 node_ != nullptr ? node_->plan.plan_node_id : -1);
+	return true;
+}
+
+bool
+VecAggState::export_parallel_partial_state(ParallelAggPartialState *out) const
+{
+	const VecAggAccumulatorList *accs = nullptr;
+
+	if (out == nullptr || !supports_parallel_partial_state())
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->naggs = (uint32_t) aggs_.size();
+	out->grouped = grp_col_indices_.empty() ? 0 : 1;
+	out->input_batches = input_batches_consumed_;
+	out->input_rows = input_rows_consumed_;
+	if (!grp_col_indices_.empty())
+	{
+		if (use_simple_group_key_)
+		{
+			for (const auto &entry : simple_hash_table_)
+			{
+				ParallelAggPartialGroupEntry *dst_group;
+				const VecAggAccumulatorList *src_accs = &entry.second.accs;
+
+				if (out->group_count >= VOLVEC_PARALLEL_MAX_GROUPS)
+					return false;
+				dst_group = &out->groups[out->group_count++];
+				memset(dst_group, 0, sizeof(*dst_group));
+				dst_group->num_group_cols = 1;
+				dst_group->group_cols[0].storage_kind = (uint8_t) simple_group_storage_;
+				dst_group->group_cols[0].is_null = entry.first.is_null;
+				dst_group->group_cols[0].value_bits = (uint64_t) entry.first.value;
+				for (size_t a = 0; a < aggs_.size() && a < lengthof(dst_group->accs); a++)
+				{
+					const VecAggAccumulator *src =
+						(src_accs != nullptr && a < src_accs->size()) ? &(*src_accs)[a] : nullptr;
+					export_partial_accumulator(src, &dst_group->accs[a]);
+				}
+			}
+			return true;
+		}
+
+		for (const auto &entry : hash_table_)
+		{
+			ParallelAggPartialGroupEntry *dst_group;
+			const VecAggAccumulatorList *src_accs = &entry.second.accs;
+			const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+				entry.second.has_rep_row ? rep_chunks_[entry.second.rep_chunk_idx] : nullptr;
+			int rep_row = entry.second.rep_row_idx;
+
+			if (out->group_count >= VOLVEC_PARALLEL_MAX_GROUPS)
+				return false;
+			dst_group = &out->groups[out->group_count++];
+			memset(dst_group, 0, sizeof(*dst_group));
+			dst_group->num_group_cols = (uint32_t) Min(entry.first.num_cols, (int) VOLVEC_PARALLEL_MAX_GROUP_COLS);
+			for (uint32_t k = 0; k < dst_group->num_group_cols; k++)
+			{
+				const VecOutputColMeta &meta = grp_col_meta_[k];
+				ParallelAggPartialGroupKeyCol *dst_col = &dst_group->group_cols[k];
+
+				dst_col->storage_kind = (uint8_t) meta.storage_kind;
+				dst_col->is_null = entry.first.is_null[k];
+				if (dst_col->is_null)
+					continue;
+				switch (meta.storage_kind)
+				{
+					case VecOutputStorageKind::StringRef:
+					{
+						const VecStringRef *ref = nullptr;
+						const char *ptr = nullptr;
+						uint32_t len = 0;
+
+						if (rep_chunk == nullptr)
+							return false;
+						for (const auto &agg : aggs_)
 						{
-							key.is_null[k] = 1;
-							key.values[k] = 0;
-							key.aux[k] = 0;
-							continue;
-						}
-						is_null = batch->nulls[idx][i] != 0;
-						key.is_null[k] = is_null ? 1 : 0;
-						if (is_null)
-						{
-							key.values[k] = 0;
-							key.aux[k] = 0;
-							continue;
-						}
-						switch (meta.storage_kind)
-						{
-							case VecOutputStorageKind::StringRef:
+							int out_col = agg.target_resno - 1;
+
+							if (agg.arg_expr == nullptr && agg.group_key_pos == (int) k &&
+								out_col >= 0 && out_col < 16)
 							{
-								uint32_t key_len = 0;
-								VecStringRef ref = batch->string_columns[idx][i];
-
-								key.values[k] = HashStringRefForGroupKey(*batch, ref, meta.sql_type, &key_len);
-								key.aux[k] = key_len;
+								ref = &rep_chunk->string_columns[out_col][rep_row];
 								break;
 							}
-							case VecOutputStorageKind::Int64:
-							case VecOutputStorageKind::NumericScaledInt64:
-							case VecOutputStorageKind::NumericAvgPair:
-								key.values[k] = (uint64_t) batch->int64_columns[idx][i];
-								key.aux[k] = 0;
-								break;
-							case VecOutputStorageKind::Double:
-								memcpy(&key.values[k], &batch->double_columns[idx][i], sizeof(uint64_t));
-								key.aux[k] = 0;
-								break;
-							case VecOutputStorageKind::Int32:
-							default:
-								key.values[k] = (uint64_t) (uint32_t) batch->int32_columns[idx][i];
-								key.aux[k] = 0;
-								break;
 						}
+						if (ref == nullptr)
+							return false;
+						ptr = rep_chunk->get_string_ptr(*ref);
+						len = ref->len;
+						if (len > 8)
+							return false;
+						dst_col->string_len = len;
+						memcpy(&dst_col->value_bits, ptr, len);
+						break;
 					}
-					auto insert_result = hash_table_.try_emplace(key);
-					auto it = insert_result.first;
-
-					if (insert_result.second)
-						ensure_new_group(&it->second, i);
-					update_group_accs(&it->second, i);
+					case VecOutputStorageKind::Int64:
+					case VecOutputStorageKind::NumericScaledInt64:
+					case VecOutputStorageKind::NumericAvgPair:
+						dst_col->value_bits = entry.first.values[k];
+						break;
+					case VecOutputStorageKind::Int32:
+					default:
+						dst_col->value_bits = entry.first.values[k];
+						break;
 				}
 			}
+			for (size_t a = 0; a < aggs_.size() && a < lengthof(dst_group->accs); a++)
+			{
+				const VecAggAccumulator *src =
+					(src_accs != nullptr && a < src_accs->size()) ? &(*src_accs)[a] : nullptr;
+				export_partial_accumulator(src, &dst_group->accs[a]);
+			}
 		}
-		fully_scanned_ = true;
-		if (use_simple_group_key_)
-			simple_it_ = simple_hash_table_.begin();
+		return true;
+	}
+	if (!hash_table_.empty())
+		accs = &hash_table_.begin()->second.accs;
+	for (size_t a = 0; a < aggs_.size() && a < lengthof(out->accs); a++)
+	{
+		const VecAggAccumulator *src = (accs != nullptr && a < accs->size()) ? &(*accs)[a] : nullptr;
+		export_partial_accumulator(src, &out->accs[a]);
+	}
+	return true;
+}
+
+bool
+VecAggState::append_group_record_to_partial_file(BufFile *file,
+												 const VecGroupKey *key,
+												 const VecSimpleGroupKey *simple_key,
+												 const VecAggGroupState &group) const
+{
+	uint32_t num_group_cols = simple_key != nullptr ? 1u : (uint32_t) grp_col_indices_.size();
+	const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+		group.has_rep_row ? rep_chunks_[group.rep_chunk_idx] : nullptr;
+	int rep_row = group.rep_row_idx;
+
+	if (!BufFileWriteAllLocal(file, &num_group_cols, sizeof(num_group_cols)))
+		return false;
+	for (uint32_t k = 0; k < num_group_cols; k++)
+	{
+		ParallelAggPartialGroupKeyCol col{};
+		const VecOutputColMeta *meta = nullptr;
+
+		if (simple_key != nullptr)
+		{
+			col.storage_kind = (uint8_t) simple_group_storage_;
+			col.is_null = simple_key->is_null;
+			col.value_bits = (uint64_t) simple_key->value;
+		}
 		else
-			it_ = hash_table_.begin();
+		{
+			const char *ptr = nullptr;
+			uint32_t len = 0;
+
+			meta = &grp_col_meta_[k];
+			col.storage_kind = (uint8_t) meta->storage_kind;
+			col.is_null = key->is_null[k];
+			if (!col.is_null)
+			{
+				switch (meta->storage_kind)
+				{
+					case VecOutputStorageKind::StringRef:
+					{
+						const VecStringRef *ref = nullptr;
+
+						if (rep_chunk == nullptr)
+							return false;
+						for (const auto &agg : aggs_)
+						{
+							int out_col = agg.target_resno - 1;
+
+							if (agg.arg_expr == nullptr &&
+								agg.group_key_pos == (int) k &&
+								out_col >= 0 && out_col < 16)
+							{
+								ref = &rep_chunk->string_columns[out_col][rep_row];
+								break;
+							}
+						}
+						if (ref == nullptr)
+							return false;
+						ptr = rep_chunk->get_string_ptr(*ref);
+						len = ref->len;
+						if (meta->sql_type == BPCHAROID)
+							len = TrimBpcharLengthLocal(ptr, len);
+						col.string_len = len;
+						break;
+					}
+					case VecOutputStorageKind::Int32:
+						col.value_bits = (uint64_t) (uint32_t) key->values[k];
+						break;
+					case VecOutputStorageKind::Int64:
+					case VecOutputStorageKind::NumericScaledInt64:
+					case VecOutputStorageKind::NumericAvgPair:
+					case VecOutputStorageKind::Double:
+						col.value_bits = key->values[k];
+						break;
+				}
+			}
+			if (!BufFileWriteAllLocal(file, &col, sizeof(col)))
+				return false;
+			if (!col.is_null &&
+				meta->storage_kind == VecOutputStorageKind::StringRef &&
+				col.string_len > 0)
+			{
+				if (!BufFileWriteAllLocal(file, ptr, col.string_len))
+					return false;
+			}
+			continue;
+		}
+
+		if (!BufFileWriteAllLocal(file, &col, sizeof(col)))
+			return false;
+	}
+
+	for (size_t a = 0; a < aggs_.size(); a++)
+	{
+		ParallelAggPartialAccumulator acc{};
+		const VecAggAccumulator *src =
+			a < group.accs.size() ? &group.accs[a] : nullptr;
+
+		export_partial_accumulator(src, &acc);
+		if (!BufFileWriteAllLocal(file, &acc, sizeof(acc)))
+			return false;
+		if (aggs_[a].is_distinct &&
+			!write_distinct_values_to_partial_file(file, src))
+			return false;
+	}
+	return true;
+}
+
+bool
+VecAggState::export_parallel_grouped_partial_file(BufFile *file,
+												  ParallelAggPartialState *out) const
+{
+	GroupedPartialFileHeader header;
+
+	if (file == nullptr || out == nullptr || !uses_file_backed_parallel_partial_state() ||
+		!supports_parallel_partial_state())
+		return false;
+
+	memset(out, 0, sizeof(*out));
+	out->naggs = (uint32_t) aggs_.size();
+	out->grouped = 1;
+	out->file_backed = 1;
+	out->input_batches = input_batches_consumed_;
+	out->input_rows = input_rows_consumed_;
+	header.naggs = out->naggs;
+	if (!BufFileWriteAllLocal(file, &header, sizeof(header)))
+		return false;
+
+	if (use_simple_group_key_)
+	{
+		for (const auto &entry : simple_hash_table_)
+		{
+			if (!append_group_record_to_partial_file(file, nullptr, &entry.first, entry.second))
+				return false;
+			out->group_count++;
+		}
+	}
+	else
+	{
+		for (const auto &entry : hash_table_)
+		{
+			if (!append_group_record_to_partial_file(file, &entry.first, nullptr, entry.second))
+				return false;
+			out->group_count++;
+		}
+	}
+
+	out->file_bytes = (uint64_t) BufFileSize(file);
+	return true;
+}
+
+bool
+VecAggState::store_group_rep_row_from_file(VecAggGroupState *group,
+										   const std::vector<ParallelAggFileGroupKeyCol> &group_cols)
+{
+	DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+		rep_chunks_.empty() ? allocate_rep_chunk() : rep_chunks_.back();
+	int rep_row;
+
+	if (group == nullptr || group->has_rep_row)
+		return false;
+	if (rep_chunk->count >= DEFAULT_CHUNK_SIZE)
+		rep_chunk = allocate_rep_chunk();
+	rep_row = rep_chunk->count;
+	group->rep_chunk_idx = (uint32_t) (rep_chunks_.size() - 1);
+	group->rep_row_idx = (uint16_t) rep_row;
+	group->has_rep_row = true;
+
+	for (const auto &agg : aggs_)
+	{
+		int out_col = agg.target_resno - 1;
+		const ParallelAggFileGroupKeyCol *col;
+
+		if (agg.arg_expr != nullptr || agg.group_key_pos < 0 ||
+			agg.group_key_pos >= (int) group_cols.size() ||
+			out_col < 0 || out_col >= 16)
+			continue;
+		col = &group_cols[agg.group_key_pos];
+		rep_chunk->nulls[out_col][rep_row] = col->header.is_null;
+		if (col->header.is_null)
+			continue;
+		switch (agg.output_storage)
+		{
+			case VecOutputStorageKind::StringRef:
+				rep_chunk->string_columns[out_col][rep_row] =
+					rep_chunk->store_string_bytes(col->string_bytes.data(),
+												  col->header.string_len);
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+			case VecOutputStorageKind::NumericAvgPair:
+				rep_chunk->int64_columns[out_col][rep_row] = (int64_t) col->header.value_bits;
+				rep_chunk->double_columns[out_col][rep_row] = (double) ((int64_t) col->header.value_bits);
+				break;
+			case VecOutputStorageKind::Double:
+			{
+				double value;
+
+				memcpy(&value, &col->header.value_bits, sizeof(value));
+				rep_chunk->double_columns[out_col][rep_row] = value;
+				break;
+			}
+			case VecOutputStorageKind::Int32:
+			default:
+				rep_chunk->int32_columns[out_col][rep_row] = (int32_t) col->header.value_bits;
+				break;
+		}
+	}
+	rep_chunk->count++;
+	return true;
+}
+
+bool
+VecAggState::merge_parallel_grouped_partial_file(BufFile *file,
+												 const ParallelAggPartialState &partial)
+{
+	GroupedPartialFileHeader header{};
+	std::vector<ParallelAggFileGroupKeyCol> group_cols;
+
+	if (file == nullptr || !supports_parallel_partial_state() ||
+		!partial.grouped || !partial.file_backed ||
+		partial.naggs != aggs_.size())
+		return false;
+	if (!BufFileReadAllLocal(file, &header, sizeof(header), false))
+		return false;
+	if (header.magic != VOLVEC_GROUPED_PARTIAL_FILE_MAGIC ||
+		header.version != VOLVEC_GROUPED_PARTIAL_FILE_VERSION ||
+		header.naggs != partial.naggs)
+		return false;
+
+	if (partial.group_count > 0)
+	{
+		if (use_simple_group_key_)
+			simple_hash_table_.reserve(simple_hash_table_.size() + partial.group_count);
+		else
+			hash_table_.reserve(hash_table_.size() + partial.group_count);
+	}
+	group_cols.reserve(grp_col_indices_.size());
+	for (uint32_t g = 0; g < partial.group_count; g++)
+	{
+		uint32_t num_group_cols = 0;
+		VecAggAccumulatorList *group_accs = nullptr;
+
+		if (!BufFileReadAllLocal(file, &num_group_cols, sizeof(num_group_cols), false))
+			return false;
+		group_cols.clear();
+		group_cols.resize(num_group_cols);
+		for (uint32_t k = 0; k < num_group_cols; k++)
+		{
+			if (!BufFileReadAllLocal(file, &group_cols[k].header, sizeof(group_cols[k].header), false))
+				return false;
+			if (!group_cols[k].header.is_null &&
+				group_cols[k].header.storage_kind == (uint8_t) VecOutputStorageKind::StringRef &&
+				group_cols[k].header.string_len > 0)
+			{
+				group_cols[k].string_bytes.resize(group_cols[k].header.string_len);
+				if (!BufFileReadAllLocal(file,
+										 group_cols[k].string_bytes.data(),
+										 group_cols[k].header.string_len,
+										 false))
+					return false;
+			}
+		}
+
+		if (use_simple_group_key_)
+		{
+			VecSimpleGroupKey simple_key;
+			decltype(simple_hash_table_.try_emplace(simple_key)) insert_result;
+			VecAggGroupState *group;
+
+			if (num_group_cols != 1)
+				return false;
+			simple_key.is_null = group_cols[0].header.is_null;
+			simple_key.value = (int64_t) group_cols[0].header.value_bits;
+			insert_result = simple_hash_table_.try_emplace(simple_key);
+			group = &insert_result.first->second;
+			if (insert_result.second)
+			{
+				group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+				if (!store_group_rep_row_from_file(group, group_cols))
+					return false;
+			}
+			group_accs = &group->accs;
+		}
+		else
+		{
+			VecGroupKey key;
+			decltype(hash_table_.try_emplace(key)) insert_result;
+			VecAggGroupState *group;
+
+			memset(&key, 0, sizeof(key));
+			key.num_cols = (int) Min(num_group_cols, (uint32_t) grp_col_indices_.size());
+			for (int k = 0; k < key.num_cols; k++)
+			{
+				const ParallelAggFileGroupKeyCol &src_col = group_cols[k];
+				const VecOutputColMeta &meta = grp_col_meta_[k];
+
+				key.is_null[k] = src_col.header.is_null;
+				if (src_col.header.is_null)
+					continue;
+				switch (meta.storage_kind)
+				{
+					case VecOutputStorageKind::StringRef:
+						key.values[k] =
+							HashStringBytesForGroupKey(src_col.string_bytes.data(),
+													   src_col.header.string_len,
+													   meta.sql_type,
+													   &key.aux[k]);
+						break;
+					case VecOutputStorageKind::Int32:
+						key.values[k] = (uint64_t) (uint32_t) src_col.header.value_bits;
+						key.aux[k] = 0;
+						break;
+					case VecOutputStorageKind::Int64:
+					case VecOutputStorageKind::NumericScaledInt64:
+					case VecOutputStorageKind::NumericAvgPair:
+					case VecOutputStorageKind::Double:
+						key.values[k] = src_col.header.value_bits;
+						key.aux[k] = 0;
+						break;
+				}
+			}
+
+			insert_result = hash_table_.try_emplace(key);
+			group = &insert_result.first->second;
+			if (insert_result.second)
+			{
+				group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+				if (!store_group_rep_row_from_file(group, group_cols))
+					return false;
+			}
+			group_accs = &group->accs;
+		}
+
+		if (group_accs->empty())
+			group_accs->resize(aggs_.size());
+		for (size_t a = 0; a < aggs_.size(); a++)
+		{
+			ParallelAggPartialAccumulator acc{};
+
+			if (!BufFileReadAllLocal(file, &acc, sizeof(acc), false))
+				return false;
+			if (aggs_[a].is_distinct)
+			{
+				if (!read_distinct_values_from_partial_file(file, &(*group_accs)[a]))
+					return false;
+			}
+			else
+				merge_partial_accumulator(acc, a, &(*group_accs)[a]);
+		}
+	}
+
+	return true;
+}
+
+bool
+VecAggState::merge_parallel_partial_state(const ParallelAggPartialState &partial)
+{
+	VecGroupKey key;
+	VecAggGroupState *group;
+	VecAggAccumulatorList *accs;
+
+	if (!supports_parallel_partial_state() ||
+		partial.naggs != aggs_.size())
+		return false;
+	if (partial.grouped)
+	{
+		for (uint32_t g = 0; g < partial.group_count; g++)
+		{
+			const ParallelAggPartialGroupEntry &src_group = partial.groups[g];
+			VecAggAccumulatorList *group_accs = nullptr;
+
+			if (use_simple_group_key_)
+			{
+				VecSimpleGroupKey simple_key;
+				decltype(simple_hash_table_.try_emplace(simple_key)) insert_result;
+
+				if (src_group.num_group_cols != 1)
+					return false;
+				simple_key.is_null = src_group.group_cols[0].is_null;
+				simple_key.value = (int64_t) src_group.group_cols[0].value_bits;
+				insert_result = simple_hash_table_.try_emplace(simple_key);
+				group = &insert_result.first->second;
+				if (insert_result.second)
+				{
+					group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+					store_group_rep_row_from_partial(group, src_group);
+				}
+				group_accs = &group->accs;
+			}
+			else
+			{
+				memset(&key, 0, sizeof(key));
+				key.num_cols = (int) Min(src_group.num_group_cols, (uint32_t) grp_col_indices_.size());
+				for (int k = 0; k < key.num_cols; k++)
+				{
+					const ParallelAggPartialGroupKeyCol &src_col = src_group.group_cols[k];
+					const VecOutputColMeta &meta = grp_col_meta_[k];
+
+					key.is_null[k] = src_col.is_null;
+					if (src_col.is_null)
+						continue;
+					switch (meta.storage_kind)
+					{
+						case VecOutputStorageKind::StringRef:
+						{
+							char buf[8] = {0};
+							uint32_t len = src_col.string_len;
+
+							if (len > sizeof(buf))
+								return false;
+							memcpy(buf, &src_col.value_bits, len);
+							if (meta.sql_type == BPCHAROID)
+								len = TrimBpcharLengthLocal(buf, len);
+							key.values[k] = HashBytes64(buf, len);
+							key.aux[k] = len;
+							break;
+						}
+						case VecOutputStorageKind::Int32:
+							key.values[k] = (uint64_t) (uint32_t) src_col.value_bits;
+							key.aux[k] = 0;
+							break;
+						case VecOutputStorageKind::Int64:
+						case VecOutputStorageKind::NumericScaledInt64:
+						case VecOutputStorageKind::NumericAvgPair:
+						default:
+							key.values[k] = src_col.value_bits;
+							key.aux[k] = 0;
+							break;
+					}
+				}
+				auto insert_result = hash_table_.try_emplace(key);
+				group = &insert_result.first->second;
+				if (insert_result.second)
+				{
+					group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+					store_group_rep_row_from_partial(group, src_group);
+				}
+				group_accs = &group->accs;
+			}
+
+			if (group_accs->size() < aggs_.size())
+				group_accs->resize(aggs_.size());
+			for (size_t a = 0; a < aggs_.size() && a < lengthof(src_group.accs); a++)
+				merge_partial_accumulator(src_group.accs[a], a, &(*group_accs)[a]);
+		}
+		return true;
+	}
+	key.num_cols = 0;
+	auto insert_result = hash_table_.try_emplace(key);
+	group = &insert_result.first->second;
+	if (insert_result.second)
+		group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+	accs = &group->accs;
+	if (accs->size() < aggs_.size())
+		accs->resize(aggs_.size());
+
+	for (size_t a = 0; a < aggs_.size() && a < lengthof(partial.accs); a++)
+	{
+		merge_partial_accumulator(partial.accs[a], a, &(*accs)[a]);
+	}
+
+	return true;
+}
+
+void
+VecAggState::do_sink()
+{
+	consume_left_input();
+	finish_sink();
 }
 
 bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
@@ -1301,22 +2566,26 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 							}
 						}
 					}
-				} else {
-					if (aggs_[a].type == VecAggType::AVG) {
-						if (aggs_[a].use_exact_numeric) {
-							chunk.int64_columns[tidx][chunk.count] =
-								WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric average sum");
-							chunk.double_columns[tidx][chunk.count] = (double) accs[a].count;
-						} else {
-							chunk.double_columns[tidx][chunk.count] = accs[a].count > 0 ? (accs[a].float_sum / accs[a].count) : 0.0;
+					} else {
+						if (aggs_[a].type == VecAggType::AVG) {
+							if (accs[a].count == 0)
+								chunk.nulls[tidx][chunk.count] = 1;
+							else if (aggs_[a].use_exact_numeric) {
+								chunk.int64_columns[tidx][chunk.count] =
+									WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric average sum");
+								chunk.double_columns[tidx][chunk.count] = (double) accs[a].count;
+							} else {
+								chunk.double_columns[tidx][chunk.count] = accs[a].float_sum / accs[a].count;
+							}
 						}
-					}
 					else if (aggs_[a].type == VecAggType::COUNT) chunk.int64_columns[tidx][chunk.count] = accs[a].count;
 					else if (aggs_[a].type == VecAggType::MAX) {
 						if (!accs[a].has_value)
 							chunk.nulls[tidx][chunk.count] = 1;
-						else if (aggs_[a].use_exact_numeric ||
-								 aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
+						else if (aggs_[a].use_exact_numeric)
+							chunk.int64_columns[tidx][chunk.count] =
+								WideIntToInt64Checked(accs[a].numeric_max, "aggregate numeric max");
+						else if (aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
 								 aggs_[a].output_storage == VecOutputStorageKind::NumericScaledInt64 ||
 								 aggs_[a].output_storage == VecOutputStorageKind::NumericAvgPair)
 							chunk.int64_columns[tidx][chunk.count] = accs[a].int64_max;
@@ -1325,11 +2594,32 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 						else
 							chunk.int32_columns[tidx][chunk.count] = accs[a].int32_max;
 					}
-					else {
-						if (aggs_[a].use_exact_numeric) {
-							chunk.int64_columns[tidx][chunk.count] =
-								WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric sum");
-						} else {
+							else {
+								if (accs[a].count == 0) {
+									chunk.nulls[tidx][chunk.count] = 1;
+								} else if (aggs_[a].use_exact_numeric) {
+									if (pg_volvec_trace_hooks)
+									{
+										static int simple_group_exact_numeric_trace_count = 0;
+
+									if (simple_group_exact_numeric_trace_count < 12)
+									{
+										long long lo = (long long) WideIntLow64(accs[a].numeric_sum);
+										long long hi = (long long) WideIntHigh64(accs[a].numeric_sum);
+
+										elog(LOG,
+											 "pg_volvec: simple grouped exact numeric materialize target_resno=%d scale=%d count=%lld wide_hi=%lld wide_lo=%lld",
+											 aggs_[a].target_resno,
+											 aggs_[a].numeric_scale,
+											 (long long) accs[a].count,
+											 hi,
+											 lo);
+										simple_group_exact_numeric_trace_count++;
+									}
+								}
+								chunk.int64_columns[tidx][chunk.count] =
+									WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric sum");
+							} else {
 							chunk.double_columns[tidx][chunk.count] = accs[a].float_sum;
 							chunk.int64_columns[tidx][chunk.count] = (int64_t)(accs[a].float_sum + (accs[a].float_sum >= 0 ? 0.5 : -0.5));
 						}
@@ -1340,11 +2630,11 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 		}
 		return chunk.count > 0;
 	}
-	while (it_ != hash_table_.end() && chunk.count < DEFAULT_CHUNK_SIZE) {
-			const auto& accs = it_->second.accs;
-			const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
-				it_->second.has_rep_row ? rep_chunks_[it_->second.rep_chunk_idx] : nullptr;
-			int rep_row = it_->second.rep_row_idx;
+		while (it_ != hash_table_.end() && chunk.count < DEFAULT_CHUNK_SIZE) {
+				const auto& accs = it_->second.accs;
+				const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
+					it_->second.has_rep_row ? rep_chunks_[it_->second.rep_chunk_idx] : nullptr;
+				int rep_row = it_->second.rep_row_idx;
 			for (size_t a = 0; a < aggs_.size(); a++) {
 				int tidx = aggs_[a].target_resno - 1; if (tidx < 0 || tidx >= 16) continue;
 				chunk.nulls[tidx][chunk.count] = 0;
@@ -1376,22 +2666,26 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 							}
 						}
 					}
-				} else {
-					if (aggs_[a].type == VecAggType::AVG) {
-						if (aggs_[a].use_exact_numeric) {
-							chunk.int64_columns[tidx][chunk.count] =
-								WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric average sum");
-							chunk.double_columns[tidx][chunk.count] = (double) accs[a].count;
-						} else {
-							chunk.double_columns[tidx][chunk.count] = accs[a].count > 0 ? (accs[a].float_sum / accs[a].count) : 0.0;
+					} else {
+						if (aggs_[a].type == VecAggType::AVG) {
+							if (accs[a].count == 0)
+								chunk.nulls[tidx][chunk.count] = 1;
+							else if (aggs_[a].use_exact_numeric) {
+								chunk.int64_columns[tidx][chunk.count] =
+									WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric average sum");
+								chunk.double_columns[tidx][chunk.count] = (double) accs[a].count;
+							} else {
+								chunk.double_columns[tidx][chunk.count] = accs[a].float_sum / accs[a].count;
+							}
 						}
-					}
 					else if (aggs_[a].type == VecAggType::COUNT) chunk.int64_columns[tidx][chunk.count] = accs[a].count;
 					else if (aggs_[a].type == VecAggType::MAX) {
 						if (!accs[a].has_value)
 							chunk.nulls[tidx][chunk.count] = 1;
-						else if (aggs_[a].use_exact_numeric ||
-								 aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
+						else if (aggs_[a].use_exact_numeric)
+							chunk.int64_columns[tidx][chunk.count] =
+								WideIntToInt64Checked(accs[a].numeric_max, "aggregate numeric max");
+						else if (aggs_[a].output_storage == VecOutputStorageKind::Int64 ||
 								 aggs_[a].output_storage == VecOutputStorageKind::NumericScaledInt64 ||
 								 aggs_[a].output_storage == VecOutputStorageKind::NumericAvgPair)
 							chunk.int64_columns[tidx][chunk.count] = accs[a].int64_max;
@@ -1400,13 +2694,34 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 						else
 							chunk.int32_columns[tidx][chunk.count] = accs[a].int32_max;
 					}
-					else { 
-						if (aggs_[a].use_exact_numeric) {
-							chunk.int64_columns[tidx][chunk.count] =
-								WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric sum");
-						} else {
-							chunk.double_columns[tidx][chunk.count] = accs[a].float_sum;
-							chunk.int64_columns[tidx][chunk.count] = (int64_t)(accs[a].float_sum + (accs[a].float_sum >= 0 ? 0.5 : -0.5));
+							else {
+								if (accs[a].count == 0) {
+									chunk.nulls[tidx][chunk.count] = 1;
+								} else if (aggs_[a].use_exact_numeric) {
+									if (pg_volvec_trace_hooks)
+									{
+										static int grouped_exact_numeric_trace_count = 0;
+
+									if (grouped_exact_numeric_trace_count < 12)
+									{
+										long long lo = (long long) WideIntLow64(accs[a].numeric_sum);
+										long long hi = (long long) WideIntHigh64(accs[a].numeric_sum);
+
+										elog(LOG,
+											 "pg_volvec: grouped exact numeric materialize target_resno=%d scale=%d count=%lld wide_hi=%lld wide_lo=%lld",
+											 aggs_[a].target_resno,
+											 aggs_[a].numeric_scale,
+											 (long long) accs[a].count,
+											 hi,
+											 lo);
+										grouped_exact_numeric_trace_count++;
+									}
+								}
+								chunk.int64_columns[tidx][chunk.count] =
+									WideIntToInt64Checked(accs[a].numeric_sum, "aggregate numeric sum");
+							} else {
+								chunk.double_columns[tidx][chunk.count] = accs[a].float_sum;
+								chunk.int64_columns[tidx][chunk.count] = (int64_t)(accs[a].float_sum + (accs[a].float_sum >= 0 ? 0.5 : -0.5));
 						}
 					}
 				}
@@ -1463,14 +2778,20 @@ VecAggState::lookup_output_col_meta(int target_resno, VecOutputColMeta *out) con
 }
 
 /* --- VecSeqScanState --- */
-VecSeqScanState::VecSeqScanState(Relation rel, Snapshot snapshot, const DeformProgram *program)
+VecSeqScanState::VecSeqScanState(Relation rel,
+								 Snapshot snapshot,
+								 const DeformProgram *program,
+								 ParallelTableScanDesc parallel_scan_desc)
 	: rel_(rel), snapshot_(snapshot), deformer_(RelationGetDescr(rel), program) {
 	/*
 	 * We drive block iteration ourselves below. Letting heap_beginscan choose a
 	 * synchronized-scan start block would skip the prefix blocks because this
 	 * custom loop never wraps back around to block 0.
 	 */
-	scan_ = (HeapScanDesc) heap_beginscan(rel_, snapshot_, 0, NULL, NULL, SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
+	if (parallel_scan_desc != nullptr)
+		scan_ = (HeapScanDesc) table_beginscan_parallel(rel_, parallel_scan_desc);
+	else
+		scan_ = (HeapScanDesc) heap_beginscan(rel_, snapshot_, 0, NULL, NULL, SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
 	stream_ = scan_->rs_read_stream;
 	current_buf_ = InvalidBuffer;
 	vmbuf_ = InvalidBuffer;
@@ -1480,7 +2801,10 @@ VecSeqScanState::VecSeqScanState(Relation rel, Snapshot snapshot, const DeformPr
 	JitDeformFunc jf;
 	const char *err;
 	if (pg_volvec_jit_deform) {
-		if (pg_volvec_try_compile_jit_deform_to_datachunk(RelationGetDescr(rel), program, &jf, &jit_context_, &err)) {
+		if (pg_volvec_disable_jit_for_parallel_worker) {
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: deform JIT disabled in process parallel worker");
+		} else if (pg_volvec_try_compile_jit_deform_to_datachunk(RelationGetDescr(rel), program, &jf, &jit_context_, &err)) {
 			deformer_.set_jit_func(jf);
 			if (pg_volvec_trace_hooks)
 				elog(LOG, "pg_volvec: deform JIT compiled successfully (targets=%d, func=%p)", program->ntargets, (void *) jf);
@@ -1492,7 +2816,12 @@ VecSeqScanState::VecSeqScanState(Relation rel, Snapshot snapshot, const DeformPr
 	}
 #endif
 	if (pg_volvec_trace_hooks && stream_ != nullptr)
-		elog(LOG, "pg_volvec: VecSeqScanState using heap read_stream for scan prefetch");
+	{
+		if (scan_->rs_base.rs_parallel != nullptr)
+			elog(LOG, "pg_volvec: VecSeqScanState using PostgreSQL parallel heap scan/read_stream");
+		else
+			elog(LOG, "pg_volvec: VecSeqScanState using heap read_stream for scan prefetch");
+	}
 }
 
 VecSeqScanState::~VecSeqScanState() { 
@@ -1528,40 +2857,147 @@ VecSeqScanState::lookup_output_col_meta(int target_resno, VecOutputColMeta *out)
 	return true;
 }
 
+bool
+VecSeqScanState::configure_source_block_range(BlockNumber start_block, uint32_t nblocks)
+{
+	configure_block_range(start_block, nblocks);
+	return true;
+}
+
+void
+VecSeqScanState::clear_source_block_range()
+{
+	clear_block_range();
+}
+
+void
+VecSeqScanState::configure_block_range(BlockNumber start_block, uint32_t nblocks)
+{
+	uint64 end_block = (uint64) start_block + (uint64) nblocks;
+
+	block_range_active_ = true;
+	block_range_start_ = start_block;
+	block_range_end_ = (end_block > scan_->rs_nblocks) ? scan_->rs_nblocks : (BlockNumber) end_block;
+	if (block_range_end_ < block_range_start_)
+		block_range_end_ = block_range_start_;
+	if (BufferIsValid(current_buf_))
+	{
+		UnlockReleaseBuffer(current_buf_);
+		current_buf_ = InvalidBuffer;
+	}
+	if (BufferIsValid(vmbuf_))
+	{
+		ReleaseBuffer(vmbuf_);
+		vmbuf_ = InvalidBuffer;
+	}
+	current_offnum_ = FirstOffsetNumber;
+	scan_->rs_cblock = InvalidBlockNumber;
+}
+
+void
+VecSeqScanState::clear_block_range()
+{
+	block_range_active_ = false;
+	block_range_start_ = InvalidBlockNumber;
+	block_range_end_ = InvalidBlockNumber;
+	if (BufferIsValid(current_buf_))
+	{
+		UnlockReleaseBuffer(current_buf_);
+		current_buf_ = InvalidBuffer;
+	}
+	if (BufferIsValid(vmbuf_))
+	{
+		ReleaseBuffer(vmbuf_);
+		vmbuf_ = InvalidBuffer;
+	}
+	current_offnum_ = FirstOffsetNumber;
+	scan_->rs_cblock = InvalidBlockNumber;
+}
+
+void
+VecSeqScanState::prepare_bindings(DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
+								   DeformBindings *bindings) const
+{
+	TupleDesc desc = RelationGetDescr(rel_);
+
+	memset(bindings, 0, sizeof(*bindings));
+	for (int i = 0; i < 16; i++)
+	{
+		bindings->columns_data[i] = chunk.int32_columns[i];
+		bindings->columns_nulls[i] = chunk.nulls[i];
+	}
+	bindings->owner_chunk = &chunk;
+	for (int i = 0; i < desc->natts && i < 16; i++)
+	{
+		Oid typid = TupleDescAttr(desc, i)->atttypid;
+
+		if (typid == FLOAT8OID)
+			bindings->columns_data[i] = chunk.double_columns[i];
+		else if (typid == NUMERICOID || typid == INT8OID)
+			bindings->columns_data[i] = chunk.int64_columns[i];
+		else if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID)
+			bindings->columns_data[i] = chunk.string_columns[i];
+		else if (typid == DATEOID)
+			bindings->columns_data[i] = chunk.int32_columns[i];
+	}
+}
+
+bool
+VecSeqScanState::open_next_buffer()
+{
+	if (block_range_active_)
+	{
+		BlockNumber next_block;
+
+		if (scan_->rs_cblock == InvalidBlockNumber)
+			next_block = block_range_start_;
+		else
+			next_block = scan_->rs_cblock + 1;
+		if (next_block >= block_range_end_)
+			return false;
+		scan_->rs_cblock = next_block;
+		current_buf_ = ReadBufferExtended(rel_, MAIN_FORKNUM, scan_->rs_cblock,
+										 RBM_NORMAL, scan_->rs_strategy);
+		if (BufferIsValid(current_buf_))
+			blocks_opened_++;
+		return BufferIsValid(current_buf_);
+	}
+
+	if (stream_ != nullptr) {
+		current_buf_ = read_stream_next_buffer(stream_, NULL);
+		if (!BufferIsValid(current_buf_))
+			return false;
+		scan_->rs_cblock = BufferGetBlockNumber(current_buf_);
+		blocks_opened_++;
+		return true;
+	}
+
+	if (scan_->rs_cblock == InvalidBlockNumber) {
+		scan_->rs_cblock = scan_->rs_startblock;
+	} else {
+		scan_->rs_cblock++;
+	}
+
+	if (scan_->rs_cblock >= scan_->rs_nblocks)
+		return false;
+
+	current_buf_ = ReadBufferExtended(rel_, MAIN_FORKNUM, scan_->rs_cblock,
+									 RBM_NORMAL, scan_->rs_strategy);
+	if (BufferIsValid(current_buf_))
+		blocks_opened_++;
+	return BufferIsValid(current_buf_);
+}
+
 bool VecSeqScanState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 	chunk.reset();
 	DeformBindings bindings;
-	for (int i = 0; i < 16; i++) { bindings.columns_data[i] = chunk.int32_columns[i]; bindings.columns_nulls[i] = chunk.nulls[i]; }
-	bindings.owner_chunk = &chunk;
-	TupleDesc desc = RelationGetDescr(rel_);
-	for (int i = 0; i < desc->natts && i < 16; i++) {
-		Oid typid = TupleDescAttr(desc, i)->atttypid;
-		if (typid == FLOAT8OID) bindings.columns_data[i] = chunk.double_columns[i];
-		else if (typid == NUMERICOID || typid == INT8OID) bindings.columns_data[i] = chunk.int64_columns[i];
-		else if (typid == BPCHAROID || typid == TEXTOID || typid == VARCHAROID) bindings.columns_data[i] = chunk.string_columns[i];
-		else if (typid == DATEOID) bindings.columns_data[i] = chunk.int32_columns[i];
-	}
+
+	prepare_bindings(chunk, &bindings);
 
 	while (chunk.count < DEFAULT_CHUNK_SIZE) {
 		if (current_buf_ == InvalidBuffer) {
-			if (stream_ != nullptr) {
-				current_buf_ = read_stream_next_buffer(stream_, NULL);
-				if (!BufferIsValid(current_buf_))
-					break;
-				scan_->rs_cblock = BufferGetBlockNumber(current_buf_);
-			} else {
-				if (scan_->rs_cblock == InvalidBlockNumber) {
-					scan_->rs_cblock = scan_->rs_startblock;
-				} else {
-					scan_->rs_cblock++;
-				}
-
-				if (scan_->rs_cblock >= scan_->rs_nblocks)
-					break;
-
-				current_buf_ = ReadBufferExtended(rel_, MAIN_FORKNUM, scan_->rs_cblock,
-												 RBM_NORMAL, scan_->rs_strategy);
-			}
+			if (!open_next_buffer())
+				break;
 
 			LockBuffer(current_buf_, BUFFER_LOCK_SHARE);
 			current_offnum_ = FirstOffsetNumber;
@@ -2144,6 +3580,35 @@ IsIdentityVarTargetList(List *targetlist)
 	return saw_visible;
 }
 
+static bool
+CanBuildDirectVarProjectTargetList(List *targetlist)
+{
+	ListCell *lc;
+	bool saw_visible = false;
+
+	if (targetlist == NIL)
+		return false;
+
+	foreach(lc, targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Expr *expr;
+		Var *var;
+
+		if (tle->resjunk)
+			continue;
+		expr = StripImplicitNodesLocal((Expr *) tle->expr);
+		if (expr == nullptr || !IsA(expr, Var))
+			return false;
+		var = (Var *) expr;
+		if (var->varattno <= 0 || var->varattno > 16)
+			return false;
+		saw_visible = true;
+	}
+
+	return saw_visible;
+}
+
 static std::unique_ptr<VecPlanState>
 BuildDirectVarProject(std::unique_ptr<VecPlanState> left, List *targetlist)
 {
@@ -2406,6 +3871,75 @@ VecHashJoinState::~VecHashJoinState()
 		delete chunk;
 }
 
+bool
+VecHashJoinState::configure_source_block_range(BlockNumber start_block, uint32_t nblocks)
+{
+	VecPlanState *probe_state = build_outer_side_ ? inner_.get() : outer_.get();
+
+	reset_probe_task_state();
+	return probe_state != nullptr &&
+		probe_state->configure_source_block_range(start_block, nblocks);
+}
+
+void
+VecHashJoinState::clear_source_block_range()
+{
+	VecPlanState *probe_state = build_outer_side_ ? inner_.get() : outer_.get();
+
+	reset_probe_task_state();
+	if (probe_state != nullptr)
+		probe_state->clear_source_block_range();
+}
+
+bool
+VecHashJoinState::configure_build_input_block_range(BlockNumber start_block, uint32_t nblocks)
+{
+	VecPlanState *build_state = build_outer_side_ ? outer_.get() : inner_.get();
+
+	return build_state != nullptr &&
+		build_state->configure_source_block_range(start_block, nblocks);
+}
+
+void
+VecHashJoinState::clear_build_input_block_range()
+{
+	VecPlanState *build_state = build_outer_side_ ? outer_.get() : inner_.get();
+
+	if (build_state != nullptr)
+		build_state->clear_source_block_range();
+}
+
+VecSeqScanState *
+VecHashJoinState::find_parallel_source_scan_state()
+{
+	VecPlanState *probe_state = build_outer_side_ ? inner_.get() : outer_.get();
+
+	return probe_state != nullptr ? probe_state->find_parallel_source_scan_state() : nullptr;
+}
+
+VecSeqScanState *
+VecHashJoinState::find_parallel_build_scan_state()
+{
+	VecPlanState *build_state = build_outer_side_ ? outer_.get() : inner_.get();
+
+	return build_state != nullptr ? build_state->find_parallel_source_scan_state() : nullptr;
+}
+
+void
+VecHashJoinState::reset_probe_task_state()
+{
+	outer_chunk_.reset();
+	probe_rows_.clear();
+	probe_keys_.clear();
+	probe_hashes_.clear();
+	probe_next_entries_.clear();
+	active_probe_sel_.clear();
+	next_probe_sel_.clear();
+	probe_batch_ready_ = false;
+	probe_input_exhausted_ = false;
+	anti_outer_pos_ = 0;
+}
+
 void
 VecHashJoinState::init_hash_table(size_t expected_rows)
 {
@@ -2607,44 +4141,66 @@ VecHashJoinState::keys_equal(const VecHashJoinKey &left, const VecHashJoinKey &r
 }
 
 void
-VecHashJoinState::build_inner_hash()
+VecHashJoinState::consume_build_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input)
+{
+	bool build_is_inner = !build_outer_side_;
+	int active_count = input.has_selection ? input.sel.count : input.count;
+	DataChunk<DEFAULT_CHUNK_SIZE> *dst =
+		inner_chunks_.empty() ? allocate_inner_chunk() : inner_chunks_.back();
+
+	for (int s = 0; s < active_count; s++)
+	{
+		int src_row = input.has_selection ? input.sel.row_ids[s] : s;
+		int dst_row;
+		VecHashJoinKey key;
+
+		if (!read_key(input, build_is_inner, src_row, &key))
+			continue;
+		if (dst->count >= DEFAULT_CHUNK_SIZE)
+			dst = allocate_inner_chunk();
+		dst_row = dst->count;
+		copy_inner_payload_row(*dst, dst_row, input, src_row);
+		append_inner_entry(key, hash_key(key),
+						  (uint32_t) (inner_chunks_.size() - 1),
+						  (uint16_t) dst_row);
+		dst->count++;
+	}
+}
+
+void
+VecHashJoinState::consume_build_input()
 {
 	DataChunk<DEFAULT_CHUNK_SIZE> input;
 	VecPlanState *build_state = build_outer_side_ ? outer_.get() : inner_.get();
-	bool build_is_inner = !build_outer_side_;
 
 	if (inner_built_)
 		return;
-
-	init_hash_table(DEFAULT_CHUNK_SIZE);
-
+	if (bucket_heads_.empty())
+		init_hash_table(DEFAULT_CHUNK_SIZE);
 	while (build_state->get_next_batch(input))
 	{
 		int active_count = input.has_selection ? input.sel.count : input.count;
-		DataChunk<DEFAULT_CHUNK_SIZE> *dst =
-			inner_chunks_.empty() ? allocate_inner_chunk() : inner_chunks_.back();
 
-		for (int s = 0; s < active_count; s++)
-		{
-			int src_row = input.has_selection ? input.sel.row_ids[s] : s;
-			int dst_row;
-			VecHashJoinKey key;
-
-			if (!read_key(input, build_is_inner, src_row, &key))
-				continue;
-			if (dst->count >= DEFAULT_CHUNK_SIZE)
-				dst = allocate_inner_chunk();
-			dst_row = dst->count;
-			copy_inner_payload_row(*dst, dst_row, input, src_row);
-			append_inner_entry(key, hash_key(key),
-							  (uint32_t) (inner_chunks_.size() - 1),
-							  (uint16_t) dst_row);
-			dst->count++;
-		}
+		build_input_batches_consumed_++;
+		build_input_rows_consumed_ += (uint64_t) active_count;
+		consume_build_batch(input);
 	}
+}
 
+void
+VecHashJoinState::finish_parallel_hash_build()
+{
+	if (inner_built_)
+		return;
 	inner_built_ = true;
 	inner_entry_matched_.assign(entries_.size(), 0);
+}
+
+void
+VecHashJoinState::build_inner_hash()
+{
+	consume_build_input();
+	finish_parallel_hash_build();
 }
 
 bool
@@ -3830,7 +5386,8 @@ InferProjectStorageKind(Expr *expr, VecExprProgram *program)
 }
 
 static std::unique_ptr<VecPlanState>
-BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node, EState *estate)
+BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node,
+							EState *estate, bool suppress_qual_filter = false)
 {
 	bool simple_targets = true;
 	bool needs_synthetic_path;
@@ -3904,7 +5461,7 @@ BuildAggWithOptionalProject(std::unique_ptr<VecPlanState> left, Agg *node, EStat
 	AggrefRewriteContext rewrite_context{&aggrefs, &aggresnos, &group_exprs, &group_resnos};
 	current_state = std::move(agg_state);
 
-	if (node->plan.qual != NIL)
+	if (node->plan.qual != NIL && !suppress_qual_filter)
 	{
 		auto qual_program = std::make_unique<VecExprProgram>();
 		Expr *combined_qual = (Expr *) make_ands_explicit(list_copy(node->plan.qual));
@@ -4279,7 +5836,8 @@ BuildCorrelatedLookupAggState(EState *estate,
 							  Agg *subplan_agg,
 							  int paramid,
 							  VecOutputColMeta *key_meta,
-							  VecOutputColMeta *value_meta)
+							  VecOutputColMeta *value_meta,
+							  const ParallelWorkerContext *parallel_worker_context)
 {
 	Agg *grouped_agg;
 	Plan *grouped_child;
@@ -4381,7 +5939,11 @@ BuildCorrelatedLookupAggState(EState *estate,
 		return nullptr;
 	}
 
-	lookup_state = ExecInitVecPlanInternal((Plan *) grouped_agg, estate, nullptr, false);
+	lookup_state = ExecInitVecPlanInternal((Plan *) grouped_agg,
+										   estate,
+										   nullptr,
+										   false,
+										   parallel_worker_context);
 	if (!lookup_state)
 		return nullptr;
 	if ((key_meta != nullptr &&
@@ -4510,7 +6072,7 @@ BuildCorrelatedLookupAggStateMulti(EState *estate,
 								false));
 	grouped_agg->plan.targetlist = synthetic_tlist;
 
-	lookup_state = ExecInitVecPlanInternal((Plan *) grouped_agg, estate, nullptr, false);
+	lookup_state = ExecInitVecPlanInternal((Plan *) grouped_agg, estate, nullptr, false, nullptr);
 	if (!lookup_state)
 		return nullptr;
 	for (int i = 0; i < num_keys; i++)
@@ -4661,7 +6223,8 @@ MatchLookupMembershipQual(Expr *expr,
 	lookup_state = ExecInitVecPlanInternal(subplan_plan,
 										   estate,
 										   lookup_required_attrs,
-										   false);
+										   false,
+										   nullptr);
 	if (!lookup_state ||
 		!lookup_state->lookup_output_col_meta(1, &spec->lookup_key_meta) ||
 		!IsLookupCompatibleStorage(spec->lookup_key_meta.storage_kind))
@@ -4921,7 +6484,8 @@ TryBuildCorrelatedLookupFilterSpec(Expr *expr,
 								   VecPlanState *inner,
 								   VolVecVector<VecJoinOutputCol> *output_cols,
 								   EState *estate,
-								   CorrelatedLookupFilterSpec *spec)
+								   CorrelatedLookupFilterSpec *spec,
+								   const ParallelWorkerContext *parallel_worker_context)
 {
 	Expr *stripped = StripImplicitNodesLocal(expr);
 	OpExpr *compare_op;
@@ -5028,10 +6592,11 @@ TryBuildCorrelatedLookupFilterSpec(Expr *expr,
 		return false;
 
 	lookup_state = BuildCorrelatedLookupAggState(estate,
-												 subplan_agg,
-												 linitial_int(subplan->parParam),
-												 &lookup_key_meta,
-												 &lookup_value_meta);
+													 subplan_agg,
+													 linitial_int(subplan->parParam),
+													 &lookup_key_meta,
+													 &lookup_value_meta,
+													 parallel_worker_context);
 	if (!lookup_state)
 		return false;
 	if (!IsLookupCompatibleStorage(key_meta.storage_kind) ||
@@ -5589,10 +7154,13 @@ ExtractLimitCount(Limit *limit_node, uint64_t *limit_count)
 
 static std::unique_ptr<VecPlanState>
 ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
-						bool force_full_deform)
+						bool force_full_deform,
+						const ParallelWorkerContext *parallel_worker_context)
 {
 	if (plan == NULL) return nullptr;
-	if (estate != nullptr && plan->extParam != NULL)
+	if (estate != nullptr && plan->extParam != NULL &&
+		!(IsProcessParallelLocalContext(parallel_worker_context) &&
+		  estate->es_param_exec_vals == nullptr))
 		ExecSetParamPlanMulti(plan->extParam, GetPerTupleExprContext(estate));
 	if (required_attrs == nullptr && !force_full_deform)
 		CollectRequiredAttrsForPlan(plan, &required_attrs);
@@ -5600,13 +7168,15 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 	bool plan_qual_already_applied = false;
 	if (IsA(plan, Limit)) {
 		uint64_t limit_count = 0;
-		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
+		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform, parallel_worker_context);
 		if (!left)
 		{
 			if (pg_volvec_trace_hooks)
 				elog(LOG, "pg_volvec: limit initialization could not build child state");
 			return nullptr;
 		}
+		if (HasProcessParallelTargetAggSubtree(parallel_worker_context, left.get()))
+			return left;
 		if (!ExtractLimitCount((Limit *) plan, &limit_count))
 		{
 			if (pg_volvec_trace_hooks)
@@ -5616,25 +7186,43 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		current_state = std::make_unique<VecLimitState>(std::move(left), limit_count);
 	} else if (IsA(plan, Sort)) {
 		VolVecVector<VecSortKeyDesc> key_descs{PgMemoryContextAllocator<VecSortKeyDesc>(CurrentMemoryContext)};
-		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
+		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform, parallel_worker_context);
 		if (!left)
 		{
 			if (pg_volvec_trace_hooks)
 				elog(LOG, "pg_volvec: sort initialization could not build child state");
 			return nullptr;
 		}
+		if (HasProcessParallelTargetAggSubtree(parallel_worker_context, left.get()))
+			return left;
+		if (CanBuildDirectVarProjectTargetList(plan->targetlist))
+		{
+			left = BuildDirectVarProject(std::move(left), plan->targetlist);
+			if (!left)
+			{
+				if (pg_volvec_trace_hooks)
+					elog(LOG, "pg_volvec: sort direct-var projection initialization failed");
+				return nullptr;
+			}
+		}
 		if (!BuildSortKeyDescs((Sort *) plan, left.get(), &key_descs))
 			return nullptr;
 		current_state = std::make_unique<VecSortState>(std::move(left), (Sort *) plan, std::move(key_descs));
 	} else if (IsA(plan, Agg)) {
 		Agg *agg_node = (Agg *) plan;
-		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
+		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform, parallel_worker_context);
 		if (!left) {
 			if (pg_volvec_trace_hooks)
 				elog(LOG, "pg_volvec: aggregate initialization could not build child state");
 			return nullptr;
 		}
-		current_state = BuildAggWithOptionalProject(std::move(left), agg_node, estate);
+		bool suppress_agg_qual = ShouldSuppressPartialAggQual(parallel_worker_context,
+															  agg_node);
+
+		current_state = BuildAggWithOptionalProject(std::move(left),
+													agg_node,
+													estate,
+													suppress_agg_qual);
 		if (!current_state)
 		{
 			if (pg_volvec_trace_hooks)
@@ -5643,6 +7231,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		}
 		if (agg_node->plan.qual != NIL)
 			plan_qual_already_applied = true;
+		if (ShouldSuppressPartialAggQual(parallel_worker_context, agg_node))
+			return current_state;
 		if (agg_node->numCols > 0 &&
 			agg_node->aggstrategy != AGG_HASHED &&
 			IsA(plan->lefttree, Sort))
@@ -5658,7 +7248,7 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		}
 	} else if (IsA(plan, SubqueryScan)) {
 		SubqueryScan *subquery_scan = (SubqueryScan *) plan;
-		auto left = ExecInitVecPlanInternal(subquery_scan->subplan, estate, nullptr, force_full_deform);
+		auto left = ExecInitVecPlanInternal(subquery_scan->subplan, estate, nullptr, force_full_deform, parallel_worker_context);
 
 		if (!left)
 		{
@@ -5666,6 +7256,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 				elog(LOG, "pg_volvec: subquery scan initialization could not build subplan state");
 			return nullptr;
 		}
+		if (HasProcessParallelTargetAggSubtree(parallel_worker_context, left.get()))
+			return left;
 		current_state = BuildDirectVarProject(std::move(left), plan->targetlist);
 		if (!current_state)
 		{
@@ -5674,7 +7266,7 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 			return nullptr;
 		}
 	} else if (IsA(plan, Material)) {
-		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform);
+		auto left = ExecInitVecPlanInternal(plan->lefttree, estate, required_attrs, force_full_deform, parallel_worker_context);
 
 		if (!left)
 		{
@@ -5682,6 +7274,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 				elog(LOG, "pg_volvec: materialize initialization could not build child state");
 			return nullptr;
 		}
+		if (HasProcessParallelTargetAggSubtree(parallel_worker_context, left.get()))
+			return left;
 		current_state = BuildDirectVarProject(std::move(left), plan->targetlist);
 		if (!current_state)
 		{
@@ -5728,8 +7322,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 										  plan->righttree,
 										  &outer_required_attrs,
 										  &inner_required_attrs);
-		outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false);
-		inner = ExecInitVecPlanInternal(plan->righttree, estate, inner_required_attrs, false);
+		outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false, parallel_worker_context);
+		inner = ExecInitVecPlanInternal(plan->righttree, estate, inner_required_attrs, false, parallel_worker_context);
 		if (!outer || !inner)
 		{
 			if (pg_volvec_trace_hooks)
@@ -5846,6 +7440,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		VecPlanState *outer_state = nullptr;
 		VecPlanState *inner_state = nullptr;
 		bool build_outer_side = false;
+		Oid outer_relid = InvalidOid;
+		Oid inner_relid = InvalidOid;
 		int visible_output_count = CountVisibleTargetEntries(hash_join->join.plan.targetlist);
 
 			if (hash_join->join.jointype != JOIN_INNER &&
@@ -5870,6 +7466,27 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 			build_outer_side = ShouldSwapInnerJoinBuildSides(hash_join->join.jointype,
 															 outer_plan,
 															 inner_plan);
+			outer_relid = FindPlanBaseRelid(outer_plan, estate);
+			inner_relid = FindPlanBaseRelid(inner_plan, estate);
+			if (parallel_worker_context != nullptr &&
+				parallel_worker_context->parallel_scan_desc != nullptr &&
+				parallel_worker_context->parallel_scan_plan_node_id >= 0 &&
+				hash_join->join.jointype == JOIN_INNER)
+			{
+				if (PlanContainsNodeId(outer_plan,
+									  parallel_worker_context->parallel_scan_plan_node_id))
+					build_outer_side = false;
+				else if (PlanContainsNodeId(inner_plan,
+										   parallel_worker_context->parallel_scan_plan_node_id))
+					build_outer_side = true;
+				else if (OidIsValid(parallel_worker_context->parallel_scan_relid))
+				{
+					if (parallel_worker_context->parallel_scan_relid == outer_relid)
+						build_outer_side = false;
+					else if (parallel_worker_context->parallel_scan_relid == inner_relid)
+						build_outer_side = true;
+				}
+			}
 			if (build_outer_side && pg_volvec_trace_hooks)
 				elog(LOG,
 					 "pg_volvec: building hash table from outer side (outer_rows=%.0f inner_rows=%.0f)",
@@ -5882,8 +7499,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 											  inner_plan,
 											  &outer_required_attrs,
 											  &inner_required_attrs);
-			outer = ExecInitVecPlanInternal(outer_plan, estate, outer_required_attrs, false);
-			inner = ExecInitVecPlanInternal(inner_plan, estate, inner_required_attrs, false);
+			outer = ExecInitVecPlanInternal(outer_plan, estate, outer_required_attrs, false, parallel_worker_context);
+			inner = ExecInitVecPlanInternal(inner_plan, estate, inner_required_attrs, false, parallel_worker_context);
 			if (!outer || !inner)
 			{
 			if (pg_volvec_trace_hooks)
@@ -5927,10 +7544,11 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 												   outer_plan,
 												   inner_plan,
 												   outer_state,
-												   inner_state,
-												   &output_cols,
-												   estate,
-												   &lookup_filter_spec);
+													   inner_state,
+													   &output_cols,
+													   estate,
+													   &lookup_filter_spec,
+													   parallel_worker_context);
 			if (use_lookup_filter)
 			{
 				join_filter_expr = lookup_filter_spec.rewritten_expr;
@@ -6070,8 +7688,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 										  plan->righttree,
 										  &outer_required_attrs,
 										  &inner_required_attrs);
-		outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false);
-		inner = ExecInitVecPlanInternal(plan->righttree, estate, inner_required_attrs, false);
+		outer = ExecInitVecPlanInternal(plan->lefttree, estate, outer_required_attrs, false, parallel_worker_context);
+		inner = ExecInitVecPlanInternal(plan->righttree, estate, inner_required_attrs, false, parallel_worker_context);
 		if (!outer || !inner)
 		{
 			if (pg_volvec_trace_hooks)
@@ -6153,10 +7771,20 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 		SeqScan *sscan = (SeqScan *) plan;
 		Oid relid = exec_rt_fetch(sscan->scan.scanrelid, estate)->relid;
 		Relation rel = table_open(relid, NoLock);
+		ParallelTableScanDesc parallel_scan_desc = nullptr;
 		DeformProgram prog;
 		TupleDesc desc = RelationGetDescr(rel);
 		BuildPrunedDeformProgram(required_attrs, desc, &prog);
-			current_state = std::make_unique<VecSeqScanState>(rel, estate->es_snapshot, &prog);
+		if (parallel_worker_context != nullptr &&
+			parallel_worker_context->parallel_scan_desc != nullptr &&
+			parallel_worker_context->parallel_scan_relid == relid &&
+			(parallel_worker_context->parallel_scan_plan_node_id < 0 ||
+			 parallel_worker_context->parallel_scan_plan_node_id == plan->plan_node_id))
+			parallel_scan_desc = parallel_worker_context->parallel_scan_desc;
+		current_state = std::make_unique<VecSeqScanState>(rel,
+														 estate->es_snapshot,
+														 &prog,
+														 parallel_scan_desc);
 	}
 	if (current_state && plan->qual != NIL && !plan_qual_already_applied) {
 		auto program = std::make_unique<VecExprProgram>();
@@ -6242,9 +7870,11 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 }
 
 std::unique_ptr<VecPlanState>
-ExecInitVecPlan(Plan *plan, EState *estate)
+ExecInitVecPlan(Plan *plan,
+				 EState *estate,
+				 const ParallelWorkerContext *parallel_worker_context)
 {
-	return ExecInitVecPlanInternal(plan, estate, nullptr, false);
+	return ExecInitVecPlanInternal(plan, estate, nullptr, false, parallel_worker_context);
 }
 
 } /* namespace pg_volvec */

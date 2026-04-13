@@ -6,6 +6,7 @@
 #include "utils/numeric.h"
 
 #include "execute.h"
+#include "../translate/pg_translate.h"
 #include "../engine/vec_exec_api.h"
 
 extern Datum numeric_add(PG_FUNCTION_ARGS);
@@ -73,11 +74,15 @@ pg_vec_execute_scan_filter_agg(QueryDesc *queryDesc,
 	EState	   *estate = queryDesc->estate;
 	DestReceiver *dest = queryDesc->dest;
 	MemoryContext oldcxt;
-	PgVecScanFilterAggExecParams exec_params;
+	PgVecScanFilterAggExecParams *exec_params;
 	PgVecScanFilterAggExecResult exec_result;
 	PgVecPlan   *plan = &state->plan;
 	int			row_idx;
 	int			attrno;
+	bool		dest_started = false;
+	ErrorData  *edata = NULL;
+	MemoryContext errcxt;
+	char	   *errmsg = NULL;
 
 	if (state->completed)
 	{
@@ -99,64 +104,104 @@ pg_vec_execute_scan_filter_agg(QueryDesc *queryDesc,
 
 	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
 
-	estate->es_processed = 0;
-	dest->rStartup(dest, queryDesc->operation, queryDesc->tupDesc);
-
-	MemSet(&exec_params, 0, sizeof(exec_params));
-	exec_params.ninputs = plan->ninputs;
-	exec_params.njoins = plan->njoins;
-	exec_params.snapshot = estate->es_snapshot;
-	exec_params.enable_jit_deform = pg_vec_jit_deform;
-	exec_params.agg = plan->agg;
-	exec_params.topn = plan->topn;
-	for (int input_id = 0; input_id < plan->ninputs; input_id++)
+	PG_TRY();
 	{
-		exec_params.rels[input_id] = state->rels[input_id];
-		exec_params.inputs[input_id] = plan->inputs[input_id];
-	}
-	for (int join_idx = 0; join_idx < plan->njoins; join_idx++)
-		exec_params.joins[join_idx] = plan->joins[join_idx];
+		estate->es_processed = 0;
+		dest->rStartup(dest, queryDesc->operation, queryDesc->tupDesc);
+		dest_started = true;
 
-	pg_vec_execute_scan_filter_agg_datachunk(&exec_params, &exec_result);
-
-	for (row_idx = 0; row_idx < exec_result.nrows; row_idx++)
-	{
-		const PgVecExecRow *row = &exec_result.rows[row_idx];
-
-		ExecClearTuple(state->result_slot);
-		for (attrno = 0; attrno < plan->agg.noutputs; attrno++)
+		exec_params = (PgVecScanFilterAggExecParams *)
+			palloc0(sizeof(PgVecScanFilterAggExecParams));
+		exec_params->ninputs = plan->ninputs;
+		exec_params->njoins = plan->njoins;
+		exec_params->snapshot = estate->es_snapshot;
+		exec_params->estate = estate;
+		exec_params->enable_jit_deform = pg_vec_jit_deform;
+		exec_params->agg = plan->agg;
+		exec_params->topn = plan->topn;
+		for (int input_id = 0; input_id < plan->ninputs; input_id++)
 		{
-			Datum		value = (Datum) 0;
-			bool		isnull = true;
-			Form_pg_attribute attr = TupleDescAttr(queryDesc->tupDesc, attrno);
-
-			if (!pg_vec_eval_output_expr(plan,
-										 row,
-										 &plan->agg.outputs[attrno],
-										 plan->agg.outputs[attrno].root,
-										 attr,
-										 &value,
-										 &isnull))
-			{
-				dest->rShutdown(dest);
-				MemoryContextSwitchTo(oldcxt);
-				return false;
-			}
-
-			state->result_slot->tts_values[attrno] = value;
-			state->result_slot->tts_isnull[attrno] = isnull;
+			exec_params->rels[input_id] = state->rels[input_id];
+			exec_params->inputs[input_id] = plan->inputs[input_id];
 		}
-		ExecStoreVirtualTuple(state->result_slot);
-		(void) dest->receiveSlot(state->result_slot, dest);
-		ExecClearTuple(state->result_slot);
+		for (int join_idx = 0; join_idx < plan->njoins; join_idx++)
+			exec_params->joins[join_idx] = plan->joins[join_idx];
+
+		pg_vec_execute_scan_filter_agg_datachunk(exec_params, &exec_result);
+
+		for (row_idx = 0; row_idx < exec_result.nrows; row_idx++)
+		{
+			const PgVecExecRow *row = &exec_result.rows[row_idx];
+
+			ExecClearTuple(state->result_slot);
+			for (attrno = 0; attrno < plan->agg.noutputs; attrno++)
+			{
+				Datum		value = (Datum) 0;
+				bool		isnull = true;
+				Form_pg_attribute attr = TupleDescAttr(queryDesc->tupDesc, attrno);
+
+				if (!pg_vec_eval_output_expr(plan,
+											 row,
+											 &plan->agg.outputs[attrno],
+											 plan->agg.outputs[attrno].root,
+											 attr,
+											 &value,
+											 &isnull))
+				{
+					dest->rShutdown(dest);
+					dest_started = false;
+					MemoryContextSwitchTo(oldcxt);
+					return false;
+				}
+
+				state->result_slot->tts_values[attrno] = value;
+				state->result_slot->tts_isnull[attrno] = isnull;
+			}
+			ExecStoreVirtualTuple(state->result_slot);
+			(void) dest->receiveSlot(state->result_slot, dest);
+			ExecClearTuple(state->result_slot);
+		}
+
+		dest->rShutdown(dest);
+		dest_started = false;
+
+		estate->es_processed = exec_result.nrows;
+		estate->es_total_processed += estate->es_processed;
+		queryDesc->already_executed = true;
+		state->completed = true;
 	}
-
-	dest->rShutdown(dest);
-
-	estate->es_processed = exec_result.nrows;
-	estate->es_total_processed += estate->es_processed;
-	queryDesc->already_executed = true;
-	state->completed = true;
+	PG_CATCH();
+	{
+		errcxt = MemoryContextSwitchTo(TopMemoryContext);
+		edata = CopyErrorData();
+		if (edata != NULL && edata->message != NULL)
+			errmsg = pstrdup(edata->message);
+		MemoryContextSwitchTo(errcxt);
+		FlushErrorState();
+		if (dest_started)
+			dest->rShutdown(dest);
+		estate->es_processed = 0;
+		MemoryContextSwitchTo(oldcxt);
+		elog(WARNING,
+			 "pg_vec: runtime fallback to standard executor for %s plan: %s",
+			 pg_vec_plan_kind_name(state->plan.kind),
+			 errmsg != NULL ? errmsg :
+			 "execution raised an internal error");
+		if (edata != NULL)
+		{
+			MemoryContextSwitchTo(TopMemoryContext);
+			FreeErrorData(edata);
+			MemoryContextSwitchTo(oldcxt);
+		}
+		if (errmsg != NULL)
+		{
+			MemoryContextSwitchTo(TopMemoryContext);
+			pfree(errmsg);
+			MemoryContextSwitchTo(oldcxt);
+		}
+		return false;
+	}
+	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldcxt);
 	(void) count;
@@ -272,12 +317,14 @@ pg_vec_const_value_to_datum(PgVecScalarKind scalar_kind,
 		case PG_VEC_SCALAR_DECIMAL64_S2:
 		case PG_VEC_SCALAR_DECIMAL128_S2:
 			return pg_vec_numeric_from_scaled_int128(value->decimal64_s2, 2);
+		case PG_VEC_SCALAR_DECIMAL128_S4:
+			return pg_vec_numeric_from_scaled_int128(value->decimal128, 4);
+		case PG_VEC_SCALAR_DECIMAL128_S6:
+			return pg_vec_numeric_from_scaled_int128(value->decimal128, 6);
 		case PG_VEC_SCALAR_CHAR1:
 			return pg_vec_bpchar_from_char1(value->char1, attr->atttypmod);
 		case PG_VEC_SCALAR_STRING128:
 			return pg_vec_string128_to_datum(&value->string128, attr);
-		case PG_VEC_SCALAR_DECIMAL128_S4:
-		case PG_VEC_SCALAR_DECIMAL128_S6:
 		case PG_VEC_SCALAR_INVALID:
 		default:
 			elog(ERROR, "pg_vec: unsupported const scalar kind %d",

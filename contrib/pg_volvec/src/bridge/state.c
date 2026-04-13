@@ -3,6 +3,7 @@
 #include "utils/hsearch.h"
 #include "state.h"
 #include "execute.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
@@ -13,6 +14,8 @@ struct PgVolVecQueryState
 {
 	MemoryContext context;
 	void *vec_plan; /* placeholder for C++ unique_ptr */
+	void *parallel_plan; /* placeholder for C++ pipeline plan */
+	void *parallel_scheduler; /* placeholder for C++ scheduler runtime */
 };
 
 typedef struct StateEntry
@@ -114,9 +117,36 @@ plan_uses_supported_relations(Plan *plan, PlannedStmt *plannedstmt)
 }
 
 static bool
+contains_non_simple_aggref_walker(Node *node, void *context)
+{
+	(void) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+		return ((Aggref *) node)->aggsplit != AGGSPLIT_SIMPLE;
+	return expression_tree_walker(node, contains_non_simple_aggref_walker, context);
+}
+
+static bool
+plan_exprs_use_non_simple_aggref(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+	if (contains_non_simple_aggref_walker((Node *) plan->targetlist, NULL))
+		return true;
+	if (contains_non_simple_aggref_walker((Node *) plan->qual, NULL))
+		return true;
+	return false;
+}
+
+static bool
 is_supported_plan(Plan *plan, PlannedStmt *plannedstmt)
 {
 	if (plan == NULL)
+		return false;
+
+	if (plan_exprs_use_non_simple_aggref(plan))
 		return false;
 
 	if (IsA(plan, SeqScan))
@@ -161,7 +191,23 @@ is_supported_plan(Plan *plan, PlannedStmt *plannedstmt)
 			   plan->righttree == NULL &&
 			   is_supported_plan(plan->lefttree, plannedstmt);
 
-	if (IsA(plan, Agg) || IsA(plan, Sort) || IsA(plan, Limit))
+	if (IsA(plan, Agg))
+	{
+		Agg *agg = (Agg *) plan;
+
+		/*
+		 * pg_volvec currently implements only simple aggregates. PostgreSQL may
+		 * introduce Partial/Finalize aggregate nodes whose Aggref result is a
+		 * transition state (for example numeric partial sum), and executing them
+		 * as a normal SUM/AVG/MAX produces wrong results.
+		 */
+		return agg->aggsplit == AGGSPLIT_SIMPLE &&
+			   plan->lefttree != NULL &&
+			   plan->righttree == NULL &&
+			   is_supported_plan(plan->lefttree, plannedstmt);
+	}
+
+	if (IsA(plan, Sort) || IsA(plan, Limit))
 		return plan->lefttree != NULL &&
 			   plan->righttree == NULL &&
 			   is_supported_plan(plan->lefttree, plannedstmt);

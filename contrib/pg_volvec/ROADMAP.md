@@ -224,6 +224,12 @@ Every new capability should come with:
 - at least one local benchmark on a supported TPCH shape
 - a flame graph if the result is slower than expected
 
+### 5. Parallel runtime direction
+
+Parallel work should follow a pipeline DAG plus morsel-driven scheduler model,
+not the older scan-only deformer idea.  See
+`morsel_parallel_design.md` for the execution model we want to grow into.
+
 ## Non-Goals For Now
 
 These may matter later, but they should not distort the near-term roadmap:

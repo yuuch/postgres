@@ -429,7 +429,7 @@ llvm_get_function(LLVMJitContext *context, const char *funcname)
  * Return type of a variable in llvmjit_types.c. This is useful to keep types
  * in sync between plain C and JIT related code.
  */
-LLVMTypeRef
+PGDLLEXPORT LLVMTypeRef
 llvm_pg_var_type(const char *varname)
 {
 	LLVMValueRef v_srcvar;

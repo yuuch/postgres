@@ -9,17 +9,21 @@
 #include <unordered_map>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 extern "C" {
 #include "postgres.h"
 #include "utils/rel.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/relscan.h"
+#include "access/tableam.h"
 #include "access/tupdesc_details.h"
 #include "nodes/plannodes.h"
 #include "executor/executor.h"
 #include "jit/jit.h"
 #include "storage/bufmgr.h"
+#include "storage/buffile.h"
 #include "storage/read_stream.h"
 #include "catalog/pg_type_d.h"
 #include "nodes/makefuncs.h"
@@ -37,6 +41,12 @@ static constexpr int MAX_REGISTERS = 64;
 static constexpr int DEFAULT_NUMERIC_SCALE = 2;
 static constexpr int VOLVEC_DEC_DIGITS = 4;
 static constexpr int VOLVEC_NBASE = 10000;
+
+enum class VecNumericWidth : uint8_t {
+	None = 0,
+	Int64 = 1,
+	Wide128 = 2
+};
 
 #if defined(__SIZEOF_INT128__)
 using NumericWideInt = __int128_t;
@@ -283,6 +293,39 @@ GetNumericScaleFromTypmod(int32 typmod)
 	if (typmod < (int32) VARHDRSZ)
 		return DEFAULT_NUMERIC_SCALE;
 	return ((((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024);
+}
+
+static inline int
+GetNumericPrecisionFromTypmod(int32 typmod)
+{
+	if (typmod < (int32) VARHDRSZ)
+		return -1;
+	return ((typmod - VARHDRSZ) >> 16) & 0xffff;
+}
+
+static inline int
+CountDecimalDigitsInt64(int64_t value)
+{
+	uint64_t magnitude;
+	int digits = 1;
+
+	if (value == PG_INT64_MIN)
+		return 19;
+	magnitude = (uint64_t) (value < 0 ? -value : value);
+	while (magnitude >= 10)
+	{
+		magnitude /= 10;
+		digits++;
+	}
+	return digits;
+}
+
+static inline VecNumericWidth
+WidthForNumericPrecision(int precision)
+{
+	if (precision <= 0)
+		return VecNumericWidth::None;
+	return precision <= 18 ? VecNumericWidth::Int64 : VecNumericWidth::Wide128;
 }
 
 struct VolVecNumericShort
@@ -781,7 +824,12 @@ struct VecExprStep {
 	VecOpCode opcode;
 	int res_idx;
 	union {
-		struct { int att_idx; Oid type; } var;
+		struct {
+			int att_idx;
+			Oid type;
+			VecOutputStorageKind storage_kind;
+			int storage_scale;
+		} var;
 		struct {
 			double fval;
 			int64_t i64val;
@@ -822,19 +870,42 @@ public:
 	}
 	const double* get_float8_reg(int i) const { return &registers_f8[i * DEFAULT_CHUNK_SIZE]; }
 	const int64_t* get_int64_reg(int i) const { return &registers_i64[i * DEFAULT_CHUNK_SIZE]; }
+	const int64_t* get_int64_hi_reg(int i) const { return &registers_i64_hi[i * DEFAULT_CHUNK_SIZE]; }
 	const int32_t* get_int32_reg(int i) const { return &registers_i32[i * DEFAULT_CHUNK_SIZE]; }
 	const uint8_t* get_nulls_reg(int i) const { return &registers_nulls[i * DEFAULT_CHUNK_SIZE]; }
+	NumericWideInt get_wide_int_reg_value(int reg_idx, int row_idx) const
+	{
+		size_t slot;
+
+		if (reg_idx < 0 || reg_idx >= MAX_REGISTERS ||
+			row_idx < 0 || row_idx >= DEFAULT_CHUNK_SIZE)
+			return 0;
+		slot = ((size_t) reg_idx * DEFAULT_CHUNK_SIZE) + (size_t) row_idx;
+		return MakeWideIntBits((uint64_t) registers_i64[slot],
+							   (uint64_t) registers_i64_hi[slot]);
+	}
 	int get_register_scale(int i) const { return (i >= 0 && i < MAX_REGISTERS) ? register_scales[i] : 0; }
 	void set_register_scale(int i, int scale) { if (i >= 0 && i < MAX_REGISTERS) register_scales[i] = scale; }
+	int get_register_precision(int i) const { return (i >= 0 && i < MAX_REGISTERS) ? register_precisions[i] : 0; }
+	void set_register_precision(int i, int precision) { if (i >= 0 && i < MAX_REGISTERS) register_precisions[i] = precision; }
+	VecNumericWidth get_register_numeric_width(int i) const { return (i >= 0 && i < MAX_REGISTERS) ? register_numeric_widths[i] : VecNumericWidth::None; }
+	void set_register_numeric_width(int i, VecNumericWidth width) { if (i >= 0 && i < MAX_REGISTERS) register_numeric_widths[i] = width; }
 	void reset_register_scales() { memset(register_scales, 0, sizeof(register_scales)); }
+	void reset_register_precisions() { memset(register_precisions, 0, sizeof(register_precisions)); }
+	void reset_register_numeric_widths() { memset(register_numeric_widths, 0, sizeof(register_numeric_widths)); }
 	int get_final_res_idx() const { return final_res_idx; }
 	VolVecVector<VecExprStep> steps; int max_reg_idx; int final_res_idx;
 	VecExprJitFunc jit_func = nullptr; void* jit_context = nullptr;
 private:
-	int32_t* registers_i32; int64_t* registers_i64; double* registers_f8; uint8_t* registers_nulls;
+	int32_t* registers_i32; int64_t* registers_i64; int64_t* registers_i64_hi; double* registers_f8; uint8_t* registers_nulls;
 	VolVecVector<char> string_constants;
 	int register_scales[MAX_REGISTERS];
+	int register_precisions[MAX_REGISTERS];
+	VecNumericWidth register_numeric_widths[MAX_REGISTERS];
 };
+
+class VecAggState;
+class VecHashJoinState;
 
 class VecPlanState : public PgMemoryContextObject {
 public:
@@ -844,15 +915,559 @@ public:
 	{
 		return false;
 	}
+	virtual bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks)
+	{
+		return false;
+	}
+	virtual void clear_source_block_range()
+	{
+	}
+	virtual VecAggState *find_parallel_aggregate_state()
+	{
+		return nullptr;
+	}
+	virtual VecAggState *find_parallel_aggregate_state_by_plan_node_id(int target_plan_node_id)
+	{
+		(void) target_plan_node_id;
+		return nullptr;
+	}
+	virtual class VecSeqScanState *find_parallel_source_scan_state()
+	{
+		return nullptr;
+	}
+	virtual VecHashJoinState *find_parallel_hash_join_state()
+	{
+		return nullptr;
+	}
+};
+
+enum class ParallelPipelineDriverKind : uint8_t {
+	SourceScan,
+	BridgeFinalize
+};
+
+enum class ParallelPipelineRole : uint8_t {
+	GenericSource,
+	AggFinalize,
+	SortMerge,
+	HashBuildSource,
+	HashBuildFinalize,
+	HashProbeSource,
+	HashOuterSource
+};
+
+enum class ParallelPipelineStage : uint32_t {
+	PartialAgg = 1u << 0,
+	HashBuild = 1u << 1,
+	HashProbe = 1u << 2,
+	SortRun = 1u << 3
+};
+
+enum class ParallelBridgeKind : uint8_t {
+	None,
+	Aggregate,
+	HashBuild,
+	HashTable,
+	SortRuns
+};
+
+enum class ParallelTaskKind : uint8_t {
+	SourceMorsel,
+	BridgeFinalize
+};
+
+struct ParallelAggPartialAccumulator {
+	double float_sum = 0.0;
+	uint64_t numeric_sum_lo = 0;
+	int64_t numeric_sum_hi = 0;
+	uint64_t numeric_max_lo = 0;
+	int64_t numeric_max_hi = 0;
+	double float_max = 0.0;
+	int64_t int64_max = 0;
+	int32_t int32_max = 0;
+	int64_t count = 0;
+	uint8_t has_value = 0;
+};
+
+static constexpr uint32 VOLVEC_PARALLEL_MAX_GROUPS = 256;
+static constexpr uint32 VOLVEC_PARALLEL_MAX_GROUP_COLS = 16;
+static constexpr uint32 VOLVEC_PARALLEL_MAX_PARTIAL_FILE_NAME = 64;
+
+struct ParallelAggPartialGroupKeyCol {
+	uint8_t storage_kind = 0;
+	uint8_t is_null = 0;
+	uint16_t reserved = 0;
+	uint32_t string_len = 0;
+	uint64_t value_bits = 0;
+};
+
+struct ParallelAggFileGroupKeyCol {
+	ParallelAggPartialGroupKeyCol header;
+	std::string string_bytes;
+};
+
+struct ParallelAggPartialGroupEntry {
+	uint32_t num_group_cols = 0;
+	ParallelAggPartialGroupKeyCol group_cols[VOLVEC_PARALLEL_MAX_GROUP_COLS];
+	ParallelAggPartialAccumulator accs[16];
+};
+
+struct ParallelAggPartialState {
+	uint32_t naggs = 0;
+	uint32_t group_count = 0;
+	uint8_t grouped = 0;
+	uint8_t file_backed = 0;
+	uint8_t reserved[2] = {0, 0};
+	uint64_t init_time_us = 0;
+	uint64_t exec_time_us = 0;
+	uint64_t blocks_opened = 0;
+	uint64_t input_batches = 0;
+	uint64_t input_rows = 0;
+	uint64_t file_bytes = 0;
+	char grouped_file_name[VOLVEC_PARALLEL_MAX_PARTIAL_FILE_NAME] = {0};
+	ParallelAggPartialAccumulator accs[16];
+	ParallelAggPartialGroupEntry groups[VOLVEC_PARALLEL_MAX_GROUPS];
+};
+
+struct ParallelPipelineDesc {
+	/* Static plan-time descriptor for one lowered pipeline. */
+	uint32_t pipeline_id = 0;
+	ParallelPipelineDriverKind driver_kind = ParallelPipelineDriverKind::SourceScan;
+	ParallelPipelineRole role = ParallelPipelineRole::GenericSource;
+	ParallelBridgeKind input_bridge = ParallelBridgeKind::None;
+	ParallelBridgeKind output_bridge = ParallelBridgeKind::None;
+	uint32_t stage_mask = 0;
+	Oid scan_relid = InvalidOid;
+	int scan_plan_node_id = -1;
+	int agg_plan_node_id = -1;
+	bool source_morsel_driven = false;
+	bool has_filter = false;
+	bool has_projection = false;
+	bool has_limit = false;
+	bool grouped_agg = false;
+	VolVecVector<uint32_t> dependencies;
+	VolVecVector<uint32_t> successors;
+
+	explicit ParallelPipelineDesc(MemoryContext context)
+		: dependencies(PgMemoryContextAllocator<uint32_t>(context)),
+		  successors(PgMemoryContextAllocator<uint32_t>(context))
+	{
+	}
+};
+
+class ParallelPipelinePlan : public PgMemoryContextObject {
+public:
+	explicit ParallelPipelinePlan(MemoryContext context)
+		: memory_context_(context),
+		  pipelines_(PgMemoryContextAllocator<ParallelPipelineDesc>(context))
+	{
+	}
+
+	ParallelPipelineDesc &add_pipeline(ParallelPipelineDriverKind driver_kind)
+	{
+		pipelines_.emplace_back(memory_context_);
+		ParallelPipelineDesc &pipeline = pipelines_.back();
+
+		pipeline.pipeline_id = (uint32_t) (pipelines_.size() - 1);
+		pipeline.driver_kind = driver_kind;
+		return pipeline;
+	}
+
+	void add_dependency(uint32_t pipeline_id, uint32_t dependency_id)
+	{
+		ParallelPipelineDesc &pipeline = pipelines_[pipeline_id];
+		ParallelPipelineDesc &dependency = pipelines_[dependency_id];
+
+		pipeline.dependencies.push_back(dependency_id);
+		dependency.successors.push_back(pipeline_id);
+	}
+
+	ParallelPipelineDesc *get_pipeline(uint32_t pipeline_id)
+	{
+		if (pipeline_id >= pipelines_.size())
+			return nullptr;
+		return &pipelines_[pipeline_id];
+	}
+
+	const ParallelPipelineDesc *get_pipeline(uint32_t pipeline_id) const
+	{
+		if (pipeline_id >= pipelines_.size())
+			return nullptr;
+		return &pipelines_[pipeline_id];
+	}
+
+	size_t pipeline_count() const
+	{
+		return pipelines_.size();
+	}
+
+	size_t source_pipeline_count() const
+	{
+		size_t count = 0;
+
+		for (const auto &pipeline : pipelines_)
+		{
+			if (pipeline.source_morsel_driven)
+				count++;
+		}
+		return count;
+	}
+
+	void set_root_pipeline(uint32_t pipeline_id)
+	{
+		root_pipeline_id_ = pipeline_id;
+	}
+
+	uint32_t root_pipeline_id() const
+	{
+		return root_pipeline_id_;
+	}
+
+	const VolVecVector<ParallelPipelineDesc> &pipelines() const
+	{
+		return pipelines_;
+	}
+
+private:
+	MemoryContext memory_context_;
+	VolVecVector<ParallelPipelineDesc> pipelines_;
+	uint32_t root_pipeline_id_ = UINT32_MAX;
+};
+
+struct ParallelTaskDesc {
+	/*
+	 * One runnable execution instance owned by a specific pipeline. A worker
+	 * never receives a free-floating morsel; it always receives a task that
+	 * names the pipeline whose kernel must run.
+	 */
+	ParallelTaskKind task_kind = ParallelTaskKind::SourceMorsel;
+	uint32_t pipeline_id = UINT32_MAX;
+	BlockNumber morsel_start_block = InvalidBlockNumber;
+	uint32_t morsel_nblocks = 0;
+};
+
+struct ParallelBridgeState {
+	/* Shared handoff state between a producer pipeline and its consumers. */
+	ParallelBridgeKind bridge_kind = ParallelBridgeKind::None;
+	uint32_t producer_pipeline_id = UINT32_MAX;
+	bool ready = false;
+	bool finalized = false;
+};
+
+struct ParallelPipelineRuntimeState {
+	/*
+	 * Mutable scheduler-owned runtime state for one pipeline. This is kept
+	 * separate from ParallelPipelineDesc so the static lowering remains stable
+	 * while execution mutates queueing, dependency, and progress state.
+	 */
+	uint32_t pipeline_id = UINT32_MAX;
+	uint32_t remaining_dependencies = 0;
+	uint32_t completed_predecessors = 0;
+	ParallelTaskKind next_task_kind = ParallelTaskKind::SourceMorsel;
+	Oid scan_relid = InvalidOid;
+	int scan_plan_node_id = -1;
+	BlockNumber next_morsel_block = InvalidBlockNumber;
+	BlockNumber total_blocks = InvalidBlockNumber;
+	uint32_t estimated_morsels = 0;
+	bool ready = false;
+	bool queued = false;
+	bool running = false;
+	bool completed = false;
+};
+
+class ParallelSchedulerState : public PgMemoryContextObject {
+public:
+	ParallelSchedulerState(MemoryContext context,
+						  const ParallelPipelinePlan *plan,
+						  uint32_t source_morsel_nblocks)
+		: plan_(plan),
+		  source_morsel_nblocks_(source_morsel_nblocks),
+		  pipeline_runtime_(PgMemoryContextAllocator<ParallelPipelineRuntimeState>(context)),
+		  bridges_(PgMemoryContextAllocator<ParallelBridgeState>(context)),
+		  ready_pipeline_ids_(PgMemoryContextAllocator<uint32_t>(context)),
+		  ready_tasks_(PgMemoryContextAllocator<ParallelTaskDesc>(context))
+	{
+	}
+
+	const ParallelPipelinePlan *plan() const
+	{
+		return plan_;
+	}
+
+	ParallelPipelineRuntimeState *get_pipeline_runtime(uint32_t pipeline_id)
+	{
+		if (pipeline_id >= pipeline_runtime_.size())
+			return nullptr;
+		return &pipeline_runtime_[pipeline_id];
+	}
+
+	const ParallelPipelineRuntimeState *get_pipeline_runtime(uint32_t pipeline_id) const
+	{
+		if (pipeline_id >= pipeline_runtime_.size())
+			return nullptr;
+		return &pipeline_runtime_[pipeline_id];
+	}
+
+	ParallelBridgeState *get_bridge_state(uint32_t producer_pipeline_id)
+	{
+		for (auto &bridge : bridges_)
+		{
+			if (bridge.producer_pipeline_id == producer_pipeline_id)
+				return &bridge;
+		}
+		return nullptr;
+	}
+
+	const ParallelBridgeState *get_bridge_state(uint32_t producer_pipeline_id) const
+	{
+		for (const auto &bridge : bridges_)
+		{
+			if (bridge.producer_pipeline_id == producer_pipeline_id)
+				return &bridge;
+		}
+		return nullptr;
+	}
+
+	size_t ready_pipeline_count() const
+	{
+		return ready_pipeline_ids_.size();
+	}
+
+	size_t bridge_count() const
+	{
+		return bridges_.size();
+	}
+
+	size_t ready_task_count() const
+	{
+		return ready_tasks_.size();
+	}
+
+	const VolVecVector<uint32_t> &ready_pipeline_ids() const
+	{
+		return ready_pipeline_ids_;
+	}
+
+	const VolVecVector<ParallelTaskDesc> &ready_tasks() const
+	{
+		return ready_tasks_;
+	}
+
+	const VolVecVector<ParallelPipelineRuntimeState> &pipeline_runtime() const
+	{
+		return pipeline_runtime_;
+	}
+
+	const VolVecVector<ParallelBridgeState> &bridges() const
+	{
+		return bridges_;
+	}
+
+	void append_pipeline_runtime(const ParallelPipelineRuntimeState &runtime)
+	{
+		pipeline_runtime_.push_back(runtime);
+	}
+
+	void append_bridge(const ParallelBridgeState &bridge)
+	{
+		bridges_.push_back(bridge);
+	}
+
+	void enqueue_ready_pipeline(uint32_t pipeline_id)
+	{
+		ParallelPipelineRuntimeState *runtime = get_pipeline_runtime(pipeline_id);
+
+		if (runtime == nullptr || runtime->completed || runtime->queued)
+			return;
+		runtime->ready = true;
+		runtime->queued = true;
+		ready_pipeline_ids_.push_back(pipeline_id);
+		/*
+		 * Source pipelines produce block-range morsel tasks. Finalize-style
+		 * pipelines enqueue one bridge task until they are rescheduled.
+		 */
+		if (runtime->next_task_kind == ParallelTaskKind::SourceMorsel)
+		{
+			BlockNumber start_block = runtime->next_morsel_block;
+			uint32_t nblocks = 0;
+
+			if (runtime->total_blocks != InvalidBlockNumber &&
+				start_block < runtime->total_blocks)
+			{
+				BlockNumber remaining = runtime->total_blocks - start_block;
+				nblocks = (remaining > source_morsel_nblocks_) ?
+					source_morsel_nblocks_ : (uint32_t) remaining;
+			}
+			ready_tasks_.push_back(ParallelTaskDesc{
+				runtime->next_task_kind,
+				pipeline_id,
+				start_block,
+				nblocks
+			});
+		}
+		else
+		{
+			ready_tasks_.push_back(ParallelTaskDesc{
+				runtime->next_task_kind,
+				pipeline_id,
+				runtime->next_morsel_block,
+				0
+			});
+		}
+	}
+
+	bool dequeue_ready_task(ParallelTaskDesc *task_out)
+	{
+		ParallelPipelineRuntimeState *runtime;
+		ParallelTaskDesc task;
+
+		if (ready_tasks_.empty() || ready_pipeline_ids_.empty())
+			return false;
+		task = ready_tasks_.front();
+		ready_tasks_.erase(ready_tasks_.begin());
+		ready_pipeline_ids_.erase(ready_pipeline_ids_.begin());
+		runtime = get_pipeline_runtime(task.pipeline_id);
+		if (runtime == nullptr || runtime->completed)
+			return false;
+		runtime->queued = false;
+		runtime->ready = false;
+		runtime->running = true;
+		if (task_out != nullptr)
+			*task_out = task;
+		return true;
+	}
+
+	bool mark_pipeline_completed(uint32_t pipeline_id)
+	{
+		const ParallelPipelineDesc *pipeline_desc;
+		ParallelPipelineRuntimeState *runtime = get_pipeline_runtime(pipeline_id);
+
+		if (runtime == nullptr || runtime->completed)
+			return false;
+		pipeline_desc = plan_ != nullptr ? plan_->get_pipeline(pipeline_id) : nullptr;
+		runtime->running = false;
+		runtime->ready = false;
+		runtime->completed = true;
+		if (pipeline_desc != nullptr && pipeline_desc->output_bridge != ParallelBridgeKind::None)
+		{
+			ParallelBridgeState *bridge = get_bridge_state(pipeline_id);
+
+			if (bridge != nullptr)
+			{
+				bridge->ready = true;
+				bridge->finalized = true;
+			}
+		}
+		if (pipeline_desc == nullptr)
+			return true;
+		for (uint32_t successor_id : pipeline_desc->successors)
+		{
+			ParallelPipelineRuntimeState *successor = get_pipeline_runtime(successor_id);
+
+			if (successor == nullptr || successor->completed)
+				continue;
+			successor->completed_predecessors++;
+			if (successor->remaining_dependencies > 0)
+				successor->remaining_dependencies--;
+			if (successor->remaining_dependencies == 0)
+				enqueue_ready_pipeline(successor_id);
+		}
+		return true;
+	}
+
+	bool finish_task(const ParallelTaskDesc &task)
+	{
+		ParallelPipelineRuntimeState *runtime = get_pipeline_runtime(task.pipeline_id);
+
+		if (runtime == nullptr || runtime->completed)
+			return false;
+		runtime->running = false;
+		runtime->ready = false;
+		runtime->queued = false;
+
+		if (task.task_kind == ParallelTaskKind::SourceMorsel &&
+			runtime->total_blocks != InvalidBlockNumber)
+		{
+			BlockNumber next_block = task.morsel_start_block + task.morsel_nblocks;
+
+			runtime->next_morsel_block = next_block;
+			if (next_block < runtime->total_blocks)
+			{
+				enqueue_ready_pipeline(task.pipeline_id);
+				return true;
+			}
+		}
+
+		return mark_pipeline_completed(task.pipeline_id);
+	}
+
+private:
+	const ParallelPipelinePlan *plan_;
+	uint32_t source_morsel_nblocks_;
+	VolVecVector<ParallelPipelineRuntimeState> pipeline_runtime_;
+	VolVecVector<ParallelBridgeState> bridges_;
+	VolVecVector<uint32_t> ready_pipeline_ids_;
+	VolVecVector<ParallelTaskDesc> ready_tasks_;
+};
+
+struct ParallelWorkerContext {
+	/*
+	 * Process-local execution context used by a leader or worker while running
+	 * one scheduled task. This intentionally holds local executor objects,
+	 * not DSM-visible state.
+	 */
+	MemoryContext memory_context = nullptr;
+	PlannedStmt *plannedstmt = nullptr;
+	EState *estate = nullptr;
+	VecPlanState *root_plan = nullptr;
+	VecAggState *agg_state = nullptr;
+	VecHashJoinState *hash_join_state = nullptr;
+	int agg_plan_node_id = -1;
+	Oid parallel_scan_relid = InvalidOid;
+	int parallel_scan_plan_node_id = -1;
+	ParallelTableScanDesc parallel_scan_desc = nullptr;
+	bool leader = false;
 };
 
 class VecSeqScanState : public VecPlanState {
 public:
-	VecSeqScanState(Relation rel, Snapshot snapshot, const DeformProgram *program); ~VecSeqScanState() override;
+	VecSeqScanState(Relation rel,
+					Snapshot snapshot,
+					const DeformProgram *program,
+					ParallelTableScanDesc parallel_scan_desc = nullptr);
+	~VecSeqScanState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+	bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks) override;
+	void clear_source_block_range() override;
+	void configure_block_range(BlockNumber start_block, uint32_t nblocks);
+	void clear_block_range();
+	VecSeqScanState *find_parallel_source_scan_state() override
+	{
+		return this;
+	}
+	uint64_t blocks_opened() const
+	{
+		return blocks_opened_;
+	}
 private:
-	Relation rel_; Snapshot snapshot_; HeapScanDesc scan_; ReadStream *stream_ = nullptr; Buffer current_buf_ = InvalidBuffer; Buffer vmbuf_ = InvalidBuffer; OffsetNumber current_offnum_ = FirstOffsetNumber; bool all_visible_ = false; DataChunkDeformer deformer_; JitContext *jit_context_ = nullptr;
+	void prepare_bindings(DataChunk<DEFAULT_CHUNK_SIZE> &chunk, DeformBindings *bindings) const;
+	bool open_next_buffer();
+
+	Relation rel_;
+	Snapshot snapshot_;
+	HeapScanDesc scan_;
+	ReadStream *stream_ = nullptr;
+	Buffer current_buf_ = InvalidBuffer;
+	Buffer vmbuf_ = InvalidBuffer;
+	OffsetNumber current_offnum_ = FirstOffsetNumber;
+	bool all_visible_ = false;
+	bool block_range_active_ = false;
+	BlockNumber block_range_start_ = InvalidBlockNumber;
+	BlockNumber block_range_end_ = InvalidBlockNumber;
+	uint64_t blocks_opened_ = 0;
+	DataChunkDeformer deformer_;
+	JitContext *jit_context_ = nullptr;
 };
 
 class VecAggState : public VecPlanState {
@@ -864,12 +1479,57 @@ public:
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_numeric_output_meta(int target_resno, NumericOutputKind *kind, int *scale) const;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+	VecAggState *find_parallel_aggregate_state() override
+	{
+		return this;
+	}
+	VecAggState *find_parallel_aggregate_state_by_plan_node_id(int target_plan_node_id) override
+	{
+		if (target_plan_node_id >= 0 &&
+			node_ != nullptr &&
+			node_->plan.plan_node_id == target_plan_node_id)
+			return this;
+		return left_ != nullptr ? left_->find_parallel_aggregate_state_by_plan_node_id(target_plan_node_id) : nullptr;
+	}
+	VecSeqScanState *find_parallel_source_scan_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_source_scan_state() : nullptr;
+	}
+	VecHashJoinState *find_parallel_hash_join_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_hash_join_state() : nullptr;
+	}
+	bool configure_input_block_range(BlockNumber start_block, uint32_t nblocks);
+	void clear_input_block_range();
+	void consume_left_input();
+	void consume_batch(DataChunk<DEFAULT_CHUNK_SIZE> &batch);
+	void finish_sink();
+	bool supports_parallel_partial_state() const;
+	bool uses_file_backed_parallel_partial_state() const
+	{
+		return !grp_col_indices_.empty();
+	}
+	bool export_parallel_partial_state(ParallelAggPartialState *out) const;
+	bool export_parallel_grouped_partial_file(BufFile *file,
+											  ParallelAggPartialState *out) const;
+	bool merge_parallel_partial_state(const ParallelAggPartialState &partial);
+	bool merge_parallel_grouped_partial_file(BufFile *file,
+											 const ParallelAggPartialState &partial);
+	uint64_t input_rows_consumed() const
+	{
+		return input_rows_consumed_;
+	}
+	uint64_t input_batches_consumed() const
+	{
+		return input_batches_consumed_;
+	}
 private:
 		std::unique_ptr<VecPlanState> left_; Agg *node_; MemoryContext memory_context_; VolVecVector<int> grp_col_indices_;
 		VolVecVector<VecOutputColMeta> grp_col_meta_;
 	struct VecAggAccumulator {
 		double float_sum = 0.0;
 		NumericWideInt numeric_sum = 0;
+		NumericWideInt numeric_max = 0;
 		double float_max = 0.0;
 		int64_t int64_max = 0;
 		int32_t int32_max = 0;
@@ -877,7 +1537,7 @@ private:
 		bool has_value = false;
 
 		void update_float(double v) { float_sum += v; count++; }
-		void update_numeric(int64_t v) { numeric_sum += WideIntFromInt64(v); count++; }
+		void update_numeric(NumericWideInt v) { numeric_sum += v; count++; }
 		void update_max_float(double v)
 		{
 			if (!has_value || v > float_max)
@@ -894,6 +1554,12 @@ private:
 		{
 			if (!has_value || v > int32_max)
 				int32_max = v;
+			has_value = true;
+		}
+		void update_max_numeric(NumericWideInt v)
+		{
+			if (!has_value || v > numeric_max)
+				numeric_max = v;
 			has_value = true;
 		}
 
@@ -958,6 +1624,8 @@ private:
 			VecOutputStorageKind output_storage = VecOutputStorageKind::Int32;
 			Oid arg_type = InvalidOid;
 			int numeric_scale = 0;
+			int numeric_precision = 0;
+			VecNumericWidth numeric_width = VecNumericWidth::None;
 			bool use_exact_numeric = false;
 			bool is_distinct = false;
 		};
@@ -973,6 +1641,31 @@ private:
 		DataChunk<DEFAULT_CHUNK_SIZE> *allocate_rep_chunk();
 		void copy_rep_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,
 						  const DataChunk<DEFAULT_CHUNK_SIZE> &src, int src_row) const;
+		void export_partial_accumulator(const VecAggAccumulator *src,
+										 ParallelAggPartialAccumulator *dst) const;
+		void merge_partial_accumulator(const ParallelAggPartialAccumulator &src,
+										size_t agg_index,
+										VecAggAccumulator *dst) const;
+		bool is_supported_parallel_distinct_agg(const VecAggDesc &agg) const;
+		VecAggAccumulator::DistinctValueSet *ensure_distinct_value_set(VecAggAccumulator *acc) const;
+		bool write_distinct_values_to_partial_file(BufFile *file,
+												   const VecAggAccumulator *acc) const;
+		bool read_distinct_values_from_partial_file(BufFile *file,
+													VecAggAccumulator *acc) const;
+		bool append_group_record_to_partial_file(BufFile *file,
+												 const VecGroupKey *key,
+												 const VecSimpleGroupKey *simple_key,
+												 const VecAggGroupState &group) const;
+		void store_group_rep_row_from_partial(VecAggGroupState *group,
+											   const ParallelAggPartialGroupEntry &entry);
+		bool store_group_rep_row_from_file(VecAggGroupState *group,
+											const std::vector<ParallelAggFileGroupKeyCol> &group_cols);
+		void ensure_group_rep_row(VecAggGroupState *group,
+								  const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+								  int row_idx);
+		void update_group_accumulators(VecAggGroupState *group,
+									   const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+									   int row_idx);
 		VolVecVector<VecAggDesc> aggs_; VecAggHashTable hash_table_;
 		VecAggSimpleHashTable simple_hash_table_;
 		VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> rep_chunks_;
@@ -980,6 +1673,8 @@ private:
 		VecAggSimpleHashTable::iterator simple_it_;
 		bool use_simple_group_key_ = false;
 		VecOutputStorageKind simple_group_storage_ = VecOutputStorageKind::Int32;
+		uint64_t input_rows_consumed_ = 0;
+		uint64_t input_batches_consumed_ = 0;
 		bool fully_scanned_ = false; void do_sink();
 	};
 
@@ -990,6 +1685,31 @@ public:
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
 	{
 		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+	}
+	bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks) override
+	{
+		return left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+	}
+	void clear_source_block_range() override
+	{
+		if (left_ != nullptr)
+			left_->clear_source_block_range();
+	}
+	VecAggState *find_parallel_aggregate_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state() : nullptr;
+	}
+	VecAggState *find_parallel_aggregate_state_by_plan_node_id(int target_plan_node_id) override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state_by_plan_node_id(target_plan_node_id) : nullptr;
+	}
+	VecSeqScanState *find_parallel_source_scan_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_source_scan_state() : nullptr;
+	}
+	VecHashJoinState *find_parallel_hash_join_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_hash_join_state() : nullptr;
 	}
 private:
 	std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
@@ -1193,6 +1913,31 @@ public:
 					VolVecVector<VecProjectColDesc> columns);
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+	bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks) override
+	{
+		return left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+	}
+	void clear_source_block_range() override
+	{
+		if (left_ != nullptr)
+			left_->clear_source_block_range();
+	}
+	VecAggState *find_parallel_aggregate_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state() : nullptr;
+	}
+	VecAggState *find_parallel_aggregate_state_by_plan_node_id(int target_plan_node_id) override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state_by_plan_node_id(target_plan_node_id) : nullptr;
+	}
+	VecSeqScanState *find_parallel_source_scan_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_source_scan_state() : nullptr;
+	}
+	VecHashJoinState *find_parallel_hash_join_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_hash_join_state() : nullptr;
+	}
 private:
 	std::unique_ptr<VecPlanState> left_;
 	VolVecVector<VecProjectColDesc> columns_;
@@ -1207,6 +1952,31 @@ public:
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
 	{
 		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+	}
+	bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks) override
+	{
+		return left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+	}
+	void clear_source_block_range() override
+	{
+		if (left_ != nullptr)
+			left_->clear_source_block_range();
+	}
+	VecAggState *find_parallel_aggregate_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state() : nullptr;
+	}
+	VecAggState *find_parallel_aggregate_state_by_plan_node_id(int target_plan_node_id) override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state_by_plan_node_id(target_plan_node_id) : nullptr;
+	}
+	VecSeqScanState *find_parallel_source_scan_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_source_scan_state() : nullptr;
+	}
+	VecHashJoinState *find_parallel_hash_join_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_hash_join_state() : nullptr;
 	}
 private:
 	std::unique_ptr<VecPlanState> left_;
@@ -1264,7 +2034,43 @@ public:
 	~VecHashJoinState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
+	bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks) override;
+	void clear_source_block_range() override;
+	VecSeqScanState *find_parallel_source_scan_state() override;
+	VecHashJoinState *find_parallel_hash_join_state() override
+	{
+		return this;
+	}
+	VecAggState *find_parallel_aggregate_state_by_plan_node_id(int target_plan_node_id) override
+	{
+		VecAggState *agg = outer_ != nullptr ?
+			outer_->find_parallel_aggregate_state_by_plan_node_id(target_plan_node_id) : nullptr;
+		if (agg != nullptr)
+			return agg;
+		return inner_ != nullptr ? inner_->find_parallel_aggregate_state_by_plan_node_id(target_plan_node_id) : nullptr;
+	}
+	VecSeqScanState *find_parallel_build_scan_state();
 	void set_join_filter_program(std::unique_ptr<VecExprProgram> program);
+	bool configure_build_input_block_range(BlockNumber start_block, uint32_t nblocks);
+	void clear_build_input_block_range();
+	void consume_build_input();
+	void finish_parallel_hash_build();
+	uint64_t build_input_rows_consumed() const
+	{
+		return build_input_rows_consumed_;
+	}
+	uint64_t build_input_batches_consumed() const
+	{
+		return build_input_batches_consumed_;
+	}
+	size_t parallel_hash_entry_count() const
+	{
+		return entries_.size();
+	}
+	size_t parallel_hash_chunk_count() const
+	{
+		return inner_chunks_.size();
+	}
 	private:
 		struct VecHashEntry {
 			uint32_t hash;
@@ -1275,6 +2081,8 @@ public:
 		};
 
 		void build_inner_hash();
+		void consume_build_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input);
+		void reset_probe_task_state();
 		void init_hash_table(size_t expected_rows);
 		void rehash_hash_table(size_t min_bucket_count);
 		void append_inner_entry(const VecHashJoinKey &key, uint32_t hash, uint32_t chunk_idx, uint16_t row_idx);
@@ -1324,6 +2132,8 @@ public:
 	uint16_t anti_outer_pos_;
 	uint32_t right_anti_emit_pos_;
 	size_t bucket_mask_;
+	uint64_t build_input_rows_consumed_ = 0;
+	uint64_t build_input_batches_consumed_ = 0;
 };
 
 struct VecSortKeyDesc {
@@ -1390,6 +2200,22 @@ public:
 	{
 		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
 	}
+	VecAggState *find_parallel_aggregate_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state() : nullptr;
+	}
+	VecAggState *find_parallel_aggregate_state_by_plan_node_id(int target_plan_node_id) override
+	{
+		return left_ != nullptr ? left_->find_parallel_aggregate_state_by_plan_node_id(target_plan_node_id) : nullptr;
+	}
+	VecSeqScanState *find_parallel_source_scan_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_source_scan_state() : nullptr;
+	}
+	VecHashJoinState *find_parallel_hash_join_state() override
+	{
+		return left_ != nullptr ? left_->find_parallel_hash_join_state() : nullptr;
+	}
 private:
 	void materialize_and_sort();
 	DataChunk<DEFAULT_CHUNK_SIZE> *allocate_payload_chunk();
@@ -1414,10 +2240,31 @@ private:
 	bool materialized_;
 };
 
-struct PgVolVecQueryState { MemoryContext context; VecPlanState* vec_plan; };
+struct PgVolVecQueryState { MemoryContext context; VecPlanState* vec_plan; ParallelPipelinePlan* parallel_plan; ParallelSchedulerState* parallel_scheduler; };
 
 void CompileExpr(Expr *expr, VecExprProgram &program, bool is_filter = false, EState *estate = nullptr);
-std::unique_ptr<VecPlanState> ExecInitVecPlan(Plan *plan, EState *estate);
+std::unique_ptr<VecPlanState> ExecInitVecPlan(Plan *plan,
+												 EState *estate,
+												 const ParallelWorkerContext *parallel_worker_context = nullptr);
+std::unique_ptr<ParallelPipelinePlan> BuildParallelPipelinePlan(Plan *plan,
+																PlannedStmt *plannedstmt,
+																EState *estate,
+																const char **failure_reason);
+std::unique_ptr<ParallelSchedulerState> BuildParallelSchedulerState(const ParallelPipelinePlan *plan,
+																   MemoryContext context,
+																   uint32_t source_morsel_nblocks,
+																   const char **failure_reason);
+bool TryInitializeLeaderOnlyAggregateWorkerContext(PgVolVecQueryState *query_state,
+												   ParallelWorkerContext *worker_context,
+												   const ParallelPipelineDesc **source_pipeline_out,
+												   const char **failure_reason);
+bool TryExecuteProcessParallelAggregate(PgVolVecQueryState *query_state,
+										 QueryDesc *queryDesc,
+										 const char **failure_reason);
+bool ExecuteParallelTask(const ParallelTaskDesc &task,
+						 const ParallelPipelinePlan *parallel_plan,
+						 ParallelWorkerContext &worker_context,
+						 const char **failure_reason);
 
 #ifdef USE_LLVM
 bool pg_volvec_try_compile_jit_deform_to_datachunk(TupleDesc desc, const DeformProgram *program, JitDeformFunc *out_func, JitContext **out_context, const char **failure_reason);

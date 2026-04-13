@@ -7,6 +7,7 @@ extern "C" {
 
 #include "postgres.h"
 
+#include "executor/executor.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
@@ -17,6 +18,7 @@ typedef struct PgVecScanFilterAggExecParams
 	int			ninputs;
 	Relation	rels[PG_VEC_MAX_INPUTS];
 	Snapshot	snapshot;
+	EState	   *estate;
 	bool		enable_jit_deform;
 	PgVecInputSpec inputs[PG_VEC_MAX_INPUTS];
 	int			njoins;

@@ -9,6 +9,7 @@
 - Scan hot paths use tuple deform JIT to decode heap tuples directly into typed column arrays.
 - Expression evaluation lowers to a linear IR and, when supported, compiles to fused LLVM loops so intermediate vector temporaries do not need to be materialized.
 - TPC-H-style `NUMERIC(15,2)` values run as scaled `int64` in the hot path, with widened accumulation for aggregation.
+- Wider exact numeric expressions use an `int128`-style `Wide128` path for correctness. That path is currently interpreter-only; expression JIT intentionally fences it off until the LLVM lowering supports the same wide semantics.
 - Strings use prefix-aware refs and only fall back to owned storage when needed.
 
 In short: PostgreSQL planner on top, `pg_volvec` columnar executor underneath, with JIT on both tuple deform and expression evaluation.
@@ -43,6 +44,8 @@ Offloaded with narrower validation:
 - Q17
 - Q21
 
+`Q17` now runs through the process-parallel path on the live TPC-H data set and matches the rewrite-based native reference; the remaining gap is a full original-query native diff, because the local native PostgreSQL plan times out at the 180s benchmark cap.
+
 `Q21` is intentionally deprioritized for now. The dominant problem on that query shape looks more like PostgreSQL planner quality on many-table joins plus sublinks than a clear missing primitive inside the `pg_volvec` executor.
 
 ## TPC-H Timing Snapshot
@@ -63,6 +66,20 @@ Quick read:
 ![TPC-H timing comparison](tpch_perf_snapshot.svg)
 
 The underlying snapshot is checked into [tpch_perf_snapshot.tsv](tpch_perf_snapshot.tsv).
+
+### Process-Parallel Checkpoint
+
+The 2026-04-12 process-parallel sweep skips Q2 and Q21, keeps PostgreSQL `Gather` parallelism off, and uses median-of-3 timings. `pg_duckdb` and native PostgreSQL keep `max_parallel_workers = 0`; `pg_volvec` uses `pg_volvec.parallel = on`, `pg_volvec.parallel_max_workers = 4`, and `max_parallel_workers = 8`. Q3 uses `enable_eager_aggregate = off` for all three engines so the plan shape stays compatible with the current `pg_volvec` lowering.
+
+Quick read:
+
+- Across the 18 direct `OK vs OK vs OK` comparisons, `pg_volvec` is fastest on 11, `pg_duckdb` is fastest on 6, and native PostgreSQL is fastest on 1.
+- The geometric mean speedup versus native PostgreSQL on those direct comparisons is about `1.55x` for `pg_volvec` and `1.10x` for `pg_duckdb`.
+- Q17 is now process-parallel and correct in this sweep: native PostgreSQL times out at `180s`, `pg_duckdb` is `15.364s`, and `pg_volvec` is `14.601s`.
+- This sweep predates the 2026-04-13 process-parallel bad-shape guard. In the raw sweep, Q10, Q12, and Q14 regressed versus native PostgreSQL; a follow-up spot fix now skips Q10/Q14 shapes where a small `HashProbeSource` would make workers redundantly build a much larger local hash-join subtree. Q12 did not reproduce as a bad process-parallel choice in the post-fix spot check, but the chart should be refreshed with a full rerun.
+- Q20 finishes in `pg_volvec` but is still much slower than `pg_duckdb`.
+
+The process-parallel checkpoint data is checked into [tpch_perf_process_parallel_skip_q2_q21_20260412.tsv](tpch_perf_process_parallel_skip_q2_q21_20260412.tsv).
 
 ## Build And Install
 

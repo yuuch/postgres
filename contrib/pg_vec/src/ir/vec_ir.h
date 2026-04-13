@@ -29,6 +29,14 @@ typedef enum PgVecPlanKind
 	PG_VEC_PLAN_SCAN_FILTER_AGG
 } PgVecPlanKind;
 
+typedef enum PgVecInputKind
+{
+	PG_VEC_INPUT_RELATION = 0,
+	PG_VEC_INPUT_DERIVED_GROUPED_AGG
+} PgVecInputKind;
+
+struct PgVecPlan;
+
 typedef enum PgVecScalarKind
 {
 	PG_VEC_SCALAR_INVALID = 0,
@@ -68,6 +76,7 @@ typedef union PgVecConstValue
 	int32		int32_value;
 	DateADT		date32;
 	int64		decimal64_s2;
+	__int128	decimal128;
 	char		char1;
 	PgVecStringConst string128;
 } PgVecConstValue;
@@ -78,6 +87,7 @@ typedef enum PgVecExprKind
 	PG_VEC_EXPR_COLUMN,
 	PG_VEC_EXPR_CONST,
 	PG_VEC_EXPR_EXTRACT_YEAR,
+	PG_VEC_EXPR_SUBSTRING_PREFIX2,
 	PG_VEC_EXPR_ADD,
 	PG_VEC_EXPR_SUB,
 	PG_VEC_EXPR_MUL
@@ -110,7 +120,11 @@ typedef enum PgVecFilterOp
 	PG_VEC_OP_GT,
 	PG_VEC_OP_GE,
 	PG_VEC_OP_PREFIX_LIKE,
-	PG_VEC_OP_CONTAINS_LIKE
+	PG_VEC_OP_CONTAINS_LIKE,
+	PG_VEC_OP_NOT_PREFIX_LIKE,
+	PG_VEC_OP_NOT_CONTAINS_LIKE,
+	PG_VEC_OP_SQL_LIKE,
+	PG_VEC_OP_NOT_SQL_LIKE
 } PgVecFilterOp;
 
 typedef enum PgVecQualKind
@@ -153,6 +167,7 @@ typedef struct PgVecAggCall
 {
 	PgVecAggKind kind;
 	bool		star_arg;
+	bool		distinct;
 	bool		has_filter;
 	bool		zero_if_empty;
 	PgVecExprProgram expr;
@@ -165,6 +180,7 @@ typedef enum PgVecOutputExprKind
 	PG_VEC_OUTPUT_EXPR_GROUP_KEY,
 	PG_VEC_OUTPUT_EXPR_AGGREF,
 	PG_VEC_OUTPUT_EXPR_CONST,
+	PG_VEC_OUTPUT_EXPR_PARAM,
 	PG_VEC_OUTPUT_EXPR_ADD,
 	PG_VEC_OUTPUT_EXPR_SUB,
 	PG_VEC_OUTPUT_EXPR_MUL,
@@ -214,19 +230,34 @@ typedef struct PgVecAggSpec
 	PgVecPostAggFilterSpec having;
 } PgVecAggSpec;
 
+typedef struct PgVecDerivedAggInputSpec
+{
+	Oid			relid;
+	int			nbase_columns;
+	PgVecColumnRef base_columns[PG_VEC_MAX_SCAN_COLUMNS];
+	int			output_map[PG_VEC_MAX_OUTPUT_COLUMNS];
+	PgVecFilterSpec base_filter;
+	PgVecAggSpec agg;
+	struct PgVecPlan *subplan;
+} PgVecDerivedAggInputSpec;
+
 typedef struct PgVecInputSpec
 {
+	PgVecInputKind kind;
 	Oid			relid;
 	int			ncolumns;
 	PgVecColumnRef columns[PG_VEC_MAX_SCAN_COLUMNS];
 	PgVecFilterSpec filter;
+	PgVecDerivedAggInputSpec derived;
 } PgVecInputSpec;
 
 typedef enum PgVecJoinKind
 {
 	PG_VEC_JOIN_INVALID = 0,
 	PG_VEC_JOIN_INNER,
-	PG_VEC_JOIN_SEMI
+	PG_VEC_JOIN_LEFT,
+	PG_VEC_JOIN_SEMI,
+	PG_VEC_JOIN_ANTI
 } PgVecJoinKind;
 
 typedef struct PgVecJoinKey

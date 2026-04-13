@@ -2,6 +2,13 @@
 
 ## Current State
 
+- As of March 31, 2026, all self-contained in-tree SQL fixtures
+  `q1..q22` plus `plain_expr` complete successfully on the local 19devel test
+  instance.
+- As of March 31, 2026, the same self-contained `q1..q22` sweep completes
+  with no `pg_vec: fallback to standard executor` warnings.
+- `meson test -C build_pg_19dev_install -v pg_vec/regress` is green with
+  `23/23` subtests passing.
 - `Q1` is supported on the generic single-table `SeqScan -> Filter -> Agg`
   path.
 - `Q6` uses the same generic single-table path and is now stable on the
@@ -28,13 +35,55 @@
 - `Q11` now runs after lowering aggregate `HAVING` quals into a post-aggregate
   filter IR and resolving uncorrelated `PARAM_EXEC` scalar subqueries into
   constants during translation.
+- `Q15` now runs after normalizing join/project boundary `Var` slots down to
+  real input attnos, fixing derived grouped-input output mapping, and keeping
+  scalar `MAX` subqueries over the derived revenue relation in the post-agg
+  filter path.
+- `Q13` now runs after preserving derived-aggregate `Agg` boundaries during
+  translation, allowing single-input outer aggregation over a derived grouped
+  input at execution time, and widening string `LIKE` lowering/execution to
+  cover generic `LIKE/NOT LIKE` patterns used by TPC-H.
+- `Q18` now runs after accepting direct derived grouped-aggregate join inputs,
+  lowering grouped-subquery `HAVING` into the same derived post-agg filter IR,
+  and preserving grouped-input sort keys when a `LIMIT` relies on
+  `GroupAggregate` output order instead of a top-level `Sort`.
+- `Q17` now runs after rewriting the correlated
+  `0.2 * avg(...)` scalar subquery into a derived grouped-agg input plus a
+  residual compare, and after widening post-agg output typing so
+  `sum(decimal) / 7.0` lowers cleanly on the join path.
+- `Q22` now runs after lowering `substring(... from 1 for 2)` into a dedicated
+  prefix expression opcode, preserving higher-scale numeric constants from the
+  scalar `AVG(...)` initplan compare, and accepting single-join anti-join
+  planner shapes.
+- `Q16` now runs after lowering hashed `NOT IN` membership subplans on base
+  scans into semi/anti join inputs inside the join tree, and after teaching
+  grouped aggregation to handle `COUNT(DISTINCT int32)` without leaving the
+  generic join executor path.
+- `Q20` now runs after widening base-scan leaf rewriting so a `SeqScan`
+  subquery can combine hashed `IN` membership with a correlated scalar
+  aggregate compare that is rewritten into an extra derived grouped-aggregate
+  join.
+- `Q21` now runs after nested-loop semi/anti join lowering starts extracting
+  only the equi-join subset of join quals as hash/probe keys, leaving
+  correlated `<>` residual predicates in the join filter path.
+- `Q2` now runs after bushy nested-loop inner-join trees are flattened into
+  the existing left-deep join IR using join-qual owner-plan context, which
+  also lets the correlated scalar `MIN(...)` rewrite lower against the same
+  generic project path.
+- `Q2`'s correlated `MIN(...)` rewrite now also initializes the derived
+  grouped-subplan expression roots correctly, so the nested grouped input no
+  longer hits runtime fallback while decoding grouped keys.
+- `pg_vec` now raises too-small session `max_stack_depth` settings to `7MB`
+  before translation, which removes the remaining default-stack fallback cases
+  on this machine such as `Q8` and `Q14`.
 - The translator now accepts live planner shapes with top `FINAL_DESERIAL`
   aggregates and elidable `INITIAL_SERIAL` pre-aggregation wrappers inside the
   join tree.
 - The multi-join executor now uses a streaming left-deep hash-probe pipeline
   instead of materializing a full intermediate joined-row set.
-- `q1`, `q3`, `q4`, `q5`, `q6`, `q7`, `q8`, `q9`, `q10`, `q11`, `q12`, `q14`,
-  `q19`, and `plain_expr`
+- `q1`, `q2`, `q3`, `q4`, `q5`, `q6`, `q7`, `q8`, `q9`, `q10`, `q11`, `q12`, `q13`,
+  `q14`, `q15`, `q16`, `q17`, `q18`, `q19`, `q20`, `q21`, `q22`, and
+  `plain_expr`
   regressions now have coverage in-tree.
 - The scan path now uses PostgreSQL's `read_stream` sequential path rather than
   manual block walking.
@@ -85,32 +134,14 @@
 - `Q8` and `Q9` are now supported on the generic multi-join grouped aggregate
   path.
 
-### Stage 3: Semi/Anti Join and Scalar Subqueries
+### Stage 4: Highest-Semantics Queries
 
-1. `Q15`
-    - scalar `MAX` subquery over derived aggregate relation
-2. `Q18`
-    - `IN (grouped subquery)` plus top-N
-
-### Stage 4: Correlated Aggregate Rewrite
-
-5. `Q17`
-    - correlated aggregate subquery rewritten as pre-agg plus join
-6. `Q22`
-    - `substring(... from 1 for 2)`, scalar `AVG` subquery, anti join
-
-### Stage 5: Highest-Semantics Queries
-
-7. `Q13`
-    - `LEFT JOIN` and nested grouping
-8. `Q16`
-    - `NOT IN`, `COUNT(DISTINCT ...)`, and sort
-9. `Q20`
-    - nested `IN`, prefix `LIKE`, correlated aggregate rewrite
-10. `Q21`
+1. `Q21`
     - `EXISTS` + `NOT EXISTS` with joins and top-N
-11. `Q2`
+    - done
+2. `Q2`
     - multi-join, suffix `LIKE`, scalar `MIN` subquery, top-N
+    - done
 
 ## Immediate Implementation Work
 
@@ -130,10 +161,6 @@
 
 ### Join Coverage Follow-up
 
-- Carry the same live-shape lowering path from `Q8`/`Q9` into the remaining
-  semi-join and scalar-subquery queries now that `Q3`, `Q5`, `Q7`, `Q10`, and
-  `Q11` accept top finalize aggregates, inner pre-aggregation wrappers, and
-  post-aggregate `HAVING`.
 - Keep the engine generic:
   - scan + left-deep hash join chain
   - grouped/plain aggregate on joined rows
@@ -141,6 +168,7 @@
 
 ## Guardrails
 
-- Keep `q1`, `q3`, `q4`, `q5`, `q6`, `q7`, `q8`, `q9`, `q10`, `q11`, `q12`,
-  `q14`, `q19`, and `plain_expr` green after every stage.
+- Keep `q1`, `q2`, `q3`, `q4`, `q5`, `q6`, `q7`, `q8`, `q9`, `q10`, `q11`, `q12`,
+  `q13`, `q14`, `q15`, `q16`, `q17`, `q18`, `q19`, `q20`, `q21`, `q22`, and
+  `plain_expr` green after every stage.
 - Add one regression per newly supported TPC-H query shape before moving on.

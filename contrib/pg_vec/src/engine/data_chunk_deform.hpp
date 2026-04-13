@@ -525,6 +525,10 @@ deform_compare_value(T lhs, T rhs, PgVecFilterOp op)
 			return lhs >= rhs;
 		case PG_VEC_OP_PREFIX_LIKE:
 		case PG_VEC_OP_CONTAINS_LIKE:
+		case PG_VEC_OP_NOT_PREFIX_LIKE:
+		case PG_VEC_OP_NOT_CONTAINS_LIKE:
+		case PG_VEC_OP_SQL_LIKE:
+		case PG_VEC_OP_NOT_SQL_LIKE:
 		case PG_VEC_OP_INVALID:
 		default:
 			return false;
@@ -582,6 +586,10 @@ string_const_compare_value(const PgVecStringConst &lhs,
 			return cmp >= 0;
 		case PG_VEC_OP_PREFIX_LIKE:
 		case PG_VEC_OP_CONTAINS_LIKE:
+		case PG_VEC_OP_NOT_PREFIX_LIKE:
+		case PG_VEC_OP_NOT_CONTAINS_LIKE:
+		case PG_VEC_OP_SQL_LIKE:
+		case PG_VEC_OP_NOT_SQL_LIKE:
 		case PG_VEC_OP_INVALID:
 		default:
 			return false;
@@ -617,6 +625,51 @@ payload_contains_bytes(const char *payload,
 	}
 
 	return false;
+}
+
+static inline bool
+payload_matches_like_pattern(const char *payload,
+							 std::size_t payload_len,
+							 const char *pattern,
+							 std::size_t pattern_len)
+{
+	std::size_t payload_idx = 0;
+	std::size_t pattern_idx = 0;
+	std::size_t last_percent_pattern = SIZE_MAX;
+	std::size_t last_percent_payload = 0;
+
+	while (payload_idx < payload_len)
+	{
+		if (pattern_idx < pattern_len &&
+			(pattern[pattern_idx] == '_' ||
+			 pattern[pattern_idx] == payload[payload_idx]))
+		{
+			pattern_idx++;
+			payload_idx++;
+			continue;
+		}
+
+		if (pattern_idx < pattern_len && pattern[pattern_idx] == '%')
+		{
+			last_percent_pattern = ++pattern_idx;
+			last_percent_payload = payload_idx;
+			continue;
+		}
+
+		if (last_percent_pattern != SIZE_MAX)
+		{
+			pattern_idx = last_percent_pattern;
+			payload_idx = ++last_percent_payload;
+			continue;
+		}
+
+		return false;
+	}
+
+	while (pattern_idx < pattern_len && pattern[pattern_idx] == '%')
+		pattern_idx++;
+
+	return pattern_idx == pattern_len;
 }
 
 static inline bool
@@ -779,6 +832,10 @@ string_ref_compare_value(const PgVecStringRef &lhs,
 			return cmp >= 0;
 		case PG_VEC_OP_PREFIX_LIKE:
 		case PG_VEC_OP_CONTAINS_LIKE:
+		case PG_VEC_OP_NOT_PREFIX_LIKE:
+		case PG_VEC_OP_NOT_CONTAINS_LIKE:
+		case PG_VEC_OP_SQL_LIKE:
+		case PG_VEC_OP_NOT_SQL_LIKE:
 		case PG_VEC_OP_INVALID:
 		default:
 			return false;
@@ -842,6 +899,23 @@ string_ref_contains_const(const PgVecStringRef &value,
 	}
 
 	return false;
+}
+
+static inline bool
+string_ref_matches_like_const(const PgVecStringRef &value,
+							  const PgVecStringArena *value_arena,
+							  const PgVecStringConst &pattern)
+{
+	{
+		PgVecStringConst tmp;
+
+		if (!string_ref_copy_to_const(value, value_arena, &tmp))
+			return false;
+		return payload_matches_like_pattern(tmp.bytes,
+											tmp.len,
+											pattern.bytes,
+											pattern.len);
+	}
 }
 
 static inline bool
@@ -948,11 +1022,28 @@ varlena_matches_string_const_inline(const void *ptr,
 									  payload_size,
 									  constant.bytes,
 									  constant.len);
+	if (op == PG_VEC_OP_NOT_CONTAINS_LIKE)
+		return !payload_contains_bytes(payload,
+									   payload_size,
+									   constant.bytes,
+									   constant.len);
+	if (op == PG_VEC_OP_SQL_LIKE)
+		return payload_matches_like_pattern(payload,
+											payload_size,
+											constant.bytes,
+											constant.len);
+	if (op == PG_VEC_OP_NOT_SQL_LIKE)
+		return !payload_matches_like_pattern(payload,
+											 payload_size,
+											 constant.bytes,
+											 constant.len);
 	if (!bytes_to_string_const(payload, payload_size, &value))
 		return false;
 
 	if (op == PG_VEC_OP_PREFIX_LIKE)
 		return string_const_starts_with(value, constant);
+	if (op == PG_VEC_OP_NOT_PREFIX_LIKE)
+		return !string_const_starts_with(value, constant);
 	if (op == PG_VEC_OP_CONTAINS_LIKE)
 		return string_const_contains(value, constant);
 	return string_const_compare_value(value, constant, op);

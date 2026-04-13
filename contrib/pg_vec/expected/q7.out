@@ -100,12 +100,12 @@ ORDER BY
 	supp_nation,
 	cust_nation,
 	l_year;
- supp_nation | cust_nation | l_year | revenue  
--------------+-------------+--------+----------
- FRANCE      | GERMANY     |   1995 | 160.0000
- FRANCE      | GERMANY     |   1996 |  40.0000
- GERMANY     | FRANCE      |   1995 |  90.0000
- GERMANY     | FRANCE      |   1996 |  50.0000
+        supp_nation        |        cust_nation        | l_year | revenue  
+---------------------------+---------------------------+--------+----------
+ FRANCE                    | GERMANY                   |   1995 | 160.0000
+ FRANCE                    | GERMANY                   |   1996 |  40.0000
+ GERMANY                   | FRANCE                    |   1995 |  90.0000
+ GERMANY                   | FRANCE                    |   1996 |  50.0000
 (4 rows)
 
 DROP TABLE lineitem;
