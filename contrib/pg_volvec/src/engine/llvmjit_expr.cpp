@@ -23,6 +23,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <algorithm>
 #include <vector>
 
 namespace pg_volvec {
@@ -40,6 +41,18 @@ static llvm_get_function_type pg_llvm_get_function = nullptr;
 static llvm_mutable_module_type pg_llvm_mutable_module = nullptr;
 static llvm_pg_var_type_type pg_llvm_pg_var_type = nullptr;
 static llvm_release_context_direct_type pg_llvm_release_context_direct = nullptr;
+static std::vector<JitContext *> pg_volvec_live_jit_contexts;
+
+static void
+unregister_jit_context(JitContext *context)
+{
+	auto it = std::find(pg_volvec_live_jit_contexts.begin(),
+						pg_volvec_live_jit_contexts.end(),
+						context);
+
+	if (it != pg_volvec_live_jit_contexts.end())
+		pg_volvec_live_jit_contexts.erase(it);
+}
 
 static bool
 resolve_jit_symbols_from_process()
@@ -94,13 +107,45 @@ load_jit_symbols(const char **failure_reason)
 }
 
 void
+pg_volvec_register_llvm_jit_context(JitContext *context)
+{
+	if (context == nullptr)
+		return;
+	if (std::find(pg_volvec_live_jit_contexts.begin(),
+				  pg_volvec_live_jit_contexts.end(),
+				  context) == pg_volvec_live_jit_contexts.end())
+		pg_volvec_live_jit_contexts.push_back(context);
+}
+
+void
 pg_volvec_release_llvm_jit_context(JitContext *context)
 {
 	if (context == nullptr)
 		return;
+	unregister_jit_context(context);
 	if (!load_jit_symbols(nullptr))
 		return;
 	pg_llvm_release_context_direct((LLVMJitContext *) context);
+}
+
+size_t
+pg_volvec_release_all_registered_llvm_jit_contexts_for_proc_exit()
+{
+	size_t released = 0;
+
+	if (!load_jit_symbols(nullptr))
+		return 0;
+	while (!pg_volvec_live_jit_contexts.empty())
+	{
+		JitContext *context = pg_volvec_live_jit_contexts.back();
+
+		pg_volvec_live_jit_contexts.pop_back();
+		if (context == nullptr)
+			continue;
+		pg_llvm_release_context_direct((LLVMJitContext *) context);
+		released++;
+	}
+	return released;
 }
 
 static inline int64_t
@@ -303,6 +348,7 @@ pg_volvec_expr_opcode_supported(VecOpCode opcode)
 		case VecOpCode::EEOP_DATE_GE:
 		case VecOpCode::EEOP_AND:
 		case VecOpCode::EEOP_OR:
+		case VecOpCode::EEOP_NOT:
 		case VecOpCode::EEOP_INT64_CASE:
 		case VecOpCode::EEOP_FLOAT8_CASE:
 		case VecOpCode::EEOP_STR_EQ:
@@ -987,6 +1033,16 @@ pg_volvec_emit_expr_row(LLVMBuilderRef b,
 										reg_null[r], reg_i32[r],
 										&reg_null[res], &reg_i32[res]);
 				break;
+			case VecOpCode::EEOP_NOT:
+			{
+				if (!reg_null[l] || !reg_i32[l])
+					return false;
+				reg_null[res] = reg_null[l];
+				LLVMValueRef val_i1 = LLVMBuildTrunc(b, reg_i32[l], type_i1, "");
+				LLVMValueRef negated = LLVMBuildNot(b, val_i1, "");
+				reg_i32[res] = LLVMBuildZExt(b, negated, type_i32, "");
+				break;
+			}
 			case VecOpCode::EEOP_INT64_CASE:
 			{
 				int c = step.d.ternary.cond;
@@ -1251,18 +1307,37 @@ bool pg_volvec_try_compile_jit_expr(const VecExprProgram *program, VecExprJitFun
 		return false;
 	LLVMJitContext *ctx = (LLVMJitContext *) pg_llvm_create_context(PGJIT_PERFORM | PGJIT_OPT3);
 	char base_name[96];
+	char *funcname;
+	LLVMValueRef fn = nullptr;
+	bool success = false;
+
 	snprintf(base_name, sizeof(base_name), "pg_volvec_jit_expr_%p", (const void *) program);
-	char *funcname = pg_llvm_expand_funcname(ctx, base_name);
-	LLVMValueRef fn = compile_expr_to_jit(ctx, program, funcname);
-	if (!fn) {
-		if (failure_reason != nullptr && *failure_reason == nullptr)
-			*failure_reason = "expression JIT lowering rejected the program";
-		pg_volvec_release_llvm_jit_context(&ctx->base);
-		return false;
+	funcname = pg_llvm_expand_funcname(ctx, base_name);
+	PG_TRY();
+	{
+		fn = compile_expr_to_jit(ctx, program, funcname);
+		if (!fn)
+		{
+			if (failure_reason != nullptr && *failure_reason == nullptr)
+				*failure_reason = "expression JIT lowering rejected the program";
+		}
+		else
+		{
+			*out_func = (VecExprJitFunc) pg_llvm_get_function(ctx, funcname);
+			*out_context = &ctx->base;
+			pg_volvec_register_llvm_jit_context(&ctx->base);
+			success = true;
+		}
 	}
-	*out_func = (VecExprJitFunc) pg_llvm_get_function(ctx, funcname);
-	*out_context = &ctx->base;
-	return true;
+	PG_CATCH();
+	{
+		pg_llvm_release_context_direct(ctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!success)
+		pg_llvm_release_context_direct(ctx);
+	return success;
 }
 
 } /* namespace pg_volvec */

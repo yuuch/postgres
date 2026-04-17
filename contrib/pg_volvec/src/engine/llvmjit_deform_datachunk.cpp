@@ -147,11 +147,8 @@ pg_volvec_jit_deform_supported(TupleDesc desc,
 				*failure_reason = "dropped attributes are not supported by deform JIT";
 			return false;
 		}
-		if (att->atthasmissing) {
-			if (failure_reason != nullptr)
-				*failure_reason = "missing attributes are not supported by deform JIT";
-			return false;
-		}
+		/* atthasmissing is intentionally not rejected here. The JIT-generated code
+		 * has attunavail blocks that null out targets for short tuples. */
 			if (att->attlen == -2) {
 				if (failure_reason != nullptr)
 					*failure_reason = "cstring attributes are not supported by deform JIT";
@@ -1060,6 +1057,8 @@ pg_volvec_try_compile_jit_deform_to_datachunk(TupleDesc desc,
 			if (out_context != nullptr && *out_context == nullptr)
 				*out_context = &context->base;
 			success = (out_func == nullptr || *out_func != nullptr);
+			if (success)
+				pg_volvec_register_llvm_jit_context(&context->base);
 		}
 	}
 	PG_CATCH();

@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="820" viewBox="0 0 1280 820">
+<rect width="1280" height="820" fill="#fbfaf7"/>
+<rect x="24" y="24" width="1232" height="772" rx="18" fill="#ffffff" stroke="#e7e1d8"/>
+<text x="92" y="50" font-family="Helvetica, Arial, sans-serif" font-size="24" font-weight="700" fill="#17202a">PostgreSQL vs pg_volvec TPCH parallel-14 benchmark</text>
+<text x="92" y="75" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#647083">Median of 3 runs, timeout capped at 180s. Native PG uses Gather parallel (14 workers); pg_volvec uses its own parallel executor (14 workers). OK/OK geomean PG/volvec: 0.93x. Capped-all geomean: 1.14x.</text>
+<rect x="780" y="42" width="12" height="12" rx="2" fill="#336791"/>
+<text x="798" y="53" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#647083">PostgreSQL native</text>
+<rect x="933" y="42" width="12" height="12" rx="2" fill="#C63D2F"/>
+<text x="951" y="53" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#647083">pg_volvec</text>
+<text x="1232" y="53" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#647083">volvec faster: 5, flat: 0, slower: 14, PG timeout: 3, volvec timeout: 1</text>
+<line x1="92.0" y1="86" x2="92.0" y2="758" stroke="#d9dde5" stroke-width="1"/>
+<text x="92.0" y="780" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">0s</text>
+<line x1="262.0" y1="86" x2="262.0" y2="758" stroke="#d9dde5" stroke-width="1"/>
+<text x="262.0" y="780" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">30s</text>
+<line x1="432.0" y1="86" x2="432.0" y2="758" stroke="#d9dde5" stroke-width="1"/>
+<text x="432.0" y="780" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">60s</text>
+<line x1="602.0" y1="86" x2="602.0" y2="758" stroke="#d9dde5" stroke-width="1"/>
+<text x="602.0" y="780" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">90s</text>
+<line x1="772.0" y1="86" x2="772.0" y2="758" stroke="#d9dde5" stroke-width="1"/>
+<text x="772.0" y="780" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">120s</text>
+<line x1="942.0" y1="86" x2="942.0" y2="758" stroke="#d9dde5" stroke-width="1"/>
+<text x="942.0" y="780" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">150s</text>
+<line x1="1112.0" y1="86" x2="1112.0" y2="758" stroke="#d9dde5" stroke-width="1"/>
+<text x="1112.0" y="780" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">180s</text>
+<text x="78" y="110" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q1</text>
+<rect x="92" y="98" width="14.2" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="110" width="8.5" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="114.2" y="106" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">2.51s</text>
+<text x="114.2" y="118" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">1.49s</text>
+<text x="1160" y="110" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#147d4f">1.68x</text>
+<text x="1232" y="110" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#147d4f">+68.1%</text>
+<text x="78" y="139" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q2</text>
+<rect x="92" y="127" width="1020.0" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="139" width="1020.0" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="1120.0" y="135" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">180s</text>
+<text x="1120.0" y="147" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">180s</text>
+<text x="1160" y="139" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#647083">timeout</text>
+<text x="1232" y="139" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">both 180s</text>
+<text x="78" y="168" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q3</text>
+<rect x="92" y="156" width="10.6" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="168" width="11.8" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="111.8" y="164" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">1.86s</text>
+<text x="111.8" y="176" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">2.08s</text>
+<text x="1160" y="168" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.89x</text>
+<text x="1232" y="168" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-10.6%</text>
+<text x="78" y="197" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q4</text>
+<rect x="92" y="185" width="14.3" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="197" width="96.2" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="196.2" y="193" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">2.52s</text>
+<text x="196.2" y="205" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">17.0s</text>
+<text x="1160" y="197" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.15x</text>
+<text x="1232" y="197" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-85.2%</text>
+<text x="78" y="226" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q5</text>
+<rect x="92" y="214" width="46.2" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="226" width="17.3" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="146.2" y="222" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">8.15s</text>
+<text x="146.2" y="234" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">3.04s</text>
+<text x="1160" y="226" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#147d4f">2.68x</text>
+<text x="1232" y="226" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#147d4f">+167.6%</text>
+<text x="78" y="255" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q6</text>
+<rect x="92" y="243" width="5.7" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="255" width="6.1" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="106.1" y="251" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">1.00s</text>
+<text x="106.1" y="263" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">1.08s</text>
+<text x="1160" y="255" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.93x</text>
+<text x="1232" y="255" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-6.9%</text>
+<text x="78" y="284" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q7</text>
+<rect x="92" y="272" width="7.5" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="284" width="17.7" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="117.7" y="280" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">1.32s</text>
+<text x="117.7" y="292" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">3.12s</text>
+<text x="1160" y="284" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.42x</text>
+<text x="1232" y="284" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-57.9%</text>
+<text x="78" y="313" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q8</text>
+<rect x="92" y="301" width="13.7" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="313" width="17.5" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="117.5" y="309" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">2.41s</text>
+<text x="117.5" y="321" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">3.10s</text>
+<text x="1160" y="313" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.78x</text>
+<text x="1232" y="313" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-22.1%</text>
+<text x="78" y="342" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q9</text>
+<rect x="92" y="330" width="34.7" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="342" width="21.1" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="134.7" y="338" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">6.12s</text>
+<text x="134.7" y="350" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">3.72s</text>
+<text x="1160" y="342" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#147d4f">1.65x</text>
+<text x="1232" y="342" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#147d4f">+64.5%</text>
+<text x="78" y="371" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q10</text>
+<rect x="92" y="359" width="15.0" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="371" width="20.3" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="120.3" y="367" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">2.65s</text>
+<text x="120.3" y="379" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">3.58s</text>
+<text x="1160" y="371" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.74x</text>
+<text x="1232" y="371" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-26.0%</text>
+<text x="78" y="400" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q11</text>
+<rect x="92" y="388" width="1.8" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="400" width="3.9" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="103.9" y="396" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">0.32s</text>
+<text x="103.9" y="408" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">0.69s</text>
+<text x="1160" y="400" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.46x</text>
+<text x="1232" y="400" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-54.2%</text>
+<text x="78" y="429" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q12</text>
+<rect x="92" y="417" width="10.4" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="429" width="21.4" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="121.4" y="425" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">1.83s</text>
+<text x="121.4" y="437" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">3.77s</text>
+<text x="1160" y="429" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.48x</text>
+<text x="1232" y="429" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-51.6%</text>
+<text x="78" y="458" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q13</text>
+<rect x="92" y="446" width="23.5" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="458" width="29.1" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="129.1" y="454" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">4.15s</text>
+<text x="129.1" y="466" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">5.13s</text>
+<text x="1160" y="458" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.81x</text>
+<text x="1232" y="458" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-19.2%</text>
+<text x="78" y="487" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q14</text>
+<rect x="92" y="475" width="6.0" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="487" width="15.6" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="115.6" y="483" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">1.06s</text>
+<text x="115.6" y="495" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">2.76s</text>
+<text x="1160" y="487" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.39x</text>
+<text x="1232" y="487" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-61.5%</text>
+<text x="78" y="516" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q15</text>
+<rect x="92" y="504" width="16.0" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="516" width="48.0" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="148.0" y="512" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">2.82s</text>
+<text x="148.0" y="524" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">8.48s</text>
+<text x="1160" y="516" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.33x</text>
+<text x="1232" y="516" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-66.8%</text>
+<text x="78" y="545" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q16</text>
+<rect x="92" y="533" width="21.7" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="545" width="2.2" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="121.7" y="541" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">3.82s</text>
+<text x="121.7" y="553" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">0.38s</text>
+<text x="1160" y="545" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#147d4f">9.98x</text>
+<text x="1232" y="545" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#147d4f">+897.9%</text>
+<text x="78" y="574" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q17</text>
+<rect x="92" y="562" width="1020.0" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="574" width="72.1" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="1120.0" y="570" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">180s</text>
+<text x="1120.0" y="582" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">12.7s</text>
+<text x="1160" y="574" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#147d4f">14.14x</text>
+<text x="1232" y="574" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#147d4f">+1314.3%</text>
+<text x="78" y="603" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q18</text>
+<rect x="92" y="591" width="146.8" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="603" width="163.9" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="263.9" y="599" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">25.9s</text>
+<text x="263.9" y="611" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">28.9s</text>
+<text x="1160" y="603" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.90x</text>
+<text x="1232" y="603" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-10.4%</text>
+<text x="78" y="632" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q19</text>
+<rect x="92" y="620" width="4.8" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="632" width="5.5" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="105.5" y="628" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">0.84s</text>
+<text x="105.5" y="640" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">0.97s</text>
+<text x="1160" y="632" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.87x</text>
+<text x="1232" y="632" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-13.0%</text>
+<text x="78" y="661" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q20</text>
+<rect x="92" y="649" width="1020.0" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="661" width="217.4" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="1120.0" y="657" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">180s</text>
+<text x="1120.0" y="669" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">38.4s</text>
+<text x="1160" y="661" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#147d4f">4.69x</text>
+<text x="1232" y="661" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#147d4f">+369.2%</text>
+<text x="78" y="690" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q21</text>
+<rect x="92" y="678" width="385.5" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="690" width="39.7" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="485.5" y="686" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">68.0s</text>
+<text x="485.5" y="698" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">7.00s</text>
+<text x="1160" y="690" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#147d4f">9.71x</text>
+<text x="1232" y="690" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#147d4f">+871.3%</text>
+<text x="78" y="719" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#17202a">Q22</text>
+<rect x="92" y="707" width="4.5" height="9" rx="3" fill="#336791" opacity="0.95"/>
+<rect x="92" y="719" width="6.9" height="9" rx="3" fill="#C63D2F" opacity="0.95"/>
+<text x="106.9" y="715" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">0.80s</text>
+<text x="106.9" y="727" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#C63D2F">1.21s</text>
+<text x="1160" y="719" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#b13b2e">0.66x</text>
+<text x="1232" y="719" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#b13b2e">-34.3%</text>
+<text x="92" y="798" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#647083">Data: tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.tsv. Lower is better; ratio = PostgreSQL median / pg_volvec median. Timeout bars are clipped to 180s.</text>
+</svg>

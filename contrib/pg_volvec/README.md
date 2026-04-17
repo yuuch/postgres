@@ -1,20 +1,33 @@
 # pg_volvec
 
-`pg_volvec` is a PostgreSQL extension prototype that keeps PostgreSQL planning unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
+`pg_volvec` is a PostgreSQL extension prototype that keeps PostgreSQL planning
+unchanged and offloads supported OLAP plan subtrees into a vectorized
+executor.
 
-## Architecture
+## What It Is
 
-- PostgreSQL still plans the query. `pg_volvec` hooks `ExecutorStart` / `ExecutorRun` / `ExecutorEnd` and intercepts only supported subtrees.
-- The execution engine is columnar and `DataChunk`-oriented. The main operator family today is `SeqScan -> optional qual -> HashJoin / Agg / Sort / Limit / SubqueryScan`.
-- Scan hot paths use tuple deform JIT to decode heap tuples directly into typed column arrays.
-- Expression evaluation lowers to a linear IR and, when supported, compiles to fused LLVM loops so intermediate vector temporaries do not need to be materialized.
-- TPC-H-style `NUMERIC(15,2)` values run as scaled `int64` in the hot path, with widened accumulation for aggregation.
-- Wider exact numeric expressions use an `int128`-style `Wide128` path for correctness. That path is currently interpreter-only; expression JIT intentionally fences it off until the LLVM lowering supports the same wide semantics.
-- Strings use prefix-aware refs and only fall back to owned storage when needed.
+- PostgreSQL still owns parsing, rewriting, planning, snapshots, and result
+  delivery.
+- `pg_volvec` hooks `ExecutorStart` / `ExecutorRun` / `ExecutorEnd` and
+  replaces supported plan regions with a `DataChunk`-oriented columnar engine.
+- Scan hot paths use tuple deform JIT to decode heap tuples directly into
+  typed column arrays.
+- Expression evaluation lowers to a linear IR and, when supported, compiles to
+  fused LLVM row loops so intermediate vectors do not have to be materialized.
+- TPC-H-style `NUMERIC(15,2)` values run as scaled `int64` in the hot path,
+  with widened accumulation for aggregation.
+- Wider exact numeric expressions use a correctness-first `Wide128` path.
+  That path is intentionally interpreter-only today.
+- Process-parallel execution is lowered into a pipeline DAG plus
+  morsel-driven runtime, while PostgreSQL's own planner remains the source of
+  truth for the physical plan shape.
 
-In short: PostgreSQL planner on top, `pg_volvec` columnar executor underneath, with JIT on both tuple deform and expression evaluation.
+In short: PostgreSQL planner on top, `pg_volvec` vector executor underneath,
+with JIT on both tuple deform and expression evaluation.
 
-## Current Coverage
+## Current Status
+
+Status refreshed: `2026-04-17`
 
 Fully verified offloaded TPC-H queries:
 
@@ -44,75 +57,144 @@ Offloaded with narrower validation:
 - Q17
 - Q21
 
-`Q17` now runs through the process-parallel path on the live TPC-H data set and matches the rewrite-based native reference; the remaining gap is a full original-query native diff, because the local native PostgreSQL plan times out at the 180s benchmark cap.
+Current executor surface:
 
-`Q21` is intentionally deprioritized for now. The dominant problem on that query shape looks more like PostgreSQL planner quality on many-table joins plus sublinks than a clear missing primitive inside the `pg_volvec` executor.
+- `SeqScan`
+- `Filter`
+- grouped / ungrouped `Agg`
+- in-memory final `Sort`
+- constant-count `Limit`
+- `HashJoin`
+- current hash-backed right/left outer join subset
+- `SubqueryScan`
+- `MergeJoin`-planned shapes through a hash-backed fallback
+- current Q22-style right-anti-planned shapes through a hash-backed fallback
 
-## TPC-H Timing Snapshot
+Important current boundaries:
 
-The chart below compares PostgreSQL, `pg_duckdb`, and `pg_volvec` on all 22 TPC-H queries using a single fair benchmark sweep on the developer machine.
+- `Wide128` exact numeric expression programs do not use expression JIT yet.
+- int-like comparison opcodes and numeric division currently stay on the
+  interpreter path for correctness.
+- `VecSortState` is still a first-cut in-memory single-run sort.
+- Process-parallel execution is live on the validated query family, but nested
+  hash-build dependency chains may still fall back to a leader-built shared
+  hash bridge. Q11 is the important example.
+- Q21 is no longer the default next executor target. The dominant local pain
+  point there looks more like PostgreSQL planner quality than a missing
+  executor primitive.
 
-- All three engines come from the `2026-04-09` full-suite rerun.
-- Each point is the median of 3 runs.
-- PostgreSQL parallel query is disabled in-session for all three engines.
-- `TIMEOUT` is plotted as `180s`.
+## Benchmark Artifacts
+
+### Fair Three-Way Baseline
+
+Checked-in artifact:
+
+- [benchmarks/tpch_perf_snapshot.svg](benchmarks/tpch_perf_snapshot.svg)
+- [benchmarks/tpch_perf_snapshot.tsv](benchmarks/tpch_perf_snapshot.tsv)
+
+This sweep is the current broad three-way comparison across PostgreSQL,
+`pg_duckdb`, and `pg_volvec`.
+
+- Run date: `2026-04-09`
+- Method: median of 3 runs
+- PostgreSQL parallel query: disabled for all three engines
+- Timeout bucket: `180s`
 
 Quick read:
 
-- Across the 18 direct `OK vs OK vs OK` comparisons, `pg_volvec` is fastest on 13 and `pg_duckdb` is fastest on 5.
-- The geometric mean speedup versus native PostgreSQL on those direct comparisons is about `1.72x` for `pg_volvec` and `1.22x` for `pg_duckdb`.
-- Native PostgreSQL hits the `180s` cap on `Q2`, `Q17`, `Q20`, and `Q21`; `pg_volvec` still times out on `Q2`; `pg_duckdb` completes all 22 in this sweep.
+- Across the direct `OK vs OK vs OK` comparisons, `pg_volvec` is fastest more
+  often than either native PostgreSQL or `pg_duckdb`.
+- `pg_volvec` is especially strong on Q1 / Q5 / Q6 / Q7 / Q8 / Q11 / Q12 /
+  Q14 / Q18 / Q19 / Q22 in this fair no-PG-parallel setting.
+- Q2 remains incomplete for `pg_volvec` in this sweep.
 
-![TPC-H timing comparison](tpch_perf_snapshot.svg)
+![TPC-H timing comparison](benchmarks/tpch_perf_snapshot.svg)
 
-The underlying snapshot is checked into [tpch_perf_snapshot.tsv](tpch_perf_snapshot.tsv).
+### PG Parallel vs pg_volvec Parallel
 
-### Process-Parallel Checkpoint
+Checked-in artifact:
 
-The 2026-04-12 process-parallel sweep skips Q2 and Q21, keeps PostgreSQL `Gather` parallelism off, and uses median-of-3 timings. `pg_duckdb` and native PostgreSQL keep `max_parallel_workers = 0`; `pg_volvec` uses `pg_volvec.parallel = on`, `pg_volvec.parallel_max_workers = 4`, and `max_parallel_workers = 8`. Q3 uses `enable_eager_aggregate = off` for all three engines so the plan shape stays compatible with the current `pg_volvec` lowering.
+- [benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.svg](benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.svg)
+- [benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.tsv](benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.tsv)
 
-Quick read:
+This sweep compares native PostgreSQL with `14` parallel workers against
+`pg_volvec`'s own process-parallel runtime with `14` workers.
 
-- Across the 18 direct `OK vs OK vs OK` comparisons, `pg_volvec` is fastest on 11, `pg_duckdb` is fastest on 6, and native PostgreSQL is fastest on 1.
-- The geometric mean speedup versus native PostgreSQL on those direct comparisons is about `1.55x` for `pg_volvec` and `1.10x` for `pg_duckdb`.
-- Q17 is now process-parallel and correct in this sweep: native PostgreSQL times out at `180s`, `pg_duckdb` is `15.364s`, and `pg_volvec` is `14.601s`.
-- This sweep predates the 2026-04-13 process-parallel bad-shape guard. In the raw sweep, Q10, Q12, and Q14 regressed versus native PostgreSQL; a follow-up spot fix now skips Q10/Q14 shapes where a small `HashProbeSource` would make workers redundantly build a much larger local hash-join subtree. Q12 did not reproduce as a bad process-parallel choice in the post-fix spot check, but the chart should be refreshed with a full rerun.
-- Q20 finishes in `pg_volvec` but is still much slower than `pg_duckdb`.
+- Run date: `2026-04-14`
+- Method: median of 3 runs
+- This is not the same fairness criterion as the three-way baseline above
+- It is useful for identifying where `pg_volvec`'s current parallel runtime is
+  already competitive and where worker setup / hash-build strategy still
+  loses to PostgreSQL's native parallel executor
 
-The process-parallel checkpoint data is checked into [tpch_perf_process_parallel_skip_q2_q21_20260412.tsv](tpch_perf_process_parallel_skip_q2_q21_20260412.tsv).
+Notable outcomes in this checkpoint:
+
+- `pg_volvec` clearly wins on Q1 / Q5 / Q9 / Q16 / Q17 / Q20 / Q21.
+- Native PostgreSQL still wins on Q3 / Q4 / Q6 / Q7 / Q8 / Q10 / Q11 / Q12 /
+  Q13 / Q14 / Q15 / Q18 / Q22.
+- Q4 and Q12 are the clearest reminders that current process-worker lowering
+  is functionally broad but not yet performance-closed.
 
 ## Build And Install
 
 Use PostgreSQL's top-level Meson build.
+
+If `build/` does not exist yet:
 
 ```bash
 meson setup build \
   --prefix="$(pwd)/installed" \
   -Dllvm=enabled \
   --buildtype=debugoptimized
-
-meson compile -C build pg_volvec
-meson install -C build --only-changed
 ```
+
+Normal development cycle:
+
+```bash
+CCACHE_DISABLE=1 PATH=/opt/homebrew/bin:$PATH meson compile -C build pg_volvec
+CCACHE_DISABLE=1 PATH=/opt/homebrew/bin:$PATH meson install -C build --only-changed
+./installed/bin/pg_ctl -D ~/data/pg_tpch restart -m fast -l ~/data/pg_tpch/logfile
+```
+
+After every `meson install`, restart PostgreSQL before testing. Do not assume
+the backend will pick up a freshly installed `pg_volvec` binary without a
+restart.
 
 ## Project Layout
 
-- `src/bridge/`: PostgreSQL hook integration and result handoff
-- `src/engine/executor.cpp`: vectorized plan initialization and operator implementations
-- `src/engine/expr.cpp`: expression lowering and interpreter
+- `src/bridge/`: PostgreSQL hook integration, query-state registry, and
+  tuple/materialization handoff
+- `src/engine/core/`: low-level shared primitives such as `DataChunk`,
+  allocators, and serialized hash metadata
+- `src/engine/expr/` plus `src/engine/expr.cpp`: expression IR surface plus
+  lowering/interpreter
+- `src/engine/exec/`: vector operator and plan-state layer (`SeqScan`, `Agg`,
+  `HashJoin`, `Sort`, `Filter`, `Limit`, and helpers), built as separate
+  translation units
+- `src/engine/parallel/` plus `src/engine/parallel_runtime.cpp`: pipeline
+  lowering and process-parallel scheduler/runtime
 - `src/engine/llvmjit_expr.cpp`: expression JIT
 - `src/engine/llvmjit_deform_datachunk.cpp`: tuple deform JIT
+- `src/engine/executor.cpp`: reference file kept in-tree, but no longer built
+  by Meson
 
-## More Docs
+## Docs
 
-- [LOCAL_RUNBOOK.md](LOCAL_RUNBOOK.md): local build, install, startup, profiling, and benchmark workflow
-- [DESIGN.md](DESIGN.md): higher-level executor design
-- [llvmjit_expr.md](llvmjit_expr.md): expression JIT notes
-- [jit_deform_datachunk.md](jit_deform_datachunk.md): deform JIT notes
-- [vecSortDesign.md](vecSortDesign.md): current sort design
-- [page-wise-scan.md](page-wise-scan.md): page-wise scan notes
-- [ROADMAP.md](ROADMAP.md): longer-term direction
-- [TODO.md](TODO.md): near-term work items
+- [docs/LOCAL_RUNBOOK.md](docs/LOCAL_RUNBOOK.md): local build, install,
+  startup, smoke, benchmark, and profiling workflow
+- [docs/DESIGN.md](docs/DESIGN.md): current executor architecture
+- [docs/module_split.md](docs/module_split.md): module split record
+- [docs/morsel_parallel_design.md](docs/morsel_parallel_design.md): parallel
+  runtime model and current boundaries
+- [docs/parallel_plan_normalization.md](docs/parallel_plan_normalization.md):
+  how accepted PostgreSQL parallel plans are normalized into `pg_volvec`
+- [docs/llvmjit_expr.md](docs/llvmjit_expr.md): expression JIT notes
+- [docs/jit_deform_datachunk.md](docs/jit_deform_datachunk.md): deform JIT
+  notes
+- [docs/vecSortDesign.md](docs/vecSortDesign.md): current sort design
+- [docs/page-wise-scan.md](docs/page-wise-scan.md): scan/read-stream notes
+- [docs/ROADMAP.md](docs/ROADMAP.md): medium-term direction
+- [docs/TODO.md](docs/TODO.md): immediate actionable work
 
 ## License
 

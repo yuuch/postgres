@@ -12,7 +12,6 @@ extern "C" {
 #include "utils/timestamp.h"
 
 extern bool pg_volvec_trace_hooks;
-extern bool pg_volvec_disable_jit_for_parallel_worker;
 }
 
 namespace pg_volvec
@@ -49,6 +48,7 @@ VecOpCodeName(VecOpCode opcode)
 		case VecOpCode::EEOP_DATE_PART_YEAR: return "DATE_PART_YEAR";
 		case VecOpCode::EEOP_AND: return "AND";
 		case VecOpCode::EEOP_OR: return "OR";
+		case VecOpCode::EEOP_NOT: return "NOT";
 		case VecOpCode::EEOP_INT64_CASE: return "INT64_CASE";
 		case VecOpCode::EEOP_FLOAT8_CASE: return "FLOAT8_CASE";
 		case VecOpCode::EEOP_STR_EQ: return "STR_EQ";
@@ -78,32 +78,93 @@ StripImplicitNodes(Expr *expr)
 }
 
 static bool
-TryConvertConstToDate32(Const *c, int32_t *out)
+IsReadyParamExecDatum(Oid type, const ParamExecData *prm)
 {
-	if (c == nullptr || c->constisnull || out == nullptr)
+	int16 typlen = 0;
+	bool typbyval = false;
+
+	if (prm == nullptr || prm->execPlan != nullptr || !OidIsValid(type))
+		return false;
+	if (prm->isnull)
+		return true;
+
+	get_typlenbyval(type, &typlen, &typbyval);
+	if (!typbyval && DatumGetPointer(prm->value) == nullptr)
+		return false;
+	return true;
+}
+
+static bool
+TryFoldDateLikeConstCompare(Const *c,
+							const char *opname,
+							int32_t *out_date,
+							VecOpCode *out_opcode)
+{
+	if (c == nullptr || c->constisnull || opname == nullptr ||
+		out_date == nullptr || out_opcode == nullptr)
 		return false;
 
 	if (c->consttype == DATEOID)
 	{
-		*out = DatumGetDateADT(c->constvalue);
+		*out_date = DatumGetDateADT(c->constvalue);
+		if (strcmp(opname, "<") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_LT;
+		else if (strcmp(opname, "<=") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_LE;
+		else if (strcmp(opname, ">") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_GT;
+		else if (strcmp(opname, ">=") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_GE;
+		else
+			return false;
 		return true;
 	}
 
 	if (c->consttype == TIMESTAMPOID)
 	{
 		Timestamp ts = DatumGetTimestamp(c->constvalue);
-		if ((ts % USECS_PER_DAY) != 0)
+		DateADT date_val;
+		bool exact_midnight;
+
+		if (TIMESTAMP_NOT_FINITE(ts))
 			return false;
-		*out = (int32_t) (ts / USECS_PER_DAY);
+		date_val = timestamp2date_safe(ts, nullptr);
+		exact_midnight = (ts == date2timestamp_safe(date_val, nullptr));
+		*out_date = date_val;
+		if (strcmp(opname, "<") == 0)
+			*out_opcode = exact_midnight ? VecOpCode::EEOP_DATE_LT : VecOpCode::EEOP_DATE_LE;
+		else if (strcmp(opname, "<=") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_LE;
+		else if (strcmp(opname, ">") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_GT;
+		else if (strcmp(opname, ">=") == 0)
+			*out_opcode = exact_midnight ? VecOpCode::EEOP_DATE_GE : VecOpCode::EEOP_DATE_GT;
+		else
+			return false;
 		return true;
 	}
 
 	if (c->consttype == TIMESTAMPTZOID)
 	{
 		TimestampTz ts = DatumGetTimestampTz(c->constvalue);
-		if ((ts % USECS_PER_DAY) != 0)
+		DateADT date_val;
+		bool exact_midnight;
+
+		if (TIMESTAMP_NOT_FINITE(ts))
 			return false;
-		*out = (int32_t) (ts / USECS_PER_DAY);
+		date_val = timestamptz2date_safe(ts, nullptr);
+		exact_midnight = (ts == date2timestamptz_safe(date_val, nullptr));
+		*out_date = date_val;
+		if (strcmp(opname, "<") == 0)
+			*out_opcode = exact_midnight ? VecOpCode::EEOP_DATE_LT : VecOpCode::EEOP_DATE_LE;
+		else if (strcmp(opname, "<=") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_LE;
+		else if (strcmp(opname, ">") == 0)
+			*out_opcode = VecOpCode::EEOP_DATE_GT;
+		else if (strcmp(opname, ">=") == 0)
+			*out_opcode = exact_midnight ? VecOpCode::EEOP_DATE_GE : VecOpCode::EEOP_DATE_GT;
+		else
+			return false;
 		return true;
 	}
 
@@ -1243,10 +1304,10 @@ void
 VecExprProgram::try_compile_jit()
 {
 #ifdef USE_LLVM
-	if (pg_volvec_disable_jit_for_parallel_worker)
+	if (!jit_enabled)
 	{
 		if (pg_volvec_trace_hooks)
-			elog(LOG, "pg_volvec: expr JIT disabled in process parallel worker");
+			elog(LOG, "pg_volvec: expr JIT disabled by core jit=off");
 		return;
 	}
 	for (int reg_idx = 0; reg_idx < max_reg_idx; reg_idx++)
@@ -1254,34 +1315,16 @@ VecExprProgram::try_compile_jit()
 		if (get_register_numeric_width(reg_idx) == VecNumericWidth::Wide128)
 			return;
 	}
-		bool has_intlike_compare = false;
-		for (const auto &step : steps)
-		{
-			if (step.opcode == VecOpCode::EEOP_VAR &&
-				step.d.var.storage_kind == VecOutputStorageKind::NumericAvgPair)
-				return;
-			if (step.opcode == VecOpCode::EEOP_INT64_DIV_FLOAT8)
-				return;
-			if (step.opcode == VecOpCode::EEOP_INT64_CASE)
-				return;
-			if (step.opcode == VecOpCode::EEOP_INT64_LT ||
-				step.opcode == VecOpCode::EEOP_INT64_LE ||
-				step.opcode == VecOpCode::EEOP_INT64_GT ||
-				step.opcode == VecOpCode::EEOP_INT64_GE ||
-				step.opcode == VecOpCode::EEOP_INT64_EQ ||
-				step.opcode == VecOpCode::EEOP_INT64_NE)
-				has_intlike_compare = true;
-		}
-		/*
-		 * Keep integer/numeric comparisons on the interpreter path until the
-		 * LLVM lowering has dedicated coverage for INT2/INT4 widening and scaled
-		 * numeric comparisons. A wrong filter is far more expensive than losing
-		 * this small JIT win.
-		 */
-		if (has_intlike_compare)
+	for (const auto &step : steps)
+	{
+		if (step.opcode == VecOpCode::EEOP_VAR &&
+			step.d.var.storage_kind == VecOutputStorageKind::NumericAvgPair)
 			return;
-		if (jit_func != nullptr || jit_context != nullptr)
+		if (step.opcode == VecOpCode::EEOP_INT64_DIV_FLOAT8)
 			return;
+	}
+	if (jit_func != nullptr || jit_context != nullptr)
+		return;
 	if (final_res_idx < 0)
 		return;
 	const char *fr = nullptr;
@@ -1496,6 +1539,15 @@ PopulateConstStep(VecExprProgram &program,
 
 	if (!constisnull)
 	{
+		int16 typlen = 0;
+		bool typbyval = false;
+
+		if (!OidIsValid(consttype))
+			return -1;
+		get_typlenbyval(consttype, &typlen, &typbyval);
+		if (!typbyval && DatumGetPointer(constvalue) == nullptr)
+			return -1;
+
 		if (consttype == FLOAT8OID)
 		{
 			step->d.constant.fval = DatumGetFloat8(constvalue);
@@ -1645,7 +1697,7 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 			estate->es_param_exec_vals == nullptr || param->paramid < 0)
 			return -1;
 		prm = &estate->es_param_exec_vals[param->paramid];
-		if (prm->execPlan != nullptr)
+		if (!IsReadyParamExecDatum(param->paramtype, prm))
 			return -1;
 
 		step.res_idx = res_idx;
@@ -1799,10 +1851,24 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 		char *funcname = get_func_name(func->funcid);
 		Expr *field_expr;
 		Expr *value_expr;
+		Expr *cast_arg_expr;
+		Oid cast_arg_type;
 		int arg;
 		VecExprStep step;
 
-		if (funcname == nullptr || list_length(func->args) != 2)
+		if (funcname == nullptr)
+			return -1;
+		if (func->funcresulttype == NUMERICOID &&
+			list_length(func->args) == 1)
+		{
+			cast_arg_expr = StripImplicitNodes((Expr *) linitial(func->args));
+			cast_arg_type = exprType((Node *) cast_arg_expr);
+
+			if (strcmp(funcname, "numeric") == 0 &&
+				IsIntegerType(cast_arg_type))
+				return CompileExprRecursive(cast_arg_expr, program, estate);
+		}
+		if (list_length(func->args) != 2)
 			return -1;
 		field_expr = StripImplicitNodes((Expr *) linitial(func->args));
 		value_expr = StripImplicitNodes((Expr *) lsecond(func->args));
@@ -1876,9 +1942,14 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 			IsA(right_expr, Const))
 		{
 			int32_t right_date = 0;
+			VecOpCode date_opcode;
 
 			left = CompileExprRecursive(left_expr, program, estate);
-			if (left < 0 || !TryConvertConstToDate32((Const *) right_expr, &right_date))
+			if (left < 0 ||
+				!TryFoldDateLikeConstCompare((Const *) right_expr,
+											 opname,
+											 &right_date,
+											 &date_opcode))
 				return -1;
 
 			right = AppendDateConstStep(program, right_date);
@@ -1888,16 +1959,7 @@ CompileExprRecursive(Expr *expr, VecExprProgram &program, EState *estate)
 			step.res_idx = res_idx;
 			step.d.op.left = left;
 			step.d.op.right = right;
-			if (strcmp(opname, "<") == 0)
-				step.opcode = VecOpCode::EEOP_DATE_LT;
-			else if (strcmp(opname, "<=") == 0)
-				step.opcode = VecOpCode::EEOP_DATE_LE;
-			else if (strcmp(opname, ">") == 0)
-				step.opcode = VecOpCode::EEOP_DATE_GT;
-			else if (strcmp(opname, ">=") == 0)
-				step.opcode = VecOpCode::EEOP_DATE_GE;
-			else
-				return -1;
+			step.opcode = date_opcode;
 
 			program.steps.push_back(step);
 			return res_idx;

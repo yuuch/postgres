@@ -560,30 +560,63 @@ bool pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQuerySta
 	MemoryContext old_context = MemoryContextSwitchTo(state_ptr->context);
 	const char *parallel_failure_reason = nullptr;
 	const char *scheduler_failure_reason = nullptr;
+	Plan *root_plan = queryDesc != nullptr && queryDesc->plannedstmt != nullptr ?
+		queryDesc->plannedstmt->planTree : nullptr;
+
+	if (pg_volvec_trace_hooks)
+		elog(LOG,
+			 "pg_volvec: initialize_plan root_nodeTag=%d parallelModeNeeded=%s operation=%d",
+			 root_plan != nullptr ? (int) nodeTag(root_plan) : -1,
+			 (queryDesc != nullptr && queryDesc->plannedstmt != nullptr &&
+			  queryDesc->plannedstmt->parallelModeNeeded) ? "on" : "off",
+			 queryDesc != nullptr ? (int) queryDesc->operation : -1);
+
 	state_ptr->vec_plan = pg_volvec::ExecInitVecPlan(queryDesc->plannedstmt->planTree, queryDesc->estate).release();
 	state_ptr->parallel_plan = nullptr;
 	state_ptr->parallel_scheduler = nullptr;
-	if (state_ptr->vec_plan != nullptr && pg_volvec_parallel)
+	if (pg_volvec_parallel)
 	{
 		std::unique_ptr<pg_volvec::ParallelPipelinePlan> parallel_plan =
 			pg_volvec::BuildParallelPipelinePlan(queryDesc->plannedstmt->planTree,
 												 queryDesc->plannedstmt,
 												 queryDesc->estate,
 												 &parallel_failure_reason);
-		state_ptr->parallel_plan = parallel_plan.release();
-		if (state_ptr->parallel_plan != nullptr)
+		if (state_ptr->vec_plan != nullptr)
 		{
-			std::unique_ptr<pg_volvec::ParallelSchedulerState> parallel_scheduler =
-				pg_volvec::BuildParallelSchedulerState(state_ptr->parallel_plan,
-													   state_ptr->context,
-													   pg_volvec_parallel_morsel_nblocks,
-													   &scheduler_failure_reason);
-			state_ptr->parallel_scheduler = parallel_scheduler.release();
+			state_ptr->parallel_plan = parallel_plan.release();
+			if (state_ptr->parallel_plan != nullptr)
+			{
+				std::unique_ptr<pg_volvec::ParallelSchedulerState> parallel_scheduler =
+					pg_volvec::BuildParallelSchedulerState(state_ptr->parallel_plan,
+														   state_ptr->context,
+														   pg_volvec_parallel_morsel_nblocks,
+														   &scheduler_failure_reason);
+				state_ptr->parallel_scheduler = parallel_scheduler.release();
+			}
+		}
+		else if (parallel_plan != nullptr && parallel_failure_reason == nullptr)
+		{
+			parallel_failure_reason =
+				"parallel lowering succeeded, but current executor bridge still requires vec_plan";
 		}
 	}
 	MemoryContextSwitchTo(old_context);
-	if (pg_volvec_trace_hooks && state_ptr->vec_plan == nullptr)
-		elog(LOG, "pg_volvec: plan initialization returned null, falling back to PostgreSQL executor");
+	if (state_ptr->vec_plan == nullptr)
+		elog(WARNING,
+			 "pg_volvec: plan initialization returned null, falling back to PostgreSQL executor%s%s%s",
+			 parallel_failure_reason != nullptr ? " (parallel: " : "",
+			 parallel_failure_reason != nullptr ? parallel_failure_reason : "",
+			 parallel_failure_reason != nullptr ? ")" : "");
+	else if (pg_volvec_parallel && state_ptr->parallel_plan == nullptr)
+		elog(WARNING, "pg_volvec: vec_plan built but parallel lowering skipped, running volvec serially (reason: %s)",
+			 parallel_failure_reason != nullptr ? parallel_failure_reason : "scheduler init");
+	else if (!pg_volvec_parallel)
+		elog(WARNING, "pg_volvec: pg_volvec.parallel=%s, running volvec serially",
+			 pg_volvec_parallel ? "on" : "off");
+	else
+		elog(WARNING, "pg_volvec: parallel plan built, pipelines=%zu, sched=%s, running parallel",
+			 state_ptr->parallel_plan != nullptr ? state_ptr->parallel_plan->pipeline_count() : 0,
+			 state_ptr->parallel_scheduler != nullptr ? "ok" : "null");
 	if (pg_volvec_trace_hooks && state_ptr->parallel_plan != nullptr)
 	{
 		elog(LOG,
@@ -620,14 +653,15 @@ bool pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQuerySta
 
 void pg_volvec_delete_plan(pg_volvec::PgVolVecQueryState *state_ptr)
 {
-	if (state_ptr->parallel_scheduler) {
-		delete state_ptr->parallel_scheduler;
-		state_ptr->parallel_scheduler = nullptr;
-	}
-	if (state_ptr->parallel_plan) {
-		delete state_ptr->parallel_plan;
-		state_ptr->parallel_plan = nullptr;
-	}
+	/*
+	 * The parallel lowering metadata is allocated inside state_ptr->context and
+	 * only lives until pg_volvec_close_query_state() immediately deletes that
+	 * MemoryContext. Let the context reclaim it wholesale instead of walking the
+	 * container graph here, which is fragile while ParallelPipelineDesc stores
+	 * MemoryContext-backed std::vector members.
+	 */
+	state_ptr->parallel_scheduler = nullptr;
+	state_ptr->parallel_plan = nullptr;
 	if (state_ptr->vec_plan) {
 		delete state_ptr->vec_plan;
 		state_ptr->vec_plan = nullptr;
@@ -689,13 +723,11 @@ extern "C" {
 bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *state_ptr,
 								ScanDirection direction, uint64 count)
 {
-	if (!state_ptr || !state_ptr->vec_plan) return false;
+	if (!state_ptr || !state_ptr->vec_plan)
+		return false;
 
-	pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_SIZE> *batch = new pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_SIZE>();
-	TupleTableSlot *slot = ExecAllocTableSlot(&queryDesc->estate->es_tupleTable, queryDesc->tupDesc, &TTSOpsVirtual);
 	uint64 processed = 0;
 	bool send_tuples = (queryDesc->operation == CMD_SELECT || queryDesc->plannedstmt->hasReturning);
-	if (!slot) { delete batch; return false; }
 
 	if (state_ptr->parallel_plan != nullptr && state_ptr->parallel_scheduler != nullptr)
 	{
@@ -716,11 +748,16 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 				elog(LOG,
 					 "pg_volvec: process parallel aggregate path skipped (%s), falling back to leader-only",
 					 parallel_failure_reason != nullptr ? parallel_failure_reason : "no reason recorded");
-			if (!(has_hash_build && !pg_volvec_parallel_experimental_hash_pipeline) &&
-				!TryExecuteLeaderOnlyParallelPlan(state_ptr))
+			if (has_hash_build && !pg_volvec_parallel_experimental_hash_pipeline)
+				return false;
+			if (!TryExecuteLeaderOnlyParallelPlan(state_ptr))
 				(void) TryExecuteLeaderOnlyParallelAggregate(state_ptr);
 		}
 	}
+
+	pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_SIZE> *batch = new pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_SIZE>();
+	TupleTableSlot *slot = ExecAllocTableSlot(&queryDesc->estate->es_tupleTable, queryDesc->tupDesc, &TTSOpsVirtual);
+	if (!slot) { delete batch; return false; }
 
 	queryDesc->estate->es_processed = 0;
 	if (send_tuples && queryDesc->dest && queryDesc->dest->rStartup)
@@ -745,24 +782,6 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 							} else if (typid == NUMERICOID) {
 								double fval = batch->double_columns[j][i];
 								int64_t ival = batch->int64_columns[j][i];
-
-								if (pg_volvec_trace_hooks)
-								{
-									static int numeric_bridge_trace_count = 0;
-
-									if (numeric_bridge_trace_count < 20)
-									{
-										elog(LOG,
-											 "pg_volvec: bridge numeric col=%d has_meta=%s storage=%u scale=%d ival=%lld fval=%.10f",
-											 j + 1,
-											 has_meta ? "on" : "off",
-											 has_meta ? (unsigned) col_meta.storage_kind : 0,
-											 has_meta ? col_meta.scale : 0,
-											 (long long) ival,
-											 fval);
-										numeric_bridge_trace_count++;
-									}
-								}
 
 								if (has_meta && col_meta.storage_kind == pg_volvec::VecOutputStorageKind::Double)
 									slot->tts_values[j] = DirectFunctionCall1(float8_numeric, Float8GetDatum(fval));

@@ -9,6 +9,8 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
+extern bool pg_volvec_trace_hooks;
+
 /* Definition of PgVolVecQueryState for C code */
 struct PgVolVecQueryState
 {
@@ -116,119 +118,42 @@ plan_uses_supported_relations(Plan *plan, PlannedStmt *plannedstmt)
 		   (plan->righttree == NULL || plan_uses_supported_relations(plan->righttree, plannedstmt));
 }
 
-static bool
-contains_non_simple_aggref_walker(Node *node, void *context)
-{
-	(void) context;
-
-	if (node == NULL)
-		return false;
-	if (IsA(node, Aggref))
-		return ((Aggref *) node)->aggsplit != AGGSPLIT_SIMPLE;
-	return expression_tree_walker(node, contains_non_simple_aggref_walker, context);
-}
-
-static bool
-plan_exprs_use_non_simple_aggref(Plan *plan)
-{
-	if (plan == NULL)
-		return false;
-	if (contains_non_simple_aggref_walker((Node *) plan->targetlist, NULL))
-		return true;
-	if (contains_non_simple_aggref_walker((Node *) plan->qual, NULL))
-		return true;
-	return false;
-}
-
-static bool
-is_supported_plan(Plan *plan, PlannedStmt *plannedstmt)
-{
-	if (plan == NULL)
-		return false;
-
-	if (plan_exprs_use_non_simple_aggref(plan))
-		return false;
-
-	if (IsA(plan, SeqScan))
-		return plan->lefttree == NULL &&
-			   plan->righttree == NULL &&
-			   plan_uses_supported_relations(plan, plannedstmt);
-
-	if (IsA(plan, Hash))
-		return plan->lefttree != NULL &&
-			   plan->righttree == NULL &&
-			   is_supported_plan(plan->lefttree, plannedstmt);
-
-	if (IsA(plan, HashJoin))
-		return plan->lefttree != NULL &&
-			   plan->righttree != NULL &&
-			   IsA(plan->righttree, Hash) &&
-			   is_supported_plan(plan->lefttree, plannedstmt) &&
-			   is_supported_plan(plan->righttree, plannedstmt);
-
-	if (IsA(plan, NestLoop))
-		return ((((Join *) plan)->jointype == JOIN_INNER) ||
-				(((Join *) plan)->jointype == JOIN_SEMI)) &&
-			   plan->lefttree != NULL &&
-			   plan->righttree != NULL &&
-			   is_supported_plan(plan->lefttree, plannedstmt) &&
-			   is_supported_plan(plan->righttree, plannedstmt);
-
-	if (IsA(plan, MergeJoin))
-		return ((Join *) plan)->jointype == JOIN_INNER &&
-			   ((MergeJoin *) plan)->mergeclauses != NIL &&
-			   plan->lefttree != NULL &&
-			   plan->righttree != NULL &&
-			   is_supported_plan(plan->lefttree, plannedstmt) &&
-			   is_supported_plan(plan->righttree, plannedstmt);
-
-	if (IsA(plan, SubqueryScan))
-		return ((SubqueryScan *) plan)->subplan != NULL &&
-			   is_supported_plan(((SubqueryScan *) plan)->subplan, plannedstmt);
-
-	if (IsA(plan, Material))
-		return plan->lefttree != NULL &&
-			   plan->righttree == NULL &&
-			   is_supported_plan(plan->lefttree, plannedstmt);
-
-	if (IsA(plan, Agg))
-	{
-		Agg *agg = (Agg *) plan;
-
-		/*
-		 * pg_volvec currently implements only simple aggregates. PostgreSQL may
-		 * introduce Partial/Finalize aggregate nodes whose Aggref result is a
-		 * transition state (for example numeric partial sum), and executing them
-		 * as a normal SUM/AVG/MAX produces wrong results.
-		 */
-		return agg->aggsplit == AGGSPLIT_SIMPLE &&
-			   plan->lefttree != NULL &&
-			   plan->righttree == NULL &&
-			   is_supported_plan(plan->lefttree, plannedstmt);
-	}
-
-	if (IsA(plan, Sort) || IsA(plan, Limit))
-		return plan->lefttree != NULL &&
-			   plan->righttree == NULL &&
-			   is_supported_plan(plan->lefttree, plannedstmt);
-
-	return false;
-}
-
 PgVolVecQueryState *
 pg_volvec_try_build_query_state(QueryDesc *queryDesc, int eflags)
 {
 	PgVolVecQueryState *state;
 	Plan *plan = queryDesc->plannedstmt->planTree;
+	(void) eflags;
 
-	if (is_supported_plan(plan, queryDesc->plannedstmt))
+	/*
+	 * Admission here is intentionally broad: PostgreSQL owns planning, and
+	 * pg_volvec decides exact shape support later during VecPlan / parallel
+	 * lowering. At this stage we only fence out plans that never touch
+	 * supported user relations.
+	 */
+	if (plan == NULL)
 	{
-		state = (PgVolVecQueryState *) palloc0(sizeof(PgVolVecQueryState));
-		state->context = AllocSetContextCreate(CurrentMemoryContext,
-											   "pg_volvec query context",
-											   ALLOCSET_DEFAULT_SIZES);
-		return state;
+		if (pg_volvec_trace_hooks)
+			elog(LOG, "pg_volvec: query state admission rejected because root plan is NULL");
+		return NULL;
+	}
+	if (!plan_uses_supported_relations(plan, queryDesc->plannedstmt))
+	{
+		if (pg_volvec_trace_hooks)
+			elog(LOG,
+				 "pg_volvec: query state admission rejected because plan does not touch supported user relations (nodeTag=%d)",
+				 (int) nodeTag(plan));
+		return NULL;
 	}
 
-	return NULL;
+	state = (PgVolVecQueryState *) palloc0(sizeof(PgVolVecQueryState));
+	state->context = AllocSetContextCreate(CurrentMemoryContext,
+										   "pg_volvec query context",
+										   ALLOCSET_DEFAULT_SIZES);
+	if (pg_volvec_trace_hooks)
+		elog(LOG,
+			 "pg_volvec: query state admitted (nodeTag=%d context=%p)",
+			 (int) nodeTag(plan),
+			 (void *) state->context);
+	return state;
 }

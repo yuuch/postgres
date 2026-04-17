@@ -1,6 +1,6 @@
 # LLVM JIT Deform to DataChunk in pg_volvec
 
-Status: implemented prototype, verified on 2026-04-02
+Status: implemented and in active use, refreshed on `2026-04-17`
 
 ## 1. Goal
 
@@ -112,6 +112,9 @@ Together with the numeric fixed-point path, this removed earlier hotspots such a
 - there is no end-to-end fused scan+expr kernel yet
 - some exotic PostgreSQL type / varlena shapes still depend on fallback behavior
 - there is no dedicated late-materialization-aware JIT path yet
+- process-worker validation may still choose to skip worker-local JIT in
+  specific safety/debugging modes while the parallel runtime continues to be
+  tightened
 
 ## 9. Next steps
 

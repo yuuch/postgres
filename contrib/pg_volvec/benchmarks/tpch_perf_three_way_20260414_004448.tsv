@@ -1,0 +1,13 @@
+query	pg_parallel_6s	pg_status	pg_volvec_parallel_s	pg_volvec_parallel_status	pg_volvec_serial_s	pg_volvec_serial_status
+q1	4.057	ok	2.041	ok	7.076	ok
+q3	3.044	ok	23.182	ok	23.190	ok
+q4	3.064	ok	error	error	85.743	ok
+q5	9.157	ok	28.895	ok	4.076	ok
+q6	2.085	ok	5.184	ok	3.068	ok
+q7	27.909	ok	3.134	ok	31.986	ok
+q8	4.084	ok	4.133	ok	8.308	ok
+q9	58.854	ok	32.157	ok	7.119	ok
+q10	28.921	ok	2064.301	ok	error	error
+q11	1.050	ok	2.055	ok	2.068	ok
+q12	27.720	ok	1093.392	ok	100.846	ok
+q13	60.790	ok	32.994	ok	6.093	ok

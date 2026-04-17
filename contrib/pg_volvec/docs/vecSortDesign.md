@@ -1,5 +1,7 @@
 # VecSortState Design
 
+Status: first-cut implementation landed, refreshed on `2026-04-17`
+
 This document describes the first vectorized `Sort` design for `pg_volvec`.
 It is intentionally scoped to unlock the standard TPC-H Q1 plan shape on the
 current engine, while leaving a clean path toward multi-run merge sort later.

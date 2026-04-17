@@ -1,0 +1,13 @@
+query	serial_ms	parallel_ms	speedup	serial_status	parallel_status
+q1	6701	30	NA	ok	error
+q3	27820	31	NA	ok	error
+q4	91041	32	NA	ok	error
+q5	3593	27	NA	ok	error
+q6	2808	29	NA	ok	error
+q7	3504	28	NA	ok	error
+q8	276	30	NA	error	error
+q9	29	34	NA	error	error
+q10	16033	28	NA	error	error
+q11	843	30	NA	ok	error
+q12	35890	31	NA	ok	error
+q13	5189	27	NA	ok	error

@@ -1,6 +1,6 @@
 # Page-wise Scan in pg_volvec
 
-Status: partially implemented, current production path documented on 2026-04-02
+Status: current production path refreshed on `2026-04-17`
 
 ## 1. Why this exists
 
@@ -16,6 +16,10 @@ The current scan path is hybrid:
 
 - C++ owns block/page traversal and visibility checks
 - deform JIT owns tuple-to-column materialization
+- heap `read_stream` is reused for asynchronous prefetch on the current scan
+  path
+- supported process-worker scans can reuse PostgreSQL parallel heap
+  scan/read-stream plumbing
 
 This is implemented in `VecSeqScanState`.
 

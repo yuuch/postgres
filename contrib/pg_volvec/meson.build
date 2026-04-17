@@ -7,8 +7,19 @@ pg_volvec_sources = files(
   'src/bridge/state.c',
   'src/bridge/execute.cpp',
   'src/engine/expr.cpp',
-  'src/engine/executor.cpp',
   'src/engine/parallel_runtime.cpp',
+  'src/engine/exec/executor_common.cpp',
+  'src/engine/exec/agg_plan.cpp',
+  'src/engine/exec/agg.cpp',
+  'src/engine/exec/seq_scan.cpp',
+  'src/engine/exec/filter.cpp',
+  'src/engine/exec/project.cpp',
+  'src/engine/exec/limit.cpp',
+  'src/engine/exec/hash_join_lookup.cpp',
+  'src/engine/exec/hash_join.cpp',
+  'src/engine/exec/hash_join_parallel.cpp',
+  'src/engine/exec/sort.cpp',
+  'src/engine/exec/executor_init.cpp',
 )
 
 pg_volvec_optimize_args = [

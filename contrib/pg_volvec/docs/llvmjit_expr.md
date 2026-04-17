@@ -1,6 +1,6 @@
 # LLVM JIT Expression Evaluation in pg_volvec
 
-Status: implemented prototype, verified on 2026-04-02
+Status: implemented and in active use, refreshed on `2026-04-17`
 
 ## 1. What problem this solves
 
@@ -127,6 +127,16 @@ directly into the aggregate update loop.
 ### 6.3 No explicit SIMD kernel generation
 
 Today the JIT relies on LLVM's normal optimization pipeline. The dense path is much more vectorizer-friendly than before, but the code does not yet emit explicit SIMD kernels or attach custom vectorization metadata.
+
+### 6.4 Current correctness fences
+
+The current runtime intentionally keeps some programs off the JIT path:
+
+- `Wide128` exact numeric programs
+- int-like comparison opcodes while widening/scale coverage is still being
+  tightened
+- numeric-division programs whose emitted scale constants have not yet been
+  fully revalidated against the interpreter
 
 ## 7. Why the current approach is preferable to nested helper calls
 

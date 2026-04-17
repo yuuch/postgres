@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "executor/executor.h"
 #include "utils/guc.h"
 #include "nodes/print.h"
@@ -18,13 +19,13 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static bool pg_volvec_enabled = true;
 bool pg_volvec_trace_hooks = false;
 bool pg_volvec_jit_deform = true;
-bool pg_volvec_disable_jit_for_parallel_worker = false;
 bool pg_volvec_parallel = false;
 int pg_volvec_parallel_max_workers = 4;
 int pg_volvec_parallel_morsel_nblocks = 128;
 int pg_volvec_parallel_min_relation_blocks = 1024;
 bool pg_volvec_parallel_leader_participation = true;
 bool pg_volvec_parallel_experimental_hash_pipeline = false;
+bool pg_volvec_disable_jit_for_parallel_worker = false;
 
 static void pg_volvec_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_volvec_ExecutorRun(QueryDesc *queryDesc,
@@ -35,6 +36,38 @@ static void pg_volvec_ExecutorEnd(QueryDesc *queryDesc);
 
 void            _PG_init(void);
 void            _PG_fini(void);
+
+static const char *
+pg_volvec_plan_node_name(Plan *plan)
+{
+	if (plan == NULL)
+		return "NULL";
+	if (IsA(plan, Gather))
+		return "Gather";
+	if (IsA(plan, GatherMerge))
+		return "GatherMerge";
+	if (IsA(plan, Agg))
+		return "Agg";
+	if (IsA(plan, Sort))
+		return "Sort";
+	if (IsA(plan, Limit))
+		return "Limit";
+	if (IsA(plan, SeqScan))
+		return "SeqScan";
+	if (IsA(plan, HashJoin))
+		return "HashJoin";
+	if (IsA(plan, MergeJoin))
+		return "MergeJoin";
+	if (IsA(plan, NestLoop))
+		return "NestLoop";
+	if (IsA(plan, SubqueryScan))
+		return "SubqueryScan";
+	if (IsA(plan, Material))
+		return "Material";
+	if (IsA(plan, Hash))
+		return "Hash";
+	return "Other";
+}
 
 void
 _PG_init(void)
@@ -172,6 +205,8 @@ static void
 pg_volvec_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	PgVolVecQueryState *state;
+	Plan *plan = queryDesc != NULL && queryDesc->plannedstmt != NULL ?
+		queryDesc->plannedstmt->planTree : NULL;
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
@@ -180,6 +215,25 @@ pg_volvec_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 	if (!pg_volvec_enabled)
 		return;
+
+	if (pg_volvec_trace_hooks)
+		elog(LOG,
+			 "pg_volvec: ExecutorStart pid=%d parallel_worker=%s parallelModeNeeded=%s root=%s nodeTag=%d",
+			 MyProcPid,
+			 IsParallelWorker() ? "on" : "off",
+			 (queryDesc != NULL && queryDesc->plannedstmt != NULL &&
+			  queryDesc->plannedstmt->parallelModeNeeded) ? "on" : "off",
+			 pg_volvec_plan_node_name(plan),
+			 plan != NULL ? (int) nodeTag(plan) : -1);
+
+	if (IsParallelWorker())
+	{
+		if (pg_volvec_trace_hooks)
+			elog(LOG,
+				 "pg_volvec: skipping hook state build inside PostgreSQL parallel worker pid=%d",
+				 MyProcPid);
+		return;
+	}
 
 	state = pg_volvec_try_build_query_state(queryDesc, eflags);
 	if (state != NULL)
@@ -192,6 +246,8 @@ pg_volvec_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			pg_volvec_close_query_state(state);
 		}
 	}
+	else if (pg_volvec_trace_hooks)
+		elog(LOG, "pg_volvec: query state admission rejected in leader pid=%d", MyProcPid);
 }
 
 static void
@@ -211,6 +267,9 @@ pg_volvec_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 coun
 				elog(LOG, "pg_volvec: ExecutorRun hook completed plan in pg_volvec");
 			return;
 		}
+		/* pg_volvec_execute_query returned false - diagnose why */
+		if (pg_volvec_trace_hooks)
+			elog(LOG, "pg_volvec: ExecutorRun fallback to native PG executor");
 	}
 
 	if (prev_ExecutorRun)
