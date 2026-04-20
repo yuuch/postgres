@@ -62,9 +62,25 @@ public:
 				 int output_ncols = -1);
 	~VecSortState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	void reset_external_input();
+	void append_external_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk);
+	void finish_external_input();
+	VecPlanState *source_plan()
+	{
+		return left_.get();
+	}
+	bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks) override;
+	void clear_source_block_range() override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
 	{
 		return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
+	}
+	bool lookup_remapped_output_col_meta(int child_input_resno,
+										 uint16_t *output_col,
+										 VecOutputColMeta *out) const override
+	{
+		return left_ != nullptr &&
+			left_->lookup_remapped_output_col_meta(child_input_resno, output_col, out);
 	}
 	VecAggState *find_parallel_aggregate_state() override
 	{
@@ -94,6 +110,7 @@ public:
 			left_->release_jit_resources_for_proc_exit();
 	}
 private:
+	void reset_materialized_state();
 	void materialize_and_sort();
 	DataChunk<DEFAULT_CHUNK_SIZE> *allocate_payload_chunk();
 	void append_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input);

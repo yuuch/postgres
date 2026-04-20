@@ -655,7 +655,16 @@ VecAggState::update_group_accumulators(VecAggGroupState *group,
 bool
 VecAggState::configure_input_block_range(BlockNumber start_block, uint32_t nblocks)
 {
-	return left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+	bool ok = left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+
+	if (pg_volvec_trace_hooks && !ok)
+		elog(LOG,
+			 "pg_volvec: agg block range configure failed plan_node_id=%d start=%u nblocks=%u left=%s",
+			 node_ != nullptr ? node_->plan.plan_node_id : -1,
+			 start_block,
+			 nblocks,
+			 left_ != nullptr ? "ok" : "null");
+	return ok;
 }
 
 void
@@ -1104,8 +1113,6 @@ VecAggState::append_group_record_to_partial_file(BufFile *file,
 							return false;
 						ptr = rep_chunk->get_string_ptr(*ref);
 						len = ref->len;
-						if (meta->sql_type == BPCHAROID)
-							len = TrimBpcharLengthLocal(ptr, len);
 						col.string_len = len;
 						break;
 					}

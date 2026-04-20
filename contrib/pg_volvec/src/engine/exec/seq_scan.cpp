@@ -53,6 +53,11 @@ VecSeqScanState::~VecSeqScanState() {
 			elog(LOG, "pg_volvec: VecSeqScanState dtor releasing deform JIT context %p", (void *) jit_context_);
 		if (BufferIsValid(current_buf_)) UnlockReleaseBuffer(current_buf_);
 		if (BufferIsValid(vmbuf_)) ReleaseBuffer(vmbuf_);
+		if (block_range_stream_ != nullptr)
+		{
+			read_stream_end(block_range_stream_);
+			block_range_stream_ = nullptr;
+		}
 		heap_endscan((TableScanDesc)scan_); 
 		table_close(rel_, NoLock); 
 		if (jit_context_) {
@@ -104,6 +109,11 @@ VecSeqScanState::configure_block_range(BlockNumber start_block, uint32_t nblocks
 	block_range_end_ = (end_block > scan_->rs_nblocks) ? scan_->rs_nblocks : (BlockNumber) end_block;
 	if (block_range_end_ < block_range_start_)
 		block_range_end_ = block_range_start_;
+	if (block_range_stream_ != nullptr)
+	{
+		read_stream_end(block_range_stream_);
+		block_range_stream_ = nullptr;
+	}
 	if (BufferIsValid(current_buf_))
 	{
 		UnlockReleaseBuffer(current_buf_);
@@ -116,6 +126,25 @@ VecSeqScanState::configure_block_range(BlockNumber start_block, uint32_t nblocks
 	}
 	current_offnum_ = FirstOffsetNumber;
 	scan_->rs_cblock = InvalidBlockNumber;
+	block_range_stream_private_.current_blocknum = block_range_start_;
+	block_range_stream_private_.last_exclusive = block_range_end_;
+	if (block_range_start_ < block_range_end_)
+	{
+		block_range_stream_ =
+			read_stream_begin_relation(READ_STREAM_SEQUENTIAL |
+									   READ_STREAM_USE_BATCHING,
+									   scan_->rs_strategy,
+									   rel_,
+									   MAIN_FORKNUM,
+									   block_range_read_stream_cb,
+									   &block_range_stream_private_,
+									   0);
+		if (pg_volvec_trace_hooks && block_range_stream_ != nullptr)
+			elog(LOG,
+				 "pg_volvec: VecSeqScanState using block-range read_stream start=%u end=%u",
+				 block_range_start_,
+				 block_range_end_);
+	}
 }
 
 void
@@ -124,6 +153,11 @@ VecSeqScanState::clear_block_range()
 	block_range_active_ = false;
 	block_range_start_ = InvalidBlockNumber;
 	block_range_end_ = InvalidBlockNumber;
+	if (block_range_stream_ != nullptr)
+	{
+		read_stream_end(block_range_stream_);
+		block_range_stream_ = nullptr;
+	}
 	if (BufferIsValid(current_buf_))
 	{
 		UnlockReleaseBuffer(current_buf_);
@@ -171,17 +205,12 @@ VecSeqScanState::open_next_buffer()
 {
 	if (block_range_active_)
 	{
-		BlockNumber next_block;
-
-		if (scan_->rs_cblock == InvalidBlockNumber)
-			next_block = block_range_start_;
-		else
-			next_block = scan_->rs_cblock + 1;
-		if (next_block >= block_range_end_)
+		if (block_range_stream_ == nullptr)
 			return false;
-		scan_->rs_cblock = next_block;
-		current_buf_ = ReadBufferExtended(rel_, MAIN_FORKNUM, scan_->rs_cblock,
-										 RBM_NORMAL, scan_->rs_strategy);
+		current_buf_ = read_stream_next_buffer(block_range_stream_, NULL);
+		if (!BufferIsValid(current_buf_))
+			return false;
+		scan_->rs_cblock = BufferGetBlockNumber(current_buf_);
 		if (BufferIsValid(current_buf_))
 			blocks_opened_++;
 		return BufferIsValid(current_buf_);

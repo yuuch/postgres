@@ -19,7 +19,15 @@ public:
 		}
 	bool configure_source_block_range(BlockNumber start_block, uint32_t nblocks) override
 	{
-		return left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+		bool ok = left_ != nullptr && left_->configure_source_block_range(start_block, nblocks);
+
+		if (pg_volvec_trace_hooks && !ok)
+			elog(LOG,
+				 "pg_volvec: filter block range configure failed start=%u nblocks=%u left=%s",
+				 start_block,
+				 nblocks,
+				 left_ != nullptr ? "ok" : "null");
+		return ok;
 	}
 	void clear_source_block_range() override
 	{
@@ -58,4 +66,3 @@ public:
 private:
 	std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
 };
-

@@ -113,6 +113,10 @@ Current user-facing `pg_volvec` GUCs:
 - `pg_volvec.parallel_leader_participation`
 - `pg_volvec.parallel_experimental_hash_pipeline`
 
+Current default `pg_volvec.parallel_morsel_nblocks` is `512`. A 2026-04-18
+Q7/Q12 sweep showed `512` cuts task/block-range overhead versus `128`, while
+`2048` can regress Q7 due to coarser load balancing.
+
 Most common serial validation session:
 
 ```sql

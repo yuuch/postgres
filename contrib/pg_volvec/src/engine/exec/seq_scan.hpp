@@ -46,10 +46,11 @@ private:
 	OffsetNumber current_offnum_ = FirstOffsetNumber;
 	bool all_visible_ = false;
 	bool block_range_active_ = false;
+	ReadStream *block_range_stream_ = nullptr;
+	BlockRangeReadStreamPrivate block_range_stream_private_{};
 	BlockNumber block_range_start_ = InvalidBlockNumber;
 	BlockNumber block_range_end_ = InvalidBlockNumber;
 	uint64_t blocks_opened_ = 0;
 	DataChunkDeformer deformer_;
 	JitContext *jit_context_ = nullptr;
 };
-

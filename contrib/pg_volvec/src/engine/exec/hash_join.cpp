@@ -1013,6 +1013,25 @@ LookupPlanOutputMeta(Plan *plan,
 		return false;
 	}
 
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Expr *expr;
+		Var *var;
+
+		if (tle->resno != target_resno || tle->resjunk)
+			continue;
+		expr = StripImplicitNodesLocal((Expr *) tle->expr);
+		if (expr == nullptr || !IsA(expr, Var))
+			break;
+		var = (Var *) expr;
+		if (var->varattno <= 0 || var->varattno > 16)
+			break;
+		if (state->lookup_remapped_output_col_meta(var->varattno, source_col, meta))
+			return true;
+		break;
+	}
+
 	if (source_col != nullptr)
 		*source_col = (uint16_t) (target_resno - 1);
 	return state->lookup_output_col_meta(target_resno, meta);

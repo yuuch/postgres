@@ -594,16 +594,28 @@ This means the first parallel version is bridge-driven, not chunk-stream-driven.
 
 ## Current Prototype Status
 
-As of 2026-04-09, the executor prototype has these pieces running locally:
+As of 2026-04-17, the executor prototype has these pieces running locally:
 
 - `Plan -> ParallelPipelinePlan` lowering
 - `ParallelSchedulerState` construction with explicit dependencies and bridges
 - source morsel task materialization with real `{start_block, nblocks}` ranges
 - block-range scanning in `VecSeqScanState`
+- block-range scan I/O now uses PostgreSQL `read_stream` with
+  `block_range_read_stream_cb`.  The scheduler still owns morsel assignment,
+  but each assigned range is read through PG's batched/AIO stream path instead
+  of per-page `ReadBufferExtended`.
 - a leader-only source task loop for aggregate source pipelines
 - a first process-worker path for single-source partial aggregates
 - source scan attachment to PostgreSQL native `ParallelTableScanDesc` and
   parallel heap `read_stream`
+- an experimental DSM query scheduler path where workers attach shared
+  pipeline/task control blocks, claim ready source/finalize tasks, run
+  pipeline-local source morsels, export aggregate partial state, and let the
+  leader merge those partials into the output aggregate state
+- file-backed scheduler HashJoin bridge handoff: build-source pipelines publish
+  worker-local fragments, `HashBuildFinalize` tasks combine them into packed
+  read-only bridge files, and dependent build/probe source pipelines attach
+  those packed bridges before executing their morsels
 
 The leader-only path is intentionally narrow, but it is no longer a dry-run:
 
@@ -622,9 +634,8 @@ The current split is intentionally hybrid:
 
 What is still missing:
 
-- worker launch and DSM-backed shared scheduler state
-- cross-process bridges
-- parallel hash build/probe
+- DSM/DSA-backed cross-process bridge artifacts for the scheduler path. The
+  current HashJoin bridge handoff is correct but uses `SharedFileSet`.
 - parallel sort run generation and merge
 
 ### Consequence for source pipelines
@@ -746,13 +757,20 @@ shared read-only hash bridge.
 Current implementation note:
 
 - simple source-driven hash build can export/merge worker-local hash fragments
-- nested build pipelines that depend on an upstream hash bridge may still fall
-  back to a leader-built shared hash bridge
-- Q11 is the important example: the supplier/nation build feeds the partsupp
-  probe, and worker initialization must be pipeline-specific rather than using
-  the whole root plan or a blindly selected `HashJoin` subtree
-- this fallback is correctness-preserving and has been smoke-tested, but it is
-  not the final parallel build design
+- nested build dependencies are currently executed through an explicit
+  build-wave compatibility path while the query-level scheduler is being wired
+  in
+- a DSM-visible query scheduler skeleton now exists: workers can attach the
+  shared pipeline/task control blocks, claim pending tasks from a shared task
+  table, and export aggregate partial state back to the leader
+- the skeleton is active behind `pg_volvec.parallel_experimental_hash_pipeline`
+  for hash-query smoke tests. HashJoin build/probe transfer is now closed via a
+  packed bridge in `SharedFileSet`; the next artifact-lifecycle step is moving
+  normal-sized fragments to DSM/DSA and keeping files as a large-payload
+  fallback.
+- worker initialization is still fuller than the final design. It must keep
+  moving toward pipeline-local state so probe-side operators do not rebuild
+  hidden child joins
 
 #### Probe pipeline
 

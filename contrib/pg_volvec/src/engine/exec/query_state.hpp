@@ -27,9 +27,12 @@ bool TryInitializeLeaderOnlyAggregateWorkerContext(PgVolVecQueryState *query_sta
 												   ParallelWorkerContext *worker_context,
 												   const ParallelPipelineDesc **source_pipeline_out,
 												   const char **failure_reason);
+bool TryExecuteQuerySchedulerSkeleton(PgVolVecQueryState *query_state,
+									  QueryDesc *queryDesc,
+									  const char **failure_reason);
 bool TryExecuteProcessParallelAggregate(PgVolVecQueryState *query_state,
-										 QueryDesc *queryDesc,
-										 const char **failure_reason);
+										QueryDesc *queryDesc,
+										const char **failure_reason);
 bool ExecuteParallelTask(const ParallelTaskDesc &task,
 						 const ParallelPipelinePlan *parallel_plan,
 						 ParallelWorkerContext &worker_context,
@@ -44,4 +47,3 @@ size_t pg_volvec_release_all_registered_llvm_jit_contexts_for_proc_exit();
 #endif
 
 } /* namespace pg_volvec */
-

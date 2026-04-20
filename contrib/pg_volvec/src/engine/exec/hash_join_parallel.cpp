@@ -59,6 +59,14 @@ ReadBytes(const uint8_t *buffer,
 
 struct HashJoinParallelAccess
 {
+	static bool PayloadColEquals(const VecHashPayloadCol &left,
+								 const VecHashPayloadCol &right)
+	{
+		return left.meta.sql_type == right.meta.sql_type &&
+			left.meta.storage_kind == right.meta.storage_kind &&
+			left.meta.scale == right.meta.scale;
+	}
+
 	static size_t ComputeChunkPayloadSize(const VecHashJoinState &state,
 										 const DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 	{
@@ -155,11 +163,12 @@ struct HashJoinParallelAccess
 								 size_t *offset,
 								 DataChunk<DEFAULT_CHUNK_SIZE> *chunk)
 	{
-		SerializedHashBuildChunkHeader header;
+		SerializedHashBuildChunkHeader header{};
 
 		if (!ReadBytes(buffer, buffer_size, offset, &header, sizeof(header)))
 			return false;
-		if (header.row_count > DEFAULT_CHUNK_SIZE)
+		if (header.row_count > DEFAULT_CHUNK_SIZE ||
+			header.string_arena_size > buffer_size)
 			return false;
 
 		chunk->reset();
@@ -219,6 +228,8 @@ struct HashJoinParallelAccess
 		}
 
 		chunk->string_arena.clear();
+		if (header.string_arena_size > buffer_size - *offset)
+			return false;
 		chunk->string_arena.resize(header.string_arena_size);
 		if (header.string_arena_size > 0 &&
 			!ReadBytes(buffer,
@@ -235,7 +246,7 @@ struct HashJoinParallelAccess
 							   size_t buffer_size)
 	{
 		VolVecVector<uint8_t> tmp{PgMemoryContextAllocator<uint8_t>(CurrentMemoryContext)};
-		SerializedHashBuildFileHeader header;
+		SerializedHashBuildFileHeader header{};
 
 		header.num_payload_cols = (uint32) state.inner_payload_cols_.size();
 		header.entry_count = (uint32) state.entries_.size();
@@ -268,7 +279,7 @@ struct HashJoinParallelAccess
 							const uint8_t *buffer,
 							size_t buffer_size)
 	{
-		SerializedHashBuildFileHeader header;
+		SerializedHashBuildFileHeader header{};
 		size_t offset = 0;
 		size_t base_chunk_idx;
 
@@ -277,6 +288,15 @@ struct HashJoinParallelAccess
 		if (header.magic != VOLVEC_HASH_BUILD_FILE_MAGIC ||
 			header.version != VOLVEC_HASH_BUILD_FILE_VERSION)
 			elog(ERROR, "pg_volvec hash build state header mismatch");
+		if (header.num_payload_cols > 16 ||
+			header.entry_count > buffer_size / sizeof(SerializedHashBuildEntry) ||
+			header.chunk_count > buffer_size / sizeof(SerializedHashBuildChunkHeader))
+			elog(ERROR,
+				 "pg_volvec hash build state header has invalid counts (payload_cols=%u entries=%u chunks=%u bytes=%zu)",
+				 header.num_payload_cols,
+				 header.entry_count,
+				 header.chunk_count,
+				 buffer_size);
 
 		base_chunk_idx = state.inner_chunks_.size();
 
@@ -303,11 +323,26 @@ struct HashJoinParallelAccess
 						   payload_cols.data(),
 						   header.num_payload_cols * sizeof(VecHashPayloadCol)))
 				elog(ERROR, "pg_volvec could not read hash build payload metadata");
-			if (payload_cols.size() != state.inner_payload_cols_.size() ||
-				memcmp(payload_cols.data(),
-					   state.inner_payload_cols_.data(),
-					   payload_cols.size() * sizeof(VecHashPayloadCol)) != 0)
-				elog(ERROR, "pg_volvec hash build payload metadata mismatch across fragments");
+			if (payload_cols.size() != state.inner_payload_cols_.size())
+				elog(ERROR,
+					 "pg_volvec hash build payload metadata mismatch across fragments (incoming_cols=%zu existing_cols=%zu)",
+					 payload_cols.size(),
+					 state.inner_payload_cols_.size());
+			for (size_t i = 0; i < payload_cols.size(); i++)
+			{
+				if (!PayloadColEquals(payload_cols[i], state.inner_payload_cols_[i]))
+					elog(ERROR,
+						 "pg_volvec hash build payload metadata mismatch across fragments (idx=%zu incoming_source=%u existing_source=%u incoming_type=%u existing_type=%u incoming_kind=%u existing_kind=%u incoming_scale=%d existing_scale=%d)",
+						 i,
+						 payload_cols[i].source_col,
+						 state.inner_payload_cols_[i].source_col,
+						 payload_cols[i].meta.sql_type,
+						 state.inner_payload_cols_[i].meta.sql_type,
+						 (unsigned) payload_cols[i].meta.storage_kind,
+						 (unsigned) state.inner_payload_cols_[i].meta.storage_kind,
+						 payload_cols[i].meta.scale,
+						 state.inner_payload_cols_[i].meta.scale);
+			}
 		}
 
 		for (uint32 i = 0; i < header.entry_count; i++)
@@ -317,6 +352,13 @@ struct HashJoinParallelAccess
 
 			if (!ReadBytes(buffer, buffer_size, &offset, &serialized, sizeof(serialized)))
 				elog(ERROR, "pg_volvec could not read serialized hash build entry");
+			if (serialized.chunk_idx >= header.chunk_count ||
+				serialized.row_idx >= DEFAULT_CHUNK_SIZE)
+				elog(ERROR,
+					 "pg_volvec serialized hash build entry references invalid row (chunk=%u/%u row=%u)",
+					 serialized.chunk_idx,
+					 header.chunk_count,
+					 serialized.row_idx);
 			entry.hash = serialized.hash;
 			entry.key = serialized.key;
 			entry.next = -1;
@@ -461,6 +503,7 @@ VecHashJoinState::deserialize_hash_bridge(const uint8_t *buffer, size_t buffer_s
 {
 	clear_partition_hash_tables();
 	clear_inner_build_chunks();
+	inner_payload_cols_.clear();
 	bucket_heads_.clear();
 	entries_.clear();
 	inner_entry_matched_.clear();
@@ -526,6 +569,7 @@ VecHashJoinState::reset_parallel_hash_build_state()
 	clear_partition_hash_tables();
 	clear_inner_build_chunks();
 	clear_shared_hash_payload_view();
+	inner_payload_cols_.clear();
 	bucket_heads_.clear();
 	entries_.clear();
 	inner_entry_matched_.clear();

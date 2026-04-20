@@ -1401,6 +1401,31 @@ StringConstMatches(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
 
 	if (string_type == BPCHAROID)
 	{
+		if (match_len <= 8 && step.d.str_prefix.offset == UINT32_MAX)
+		{
+			const char *prefix_bytes = reinterpret_cast<const char *>(&ref.prefix);
+			uint32_t prefix_limit = Min(ref.len, (uint32_t) 8);
+
+			if (ref.len < match_len)
+				return false;
+			for (uint32_t pos = match_len; pos < prefix_limit; pos++)
+			{
+				if (prefix_bytes[pos] != ' ')
+					return false;
+			}
+			if (ref.len <= 8)
+				return true;
+			const char *lhs = chunk.get_string_ptr(ref);
+
+			if (lhs == nullptr)
+				return false;
+			for (uint32_t pos = 8; pos < ref.len; pos++)
+			{
+				if (lhs[pos] != ' ')
+					return false;
+			}
+			return true;
+		}
 		const char *lhs = chunk.get_string_ptr(ref);
 		const char *rhs = (step.d.str_prefix.offset != UINT32_MAX) ?
 			program.get_string_const_ptr(step.d.str_prefix.offset) : nullptr;

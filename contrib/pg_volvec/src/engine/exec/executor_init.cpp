@@ -2,6 +2,63 @@
 
 namespace pg_volvec {
 
+class VecMetadataOnlyState : public VecPlanState {
+public:
+	explicit VecMetadataOnlyState(Plan *plan)
+	{
+		ListCell *lc;
+
+		memset(has_meta_, 0, sizeof(has_meta_));
+		if (plan == nullptr)
+			return;
+		foreach(lc, plan->targetlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+			Oid typid;
+			int idx;
+
+			if (tle == nullptr || tle->resjunk ||
+				tle->resno <= 0 || tle->resno > 16 ||
+				tle->expr == nullptr)
+				continue;
+			idx = tle->resno - 1;
+			typid = exprType((Node *) tle->expr);
+			meta_[idx].sql_type = typid;
+			meta_[idx].storage_kind = DefaultOutputStorageKindForType(typid);
+			meta_[idx].scale = typid == NUMERICOID ?
+				GetNumericScaleFromTypmod(exprTypmod((Node *) tle->expr)) : 0;
+			has_meta_[idx] = true;
+		}
+	}
+
+	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override
+	{
+		chunk.reset();
+		return false;
+	}
+
+	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
+	{
+		int idx = target_resno - 1;
+
+		if (idx < 0 || idx >= 16 || !has_meta_[idx])
+			return false;
+		if (out != nullptr)
+			*out = meta_[idx];
+		return true;
+	}
+
+private:
+	VecOutputColMeta meta_[16];
+	bool has_meta_[16];
+};
+
+static std::unique_ptr<VecPlanState>
+BuildMetadataOnlyPlanState(Plan *plan)
+{
+	return std::make_unique<VecMetadataOnlyState>(plan);
+}
+
 static bool
 ExtractJoinKeysFromClauses(List *clauses,
 						   const char *clause_kind,
@@ -638,7 +695,8 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 			if (parallel_worker_context != nullptr &&
 				parallel_worker_context->parallel_scan_desc != nullptr &&
 				parallel_worker_context->parallel_scan_plan_node_id >= 0 &&
-				hash_join->join.jointype == JOIN_INNER)
+				(hash_join->join.jointype == JOIN_INNER ||
+				 hash_join->join.jointype == JOIN_ANTI))
 			{
 				bool scan_in_outer =
 					PlanContainsNodeId(outer_plan,
@@ -646,10 +704,14 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 				bool scan_in_inner =
 					PlanContainsNodeId(inner_plan,
 									   parallel_worker_context->parallel_scan_plan_node_id);
+				bool hash_build_target =
+					parallel_worker_context->hash_build_execution &&
+					parallel_worker_context->hash_join_plan_node_id >= 0 &&
+					plan->plan_node_id == parallel_worker_context->hash_join_plan_node_id;
 
 				if (pg_volvec_trace_hooks)
 					elog(LOG,
-						 "pg_volvec: hash join parallel side binding hash_node=%d scan_plan_node_id=%d scan_relid=%u outer_contains=%s inner_contains=%s outer_relid=%u inner_relid=%u initial_build_outer=%s",
+						 "pg_volvec: hash join parallel side binding hash_node=%d scan_plan_node_id=%d scan_relid=%u outer_contains=%s inner_contains=%s outer_relid=%u inner_relid=%u hash_build_execution=%s hash_build_target=%s initial_build_outer=%s",
 						 plan->plan_node_id,
 						 parallel_worker_context->parallel_scan_plan_node_id,
 						 parallel_worker_context->parallel_scan_relid,
@@ -657,19 +719,62 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 						 scan_in_inner ? "true" : "false",
 						 outer_relid,
 						 inner_relid,
+						 parallel_worker_context->hash_build_execution ? "true" : "false",
+						 hash_build_target ? "true" : "false",
 						 build_outer_side ? "true" : "false");
 
-				if (scan_in_outer)
+				if (hash_build_target)
+				{
+					if (scan_in_outer)
+						build_outer_side = true;
+					else if (scan_in_inner)
+						build_outer_side = false;
+				}
+				else if (scan_in_outer)
 					build_outer_side = false;
 				else if (scan_in_inner)
 					build_outer_side = true;
 				else if (OidIsValid(parallel_worker_context->parallel_scan_relid))
 				{
-					if (parallel_worker_context->parallel_scan_relid == outer_relid)
+					if (hash_build_target)
+					{
+						if (parallel_worker_context->parallel_scan_relid == outer_relid)
+							build_outer_side = true;
+						else if (parallel_worker_context->parallel_scan_relid == inner_relid)
+							build_outer_side = false;
+					}
+					else if (parallel_worker_context->parallel_scan_relid == outer_relid)
 						build_outer_side = false;
 					else if (parallel_worker_context->parallel_scan_relid == inner_relid)
 						build_outer_side = true;
 				}
+			}
+			else if (parallel_worker_context != nullptr &&
+					 parallel_worker_context->hash_build_execution &&
+					 parallel_worker_context->hash_join_plan_node_id >= 0 &&
+					 plan->plan_node_id == parallel_worker_context->hash_join_plan_node_id &&
+					 parallel_worker_context->agg_plan_node_id >= 0 &&
+					 hash_join->join.jointype == JOIN_INNER)
+			{
+				bool agg_in_outer =
+					PlanContainsNodeId(outer_plan,
+									   parallel_worker_context->agg_plan_node_id);
+				bool agg_in_inner =
+					PlanContainsNodeId(inner_plan,
+									   parallel_worker_context->agg_plan_node_id);
+
+				if (agg_in_outer)
+					build_outer_side = true;
+				else if (agg_in_inner)
+					build_outer_side = false;
+				if (pg_volvec_trace_hooks)
+					elog(LOG,
+						 "pg_volvec: hash join aggregate bridge build binding hash_node=%d agg_plan_node_id=%d outer_contains=%s inner_contains=%s build_outer=%s",
+						 plan->plan_node_id,
+						 parallel_worker_context->agg_plan_node_id,
+						 agg_in_outer ? "true" : "false",
+						 agg_in_inner ? "true" : "false",
+						 build_outer_side ? "true" : "false");
 			}
 			if (build_outer_side && pg_volvec_trace_hooks)
 				elog(LOG,
@@ -685,6 +790,23 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 											  &inner_required_attrs);
 			outer = ExecInitVecPlanInternal(outer_plan, estate, outer_required_attrs, false, parallel_worker_context);
 			inner = ExecInitVecPlanInternal(inner_plan, estate, inner_required_attrs, false, parallel_worker_context);
+			if ((!outer || !inner) &&
+				parallel_worker_context != nullptr &&
+				parallel_worker_context->hash_join_plan_node_id >= 0 &&
+				plan->plan_node_id == parallel_worker_context->hash_join_plan_node_id)
+			{
+				bool executing_build_side =
+					parallel_worker_context->hash_build_execution;
+				bool outer_is_executed =
+					executing_build_side ? build_outer_side : !build_outer_side;
+				bool inner_is_executed =
+					executing_build_side ? !build_outer_side : build_outer_side;
+
+				if (!outer && !outer_is_executed)
+					outer = BuildMetadataOnlyPlanState(outer_plan);
+				if (!inner && !inner_is_executed)
+					inner = BuildMetadataOnlyPlanState(inner_plan);
+			}
 			if (!outer || !inner)
 			{
 			if (pg_volvec_trace_hooks)
@@ -781,7 +903,10 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 					}
 				}
 			}
-			if (hash_join->join.jointype == JOIN_ANTI)
+			if (hash_join->join.jointype == JOIN_ANTI &&
+				!(parallel_worker_context != nullptr &&
+				  parallel_worker_context->hash_join_plan_node_id >= 0 &&
+				  plan->plan_node_id == parallel_worker_context->hash_join_plan_node_id))
 			{
 				build_outer_side = true;
 				if (pg_volvec_trace_hooks)

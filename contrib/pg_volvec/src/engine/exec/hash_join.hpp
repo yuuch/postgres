@@ -118,15 +118,16 @@ public:
 											const ParallelHashBuildPartialState &partial);
 	void reserve_parallel_hash_build_capacity(size_t total_entries,
 											  size_t total_chunks);
-	size_t estimate_parallel_hash_bridge_size() const;
-	void reset_parallel_hash_build_state();
-	void publish_hash_bridge();
-	void load_hash_bridge();
-	void attach_shared_hash_bridge(const uint8_t *buffer, size_t buffer_size);
-	const uint8_t *shared_hash_bridge_buffer() const
-	{
-		return shared_hash_bridge_buffer_;
-	}
+		size_t estimate_parallel_hash_bridge_size() const;
+		void reset_parallel_hash_build_state();
+		void publish_hash_bridge();
+		void load_hash_bridge();
+		void attach_shared_hash_bridge(const uint8_t *buffer, size_t buffer_size);
+		void serialize_hash_bridge(uint8_t *buffer, size_t buffer_size) const;
+		const uint8_t *shared_hash_bridge_buffer() const
+		{
+			return shared_hash_bridge_buffer_;
+		}
 	size_t shared_hash_bridge_size() const
 	{
 		return shared_hash_bridge_buffer_size_;
@@ -150,7 +151,6 @@ public:
 		void serialize_hash_build_fragment(uint8_t *buffer, size_t buffer_size) const;
 		void append_hash_build_fragment(const uint8_t *buffer, size_t buffer_size);
 		size_t compute_hash_bridge_size() const;
-		void serialize_hash_bridge(uint8_t *buffer, size_t buffer_size) const;
 		void deserialize_hash_bridge(const uint8_t *buffer, size_t buffer_size);
 		void copy_inner_payload_value_to_chunk(DataChunk<DEFAULT_CHUNK_SIZE> &dst,
 											  int dst_row,
@@ -167,6 +167,7 @@ public:
 		void init_hash_table(size_t expected_rows);
 		void rehash_hash_table(size_t min_bucket_count);
 		void append_inner_entry(const VecHashJoinKey &key, uint32_t hash, uint32_t chunk_idx, uint16_t row_idx);
+		bool build_key_exists(const VecHashJoinKey &key, uint32_t hash) const;
 		uint16_t ensure_inner_payload_col(uint16_t source_col, const VecOutputColMeta &meta);
 		DataChunk<DEFAULT_CHUNK_SIZE> *allocate_inner_chunk();
 		void copy_inner_payload_row(DataChunk<DEFAULT_CHUNK_SIZE> &dst, int dst_row,

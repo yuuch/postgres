@@ -149,8 +149,12 @@ Purpose: parallel pipeline and scheduler interfaces.
 Current files:
 
 - `parallel_runtime.hpp`
+- `runtime_lowering.inc`
+- `runtime_worker_state.inc`
+- `runtime_execution.inc`
+- `runtime_worker_main.inc`
 
-Related implementation file still at engine root:
+Related root facade:
 
 - `parallel_runtime.cpp`
 
@@ -163,9 +167,16 @@ Responsibilities:
 
 Assessment:
 
-- This split is good.
-- `parallel_runtime.cpp` now consumes the private internal header rather than leaning on `volvec_engine.hpp` for every concrete type, which is the right direction.
-- Like `expr/`, the implementation is still outside the directory, so the physical layout is not fully normalized.
+- This split is transitional but useful.
+- `parallel_runtime.cpp` is now only a thin translation-unit facade that keeps
+  the include order and namespace structure stable.
+- The actual runtime implementation has moved under `src/engine/parallel/`
+  as smaller implementation shards.
+- The shards are intentionally still compiled through one translation unit for
+  now. That avoids a large symbol-boundary churn while the scheduler and
+  HashJoin pipeline model are still moving.
+- The next cleanup step is to turn stable shards into real separate
+  translation units with a smaller `parallel/internal.hpp`.
 
 ### Top-level engine files
 
@@ -182,6 +193,8 @@ Assessment:
 
 - `volvec_engine.hpp` is no longer the only way to pull in the full engine surface.
 - `executor.cpp` still exists, but it is now a reference artifact, not a build artifact.
+- `parallel_runtime.cpp` still exists, but it is now a small facade rather than
+  the full implementation body.
 - The compile-time dependency graph is substantially better than before, but the engine still carries a broad private helper surface through `exec/internal.hpp`.
 
 ## Is The Split Reasonable?

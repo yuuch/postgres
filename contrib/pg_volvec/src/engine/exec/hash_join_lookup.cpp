@@ -27,11 +27,15 @@ VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 	  probe_keys_(PgMemoryContextAllocator<VecHashJoinKey>(memory_context_)),
 	  probe_hashes_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
 	  probe_next_entries_(PgMemoryContextAllocator<int32_t>(memory_context_)),
-		  active_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
-		  next_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
-		  inner_built_(false),
-		  probe_batch_ready_(false),
-		  probe_input_exhausted_(false),
+	  active_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
+	  next_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
+	  ht_match_payloads_(PgMemoryContextAllocator<uint64_t>(memory_context_)),
+	  ht_match_starts_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
+	  ht_match_counts_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
+	  ht_match_pos_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
+	  inner_built_(false),
+	  probe_batch_ready_(false),
+	  probe_input_exhausted_(false),
 	  build_outer_side_(build_outer_side),
 	  join_filter_program_(nullptr),
 	  semi_build_marked_(false),
@@ -41,12 +45,33 @@ VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 	  right_anti_marked_(false),
 	  anti_outer_pos_(0),
 	  right_anti_emit_pos_(0),
-	  bucket_mask_(0)
+	  bucket_mask_(0),
+	  build_input_rows_consumed_(0),
+	  build_input_batches_consumed_(0),
+	  local_hash_tables_(PgMemoryContextAllocator<VecLinearProbeHT>(memory_context_)),
+	  partition_bloom_filters_(PgMemoryContextAllocator<VecBloomFilter>(memory_context_)),
+	  shared_hash_bridge_(nullptr),
+	  shared_hash_bridge_buffer_(nullptr),
+	  shared_hash_bridge_buffer_size_(0),
+	  shared_hash_bridge_buffer_owned_(false),
+	  shared_hash_chunks_(nullptr),
+	  shared_hash_chunk_count_(0),
+	  assigned_partition_start_(0),
+	  assigned_partition_end_(VOLVEC_RADIX_FANOUT),
+	  total_build_rows_(0),
+	  use_parallel_ht_(false)
 {
 	Assert(!build_outer_side_ ||
 		   jointype_ == JOIN_INNER ||
 		   jointype_ == JOIN_SEMI ||
 		   jointype_ == JOIN_ANTI);
+	for (int i = 0; i < VOLVEC_RADIX_FANOUT; i++)
+	{
+		partition_bucket_heads_[i] = nullptr;
+		partition_bucket_masks_[i] = 0;
+		partition_bucket_heads_external_[i] = false;
+		build_histogram_[i] = 0;
+	}
 	for (const auto &key_col : key_cols)
 		key_cols_.push_back(key_col);
 	for (const auto &output_col : output_cols)
@@ -76,10 +101,20 @@ bool
 VecHashJoinState::configure_source_block_range(BlockNumber start_block, uint32_t nblocks)
 {
 	VecPlanState *probe_state = build_outer_side_ ? inner_.get() : outer_.get();
+	bool ok;
 
 	reset_probe_task_state();
-	return probe_state != nullptr &&
+	ok = probe_state != nullptr &&
 		probe_state->configure_source_block_range(start_block, nblocks);
+	if (pg_volvec_trace_hooks && !ok)
+		elog(LOG,
+			 "pg_volvec: hash join probe block range configure failed plan_node_id=%d build_outer=%s start=%u nblocks=%u probe=%s",
+			 plan_node_id_,
+			 build_outer_side_ ? "true" : "false",
+			 start_block,
+			 nblocks,
+			 probe_state != nullptr ? "ok" : "null");
+	return ok;
 }
 
 void
@@ -197,6 +232,25 @@ VecHashJoinState::append_inner_entry(const VecHashJoinKey &key, uint32_t hash,
 	entry.row_idx = row_idx;
 	entries_.push_back(entry);
 	bucket_heads_[bucket] = (int32_t) (entries_.size() - 1);
+}
+
+bool
+VecHashJoinState::build_key_exists(const VecHashJoinKey &key, uint32_t hash) const
+{
+	int32_t entry_idx;
+
+	if (bucket_heads_.empty())
+		return false;
+	entry_idx = bucket_heads_[hash & bucket_mask_];
+	while (entry_idx >= 0)
+	{
+		const VecHashEntry &entry = entries_[entry_idx];
+
+		if (entry.hash == hash && keys_equal(entry.key, key))
+			return true;
+		entry_idx = entry.next;
+	}
+	return false;
 }
 
 uint16_t
@@ -355,16 +409,22 @@ VecHashJoinState::consume_build_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input
 		int src_row = input.has_selection ? input.sel.row_ids[s] : s;
 		int dst_row;
 		VecHashJoinKey key;
+		uint32_t hash;
 
 		if (!read_key(input, build_is_inner, src_row, &key))
+			continue;
+		hash = hash_key(key);
+		if (jointype_ == JOIN_ANTI && !build_outer_side_ &&
+			inner_payload_cols_.empty() &&
+			build_key_exists(key, hash))
 			continue;
 		if (dst->count >= DEFAULT_CHUNK_SIZE)
 			dst = allocate_inner_chunk();
 		dst_row = dst->count;
 		copy_inner_payload_row(*dst, dst_row, input, src_row);
-		append_inner_entry(key, hash_key(key),
-						  (uint32_t) (inner_chunks_.size() - 1),
-						  (uint16_t) dst_row);
+		append_inner_entry(key, hash,
+						   (uint32_t) (inner_chunks_.size() - 1),
+						   (uint16_t) dst_row);
 		dst->count++;
 	}
 }

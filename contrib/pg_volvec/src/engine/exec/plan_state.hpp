@@ -3,6 +3,10 @@
 #include "core/data_chunk.hpp"
 #include "expr/expr.hpp"
 
+extern "C" {
+extern bool pg_volvec_trace_hooks;
+}
+
 class VecAggState;
 class VecHashJoinState;
 
@@ -185,4 +189,3 @@ struct ParallelPipelineDesc {
 	{
 	}
 };
-

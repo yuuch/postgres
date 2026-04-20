@@ -18,10 +18,11 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static bool pg_volvec_enabled = true;
 bool pg_volvec_trace_hooks = false;
+bool pg_volvec_trace_execution_path = false;
 bool pg_volvec_jit_deform = true;
 bool pg_volvec_parallel = false;
 int pg_volvec_parallel_max_workers = 4;
-int pg_volvec_parallel_morsel_nblocks = 128;
+int pg_volvec_parallel_morsel_nblocks = 512;
 int pg_volvec_parallel_min_relation_blocks = 1024;
 bool pg_volvec_parallel_leader_participation = true;
 bool pg_volvec_parallel_experimental_hash_pipeline = false;
@@ -94,6 +95,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("pg_volvec.trace_execution_path",
+							 "Emit one low-noise execution path log line per query.",
+							 NULL,
+							 &pg_volvec_trace_execution_path,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	DefineCustomBoolVariable("pg_volvec.jit_deform",
 							 "Enable LLVM JIT deform for pg_volvec when a supported deform program is available.",
 							 NULL,
@@ -133,7 +145,7 @@ _PG_init(void)
 							"Block range size used for experimental pg_volvec morsel scheduling.",
 							NULL,
 							&pg_volvec_parallel_morsel_nblocks,
-							128,
+							512,
 							1,
 							1048576,
 							PGC_USERSET,
@@ -268,9 +280,15 @@ pg_volvec_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 coun
 			return;
 		}
 		/* pg_volvec_execute_query returned false - diagnose why */
+		if (pg_volvec_trace_execution_path)
+			elog(LOG,
+				 "pg_volvec_path: path=native_pg reason=pg_volvec_execute_query_returned_false");
 		if (pg_volvec_trace_hooks)
 			elog(LOG, "pg_volvec: ExecutorRun fallback to native PG executor");
 	}
+	else if (pg_volvec_trace_execution_path)
+		elog(LOG,
+			 "pg_volvec_path: path=native_pg reason=no_registered_pg_volvec_state");
 
 	if (prev_ExecutorRun)
 		prev_ExecutorRun(queryDesc, direction, count);

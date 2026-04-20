@@ -32,6 +32,72 @@ VecSortState::~VecSortState()
 		delete chunk;
 }
 
+void
+VecSortState::reset_materialized_state()
+{
+	for (auto *chunk : payload_chunks_)
+		delete chunk;
+	payload_chunks_.clear();
+	rows_.clear();
+	for (auto &lane : key_lanes_)
+	{
+		lane.nulls.clear();
+		lane.i32_values.clear();
+		lane.i64_values.clear();
+		lane.u64_values.clear();
+		lane.string_values.clear();
+		lane.string_arena.clear();
+	}
+	emit_pos_ = 0;
+	materialized_ = false;
+}
+
+void
+VecSortState::reset_external_input()
+{
+	reset_materialized_state();
+}
+
+void
+VecSortState::append_external_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
+{
+	append_batch(chunk);
+}
+
+void
+VecSortState::finish_external_input()
+{
+	std::sort(rows_.begin(), rows_.end(), [this](const VecRowRef &a, const VecRowRef &b) {
+		return row_less(a, b);
+	});
+	emit_pos_ = 0;
+	materialized_ = true;
+}
+
+bool
+VecSortState::configure_source_block_range(BlockNumber start_block, uint32_t nblocks)
+{
+	reset_materialized_state();
+	bool ok = left_ != nullptr &&
+		left_->configure_source_block_range(start_block, nblocks);
+
+	if (pg_volvec_trace_hooks && !ok)
+		elog(LOG,
+			 "pg_volvec: sort block range configure failed start=%u nblocks=%u left=%s",
+			 start_block,
+			 nblocks,
+			 left_ != nullptr ? "ok" : "null");
+	return ok;
+}
+
+void
+VecSortState::clear_source_block_range()
+{
+	if (left_ != nullptr)
+		left_->clear_source_block_range();
+	reset_materialized_state();
+}
+
 DataChunk<DEFAULT_CHUNK_SIZE> *
 VecSortState::allocate_payload_chunk()
 {
