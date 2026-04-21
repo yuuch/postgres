@@ -222,16 +222,44 @@ private:
 		void update_group_accumulators(VecAggGroupState *group,
 									   const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
 									   int row_idx);
-		VolVecVector<VecAggDesc> aggs_; VecAggHashTable hash_table_;
-		VecAggSimpleHashTable simple_hash_table_;
-		VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> rep_chunks_;
-		VecAggHashTable::iterator it_;
-		VecAggSimpleHashTable::iterator simple_it_;
+
+		// P0 optimization: batch hash computation
+		void batch_compute_group_hashes(const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+										uint64_t *hashes_out);
+		void batch_update_simple_aggregates(VecAggGroupState **group_ptrs,
+											const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+											int n_rows);
+
+		struct VecAggPartition {
+			VecAggHashTable groups;
+			VecAggSimpleHashTable simple_groups;
+			VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> rep_chunks;
+
+		VecAggPartition(MemoryContext ctx)
+			: groups(ctx),
+			  simple_groups(ctx),
+			  rep_chunks(VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *>::allocator_type(ctx)) {}
+		};
+
+		static constexpr int NUM_PARTITIONS = 256;
+
+		void consume_batch_partitioned(DataChunk<DEFAULT_CHUNK_SIZE> &batch);
+		void finalize_partitions();
+
+	VolVecVector<VecAggDesc> aggs_; VecAggHashTable hash_table_;
+	VecAggSimpleHashTable simple_hash_table_;
+	VolVecVector<DataChunk<DEFAULT_CHUNK_SIZE> *> rep_chunks_;
+	VecAggHashTable::Iterator it_;
+	VecAggSimpleHashTable::Iterator simple_it_;
 		bool use_simple_group_key_ = false;
 		VecOutputStorageKind simple_group_storage_ = VecOutputStorageKind::Int32;
 		uint64_t input_rows_consumed_ = 0;
 		uint64_t input_batches_consumed_ = 0;
-		bool valid_ = true;
-		bool fully_scanned_ = false; void do_sink();
-	};
+	bool valid_ = true;
+	bool fully_scanned_ = false;
+	bool use_partitioned_ = false;
+	VolVecVector<VecAggPartition *> partitions_;
+
+	void do_sink();
+};
 

@@ -250,8 +250,7 @@ VecLookupProjectState::VecLookupProjectState(std::unique_ptr<VecPlanState> left,
 	: left_(std::move(left)),
 	  lookup_source_(std::move(lookup_source)),
 	  memory_context_(CurrentMemoryContext),
-	  lookup_table_(0, VecLookupScalarKeyHash{}, std::equal_to<VecLookupScalarKey>{},
-					PgMemoryContextAllocator<std::pair<const VecLookupScalarKey, VecLookupScalarValue>>(memory_context_)),
+	  lookup_table_(memory_context_),
 	  input_key_col_(input_key_col),
 	  input_key_meta_(input_key_meta),
 	  lookup_key_col_(lookup_key_col),
@@ -352,7 +351,7 @@ VecLookupProjectState::build_lookup()
 						return false;
 				}
 			}
-			lookup_table_[key] = value;
+			auto [slot, inserted] = lookup_table_.insert(key); slot->val = value;
 		}
 	}
 
@@ -373,39 +372,39 @@ VecLookupProjectState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 	while (left_->get_next_batch(chunk))
 	{
 		for (int row = 0; row < chunk.count; row++)
+	{
+		VecLookupScalarKey key;
+		RobinHoodPgMap<VecLookupScalarKey, VecLookupScalarValue, VecLookupScalarKeyHash>::Slot *slot = nullptr;
+
+		if (!extract_lookup_key(chunk, row, input_key_col_, input_key_meta_, &key))
+			return false;
+		if (!key.is_null)
+			slot = lookup_table_.find(key);
+		if (key.is_null || slot == nullptr)
 		{
-			VecLookupScalarKey key;
-			auto it = lookup_table_.end();
-
-			if (!extract_lookup_key(chunk, row, input_key_col_, input_key_meta_, &key))
-				return false;
-			if (!key.is_null)
-				it = lookup_table_.find(key);
-			if (key.is_null || it == lookup_table_.end())
-			{
-				chunk.nulls[out_col][row] = 1;
-				continue;
-			}
-
-			chunk.nulls[out_col][row] = it->second.is_null;
-			if (chunk.nulls[out_col][row])
-				continue;
-			switch (output_meta_.storage_kind)
-			{
-				case VecOutputStorageKind::Int32:
-					chunk.int32_columns[out_col][row] = it->second.i32;
-					break;
-				case VecOutputStorageKind::Int64:
-				case VecOutputStorageKind::NumericScaledInt64:
-					chunk.int64_columns[out_col][row] = it->second.i64;
-					break;
-				case VecOutputStorageKind::Double:
-					chunk.double_columns[out_col][row] = it->second.f8;
-					break;
-				default:
-					return false;
-			}
+			chunk.nulls[out_col][row] = 1;
+			continue;
 		}
+
+		chunk.nulls[out_col][row] = slot->val.is_null;
+		if (chunk.nulls[out_col][row])
+			continue;
+		switch (output_meta_.storage_kind)
+		{
+			case VecOutputStorageKind::Int32:
+				chunk.int32_columns[out_col][row] = slot->val.i32;
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+				chunk.int64_columns[out_col][row] = slot->val.i64;
+				break;
+			case VecOutputStorageKind::Double:
+				chunk.double_columns[out_col][row] = slot->val.f8;
+				break;
+			default:
+				return false;
+		}
+	}
 
 		if ((chunk.has_selection ? chunk.sel.count : chunk.count) > 0)
 			return true;
@@ -428,8 +427,7 @@ VecLookupProjectStateMultiKey::VecLookupProjectStateMultiKey(
 	: left_(std::move(left)),
 	  lookup_source_(std::move(lookup_source)),
 	  memory_context_(CurrentMemoryContext),
-	  lookup_table_(0, VecLookupCompositeKeyHash{}, std::equal_to<VecLookupCompositeKey>{},
-					PgMemoryContextAllocator<std::pair<const VecLookupCompositeKey, VecLookupScalarValue>>(memory_context_)),
+	  lookup_table_(memory_context_),
 	  num_keys_(num_keys),
 	  lookup_value_col_(lookup_value_col),
 	  output_resno_(output_resno),
@@ -557,7 +555,7 @@ VecLookupProjectStateMultiKey::build_lookup()
 						return false;
 				}
 			}
-			lookup_table_[key] = value;
+			auto [slot, inserted] = lookup_table_.insert(key); slot->val = value;
 		}
 	}
 
@@ -577,40 +575,40 @@ VecLookupProjectStateMultiKey::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chu
 
 	while (left_->get_next_batch(chunk))
 	{
-		for (int row = 0; row < chunk.count; row++)
+	for (int row = 0; row < chunk.count; row++)
+	{
+		VecLookupCompositeKey key;
+		RobinHoodPgMap<VecLookupCompositeKey, VecLookupScalarValue, VecLookupCompositeKeyHash>::Slot *slot = nullptr;
+
+		if (!extract_lookup_key(chunk, row, input_key_cols_, input_key_metas_, &key))
+			return false;
+		if (!key.is_null)
+			slot = lookup_table_.find(key);
+		if (key.is_null || slot == nullptr)
 		{
-			VecLookupCompositeKey key;
-			auto it = lookup_table_.end();
-
-			if (!extract_lookup_key(chunk, row, input_key_cols_, input_key_metas_, &key))
-				return false;
-			if (!key.is_null)
-				it = lookup_table_.find(key);
-			if (key.is_null || it == lookup_table_.end())
-			{
-				chunk.nulls[out_col][row] = 1;
-				continue;
-			}
-
-			chunk.nulls[out_col][row] = it->second.is_null;
-			if (chunk.nulls[out_col][row])
-				continue;
-			switch (output_meta_.storage_kind)
-			{
-				case VecOutputStorageKind::Int32:
-					chunk.int32_columns[out_col][row] = it->second.i32;
-					break;
-				case VecOutputStorageKind::Int64:
-				case VecOutputStorageKind::NumericScaledInt64:
-					chunk.int64_columns[out_col][row] = it->second.i64;
-					break;
-				case VecOutputStorageKind::Double:
-					chunk.double_columns[out_col][row] = it->second.f8;
-					break;
-				default:
-					return false;
-			}
+			chunk.nulls[out_col][row] = 1;
+			continue;
 		}
+
+		chunk.nulls[out_col][row] = slot->val.is_null;
+		if (chunk.nulls[out_col][row])
+			continue;
+		switch (output_meta_.storage_kind)
+		{
+			case VecOutputStorageKind::Int32:
+				chunk.int32_columns[out_col][row] = slot->val.i32;
+				break;
+			case VecOutputStorageKind::Int64:
+			case VecOutputStorageKind::NumericScaledInt64:
+				chunk.int64_columns[out_col][row] = slot->val.i64;
+				break;
+			case VecOutputStorageKind::Double:
+				chunk.double_columns[out_col][row] = slot->val.f8;
+				break;
+			default:
+				return false;
+		}
+	}
 
 		if ((chunk.has_selection ? chunk.sel.count : chunk.count) > 0)
 			return true;

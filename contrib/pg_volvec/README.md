@@ -135,6 +135,44 @@ Notable outcomes in this checkpoint:
 - Q4 and Q12 are the clearest reminders that current process-worker lowering
   is functionally broad but not yet performance-closed.
 
+### Latest PostgreSQL Parallel Baseline
+
+Checked-in artifact:
+
+- [benchmarks/tpch_supported_twice_20260421_154310.tsv](benchmarks/tpch_supported_twice_20260421_154310.tsv)
+
+This is the latest checked-in native PostgreSQL parallel baseline snapshot in
+the `bench_supported_twice` format.
+
+- Run date: `2026-04-21`
+- Engine: native PostgreSQL parallel
+- Source artifact mode: `pg_parallel`
+- Measurement column: `best_ms`
+- Note: this artifact captures the PostgreSQL side only; `q20` hit statement
+  timeout in this run
+
+| Query | Best ms | Status |
+|---|---:|---|
+| Q1 | 4110 | ok |
+| Q3 | 3062 | ok |
+| Q4 | 3069 | ok |
+| Q5 | 2044 | ok |
+| Q6 | 2057 | ok |
+| Q7 | 2044 | ok |
+| Q8 | 4077 | ok |
+| Q9 | 8095 | ok |
+| Q10 | 3049 | ok |
+| Q11 | 1040 | ok |
+| Q12 | 2039 | ok |
+| Q13 | 12097 | ok |
+| Q14 | 2034 | ok |
+| Q15 | 4056 | ok |
+| Q16 | 1026 | ok |
+| Q18 | 57860 | ok |
+| Q19 | 3050 | ok |
+| Q20 | 360402 | error (statement timeout) |
+| Q22 | 1035 | ok |
+
 ## Build And Install
 
 Use PostgreSQL's top-level Meson build.

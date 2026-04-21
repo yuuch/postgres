@@ -1,4 +1,7 @@
 #include "exec/internal.hpp"
+#include "hash_table.hpp"
+
+#include <unordered_set>
 
 namespace pg_volvec {
 
@@ -27,8 +30,16 @@ VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 	  probe_keys_(PgMemoryContextAllocator<VecHashJoinKey>(memory_context_)),
 	  probe_hashes_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
 	  probe_next_entries_(PgMemoryContextAllocator<int32_t>(memory_context_)),
+	  probe_partition_ids_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
 	  active_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
 	  next_probe_sel_(PgMemoryContextAllocator<uint16_t>(memory_context_)),
+	  probe_candidates_(PgMemoryContextAllocator<ProbeCandidate>(memory_context_)),
+	  probe_partition_offsets_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
+	  probe_partition_order_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
+	  probe_partition_cursor_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
+	  join_filter_build_col_mask_(PgMemoryContextAllocator<uint8_t>(memory_context_)),
+	  output_build_col_mask_(PgMemoryContextAllocator<uint8_t>(memory_context_)),
+	  required_build_col_mask_(PgMemoryContextAllocator<uint8_t>(memory_context_)),
 	  ht_match_payloads_(PgMemoryContextAllocator<uint64_t>(memory_context_)),
 	  ht_match_starts_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
 	  ht_match_counts_(PgMemoryContextAllocator<uint32_t>(memory_context_)),
@@ -54,6 +65,14 @@ VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 	  shared_hash_bridge_buffer_(nullptr),
 	  shared_hash_bridge_buffer_size_(0),
 	  shared_hash_bridge_buffer_owned_(false),
+	  shared_hash_partitions_(nullptr),
+	  shared_hash_partition_count_(0),
+	  shared_payload_cols_view_(nullptr),
+	  shared_payload_col_count_(0),
+	  shared_bucket_heads_view_(nullptr),
+	  shared_bucket_count_(0),
+	  shared_entries_view_(nullptr),
+	  shared_entry_count_(0),
 	  shared_hash_chunks_(nullptr),
 	  shared_hash_chunk_count_(0),
 	  assigned_partition_start_(0),
@@ -83,6 +102,20 @@ VecHashJoinState::VecHashJoinState(std::unique_ptr<VecPlanState> outer,
 			remapped.input_col = ensure_inner_payload_col(remapped.input_col, remapped.meta);
 		output_cols_.push_back(remapped);
 	}
+	join_filter_build_col_mask_.assign(16, 0);
+	output_build_col_mask_.assign(16, 0);
+	required_build_col_mask_.assign(16, 0);
+	for (const auto &output_col : output_cols_)
+	{
+		if ((build_outer_side_ && output_col.side == VecJoinSide::Outer) ||
+			(!build_outer_side_ && output_col.side == VecJoinSide::Inner))
+		{
+			if (output_col.input_col < output_build_col_mask_.size())
+				output_build_col_mask_[output_col.input_col] = 1;
+			if (output_col.input_col < required_build_col_mask_.size())
+				required_build_col_mask_[output_col.input_col] = 1;
+		}
+	}
 }
 
 void
@@ -95,6 +128,25 @@ VecHashJoinState::~VecHashJoinState()
 {
 	for (auto *chunk : inner_chunks_)
 		delete chunk;
+	
+	std::unordered_set<DataChunk<DEFAULT_CHUNK_SIZE> *> deleted_chunks;
+	for (int i = 0; i < VOLVEC_RADIX_FANOUT; i++)
+	{
+		for (auto *chunk : partition_chunks_[i])
+		{
+			if (deleted_chunks.find(chunk) == deleted_chunks.end())
+			{
+				delete chunk;
+				deleted_chunks.insert(chunk);
+			}
+		}
+		
+		if (partition_bucket_heads_[i] != nullptr &&
+			!partition_bucket_heads_external_[i])
+		{
+			pfree(partition_bucket_heads_[i]);
+		}
+	}
 }
 
 bool
@@ -145,6 +197,22 @@ VecHashJoinState::clear_build_input_block_range()
 		build_state->clear_source_block_range();
 }
 
+void
+VecHashJoinState::set_assigned_partition_range(uint32_t start_partition,
+							   uint32_t end_partition)
+{
+	assigned_partition_start_ = Min(start_partition, (uint32_t) VOLVEC_RADIX_FANOUT);
+	assigned_partition_end_ = Min(Max(end_partition, assigned_partition_start_),
+						   (uint32_t) VOLVEC_RADIX_FANOUT);
+}
+
+void
+VecHashJoinState::reset_assigned_partition_range()
+{
+	assigned_partition_start_ = 0;
+	assigned_partition_end_ = VOLVEC_RADIX_FANOUT;
+}
+
 VecSeqScanState *
 VecHashJoinState::find_parallel_source_scan_state()
 {
@@ -169,8 +237,13 @@ VecHashJoinState::reset_probe_task_state()
 	probe_keys_.clear();
 	probe_hashes_.clear();
 	probe_next_entries_.clear();
+	probe_partition_ids_.clear();
 	active_probe_sel_.clear();
 	next_probe_sel_.clear();
+	probe_candidates_.clear();
+	probe_partition_offsets_.clear();
+	probe_partition_order_.clear();
+	probe_partition_cursor_.clear();
 	probe_batch_ready_ = false;
 	probe_input_exhausted_ = false;
 	anti_outer_pos_ = 0;
@@ -189,6 +262,10 @@ VecHashJoinState::init_hash_table(size_t expected_rows)
 	entries_.clear();
 	inner_entry_matched_.clear();
 	entries_.reserve(expected_rows > 0 ? expected_rows : DEFAULT_CHUNK_SIZE);
+	shared_bucket_heads_view_ = nullptr;
+	shared_bucket_count_ = 0;
+	shared_entries_view_ = nullptr;
+	shared_entry_count_ = 0;
 }
 
 void
@@ -208,6 +285,10 @@ VecHashJoinState::rehash_hash_table(size_t min_bucket_count)
 		entries_[i].next = bucket_heads_[bucket];
 		bucket_heads_[bucket] = (int32_t) i;
 	}
+	shared_bucket_heads_view_ = nullptr;
+	shared_bucket_count_ = 0;
+	shared_entries_view_ = nullptr;
+	shared_entry_count_ = 0;
 }
 
 void
@@ -450,12 +531,113 @@ VecHashJoinState::consume_build_input()
 }
 
 void
+VecHashJoinState::consume_build_input_radix()
+{
+	DataChunk<DEFAULT_CHUNK_SIZE> input;
+	VecPlanState *build_state = build_outer_side_ ? outer_.get() : inner_.get();
+	bool build_is_inner = !build_outer_side_;
+
+	if (inner_built_)
+		return;
+
+	struct PartitionRow {
+		VecHashJoinKey key;
+		uint32_t hash;
+		uint32_t partition_id;
+		int src_row;
+	};
+
+	VolVecVector<PartitionRow> pending_rows;
+	pending_rows.reserve(DEFAULT_CHUNK_SIZE);
+
+	while (build_state->get_next_batch(input))
+	{
+		int active_count = input.has_selection ? input.sel.count : input.count;
+
+		build_input_batches_consumed_++;
+		build_input_rows_consumed_ += (uint64_t) active_count;
+
+		pending_rows.clear();
+
+		for (int s = 0; s < active_count; s++)
+		{
+			int src_row = input.has_selection ? input.sel.row_ids[s] : s;
+			VecHashJoinKey key;
+			uint32_t hash;
+
+			if (!read_key(input, build_is_inner, src_row, &key))
+				continue;
+
+			hash = hash_key(key);
+			uint32_t partition_id = volvec_radix_partition_idx(hash);
+
+			if (jointype_ == JOIN_ANTI && !build_outer_side_ &&
+				inner_payload_cols_.empty() &&
+				build_key_exists(key, hash))
+				continue;
+
+			pending_rows.push_back({key, hash, partition_id, src_row});
+			build_histogram_[partition_id]++;
+		}
+
+		for (const auto &prow : pending_rows)
+		{
+			uint32_t pid = prow.partition_id;
+			DataChunk<DEFAULT_CHUNK_SIZE> *dst;
+
+			if (partition_chunks_[pid].empty() ||
+				partition_chunks_[pid].back()->count >= DEFAULT_CHUNK_SIZE)
+			{
+				MemoryContext old = MemoryContextSwitchTo(memory_context_);
+				dst = new DataChunk<DEFAULT_CHUNK_SIZE>();
+				MemoryContextSwitchTo(old);
+				partition_chunks_[pid].push_back(dst);
+			}
+			else
+			{
+				dst = partition_chunks_[pid].back();
+			}
+
+			int dst_row = dst->count;
+			copy_inner_payload_row(*dst, dst_row, input, prow.src_row);
+
+			VecHashEntry entry;
+			entry.hash = prow.hash;
+			entry.key = prow.key;
+			entry.chunk_idx = partition_row_stores_[pid].row_count;
+			entry.row_idx = (uint16_t)dst_row;
+			entry.next = -1;
+
+			append_partition_row_from_input(pid, input, prow.src_row, prow.key, prow.hash);
+			partition_entries_[pid].push_back(entry);
+			dst->count++;
+		}
+	}
+
+	total_build_rows_ = 0;
+	for (int i = 0; i < VOLVEC_RADIX_FANOUT; i++)
+		total_build_rows_ += build_histogram_[i];
+}
+
+void
 VecHashJoinState::finish_parallel_hash_build()
 {
 	if (inner_built_)
 		return;
 	inner_built_ = true;
-	inner_entry_matched_.assign(entries_.size(), 0);
+	
+	if (use_parallel_ht_)
+	{
+		for (int part_idx = 0; part_idx < VOLVEC_RADIX_FANOUT; part_idx++)
+		{
+			if (build_histogram_[part_idx] > 0)
+				build_linear_probe_table_for_partition(part_idx);
+		}
+	}
+	else
+	{
+		inner_entry_matched_.assign(entries_.size(), 0);
+	}
 }
 
 void
@@ -463,6 +645,66 @@ VecHashJoinState::build_inner_hash()
 {
 	consume_build_input();
 	finish_parallel_hash_build();
+}
+
+void
+VecHashJoinState::build_linear_probe_table_for_partition(int part_idx)
+{
+	if (part_idx < 0 || part_idx >= VOLVEC_RADIX_FANOUT)
+		return;
+
+	const auto &entries = partition_entries_[part_idx];
+	if (entries.empty())
+		return;
+
+	size_t entry_count = entries.size();
+	size_t bucket_count = 1024;
+
+	while (bucket_count < entry_count * 2)
+		bucket_count <<= 1;
+
+	MemoryContext old = MemoryContextSwitchTo(memory_context_);
+	int32_t *bucket_heads = (int32_t *) palloc(bucket_count * sizeof(int32_t));
+	MemoryContextSwitchTo(old);
+
+	for (size_t i = 0; i < bucket_count; i++)
+		bucket_heads[i] = -1;
+
+	size_t mask = bucket_count - 1;
+
+	VecHashEntry *entries_mutable = const_cast<VecHashEntry *>(entries.data());
+
+	for (size_t i = 0; i < entry_count; i++)
+	{
+		size_t bucket = entries[i].hash & mask;
+		entries_mutable[i].next = bucket_heads[bucket];
+		bucket_heads[bucket] = (int32_t) i;
+	}
+
+	partition_bucket_heads_[part_idx] = bucket_heads;
+	partition_bucket_masks_[part_idx] = mask;
+	partition_bucket_heads_external_[part_idx] = false;
+}
+
+void
+VecHashJoinState::partition_build_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &input,
+										uint32_t *hashes, uint64_t *keys, uint64_t *payloads)
+{
+	for (int part_idx = 0; part_idx < VOLVEC_RADIX_FANOUT; part_idx++)
+	{
+		if (build_histogram_[part_idx] == 0)
+			continue;
+		build_linear_probe_table_for_partition(part_idx);
+	}
+}
+
+void
+VecHashJoinState::build_linear_probe_tables()
+{
+	for (int part_idx = 0; part_idx < VOLVEC_RADIX_FANOUT; part_idx++)
+	{
+		build_linear_probe_table_for_partition(part_idx);
+	}
 }
 
 bool
@@ -494,28 +736,42 @@ VecHashJoinState::prepare_probe_batch()
 	probe_keys_.clear();
 	probe_hashes_.clear();
 	probe_next_entries_.clear();
+	probe_partition_ids_.clear();
 	active_probe_sel_.clear();
 	next_probe_sel_.clear();
+	probe_candidates_.clear();
+	probe_partition_offsets_.clear();
+	probe_partition_order_.clear();
+	probe_partition_cursor_.clear();
 	probe_rows_.reserve(active_count);
 	probe_keys_.reserve(active_count);
 	probe_hashes_.reserve(active_count);
 	probe_next_entries_.reserve(active_count);
+	probe_partition_ids_.reserve(active_count);
 	active_probe_sel_.reserve(active_count);
 	next_probe_sel_.reserve(active_count);
+	probe_candidates_.reserve(active_count);
 
+	probe_partition_offsets_.assign(VOLVEC_RADIX_FANOUT + 1, 0);
 	for (int s = 0; s < active_count; s++)
 	{
 		int row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
 		VecHashJoinKey key;
 		uint32_t hash;
 		int32_t head;
+		uint16_t partition_id;
 		uint16_t probe_idx;
 
 		if (!read_key(outer_chunk_, build_outer_side_, row, &key))
 			continue;
 
 		hash = hash_key(key);
-		head = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
+		partition_id = (shared_hash_partition_count_ == 1) ? 0 : (uint16_t) volvec_radix_partition_idx(hash);
+		const int32_t *bucket_heads = use_parallel_ht_ ? 
+			bucket_heads_for_partition(partition_id) : active_bucket_heads();
+		size_t mask = use_parallel_ht_ ? 
+			active_bucket_mask_for_partition(partition_id) : bucket_mask_;
+		head = bucket_heads == nullptr ? -1 : bucket_heads[hash & mask];
 		if (head < 0)
 			continue;
 
@@ -524,10 +780,77 @@ VecHashJoinState::prepare_probe_batch()
 		probe_keys_.push_back(key);
 		probe_hashes_.push_back(hash);
 		probe_next_entries_.push_back(head);
+		probe_partition_ids_.push_back(partition_id);
 		active_probe_sel_.push_back(probe_idx);
+		probe_partition_offsets_[partition_id + 1]++;
 	}
+	for (uint32_t i = 1; i < probe_partition_offsets_.size(); i++)
+		probe_partition_offsets_[i] += probe_partition_offsets_[i - 1];
+	initialize_probe_partition_order();
+	assign_probe_candidates_from_partition(0);
 
 	probe_batch_ready_ = true;
+}
+
+const VecHashJoinState::VecHashEntry &
+VecHashJoinState::get_entry_at(size_t entry_idx) const
+{
+	if (shared_entries_view_ != nullptr)
+		return shared_entries_view_[entry_idx];
+	return entries_[entry_idx];
+}
+
+const int32_t *
+VecHashJoinState::active_bucket_heads() const
+{
+	if (shared_bucket_heads_view_ != nullptr)
+		return shared_bucket_heads_view_;
+	return bucket_heads_.empty() ? nullptr : bucket_heads_.data();
+}
+
+size_t
+VecHashJoinState::active_entry_count() const
+{
+	if (shared_entries_view_ != nullptr)
+		return shared_entry_count_;
+	return entries_.size();
+}
+
+void
+VecHashJoinState::initialize_probe_partition_order()
+{
+	probe_partition_order_.clear();
+	probe_partition_cursor_.assign(VOLVEC_RADIX_FANOUT, 0);
+	for (uint32_t part_idx = assigned_partition_start_;
+		 part_idx < assigned_partition_end_ && part_idx < VOLVEC_RADIX_FANOUT;
+		 part_idx++)
+	{
+		if (probe_partition_offsets_[part_idx + 1] > probe_partition_offsets_[part_idx])
+			probe_partition_order_.push_back(part_idx);
+	}
+}
+
+void
+VecHashJoinState::assign_probe_candidates_from_partition(uint32_t start_partition_order_idx)
+{
+	probe_candidates_.clear();
+	for (uint32_t order_idx = start_partition_order_idx;
+		 order_idx < probe_partition_order_.size();
+		 order_idx++)
+	{
+		uint32_t part_idx = probe_partition_order_[order_idx];
+		for (uint16_t probe_idx : active_probe_sel_)
+		{
+			if (probe_partition_ids_[probe_idx] != part_idx)
+				continue;
+			probe_candidates_.push_back(ProbeCandidate{probe_idx, probe_next_entries_[probe_idx]});
+		}
+		if (!probe_candidates_.empty())
+		{
+			probe_partition_cursor_[part_idx] = order_idx;
+			return;
+		}
+	}
 }
 
 bool
@@ -539,7 +862,7 @@ VecHashJoinState::advance_probe_match(uint16_t probe_idx, int32_t *match_entry_i
 
 	while (entry_idx >= 0)
 	{
-		const VecHashEntry &entry = entries_[entry_idx];
+		const VecHashEntry &entry = get_entry_at(entry_idx);
 
 		probe_next_entries_[probe_idx] = entry.next;
 		if (entry.hash == hash && keys_equal(entry.key, key))
@@ -552,6 +875,21 @@ VecHashJoinState::advance_probe_match(uint16_t probe_idx, int32_t *match_entry_i
 	}
 
 	probe_next_entries_[probe_idx] = -1;
+	return false;
+}
+
+bool
+VecHashJoinState::next_probe_candidate(ProbeCandidate *candidate)
+{
+	if (candidate == nullptr)
+		return false;
+	while (!probe_candidates_.empty())
+	{
+		*candidate = probe_candidates_.back();
+		probe_candidates_.pop_back();
+		if (candidate->entry_idx >= 0)
+			return true;
+	}
 	return false;
 }
 
@@ -600,6 +938,41 @@ VecHashJoinState::candidate_passes_join_filter(const DataChunk<DEFAULT_CHUNK_SIZ
 
 	join_filter_program_->evaluate(join_filter_chunk_);
 	return (join_filter_chunk_.has_selection ? join_filter_chunk_.sel.count : join_filter_chunk_.count) > 0;
+}
+
+const ParallelHashBuildPartition *
+VecHashJoinState::active_partition_view() const
+{
+	if (!use_parallel_ht_ || shared_hash_partition_count_ == 0)
+		return nullptr;
+	return shared_hash_partitions_;
+}
+
+size_t
+VecHashJoinState::active_entry_base() const
+{
+	if (!use_parallel_ht_ || shared_hash_partition_count_ <= 1)
+		return 0;
+	/* Multi-partition: entries are partitioned. Base = 0 for now. */
+	return 0;
+}
+
+size_t
+VecHashJoinState::active_bucket_mask_for_partition(uint32_t partition_id) const
+{
+	if (!use_parallel_ht_ || shared_hash_partition_count_ <= 1)
+		return bucket_mask_;
+	Assert(partition_id < VOLVEC_RADIX_FANOUT);
+	return partition_bucket_masks_[partition_id];
+}
+
+const int32_t *
+VecHashJoinState::bucket_heads_for_partition(uint32_t partition_id) const
+{
+	if (!use_parallel_ht_ || shared_hash_partition_count_ <= 1)
+		return active_bucket_heads();
+	Assert(partition_id < VOLVEC_RADIX_FANOUT);
+	return partition_bucket_heads_[partition_id];
 }
 
 } /* namespace pg_volvec */

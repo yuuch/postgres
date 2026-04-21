@@ -1,6 +1,6 @@
 # pg_volvec TODO
 
-Status refreshed: `2026-04-18`
+Status refreshed: `2026-04-21`
 
 ## Verified Query Set
 
@@ -33,6 +33,39 @@ Offloaded with narrower validation:
 - Q21
 
 ## Immediate Priorities
+
+### 2026-04-21 SF10 Reload And Benchmark Checkpoint
+
+- [x] Reimported TPC-H SF10 data into `tpch` from
+  `tpch_v3/TPC-H V3.0.1/dbgen/tpch_data` after the live database was found
+  incomplete. Verified row statistics after `ANALYZE`: customer 1.5M,
+  lineitem ~59.98M, orders ~15.0M, part 2.0M, partsupp 8.0M, supplier 100k,
+  nation 25, region 5.
+- [x] Native PG parallel benchmark artifact:
+  `contrib/pg_volvec/benchmarks/tpch_supported_twice_20260421_154310.tsv`.
+  PG parallel completed all default supported queries except Q20, which hit
+  the 360s statement timeout.
+- [ ] pg_volvec parallel benchmark artifact:
+  `contrib/pg_volvec/benchmarks/tpch_supported_twice_20260421_150737.tsv`.
+  Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q13/Q14/Q15/Q16 completed; Q4/Q11/Q18/Q20
+  exposed correctness/runtime blockers; Q19/Q22 failures in that sweep were
+  downstream of backend recovery after earlier errors.
+- [x] Fixed Q3 SF10 initialization crash caused by over-eager aggregate hash
+  table reserve (`invalid memory alloc request size 1107296256`). Initial
+  aggregate reserve is now capped conservatively.
+- [x] Fixed Q3 QueryScheduler undercount after DSA/shared hash bridge changes:
+  single-partition shared bridges now route all probe keys to partition 0
+  instead of radix partition ids. Q3 now returns 114003 rows and exact native
+  diff passes.
+- [ ] Q4/Q18 blocker: planner produces an internal HashAggregate/distinct-like
+  build side for semi/exists shapes. Current vector aggregate tries to build
+  millions of groups in a local hash table and hits a guarded 1GB allocation.
+  This should be solved by a QueryScheduler-native semi-membership/hash-build
+  bridge, not by regular serial fallback.
+- [ ] Q11 blocker: QueryScheduler partition hash finalize can fail worker
+  initialization (`parallel worker could not initialize VecPlanState`).
+- [ ] Q20 blocker: QueryScheduler row/sort bridge is correct but still far too
+  slow; full vectorized sort-run/merge-path work remains.
 
 ### 0. QueryScheduler Coverage Rollout
 
@@ -119,6 +152,11 @@ section after each fix lands.
   `SharedFileSet` to DSM/DSA-backed storage for medium-sized artifacts, keeping
   file fallback only for payloads that are too large for practical shared
   memory.
+- [ ] QueryScheduler qbridge follow-up: once a pipeline's direct DAG dependents
+  have all completed, reclaim its DSM/DSA-backed shared hash bridge blob
+  instead of holding it until whole-query teardown. Keep the first version
+  conservative: centralize reclamation in scheduler/finalize code, do not let
+  arbitrary workers free shared bridge storage.
 - [x] Prefer DSM inline aggregate partial slots for small grouped aggregates;
   `bpchar` group keys are trimmed before the inline 8-byte string-key cutoff so
   Q7/Q12 no longer force aggregate partial files just because their SQL type is

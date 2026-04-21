@@ -93,7 +93,10 @@ enum class ParallelBridgeKind : uint8_t {
 
 enum class ParallelTaskKind : uint8_t {
 	SourceMorsel,
-	BridgeFinalize
+	BridgeFinalize,
+	HashBuildPartition,
+	HashPartitionFinalize,
+	HashProbePartition
 };
 
 struct ParallelAggPartialAccumulator {
@@ -157,7 +160,10 @@ struct ParallelHashBuildPartialState {
 	uint64_t input_rows = 0;
 	uint64_t entry_count = 0;
 	uint64_t chunk_count = 0;
+	uint64_t row_count = 0;
 	uint64_t file_bytes = 0;
+	uint64_t row_file_bytes = 0;
+	uint64_t dsa_pack = 0;
 	char file_name[VOLVEC_PARALLEL_MAX_PARTIAL_FILE_NAME] = {0};
 };
 

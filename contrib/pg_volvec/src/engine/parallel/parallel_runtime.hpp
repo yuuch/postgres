@@ -89,6 +89,7 @@ struct ParallelTaskDesc {
 	 */
 	ParallelTaskKind task_kind = ParallelTaskKind::SourceMorsel;
 	uint32_t pipeline_id = UINT32_MAX;
+	uint32_t partition_id = UINT32_MAX;
 	BlockNumber morsel_start_block = InvalidBlockNumber;
 	uint32_t morsel_nblocks = 0;
 };
@@ -249,6 +250,7 @@ public:
 			ready_tasks_.push_back(ParallelTaskDesc{
 				runtime->next_task_kind,
 				pipeline_id,
+				UINT32_MAX,
 				start_block,
 				nblocks
 			});
@@ -258,6 +260,7 @@ public:
 			ready_tasks_.push_back(ParallelTaskDesc{
 				runtime->next_task_kind,
 				pipeline_id,
+				UINT32_MAX,
 				runtime->next_morsel_block,
 				0
 			});

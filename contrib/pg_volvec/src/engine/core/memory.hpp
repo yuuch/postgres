@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/types.hpp"
+#include "core/robin_hood_pg_adapter.hpp"
 
 class PgMemoryContextObject
 {
@@ -74,9 +75,8 @@ private:
 template <typename T>
 using VolVecVector = std::vector<T, PgMemoryContextAllocator<T>>;
 
-template <typename Key, typename Value, typename Hash = std::hash<Key>, typename KeyEqual = std::equal_to<Key>>
-using VolVecHashMap = std::unordered_map<Key, Value, Hash, KeyEqual,
-	PgMemoryContextAllocator<std::pair<const Key, Value>>>;
+template <typename Key, typename Value, typename Hash = std::hash<Key>>
+using VolVecHashMap = RobinHoodPgMap<Key, Value, Hash>;
 
 /* === Parallel Hash Join: Radix Partition + Linear Probe + Bloom Filter === */
 static constexpr int VOLVEC_RADIX_BITS = 8;

@@ -76,6 +76,7 @@ struct alignas(16) DataChunk {
 	{
 		memset(nulls, 0, sizeof(nulls));
 	}
+
 	void reset() { count = 0; sel.clear(); has_selection = false; memset(nulls, 0, sizeof(nulls)); string_arena.clear(); }
 	VecStringRef store_string_bytes(const char *data, uint32_t len)
 	{

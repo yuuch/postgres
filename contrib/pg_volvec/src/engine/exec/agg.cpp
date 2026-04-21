@@ -7,19 +7,20 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 		: left_(std::move(left)),
 		  node_(node),
 		  memory_context_(CurrentMemoryContext),
-		  grp_col_indices_(PgMemoryContextAllocator<int>(memory_context_)),
-		  grp_col_meta_(PgMemoryContextAllocator<VecOutputColMeta>(memory_context_)),
-		  aggs_(PgMemoryContextAllocator<VecAggDesc>(memory_context_)),
-		  hash_table_(0, VecGroupKeyHash{}, std::equal_to<VecGroupKey>{},
-					 PgMemoryContextAllocator<std::pair<const VecGroupKey, VecAggGroupState>>(memory_context_)),
-		  simple_hash_table_(0, VecSimpleGroupKeyHash{}, std::equal_to<VecSimpleGroupKey>{},
-							PgMemoryContextAllocator<std::pair<const VecSimpleGroupKey, VecAggGroupState>>(memory_context_)),
-		  rep_chunks_(PgMemoryContextAllocator<DataChunk<DEFAULT_CHUNK_SIZE> *>(memory_context_)),
-		  fully_scanned_(false)
+	  grp_col_indices_(PgMemoryContextAllocator<int>(memory_context_)),
+	  grp_col_meta_(PgMemoryContextAllocator<VecOutputColMeta>(memory_context_)),
+	  aggs_(PgMemoryContextAllocator<VecAggDesc>(memory_context_)),
+	  hash_table_(memory_context_),
+	  simple_hash_table_(memory_context_),
+	  rep_chunks_(PgMemoryContextAllocator<DataChunk<DEFAULT_CHUNK_SIZE> *>(memory_context_)),
+	  fully_scanned_(false),
+	  partitions_(PgMemoryContextAllocator<VecAggPartition *>(memory_context_))
 {
-		for (int i = 0; i < node->numCols; i++) {
+	partitions_.resize(NUM_PARTITIONS, nullptr);
+	for (int i = 0; i < node->numCols; i++) {
 			VecOutputColMeta meta;
 			int target_resno = node->grpColIdx[i];
+			ListCell *meta_lc;
 
 			grp_col_indices_.push_back(target_resno - 1);
 			if (left_ == nullptr || !left_->lookup_output_col_meta(target_resno, &meta))
@@ -28,34 +29,72 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 				meta.storage_kind = VecOutputStorageKind::Int32;
 				meta.scale = 0;
 			}
+			foreach(meta_lc, node->plan.targetlist)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(meta_lc);
+
+				if (tle == nullptr || tle->resjunk ||
+					tle->resno != target_resno ||
+					tle->expr == nullptr)
+					continue;
+				meta.sql_type = exprType((Node *) tle->expr);
+				meta.storage_kind = DefaultOutputStorageKindForType(meta.sql_type);
+				meta.scale = meta.sql_type == NUMERICOID ?
+					GetNumericScaleFromTypmod(exprTypmod((Node *) tle->expr)) : 0;
+			}
 			grp_col_meta_.push_back(meta);
+			if (pg_volvec_trace_hooks)
+				elog(LOG,
+					 "pg_volvec: agg group meta idx=%d target_resno=%d sql_type=%u storage=%u scale=%d",
+					 i,
+					 target_resno,
+					 meta.sql_type,
+					 (unsigned) meta.storage_kind,
+					 meta.scale);
 		}
 		if (grp_col_indices_.size() == 1 &&
 			(grp_col_meta_[0].storage_kind == VecOutputStorageKind::Int32 ||
 			 grp_col_meta_[0].storage_kind == VecOutputStorageKind::Int64 ||
 			 grp_col_meta_[0].storage_kind == VecOutputStorageKind::NumericScaledInt64))
 		{
-			use_simple_group_key_ = true;
-			simple_group_storage_ = grp_col_meta_[0].storage_kind;
-		}
-		if (node != nullptr && node->plan.plan_rows > 0)
-		{
-			double estimated_groups = node->plan.plan_rows;
-			size_t reserve_count;
+	use_simple_group_key_ = true;
+	simple_group_storage_ = grp_col_meta_[0].storage_kind;
+}
+if (node != nullptr && node->plan.plan_rows > 0)
+{
+	static constexpr size_t kMaxInitialAggReserve = 1 << 14;
+	double estimated_groups = node->plan.plan_rows;
+	size_t reserve_count;
 
-			if (estimated_groups > (double) (SIZE_MAX / 2))
-				reserve_count = SIZE_MAX / 2;
-			else
-				reserve_count = (size_t) estimated_groups + 1;
-			if (use_simple_group_key_)
-				simple_hash_table_.reserve(reserve_count);
-			else
-				hash_table_.reserve(reserve_count);
-		}
+	if (estimated_groups > (double) (SIZE_MAX / 2))
+		reserve_count = SIZE_MAX / 2;
+	else
+		reserve_count = (size_t) estimated_groups + 1;
+	reserve_count = Min(reserve_count, kMaxInitialAggReserve);
+
+	if (use_simple_group_key_)
+		simple_hash_table_.reserve(reserve_count);
+	else
+		hash_table_.reserve(reserve_count);
+}
+if (node != nullptr && node->plan.lefttree != nullptr &&
+	node->plan.lefttree->plan_rows > 1000000.0 &&
+	node->numCols > 0)
+{
+	use_partitioned_ = false;
+	if (pg_volvec_trace_hooks)
+		elog(LOG,
+			 "pg_volvec: partitioned aggregation disabled pending correctness fix (input_rows=%.0f groups=%d)",
+			 node->plan.lefttree->plan_rows,
+			 node->numCols);
+}
 		ListCell *lc;
 		foreach(lc, node->plan.targetlist) {
 			TargetEntry *tle = (TargetEntry *) lfirst(lc);
 			VecAggDesc desc; desc.target_resno = tle->resno;
+
+			if (tle->resjunk)
+				continue;
 			desc.output_type = exprType((Node *) tle->expr);
 			desc.output_storage = DefaultOutputStorageKindForType(desc.output_type);
 		if (IsA(tle->expr, Aggref)) {
@@ -184,7 +223,21 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 					}
 				}
 			}
-			aggs_.push_back(std::move(desc));
+			{
+				bool replaced_existing = false;
+
+				for (auto &existing_desc : aggs_)
+				{
+					if (existing_desc.target_resno == desc.target_resno)
+					{
+						existing_desc = std::move(desc);
+						replaced_existing = true;
+						break;
+					}
+				}
+				if (!replaced_existing)
+					aggs_.push_back(std::move(desc));
+			}
 			if (pg_volvec_trace_hooks)
 			{
 				const auto &trace_desc = aggs_.back();
@@ -321,12 +374,7 @@ VecAggState::ensure_distinct_value_set(VecAggAccumulator *acc) const
 	if (acc->distinct_values != nullptr)
 		return acc->distinct_values;
 	old_context = MemoryContextSwitchTo(memory_context_);
-	acc->distinct_values =
-		new VecAggAccumulator::DistinctValueSet(
-			0,
-			std::hash<int64_t>{},
-			std::equal_to<int64_t>{},
-			PgMemoryContextAllocator<std::pair<const int64_t, char>>(memory_context_));
+	acc->distinct_values = new VecAggAccumulator::DistinctValueSet(memory_context_);
 	MemoryContextSwitchTo(old_context);
 	return acc->distinct_values;
 }
@@ -349,7 +397,7 @@ VecAggState::write_distinct_values_to_partial_file(BufFile *file,
 		return true;
 	for (const auto &entry : *acc->distinct_values)
 	{
-		int64_t value = entry.first;
+		int64_t value = entry.key;
 
 		if (!BufFileWriteAllLocal(file, &value, sizeof(value)))
 			return false;
@@ -377,7 +425,7 @@ VecAggState::read_distinct_values_from_partial_file(BufFile *file,
 
 		if (!BufFileReadAllLocal(file, &value, sizeof(value), false))
 			return false;
-		if (values->emplace(value, 1).second)
+		if (values->insert(value).second)
 			acc->count++;
 	}
 	return true;
@@ -570,7 +618,7 @@ VecAggState::update_group_accumulators(VecAggGroupState *group,
 
 			if (accs[a].distinct_values == nullptr)
 				ensure_distinct_value_set(&accs[a]);
-			if (accs[a].distinct_values->emplace(distinct_value, 1).second)
+			if (accs[a].distinct_values->insert(distinct_value).second)
 			{
 				accs[a].count++;
 				if (pg_volvec_trace_hooks)
@@ -714,9 +762,16 @@ VecAggState::consume_batch(DataChunk<DEFAULT_CHUNK_SIZE> &batch)
 			}
 		}
 	}
+
 	n = batch.has_selection ? batch.sel.count : batch.count;
 	input_batches_consumed_++;
 	input_rows_consumed_ += (uint64_t) n;
+
+	if (use_partitioned_)
+	{
+		consume_batch_partitioned(batch);
+		return;
+	}
 	for (int s = 0; s < n; s++) {
 		int i = batch.has_selection ? batch.sel.row_ids[s] : s;
 		if (use_simple_group_key_)
@@ -732,14 +787,14 @@ VecAggState::consume_batch(DataChunk<DEFAULT_CHUNK_SIZE> &batch)
 					key.value = (int64_t) batch.int32_columns[idx][i];
 				else
 					key.value = batch.int64_columns[idx][i];
-			}
-			auto insert_result = simple_hash_table_.try_emplace(key);
-			auto it = insert_result.first;
-
-			if (insert_result.second)
-				ensure_group_rep_row(&it->second, batch, i);
-			update_group_accumulators(&it->second, batch, i);
 		}
+		auto insert_result = simple_hash_table_.insert(key);
+		auto slot = insert_result.first;
+
+		if (insert_result.second)
+			ensure_group_rep_row(&slot->val, batch, i);
+		update_group_accumulators(&slot->val, batch, i);
+	}
 		else
 		{
 			VecGroupKey key;
@@ -792,15 +847,536 @@ VecAggState::consume_batch(DataChunk<DEFAULT_CHUNK_SIZE> &batch)
 					default:
 						key.values[k] = (uint64_t) (uint32_t) batch.int32_columns[idx][i];
 						key.aux[k] = 0;
-						break;
+				break;
+			}
+		}
+		auto insert_result = hash_table_.insert(key);
+		auto slot = insert_result.first;
+
+		if (insert_result.second)
+			ensure_group_rep_row(&slot->val, batch, i);
+		update_group_accumulators(&slot->val, batch, i);
+	}
+}
+}
+
+void
+VecAggState::batch_compute_group_hashes(const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+										uint64_t *hashes_out)
+{
+	int n_rows = batch.has_selection ? batch.sel.count : batch.count;
+
+	if (use_simple_group_key_)
+	{
+		int idx = grp_col_indices_[0];
+		const uint8_t *nulls = (idx >= 0 && idx < 16) ? batch.nulls[idx] : nullptr;
+
+		if (simple_group_storage_ == VecOutputStorageKind::Int32)
+		{
+			const int32_t *data = batch.int32_columns[idx];
+			for (int s = 0; s < n_rows; ++s)
+			{
+				int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+				if (nulls && nulls[i])
+				{
+					hashes_out[s] = std::hash<uint8_t>{}(1);
+				}
+				else
+				{
+					std::size_t h = std::hash<uint8_t>{}(0);
+					h ^= std::hash<int32_t>{}(data[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+					hashes_out[s] = h;
 				}
 			}
-			auto insert_result = hash_table_.try_emplace(key);
-			auto it = insert_result.first;
+		}
+		else
+		{
+			const int64_t *data = batch.int64_columns[idx];
+			for (int s = 0; s < n_rows; ++s)
+			{
+				int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+				if (nulls && nulls[i])
+				{
+					hashes_out[s] = std::hash<uint8_t>{}(1);
+				}
+				else
+				{
+					std::size_t h = std::hash<uint8_t>{}(0);
+					h ^= std::hash<int64_t>{}(data[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+					hashes_out[s] = h;
+				}
+			}
+		}
+	}
+	else
+	{
+		for (int s = 0; s < n_rows; ++s)
+			hashes_out[s] = 0;
+
+		for (size_t k = 0; k < grp_col_indices_.size() && k < kMaxDeformTargets; ++k)
+		{
+			int idx = grp_col_indices_[k];
+			const VecOutputColMeta &meta = grp_col_meta_[k];
+
+			if (idx < 0 || idx >= 16)
+			{
+				for (int s = 0; s < n_rows; ++s)
+				{
+					std::size_t h = hashes_out[s];
+					h ^= std::hash<uint8_t>{}(1) + 0x9e3779b9 + (h << 6) + (h >> 2);
+					hashes_out[s] = h;
+				}
+				continue;
+			}
+
+			const uint8_t *nulls = batch.nulls[idx];
+
+			switch (meta.storage_kind)
+			{
+				case VecOutputStorageKind::Int32:
+				{
+					const int32_t *data = batch.int32_columns[idx];
+					for (int s = 0; s < n_rows; ++s)
+					{
+						int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+						std::size_t h = hashes_out[s];
+						h ^= std::hash<uint8_t>{}(nulls[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						if (!nulls[i])
+						{
+							h ^= std::hash<int32_t>{}(data[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						}
+						hashes_out[s] = h;
+					}
+					break;
+				}
+				case VecOutputStorageKind::Int64:
+				case VecOutputStorageKind::NumericScaledInt64:
+				case VecOutputStorageKind::NumericAvgPair:
+				{
+					const int64_t *data = batch.int64_columns[idx];
+					for (int s = 0; s < n_rows; ++s)
+					{
+						int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+						std::size_t h = hashes_out[s];
+						h ^= std::hash<uint8_t>{}(nulls[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						if (!nulls[i])
+						{
+							h ^= std::hash<int64_t>{}(data[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						}
+						hashes_out[s] = h;
+					}
+					break;
+				}
+				case VecOutputStorageKind::Double:
+				{
+					const double *data = batch.double_columns[idx];
+					for (int s = 0; s < n_rows; ++s)
+					{
+						int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+						std::size_t h = hashes_out[s];
+						h ^= std::hash<uint8_t>{}(nulls[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						if (!nulls[i])
+						{
+							uint64_t bits;
+							memcpy(&bits, &data[i], sizeof(uint64_t));
+							h ^= std::hash<uint64_t>{}(bits) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						}
+						hashes_out[s] = h;
+					}
+					break;
+				}
+				case VecOutputStorageKind::StringRef:
+				{
+					const VecStringRef *data = batch.string_columns[idx];
+					for (int s = 0; s < n_rows; ++s)
+					{
+						int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+						std::size_t h = hashes_out[s];
+						h ^= std::hash<uint8_t>{}(nulls[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						if (!nulls[i])
+						{
+							uint32_t key_len = 0;
+							uint64_t str_hash = HashStringRefForGroupKey(batch, data[i], meta.sql_type, &key_len);
+							h ^= std::hash<uint64_t>{}(str_hash) + 0x9e3779b9 + (h << 6) + (h >> 2);
+							h ^= std::hash<uint32_t>{}(key_len) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						}
+						hashes_out[s] = h;
+					}
+					break;
+				}
+				default:
+					for (int s = 0; s < n_rows; ++s)
+					{
+						std::size_t h = hashes_out[s];
+						h ^= std::hash<uint8_t>{}(nulls[batch.has_selection ? batch.sel.row_ids[s] : s]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+						hashes_out[s] = h;
+					}
+					break;
+			}
+		}
+	}
+}
+
+void
+VecAggState::batch_update_simple_aggregates(VecAggGroupState **group_ptrs,
+											const DataChunk<DEFAULT_CHUNK_SIZE> &batch,
+											int n_rows)
+{
+	for (size_t agg_idx = 0; agg_idx < aggs_.size(); ++agg_idx)
+	{
+		const auto &agg = aggs_[agg_idx];
+
+		if (agg.type == VecAggType::COUNT && !agg.arg_expr && !agg.is_distinct)
+		{
+			for (int s = 0; s < n_rows; ++s)
+			{
+				auto &acc = group_ptrs[s]->accs[agg_idx];
+				acc.count += 1;
+			}
+		}
+		else if (agg.type == VecAggType::SUM && !agg.is_distinct && agg.arg_expr)
+		{
+			int r = agg.arg_expr->final_res_idx;
+			if (r < 0)
+				continue;
+
+			const uint8_t *nulls = agg.arg_expr->get_nulls_reg(r);
+
+			if (agg.output_storage == VecOutputStorageKind::Int64 ||
+				agg.output_storage == VecOutputStorageKind::NumericScaledInt64 ||
+				agg.output_storage == VecOutputStorageKind::NumericAvgPair)
+			{
+				const int64_t *data = agg.arg_expr->get_int64_reg(r);
+				for (int s = 0; s < n_rows; ++s)
+				{
+					int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+					if (!nulls[i])
+					{
+						auto &acc = group_ptrs[s]->accs[agg_idx];
+						acc.update_float((double)data[i]);
+					}
+				}
+			}
+			else if (agg.output_storage == VecOutputStorageKind::Double)
+			{
+				const double *data = agg.arg_expr->get_float8_reg(r);
+				for (int s = 0; s < n_rows; ++s)
+				{
+					int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+					if (!nulls[i])
+					{
+						auto &acc = group_ptrs[s]->accs[agg_idx];
+						acc.update_float(data[i]);
+					}
+				}
+			}
+			else if (agg.output_storage == VecOutputStorageKind::Int32)
+			{
+				const int32_t *data = agg.arg_expr->get_int32_reg(r);
+				for (int s = 0; s < n_rows; ++s)
+				{
+					int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+					if (!nulls[i])
+					{
+						auto &acc = group_ptrs[s]->accs[agg_idx];
+						acc.update_float((double)data[i]);
+					}
+				}
+			}
+		}
+	}
+}
+
+void
+VecAggState::consume_batch_partitioned(DataChunk<DEFAULT_CHUNK_SIZE> &batch)
+{
+	int n_rows = batch.has_selection ? batch.sel.count : batch.count;
+
+	if (!use_partitioned_ || partitions_.empty())
+	{
+		consume_batch(batch);
+		return;
+	}
+
+	uint64_t hashes[DEFAULT_CHUNK_SIZE];
+	batch_compute_group_hashes(batch, hashes);
+
+	int partition_counts[NUM_PARTITIONS] = {0};
+	int partition_indices[NUM_PARTITIONS][DEFAULT_CHUNK_SIZE];
+
+	for (int s = 0; s < n_rows; ++s)
+	{
+		int part_id = hashes[s] & 0xFF;
+		partition_indices[part_id][partition_counts[part_id]++] = s;
+	}
+
+	for (int part_id = 0; part_id < NUM_PARTITIONS; ++part_id)
+	{
+		if (partition_counts[part_id] == 0)
+			continue;
+
+		if (!partitions_[part_id])
+		{
+			partitions_[part_id] = new (MemoryContextAlloc(memory_context_, sizeof(VecAggPartition)))
+				VecAggPartition(memory_context_);
+		}
+
+		auto &part = *partitions_[part_id];
+
+		for (int j = 0; j < partition_counts[part_id]; ++j)
+		{
+			int s = partition_indices[part_id][j];
+			int i = batch.has_selection ? batch.sel.row_ids[s] : s;
+
+			if (use_simple_group_key_)
+			{
+				VecSimpleGroupKey key;
+				int idx = grp_col_indices_[0];
+				bool is_null = idx < 0 || idx >= 16 || batch.nulls[idx][i] != 0;
+
+				key.is_null = is_null ? 1 : 0;
+				if (!is_null)
+				{
+					if (simple_group_storage_ == VecOutputStorageKind::Int32)
+						key.value = (int64_t) batch.int32_columns[idx][i];
+					else
+						key.value = batch.int64_columns[idx][i];
+				}
+
+				auto insert_result = part.simple_groups.insert(key);
+				auto it = insert_result.first;
+
+				if (insert_result.second)
+				{
+					DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk;
+					auto &group = it->val;
+
+					if (part.rep_chunks.empty() ||
+						part.rep_chunks.back()->count >= DEFAULT_CHUNK_SIZE)
+					{
+						MemoryContext old_context = MemoryContextSwitchTo(memory_context_);
+						rep_chunk = new DataChunk<DEFAULT_CHUNK_SIZE>();
+						MemoryContextSwitchTo(old_context);
+						part.rep_chunks.push_back(rep_chunk);
+					}
+					rep_chunk = part.rep_chunks.back();
+					group.rep_chunk_idx = part.rep_chunks.size() - 1;
+					group.rep_row_idx = rep_chunk->count;
+					group.has_rep_row = true;
+					copy_rep_row(*rep_chunk, rep_chunk->count, batch, i);
+					rep_chunk->count++;
+				}
+				update_group_accumulators(&it->val, batch, i);
+			}
+			else
+			{
+				VecGroupKey key;
+				key.num_cols = (int) grp_col_indices_.size();
+				if (key.num_cols > kMaxDeformTargets)
+					key.num_cols = kMaxDeformTargets;
+
+				for (int k = 0; k < key.num_cols; k++)
+				{
+					int idx = grp_col_indices_[k];
+					const VecOutputColMeta &meta = grp_col_meta_[k];
+					bool is_null;
+
+					if (idx < 0 || idx >= 16)
+					{
+						key.is_null[k] = 1;
+						key.values[k] = 0;
+						key.aux[k] = 0;
+						continue;
+					}
+					is_null = batch.nulls[idx][i] != 0;
+					key.is_null[k] = is_null ? 1 : 0;
+					if (is_null)
+					{
+						key.values[k] = 0;
+						key.aux[k] = 0;
+						continue;
+					}
+
+					switch (meta.storage_kind)
+					{
+						case VecOutputStorageKind::StringRef:
+						{
+							uint32_t key_len = 0;
+							VecStringRef ref = batch.string_columns[idx][i];
+							key.values[k] = HashStringRefForGroupKey(batch, ref, meta.sql_type, &key_len);
+							key.aux[k] = key_len;
+							break;
+						}
+						case VecOutputStorageKind::Int64:
+						case VecOutputStorageKind::NumericScaledInt64:
+						case VecOutputStorageKind::NumericAvgPair:
+							key.values[k] = (uint64_t) batch.int64_columns[idx][i];
+							key.aux[k] = 0;
+							break;
+						case VecOutputStorageKind::Double:
+							memcpy(&key.values[k], &batch.double_columns[idx][i], sizeof(uint64_t));
+							key.aux[k] = 0;
+							break;
+						case VecOutputStorageKind::Int32:
+						default:
+							key.values[k] = (uint64_t) (uint32_t) batch.int32_columns[idx][i];
+							key.aux[k] = 0;
+							break;
+					}
+				}
+
+				auto insert_result = part.groups.insert(key);
+				auto it = insert_result.first;
+
+				if (insert_result.second)
+				{
+					DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk;
+					auto &group = it->val;
+
+					if (part.rep_chunks.empty() ||
+						part.rep_chunks.back()->count >= DEFAULT_CHUNK_SIZE)
+					{
+						MemoryContext old_context = MemoryContextSwitchTo(memory_context_);
+						rep_chunk = new DataChunk<DEFAULT_CHUNK_SIZE>();
+						MemoryContextSwitchTo(old_context);
+						part.rep_chunks.push_back(rep_chunk);
+					}
+					rep_chunk = part.rep_chunks.back();
+					group.rep_chunk_idx = part.rep_chunks.size() - 1;
+					group.rep_row_idx = rep_chunk->count;
+					group.has_rep_row = true;
+					copy_rep_row(*rep_chunk, rep_chunk->count, batch, i);
+					rep_chunk->count++;
+				}
+				update_group_accumulators(&it->val, batch, i);
+			}
+		}
+	}
+
+	input_batches_consumed_++;
+	input_rows_consumed_ += (uint64_t) n_rows;
+}
+
+void
+VecAggState::finalize_partitions()
+{
+	if (!use_partitioned_ || partitions_.empty())
+		return;
+
+	for (int part_id = 0; part_id < NUM_PARTITIONS; ++part_id)
+	{
+		if (!partitions_[part_id])
+			continue;
+
+		auto &part = *partitions_[part_id];
+
+		if (use_simple_group_key_)
+		{
+			for (auto it = part.simple_groups.begin(); it != part.simple_groups.end(); ++it)
+			{
+			auto &kv = *it;
+			auto insert_result = simple_hash_table_.insert(kv.key);
+			auto &target_group = insert_result.first->val;
 
 			if (insert_result.second)
-				ensure_group_rep_row(&it->second, batch, i);
-			update_group_accumulators(&it->second, batch, i);
+				{
+					target_group.accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+					target_group.accs.resize(aggs_.size());
+					for (size_t a = 0; a < aggs_.size(); ++a)
+						target_group.accs[a] = kv.val.accs[a];
+					if (kv.val.has_rep_row)
+					{
+						DataChunk<DEFAULT_CHUNK_SIZE> *src_chunk = part.rep_chunks[kv.val.rep_chunk_idx];
+						DataChunk<DEFAULT_CHUNK_SIZE> *dst_chunk =
+							rep_chunks_.empty() ? allocate_rep_chunk() : rep_chunks_.back();
+
+						if (dst_chunk->count >= DEFAULT_CHUNK_SIZE)
+							dst_chunk = allocate_rep_chunk();
+
+						target_group.rep_chunk_idx = rep_chunks_.size() - 1;
+						target_group.rep_row_idx = dst_chunk->count;
+						copy_rep_row(*dst_chunk, dst_chunk->count, *src_chunk, kv.val.rep_row_idx);
+						dst_chunk->count++;
+					}
+				}
+				else
+				{
+					for (size_t a = 0; a < aggs_.size(); ++a)
+					{
+						auto &src_acc = kv.val.accs[a];
+						auto &dst_acc = target_group.accs[a];
+						dst_acc.count += src_acc.count;
+						dst_acc.float_sum += src_acc.float_sum;
+						dst_acc.numeric_sum += src_acc.numeric_sum;
+						if (src_acc.has_value)
+						{
+							if (!dst_acc.has_value || src_acc.numeric_max > dst_acc.numeric_max)
+								dst_acc.numeric_max = src_acc.numeric_max;
+							if (!dst_acc.has_value || src_acc.float_max > dst_acc.float_max)
+								dst_acc.float_max = src_acc.float_max;
+							if (!dst_acc.has_value || src_acc.int64_max > dst_acc.int64_max)
+								dst_acc.int64_max = src_acc.int64_max;
+							if (!dst_acc.has_value || src_acc.int32_max > dst_acc.int32_max)
+								dst_acc.int32_max = src_acc.int32_max;
+							dst_acc.has_value = true;
+						}
+					}
+				}
+			}
+		}
+		else
+		{
+			for (auto it = part.groups.begin(); it != part.groups.end(); ++it)
+			{
+			auto &kv = *it;
+			auto insert_result = hash_table_.insert(kv.key);
+			auto &target_group = insert_result.first->val;
+
+			if (insert_result.second)
+				{
+					target_group.accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
+					target_group.accs.resize(aggs_.size());
+					for (size_t a = 0; a < aggs_.size(); ++a)
+						target_group.accs[a] = kv.val.accs[a];
+					if (kv.val.has_rep_row)
+					{
+						DataChunk<DEFAULT_CHUNK_SIZE> *src_chunk = part.rep_chunks[kv.val.rep_chunk_idx];
+						DataChunk<DEFAULT_CHUNK_SIZE> *dst_chunk =
+							rep_chunks_.empty() ? allocate_rep_chunk() : rep_chunks_.back();
+
+						if (dst_chunk->count >= DEFAULT_CHUNK_SIZE)
+							dst_chunk = allocate_rep_chunk();
+
+						target_group.rep_chunk_idx = rep_chunks_.size() - 1;
+						target_group.rep_row_idx = dst_chunk->count;
+						copy_rep_row(*dst_chunk, dst_chunk->count, *src_chunk, kv.val.rep_row_idx);
+						dst_chunk->count++;
+					}
+				}
+				else
+				{
+					for (size_t a = 0; a < aggs_.size(); ++a)
+					{
+						auto &src_acc = kv.val.accs[a];
+						auto &dst_acc = target_group.accs[a];
+						dst_acc.count += src_acc.count;
+						dst_acc.float_sum += src_acc.float_sum;
+						dst_acc.numeric_sum += src_acc.numeric_sum;
+						if (src_acc.has_value)
+						{
+							if (!dst_acc.has_value || src_acc.numeric_max > dst_acc.numeric_max)
+								dst_acc.numeric_max = src_acc.numeric_max;
+							if (!dst_acc.has_value || src_acc.float_max > dst_acc.float_max)
+								dst_acc.float_max = src_acc.float_max;
+							if (!dst_acc.has_value || src_acc.int64_max > dst_acc.int64_max)
+								dst_acc.int64_max = src_acc.int64_max;
+							if (!dst_acc.has_value || src_acc.int32_max > dst_acc.int32_max)
+								dst_acc.int32_max = src_acc.int32_max;
+							dst_acc.has_value = true;
+						}
+					}
+				}
+			}
 		}
 	}
 }
@@ -820,11 +1396,15 @@ VecAggState::finish_sink()
 	if (fully_scanned_)
 		return;
 	fully_scanned_ = true;
+
+	if (use_partitioned_)
+		finalize_partitions();
+
 	if (grp_col_indices_.empty() && hash_table_.empty())
 	{
 		VecGroupKey key = {};
-		auto insert_result = hash_table_.try_emplace(key);
-		auto &accs = insert_result.first->second.accs;
+		auto insert_result = hash_table_.insert(key);
+		auto &accs = insert_result.first->val.accs;
 
 		if (accs.empty())
 			accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
@@ -949,10 +1529,11 @@ VecAggState::export_parallel_partial_state(ParallelAggPartialState *out) const
 	{
 		if (use_simple_group_key_)
 		{
-			for (const auto &entry : simple_hash_table_)
+			for (auto it = simple_hash_table_.begin(); it != simple_hash_table_.end(); ++it)
 			{
+				auto &kv = *it;
 				ParallelAggPartialGroupEntry *dst_group;
-				const VecAggAccumulatorList *src_accs = &entry.second.accs;
+				const VecAggAccumulatorList *src_accs = &kv.val.accs;
 
 				if (out->group_count >= VOLVEC_PARALLEL_MAX_GROUPS)
 					return false;
@@ -960,8 +1541,8 @@ VecAggState::export_parallel_partial_state(ParallelAggPartialState *out) const
 				memset(dst_group, 0, sizeof(*dst_group));
 				dst_group->num_group_cols = 1;
 				dst_group->group_cols[0].storage_kind = (uint8_t) simple_group_storage_;
-				dst_group->group_cols[0].is_null = entry.first.is_null;
-				dst_group->group_cols[0].value_bits = (uint64_t) entry.first.value;
+				dst_group->group_cols[0].is_null = kv.key.is_null;
+				dst_group->group_cols[0].value_bits = (uint64_t) kv.key.value;
 				for (size_t a = 0; a < aggs_.size() && a < lengthof(dst_group->accs); a++)
 				{
 					const VecAggAccumulator *src =
@@ -972,26 +1553,27 @@ VecAggState::export_parallel_partial_state(ParallelAggPartialState *out) const
 			return true;
 		}
 
-		for (const auto &entry : hash_table_)
+		for (auto it = hash_table_.begin(); it != hash_table_.end(); ++it)
 		{
+			auto &kv = *it;
 			ParallelAggPartialGroupEntry *dst_group;
-			const VecAggAccumulatorList *src_accs = &entry.second.accs;
+			const VecAggAccumulatorList *src_accs = &kv.val.accs;
 			const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
-				entry.second.has_rep_row ? rep_chunks_[entry.second.rep_chunk_idx] : nullptr;
-			int rep_row = entry.second.rep_row_idx;
+				kv.val.has_rep_row ? rep_chunks_[kv.val.rep_chunk_idx] : nullptr;
+			int rep_row = kv.val.rep_row_idx;
 
 			if (out->group_count >= VOLVEC_PARALLEL_MAX_GROUPS)
 				return false;
 			dst_group = &out->groups[out->group_count++];
 			memset(dst_group, 0, sizeof(*dst_group));
-			dst_group->num_group_cols = (uint32_t) Min(entry.first.num_cols, (int) VOLVEC_PARALLEL_MAX_GROUP_COLS);
+			dst_group->num_group_cols = (uint32_t) Min(kv.key.num_cols, (int) VOLVEC_PARALLEL_MAX_GROUP_COLS);
 			for (uint32_t k = 0; k < dst_group->num_group_cols; k++)
 			{
 				const VecOutputColMeta &meta = grp_col_meta_[k];
 				ParallelAggPartialGroupKeyCol *dst_col = &dst_group->group_cols[k];
 
 				dst_col->storage_kind = (uint8_t) meta.storage_kind;
-				dst_col->is_null = entry.first.is_null[k];
+				dst_col->is_null = kv.key.is_null[k];
 				if (dst_col->is_null)
 					continue;
 				switch (meta.storage_kind)
@@ -1028,11 +1610,11 @@ VecAggState::export_parallel_partial_state(ParallelAggPartialState *out) const
 					case VecOutputStorageKind::Int64:
 					case VecOutputStorageKind::NumericScaledInt64:
 					case VecOutputStorageKind::NumericAvgPair:
-						dst_col->value_bits = entry.first.values[k];
+						dst_col->value_bits = kv.key.values[k];
 						break;
 					case VecOutputStorageKind::Int32:
 					default:
-						dst_col->value_bits = entry.first.values[k];
+						dst_col->value_bits = kv.key.values[k];
 						break;
 				}
 			}
@@ -1046,7 +1628,7 @@ VecAggState::export_parallel_partial_state(ParallelAggPartialState *out) const
 		return true;
 	}
 	if (!hash_table_.empty())
-		accs = &hash_table_.begin()->second.accs;
+		accs = &hash_table_.begin()->val.accs;
 	for (size_t a = 0; a < aggs_.size() && a < lengthof(out->accs); a++)
 	{
 		const VecAggAccumulator *src = (accs != nullptr && a < accs->size()) ? &(*accs)[a] : nullptr;
@@ -1181,18 +1763,20 @@ VecAggState::export_parallel_grouped_partial_file(BufFile *file,
 
 	if (use_simple_group_key_)
 	{
-		for (const auto &entry : simple_hash_table_)
+		for (auto it = simple_hash_table_.begin(); it != simple_hash_table_.end(); ++it)
 		{
-			if (!append_group_record_to_partial_file(file, nullptr, &entry.first, entry.second))
+			auto &kv = *it;
+			if (!append_group_record_to_partial_file(file, nullptr, &kv.key, kv.val))
 				return false;
 			out->group_count++;
 		}
 	}
 	else
 	{
-		for (const auto &entry : hash_table_)
+		for (auto it = hash_table_.begin(); it != hash_table_.end(); ++it)
 		{
-			if (!append_group_record_to_partial_file(file, &entry.first, nullptr, entry.second))
+			auto &kv = *it;
+			if (!append_group_record_to_partial_file(file, &kv.key, nullptr, kv.val))
 				return false;
 			out->group_count++;
 		}
@@ -1318,15 +1902,15 @@ VecAggState::merge_parallel_grouped_partial_file(BufFile *file,
 		if (use_simple_group_key_)
 		{
 			VecSimpleGroupKey simple_key;
-			decltype(simple_hash_table_.try_emplace(simple_key)) insert_result;
+			decltype(simple_hash_table_.insert(simple_key)) insert_result;
 			VecAggGroupState *group;
 
 			if (num_group_cols != 1)
 				return false;
 			simple_key.is_null = group_cols[0].header.is_null;
 			simple_key.value = (int64_t) group_cols[0].header.value_bits;
-			insert_result = simple_hash_table_.try_emplace(simple_key);
-			group = &insert_result.first->second;
+			insert_result = simple_hash_table_.insert(simple_key);
+			group = &insert_result.first->val;
 			if (insert_result.second)
 			{
 				group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
@@ -1338,7 +1922,7 @@ VecAggState::merge_parallel_grouped_partial_file(BufFile *file,
 		else
 		{
 			VecGroupKey key;
-			decltype(hash_table_.try_emplace(key)) insert_result;
+			decltype(hash_table_.insert(key)) insert_result;
 			VecAggGroupState *group;
 
 			memset(&key, 0, sizeof(key));
@@ -1374,8 +1958,8 @@ VecAggState::merge_parallel_grouped_partial_file(BufFile *file,
 				}
 			}
 
-			insert_result = hash_table_.try_emplace(key);
-			group = &insert_result.first->second;
+			insert_result = hash_table_.insert(key);
+			group = &insert_result.first->val;
 			if (insert_result.second)
 			{
 				group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
@@ -1426,14 +2010,14 @@ VecAggState::merge_parallel_partial_state(const ParallelAggPartialState &partial
 			if (use_simple_group_key_)
 			{
 				VecSimpleGroupKey simple_key;
-				decltype(simple_hash_table_.try_emplace(simple_key)) insert_result;
+				decltype(simple_hash_table_.insert(simple_key)) insert_result;
 
 				if (src_group.num_group_cols != 1)
 					return false;
 				simple_key.is_null = src_group.group_cols[0].is_null;
 				simple_key.value = (int64_t) src_group.group_cols[0].value_bits;
-				insert_result = simple_hash_table_.try_emplace(simple_key);
-				group = &insert_result.first->second;
+				insert_result = simple_hash_table_.insert(simple_key);
+				group = &insert_result.first->val;
 				if (insert_result.second)
 				{
 					group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
@@ -1482,8 +2066,8 @@ VecAggState::merge_parallel_partial_state(const ParallelAggPartialState &partial
 							break;
 					}
 				}
-				auto insert_result = hash_table_.try_emplace(key);
-				group = &insert_result.first->second;
+				auto insert_result = hash_table_.insert(key);
+				group = &insert_result.first->val;
 				if (insert_result.second)
 				{
 					group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
@@ -1500,8 +2084,8 @@ VecAggState::merge_parallel_partial_state(const ParallelAggPartialState &partial
 		return true;
 	}
 	key.num_cols = 0;
-	auto insert_result = hash_table_.try_emplace(key);
-	group = &insert_result.first->second;
+	auto insert_result = hash_table_.insert(key);
+	group = &insert_result.first->val;
 	if (insert_result.second)
 		group->accs = VecAggAccumulatorList(PgMemoryContextAllocator<VecAggAccumulator>(memory_context_));
 	accs = &group->accs;
@@ -1528,10 +2112,10 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 	chunk.reset();
 	if (use_simple_group_key_) {
 		while (simple_it_ != simple_hash_table_.end() && chunk.count < DEFAULT_CHUNK_SIZE) {
-			const auto& accs = simple_it_->second.accs;
+			const auto& accs = simple_it_->val.accs;
 			const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
-				simple_it_->second.has_rep_row ? rep_chunks_[simple_it_->second.rep_chunk_idx] : nullptr;
-			int rep_row = simple_it_->second.rep_row_idx;
+				simple_it_->val.has_rep_row ? rep_chunks_[simple_it_->val.rep_chunk_idx] : nullptr;
+			int rep_row = simple_it_->val.rep_row_idx;
 			for (size_t a = 0; a < aggs_.size(); a++) {
 				int tidx = aggs_[a].target_resno - 1; if (tidx < 0 || tidx >= 16) continue;
 				chunk.nulls[tidx][chunk.count] = 0;
@@ -1628,10 +2212,10 @@ bool VecAggState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 		return chunk.count > 0;
 	}
 		while (it_ != hash_table_.end() && chunk.count < DEFAULT_CHUNK_SIZE) {
-				const auto& accs = it_->second.accs;
+				const auto& accs = it_->val.accs;
 				const DataChunk<DEFAULT_CHUNK_SIZE> *rep_chunk =
-					it_->second.has_rep_row ? rep_chunks_[it_->second.rep_chunk_idx] : nullptr;
-				int rep_row = it_->second.rep_row_idx;
+					it_->val.has_rep_row ? rep_chunks_[it_->val.rep_chunk_idx] : nullptr;
+				int rep_row = it_->val.rep_row_idx;
 			for (size_t a = 0; a < aggs_.size(); a++) {
 				int tidx = aggs_[a].target_resno - 1; if (tidx < 0 || tidx >= 16) continue;
 				chunk.nulls[tidx][chunk.count] = 0;

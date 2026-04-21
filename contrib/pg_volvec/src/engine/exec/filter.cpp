@@ -19,8 +19,7 @@ VecLookupFilterState::VecLookupFilterState(std::unique_ptr<VecPlanState> left,
 	: left_(std::move(left)),
 	  lookup_source_(std::move(lookup_source)),
 	  memory_context_(CurrentMemoryContext),
-	  lookup_table_(0, VecLookupScalarKeyHash{}, std::equal_to<VecLookupScalarKey>{},
-					PgMemoryContextAllocator<std::pair<const VecLookupScalarKey, VecLookupScalarValue>>(memory_context_)),
+	  lookup_table_(memory_context_),
 	  input_key_col_(input_key_col),
 	  input_key_meta_(input_key_meta),
 	  lookup_key_col_(lookup_key_col),
@@ -81,13 +80,14 @@ VecLookupFilterState::build_lookup()
 			if (!extract_lookup_key(lookup_chunk_, row, lookup_key_col_, lookup_key_meta_, &key))
 				return false;
 			if (key.is_null)
-			{
-				lookup_has_null_ = true;
-				continue;
-			}
-			value.is_null = 0;
-			lookup_table_[key] = value;
+		{
+			lookup_has_null_ = true;
+			continue;
 		}
+		value.is_null = 0;
+		auto [slot, inserted] = lookup_table_.insert(key);
+		slot->val = value;
+	}
 	}
 
 	lookup_built_ = true;
@@ -118,16 +118,16 @@ VecLookupFilterState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 			int row = source_has_selection ? chunk.sel.row_ids[s] : s;
 			VecLookupScalarKey key;
 			bool matched = false;
-			bool pass;
+		bool pass;
 
-			if (!extract_lookup_key(chunk, row, input_key_col_, input_key_meta_, &key))
-				return false;
-			if (!key.is_null)
-				matched = (lookup_table_.find(key) != lookup_table_.end());
-			if (negate_)
-				pass = !key.is_null && !matched && !lookup_has_null_;
-			else
-				pass = !key.is_null && matched;
+		if (!extract_lookup_key(chunk, row, input_key_col_, input_key_meta_, &key))
+			return false;
+		if (!key.is_null)
+			matched = (lookup_table_.find(key) != nullptr);
+		if (negate_)
+			pass = !key.is_null && !matched && !lookup_has_null_;
+		else
+			pass = !key.is_null && matched;
 			if (pass)
 				chunk.sel.row_ids[chunk.sel.count++] = (uint16_t) row;
 		}

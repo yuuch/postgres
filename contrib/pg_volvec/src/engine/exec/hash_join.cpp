@@ -1,4 +1,5 @@
 #include "exec/internal.hpp"
+#include "hash_table.hpp"
 
 namespace pg_volvec {
 
@@ -49,45 +50,49 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				{
 					int active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
 
-					for (int s = 0; s < active_count; s++)
-					{
-						int probe_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
-						VecHashJoinKey key;
-						uint32_t hash;
-						int32_t entry_idx;
+				for (int s = 0; s < active_count; s++)
+				{
+					int probe_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
+					VecHashJoinKey key;
+					uint32_t hash;
+					int32_t entry_idx;
 
-						if (!read_key(outer_chunk_, true, probe_row, &key))
-							continue;
-						hash = hash_key(key);
-						entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
-						while (entry_idx >= 0)
-						{
-							const VecHashEntry &entry = entries_[entry_idx];
-							const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk =
-								inner_chunks_[entry.chunk_idx];
+					if (!read_key(outer_chunk_, true, probe_row, &key))
+						continue;
+					hash = hash_key(key);
+					uint16_t partition_id = (shared_hash_partition_count_ == 1) ? 0 : (uint16_t) volvec_radix_partition_idx(hash);
+					const int32_t *bucket_heads = use_parallel_ht_ ? 
+						bucket_heads_for_partition(partition_id) : active_bucket_heads();
+					size_t mask = use_parallel_ht_ ? 
+						active_bucket_mask_for_partition(partition_id) : bucket_mask_;
+					entry_idx = bucket_heads == nullptr ? -1 : bucket_heads[hash & mask];
+					while (entry_idx >= 0)
+				{
+				const VecHashEntry &entry = get_entry_at(entry_idx);
 
-							if (entry.hash == hash &&
-								keys_equal(entry.key, key) &&
-								candidate_passes_join_filter(*build_chunk, entry.row_idx,
-															 outer_chunk_, probe_row))
-								inner_entry_matched_[entry_idx] = 1;
-							entry_idx = entry.next;
-						}
-					}
+				if (entry.hash == hash &&
+					keys_equal(entry.key, key) &&
+					candidate_passes_join_filter_for_build_entry(outer_chunk_,
+										 probe_row,
+										 partition_id,
+										 entry.chunk_idx,
+										 entry.row_idx))
+					inner_entry_matched_[entry_idx] = 1;
+				entry_idx = entry.next;
 				}
-				anti_build_marked_ = true;
+			}
+		}
+		anti_build_marked_ = true;
 				anti_build_emit_pos_ = 0;
 			}
 
-			while (anti_build_emit_pos_ < entries_.size() &&
+			while (anti_build_emit_pos_ < active_entry_count() &&
 				   chunk.count < DEFAULT_CHUNK_SIZE)
 			{
-				const VecHashEntry &entry = entries_[anti_build_emit_pos_];
-				const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk;
+				const VecHashEntry &entry = get_entry_at(anti_build_emit_pos_);
 
 				if (inner_entry_matched_[anti_build_emit_pos_++])
 					continue;
-				build_chunk = inner_chunks_[entry.chunk_idx];
 				for (const auto &output_col : output_cols_)
 				{
 					int out_col = output_col.output_resno - 1;
@@ -96,8 +101,14 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 						continue;
 					if (output_col.side != VecJoinSide::Outer)
 						elog(ERROR, "pg_volvec anti join build-outer path cannot expose inner columns");
-					copy_output_value(chunk.count, out_col, output_col.meta,
-									  *build_chunk, output_col.input_col, entry.row_idx);
+					copy_inner_payload_value_to_chunk(chunk,
+										chunk.count,
+										out_col,
+										output_col.meta,
+										output_col.input_col,
+										0,
+										entry.chunk_idx,
+										entry.row_idx);
 				}
 				chunk.count++;
 			}
@@ -113,29 +124,36 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				!advance_outer_batch())
 				break;
 
-			active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
-			while (anti_outer_pos_ < active_count && chunk.count < DEFAULT_CHUNK_SIZE)
+		active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
+		while (anti_outer_pos_ < active_count && chunk.count < DEFAULT_CHUNK_SIZE)
+		{
+			int outer_row = outer_chunk_.has_selection ?
+				outer_chunk_.sel.row_ids[anti_outer_pos_] : anti_outer_pos_;
+			VecHashJoinKey key;
+			bool has_match = false;
+			int32_t entry_idx = -1;
+
+			anti_outer_pos_++;
+			if (read_key(outer_chunk_, false, outer_row, &key))
 			{
-				int outer_row = outer_chunk_.has_selection ?
-					outer_chunk_.sel.row_ids[anti_outer_pos_] : anti_outer_pos_;
-				VecHashJoinKey key;
-				bool has_match = false;
-				int32_t entry_idx = -1;
-
-				anti_outer_pos_++;
-				if (read_key(outer_chunk_, false, outer_row, &key))
+				uint32_t hash = hash_key(key);
+				uint16_t partition_id = (shared_hash_partition_count_ == 1) ? 0 : (uint16_t) volvec_radix_partition_idx(hash);
+				const int32_t *bucket_heads = use_parallel_ht_ ? 
+					bucket_heads_for_partition(partition_id) : active_bucket_heads();
+				size_t mask = use_parallel_ht_ ? 
+					active_bucket_mask_for_partition(partition_id) : bucket_mask_;
+				entry_idx = bucket_heads == nullptr ? -1 : bucket_heads[hash & mask];
+				while (entry_idx >= 0)
 				{
-					uint32_t hash = hash_key(key);
+					const VecHashEntry &entry = get_entry_at(entry_idx);
 
-					entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
-					while (entry_idx >= 0)
-					{
-						const VecHashEntry &entry = entries_[entry_idx];
-						const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
-
-						if (entry.hash == hash &&
-							keys_equal(entry.key, key) &&
-							candidate_passes_join_filter(outer_chunk_, outer_row, *inner_chunk, entry.row_idx))
+					if (entry.hash == hash &&
+						keys_equal(entry.key, key) &&
+						candidate_passes_join_filter_for_build_entry(outer_chunk_,
+											 outer_row,
+											 partition_id,
+											 entry.chunk_idx,
+											 entry.row_idx))
 						{
 							has_match = true;
 							break;
@@ -204,42 +222,48 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				{
 					int active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
 
-					for (int s = 0; s < active_count; s++)
+				for (int s = 0; s < active_count; s++)
+				{
+					int probe_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
+					VecHashJoinKey key;
+					uint32_t hash;
+					int32_t entry_idx;
+
+					if (!read_key(outer_chunk_, true, probe_row, &key))
+						continue;
+					hash = hash_key(key);
+					uint16_t partition_id = (shared_hash_partition_count_ == 1) ? 0 : (uint16_t) volvec_radix_partition_idx(hash);
+					const int32_t *bucket_heads = use_parallel_ht_ ? 
+						bucket_heads_for_partition(partition_id) : active_bucket_heads();
+					size_t mask = use_parallel_ht_ ? 
+						active_bucket_mask_for_partition(partition_id) : bucket_mask_;
+					entry_idx = bucket_heads == nullptr ? -1 : bucket_heads[hash & mask];
+					while (entry_idx >= 0)
 					{
-						int probe_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
-						VecHashJoinKey key;
-						uint32_t hash;
-						int32_t entry_idx;
+				const VecHashEntry &entry = get_entry_at(entry_idx);
 
-						if (!read_key(outer_chunk_, true, probe_row, &key))
-							continue;
-						hash = hash_key(key);
-						entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
-						while (entry_idx >= 0)
-						{
-							const VecHashEntry &entry = entries_[entry_idx];
-							const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk = inner_chunks_[entry.chunk_idx];
-
-							if (entry.hash == hash &&
-								keys_equal(entry.key, key) &&
-								candidate_passes_join_filter(*build_chunk, entry.row_idx, outer_chunk_, probe_row))
-								inner_entry_matched_[entry_idx] = 1;
-							entry_idx = entry.next;
-						}
-					}
+				if (entry.hash == hash &&
+					keys_equal(entry.key, key) &&
+					candidate_passes_join_filter_for_build_entry(outer_chunk_,
+										 probe_row,
+										 partition_id,
+										 entry.chunk_idx,
+										 entry.row_idx))
+					inner_entry_matched_[entry_idx] = 1;
+				entry_idx = entry.next;
 				}
-				semi_build_marked_ = true;
-				semi_build_emit_pos_ = 0;
+				}
+			}
+			semi_build_marked_ = true;
+			semi_build_emit_pos_ = 0;
 			}
 
-			while (semi_build_emit_pos_ < entries_.size() && chunk.count < DEFAULT_CHUNK_SIZE)
+			while (semi_build_emit_pos_ < active_entry_count() && chunk.count < DEFAULT_CHUNK_SIZE)
 			{
-				const VecHashEntry &entry = entries_[semi_build_emit_pos_];
-				const DataChunk<DEFAULT_CHUNK_SIZE> *build_chunk;
+				const VecHashEntry &entry = get_entry_at(semi_build_emit_pos_);
 
 				if (!inner_entry_matched_[semi_build_emit_pos_++])
 					continue;
-				build_chunk = inner_chunks_[entry.chunk_idx];
 				for (const auto &output_col : output_cols_)
 				{
 					int out_col = output_col.output_resno - 1;
@@ -249,33 +273,14 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 						continue;
 					if (output_col.side != VecJoinSide::Outer)
 						elog(ERROR, "pg_volvec semi join build-outer path cannot expose unmatched inner columns");
-					chunk.nulls[out_col][chunk.count] = build_chunk->nulls[src_col][entry.row_idx];
-					if (chunk.nulls[out_col][chunk.count])
-						continue;
-					switch (output_col.meta.storage_kind)
-					{
-						case VecOutputStorageKind::Double:
-							chunk.double_columns[out_col][chunk.count] =
-								build_chunk->double_columns[src_col][entry.row_idx];
-							break;
-						case VecOutputStorageKind::Int64:
-						case VecOutputStorageKind::NumericScaledInt64:
-						case VecOutputStorageKind::NumericAvgPair:
-							chunk.int64_columns[out_col][chunk.count] =
-								build_chunk->int64_columns[src_col][entry.row_idx];
-							chunk.double_columns[out_col][chunk.count] =
-								build_chunk->double_columns[src_col][entry.row_idx];
-							break;
-						case VecOutputStorageKind::StringRef:
-							chunk.string_columns[out_col][chunk.count] =
-								CopyStringRefToChunk(chunk, *build_chunk,
-													 build_chunk->string_columns[src_col][entry.row_idx]);
-							break;
-						case VecOutputStorageKind::Int32:
-							chunk.int32_columns[out_col][chunk.count] =
-								build_chunk->int32_columns[src_col][entry.row_idx];
-							break;
-					}
+					copy_inner_payload_value_to_chunk(chunk,
+										chunk.count,
+										out_col,
+										output_col.meta,
+										src_col,
+										0,
+										entry.chunk_idx,
+										entry.row_idx);
 				}
 				chunk.count++;
 			}
@@ -300,81 +305,89 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				bool has_match = false;
 				int32_t entry_idx = -1;
 				int32_t matched_entry_idx = -1;
+				uint16_t partition_id = 0;
 
-				anti_outer_pos_++;
-				if (read_key(outer_chunk_, false, outer_row, &key))
+			anti_outer_pos_++;
+			if (read_key(outer_chunk_, false, outer_row, &key))
+			{
+				uint32_t hash = hash_key(key);
+				partition_id = (shared_hash_partition_count_ == 1) ? 0 : (uint16_t) volvec_radix_partition_idx(hash);
+				const int32_t *bucket_heads = use_parallel_ht_ ? 
+					bucket_heads_for_partition(partition_id) : active_bucket_heads();
+				size_t mask = use_parallel_ht_ ? 
+					active_bucket_mask_for_partition(partition_id) : bucket_mask_;
+				entry_idx = bucket_heads == nullptr ? -1 : bucket_heads[hash & mask];
+				while (entry_idx >= 0)
 				{
-					uint32_t hash = hash_key(key);
+					const VecHashEntry &entry = get_entry_at(entry_idx);
 
-					entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
-					while (entry_idx >= 0)
+					if (entry.hash == hash &&
+						keys_equal(entry.key, key) &&
+						candidate_passes_join_filter_for_build_entry(outer_chunk_,
+											 outer_row,
+											 partition_id,
+											 entry.chunk_idx,
+											 entry.row_idx))
 					{
-						const VecHashEntry &entry = entries_[entry_idx];
-						const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
-
-						if (entry.hash == hash &&
-							keys_equal(entry.key, key) &&
-							candidate_passes_join_filter(outer_chunk_, outer_row, *inner_chunk, entry.row_idx))
-						{
-							has_match = true;
-							matched_entry_idx = entry_idx;
-							break;
-						}
-						entry_idx = entry.next;
+						has_match = true;
+						matched_entry_idx = entry_idx;
+						break;
 					}
-				}
-				if (!has_match)
-					continue;
+					entry_idx = entry.next;
+			}
+		}
+		if (!has_match)
+			continue;
 
-				for (const auto &output_col : output_cols_)
-				{
-					int out_col = output_col.output_resno - 1;
-					int src_col = output_col.input_col;
-					const VecHashEntry &matched_entry = entries_[matched_entry_idx];
-					const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk =
-						inner_chunks_[matched_entry.chunk_idx];
+		for (const auto &output_col : output_cols_)
+		{
+			int out_col = output_col.output_resno - 1;
+			int src_col = output_col.input_col;
+			const VecHashEntry &matched_entry = get_entry_at(matched_entry_idx);
 
-					if (output_col.output_resno > visible_output_count_)
-						continue;
+			if (output_col.output_resno > visible_output_count_)
+				continue;
 					if (output_col.side == VecJoinSide::Outer)
 						chunk.nulls[out_col][chunk.count] = outer_chunk_.nulls[src_col][outer_row];
 					else
-						chunk.nulls[out_col][chunk.count] = inner_chunk->nulls[src_col][matched_entry.row_idx];
+						copy_inner_payload_value_to_chunk(chunk,
+										chunk.count,
+										out_col,
+										output_col.meta,
+										src_col,
+										partition_id,
+										matched_entry.chunk_idx,
+										matched_entry.row_idx);
 					if (chunk.nulls[out_col][chunk.count])
 						continue;
 					switch (output_col.meta.storage_kind)
 					{
 						case VecOutputStorageKind::Double:
-							chunk.double_columns[out_col][chunk.count] =
-								(output_col.side == VecJoinSide::Outer) ?
-								outer_chunk_.double_columns[src_col][outer_row] :
-								inner_chunk->double_columns[src_col][matched_entry.row_idx];
+							if (output_col.side == VecJoinSide::Outer)
+								chunk.double_columns[out_col][chunk.count] =
+									outer_chunk_.double_columns[src_col][outer_row];
 							break;
 						case VecOutputStorageKind::Int64:
 						case VecOutputStorageKind::NumericScaledInt64:
 						case VecOutputStorageKind::NumericAvgPair:
-							chunk.int64_columns[out_col][chunk.count] =
-								(output_col.side == VecJoinSide::Outer) ?
-								outer_chunk_.int64_columns[src_col][outer_row] :
-								inner_chunk->int64_columns[src_col][matched_entry.row_idx];
-							chunk.double_columns[out_col][chunk.count] =
-								(output_col.side == VecJoinSide::Outer) ?
-								outer_chunk_.double_columns[src_col][outer_row] :
-								inner_chunk->double_columns[src_col][matched_entry.row_idx];
+							if (output_col.side == VecJoinSide::Outer)
+							{
+								chunk.int64_columns[out_col][chunk.count] =
+									outer_chunk_.int64_columns[src_col][outer_row];
+								chunk.double_columns[out_col][chunk.count] =
+									outer_chunk_.double_columns[src_col][outer_row];
+							}
 							break;
 						case VecOutputStorageKind::StringRef:
-							chunk.string_columns[out_col][chunk.count] =
-								(output_col.side == VecJoinSide::Outer) ?
-								CopyStringRefToChunk(chunk, outer_chunk_,
-													 outer_chunk_.string_columns[src_col][outer_row]) :
-								CopyStringRefToChunk(chunk, *inner_chunk,
-													 inner_chunk->string_columns[src_col][matched_entry.row_idx]);
+							if (output_col.side == VecJoinSide::Outer)
+								chunk.string_columns[out_col][chunk.count] =
+									CopyStringRefToChunk(chunk, outer_chunk_,
+												 outer_chunk_.string_columns[src_col][outer_row]);
 							break;
 						case VecOutputStorageKind::Int32:
-							chunk.int32_columns[out_col][chunk.count] =
-								(output_col.side == VecJoinSide::Outer) ?
-								outer_chunk_.int32_columns[src_col][outer_row] :
-								inner_chunk->int32_columns[src_col][matched_entry.row_idx];
+							if (output_col.side == VecJoinSide::Outer)
+								chunk.int32_columns[out_col][chunk.count] =
+									outer_chunk_.int32_columns[src_col][outer_row];
 							break;
 					}
 				}
@@ -397,42 +410,48 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 			{
 				int active_count = outer_chunk_.has_selection ? outer_chunk_.sel.count : outer_chunk_.count;
 
-				for (int s = 0; s < active_count; s++)
-				{
-					int outer_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
-					VecHashJoinKey key;
-					uint32_t hash;
-					int32_t entry_idx;
+			for (int s = 0; s < active_count; s++)
+			{
+				int outer_row = outer_chunk_.has_selection ? outer_chunk_.sel.row_ids[s] : s;
+				VecHashJoinKey key;
+				uint32_t hash;
+				int32_t entry_idx;
 
-					if (!read_key(outer_chunk_, false, outer_row, &key))
-						continue;
+				if (!read_key(outer_chunk_, false, outer_row, &key))
+					continue;
 					hash = hash_key(key);
-					entry_idx = bucket_heads_.empty() ? -1 : bucket_heads_[hash & bucket_mask_];
-					while (entry_idx >= 0)
-					{
-						const VecHashEntry &entry = entries_[entry_idx];
-						const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
+					uint16_t partition_id = (shared_hash_partition_count_ == 1) ? 0 : (uint16_t) volvec_radix_partition_idx(hash);
+					const int32_t *bucket_heads = use_parallel_ht_ ?
+					bucket_heads_for_partition(partition_id) : active_bucket_heads();
+				size_t mask = use_parallel_ht_ ? 
+					active_bucket_mask_for_partition(partition_id) : bucket_mask_;
+			entry_idx = bucket_heads == nullptr ? -1 : bucket_heads[hash & mask];
+			while (entry_idx >= 0)
+			{
+			const VecHashEntry &entry = get_entry_at(entry_idx);
 
-						if (entry.hash == hash &&
-							keys_equal(entry.key, key) &&
-							candidate_passes_join_filter(outer_chunk_, outer_row, *inner_chunk, entry.row_idx))
-							inner_entry_matched_[entry_idx] = 1;
-						entry_idx = entry.next;
-					}
-				}
+			if (entry.hash == hash &&
+				keys_equal(entry.key, key) &&
+				candidate_passes_join_filter_for_build_entry(outer_chunk_,
+									 outer_row,
+									 partition_id,
+									 entry.chunk_idx,
+									 entry.row_idx))
+				inner_entry_matched_[entry_idx] = 1;
+			entry_idx = entry.next;
+			}
+		}
 			}
 			right_anti_marked_ = true;
 			right_anti_emit_pos_ = 0;
 		}
 
-		while (right_anti_emit_pos_ < entries_.size() && chunk.count < DEFAULT_CHUNK_SIZE)
+		while (right_anti_emit_pos_ < active_entry_count() && chunk.count < DEFAULT_CHUNK_SIZE)
 		{
-			const VecHashEntry &entry = entries_[right_anti_emit_pos_];
-			const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk;
+			const VecHashEntry &entry = get_entry_at(right_anti_emit_pos_);
 
 			if (inner_entry_matched_[right_anti_emit_pos_++])
 				continue;
-			inner_chunk = inner_chunks_[entry.chunk_idx];
 			for (const auto &output_col : output_cols_)
 			{
 				int out_col = output_col.output_resno - 1;
@@ -442,33 +461,14 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					continue;
 				if (output_col.side != VecJoinSide::Inner)
 					elog(ERROR, "pg_volvec right anti join does not support outer output columns");
-				chunk.nulls[out_col][chunk.count] = inner_chunk->nulls[src_col][entry.row_idx];
-				if (chunk.nulls[out_col][chunk.count])
-					continue;
-				switch (output_col.meta.storage_kind)
-				{
-					case VecOutputStorageKind::Double:
-						chunk.double_columns[out_col][chunk.count] =
-							inner_chunk->double_columns[src_col][entry.row_idx];
-						break;
-					case VecOutputStorageKind::Int64:
-					case VecOutputStorageKind::NumericScaledInt64:
-					case VecOutputStorageKind::NumericAvgPair:
-						chunk.int64_columns[out_col][chunk.count] =
-							inner_chunk->int64_columns[src_col][entry.row_idx];
-						chunk.double_columns[out_col][chunk.count] =
-							inner_chunk->double_columns[src_col][entry.row_idx];
-						break;
-					case VecOutputStorageKind::StringRef:
-						chunk.string_columns[out_col][chunk.count] =
-							CopyStringRefToChunk(chunk, *inner_chunk,
-												 inner_chunk->string_columns[src_col][entry.row_idx]);
-						break;
-					case VecOutputStorageKind::Int32:
-						chunk.int32_columns[out_col][chunk.count] =
-							inner_chunk->int32_columns[src_col][entry.row_idx];
-						break;
-				}
+				copy_inner_payload_value_to_chunk(chunk,
+									chunk.count,
+									out_col,
+									output_col.meta,
+									src_col,
+									0,
+									entry.chunk_idx,
+									entry.row_idx);
 			}
 			chunk.count++;
 		}
@@ -494,9 +494,11 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 		}
 
 		next_probe_sel_.clear();
-		for (uint16_t probe_idx : active_probe_sel_)
+		ProbeCandidate candidate{};
+		while (next_probe_candidate(&candidate))
 		{
 			int32_t match_entry_idx;
+			uint16_t probe_idx = candidate.probe_idx;
 
 			if (chunk.count >= DEFAULT_CHUNK_SIZE)
 			{
@@ -505,8 +507,7 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 			}
 			if (advance_probe_match(probe_idx, &match_entry_idx))
 			{
-				const VecHashEntry &entry = entries_[match_entry_idx];
-				const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk = inner_chunks_[entry.chunk_idx];
+				const VecHashEntry &entry = get_entry_at(match_entry_idx);
 				int outer_row = probe_rows_[probe_idx];
 				int dst_row = chunk.count++;
 				bool probe_is_outer = !build_outer_side_;
@@ -517,23 +518,21 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				for (const auto &output_col : output_cols_)
 				{
 					int out_col = output_col.output_resno - 1;
-					const DataChunk<DEFAULT_CHUNK_SIZE> *src;
-					int src_row;
 					int src_col = output_col.input_col;
 
 					if ((output_col.side == VecJoinSide::Outer && probe_is_outer) ||
 						(output_col.side == VecJoinSide::Inner && !probe_is_outer))
-					{
-						src = &outer_chunk_;
-						src_row = outer_row;
-					}
+						copy_output_value(dst_row, out_col, output_col.meta,
+									  outer_chunk_, src_col, outer_row);
 					else
-					{
-						src = inner_chunk;
-						src_row = entry.row_idx;
-					}
-
-					copy_output_value(dst_row, out_col, output_col.meta, *src, src_col, src_row);
+					copy_inner_payload_value_to_chunk(chunk,
+										  dst_row,
+										  out_col,
+										  output_col.meta,
+										  src_col,
+										  probe_partition_ids_[probe_idx],
+										  entry.chunk_idx,
+										  entry.row_idx);
 				}
 
 				if (probe_next_entries_[probe_idx] >= 0)
@@ -561,6 +560,8 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 		}
 
 		active_probe_sel_.swap(next_probe_sel_);
+		if (!active_probe_sel_.empty())
+			assign_probe_candidates_from_partition(0);
 		if (active_probe_sel_.empty())
 		{
 			outer_chunk_.reset();
@@ -578,14 +579,12 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 			right_anti_emit_pos_ = 0;
 		}
 
-		while (right_anti_emit_pos_ < entries_.size() && chunk.count < DEFAULT_CHUNK_SIZE)
+		while (right_anti_emit_pos_ < active_entry_count() && chunk.count < DEFAULT_CHUNK_SIZE)
 		{
-			const VecHashEntry &entry = entries_[right_anti_emit_pos_];
-			const DataChunk<DEFAULT_CHUNK_SIZE> *inner_chunk;
+			const VecHashEntry &entry = get_entry_at(right_anti_emit_pos_);
 
 			if (inner_entry_matched_[right_anti_emit_pos_++])
 				continue;
-			inner_chunk = inner_chunks_[entry.chunk_idx];
 			for (const auto &output_col : output_cols_)
 			{
 				int out_col = output_col.output_resno - 1;
@@ -596,8 +595,14 @@ VecHashJoinState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					chunk.string_columns[out_col][chunk.count] = VecStringRef{0, 0, 0};
 					continue;
 				}
-				copy_output_value(chunk.count, out_col, output_col.meta,
-								  *inner_chunk, output_col.input_col, entry.row_idx);
+				copy_inner_payload_value_to_chunk(chunk,
+									chunk.count,
+									out_col,
+									output_col.meta,
+									output_col.input_col,
+									use_parallel_ht_ ? volvec_radix_partition_idx(entry.hash) : 0,
+									entry.chunk_idx,
+									entry.row_idx);
 			}
 			chunk.count++;
 		}

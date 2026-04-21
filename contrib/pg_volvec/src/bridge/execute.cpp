@@ -87,6 +87,12 @@ ParallelTaskKindName(pg_volvec::ParallelTaskKind kind)
 			return "SourceMorsel";
 		case pg_volvec::ParallelTaskKind::BridgeFinalize:
 			return "BridgeFinalize";
+		case pg_volvec::ParallelTaskKind::HashBuildPartition:
+			return "HashBuildPartition";
+		case pg_volvec::ParallelTaskKind::HashPartitionFinalize:
+			return "HashPartitionFinalize";
+		case pg_volvec::ParallelTaskKind::HashProbePartition:
+			return "HashProbePartition";
 	}
 	return "Unknown";
 }
@@ -127,9 +133,11 @@ ParallelReadyTasksName(const pg_volvec::ParallelSchedulerState *scheduler)
 				ready_list += ",";
 			ready_list += "{pipeline=" + std::to_string(task.pipeline_id) +
 					  ",task=" + ParallelTaskKindName(task.task_kind);
+			if (task.partition_id != UINT32_MAX)
+				ready_list += ",partition=" + std::to_string(task.partition_id);
 			if (task.task_kind == pg_volvec::ParallelTaskKind::SourceMorsel)
 				ready_list += ",start=" + std::to_string(task.morsel_start_block) +
-							  ",nblocks=" + std::to_string(task.morsel_nblocks);
+						  ",nblocks=" + std::to_string(task.morsel_nblocks);
 			ready_list += "}";
 		}
 		return ready_list;
@@ -329,7 +337,7 @@ TryExecuteLeaderOnlyParallelAggregate(pg_volvec::PgVolVecQueryState *state_ptr)
 		{
 			case pg_volvec::ParallelTaskKind::SourceMorsel:
 				if (!ExecuteParallelTask(task,
-													  parallel_plan,
+												  parallel_plan,
 													  worker_context,
 													  &failure_reason))
 					elog(ERROR,
@@ -339,6 +347,14 @@ TryExecuteLeaderOnlyParallelAggregate(pg_volvec::PgVolVecQueryState *state_ptr)
 				break;
 			case pg_volvec::ParallelTaskKind::BridgeFinalize:
 				elog(ERROR, "pg_volvec leader-only aggregate path received unexpected finalize task");
+				break;
+			case pg_volvec::ParallelTaskKind::HashBuildPartition:
+			case pg_volvec::ParallelTaskKind::HashPartitionFinalize:
+			case pg_volvec::ParallelTaskKind::HashProbePartition:
+				elog(ERROR,
+					 "pg_volvec leader-only aggregate path received unsupported partition task kind=%s partition=%u",
+					 ParallelTaskKindName(task.task_kind),
+					 task.partition_id);
 				break;
 		}
 	}
@@ -632,6 +648,13 @@ vec_stringref_to_text_datum(const pg_volvec::DataChunk<pg_volvec::DEFAULT_CHUNK_
 {
 	if (ref.len == 0)
 		return PointerGetDatum(cstring_to_text_with_len("", 0));
+	if (ref.len > 65536)
+		elog(ERROR,
+			 "pg_volvec suspicious output string reference length (len=%u offset=%u prefix=%llu arena=%zu)",
+			 ref.len,
+			 ref.offset,
+			 (unsigned long long) ref.prefix,
+			 batch != nullptr ? batch->string_arena.size() : 0);
 
 	if (pg_volvec::VecStringRefIsInline(ref))
 	{
