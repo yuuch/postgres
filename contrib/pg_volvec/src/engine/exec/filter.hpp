@@ -48,16 +48,6 @@ public:
 	{
 		return left_ != nullptr ? left_->find_parallel_source_scan_state() : nullptr;
 	}
-	VecHashJoinState *find_parallel_hash_join_state() override
-	{
-		return left_ != nullptr ? left_->find_parallel_hash_join_state() : nullptr;
-	}
-	VecHashJoinState *find_parallel_hash_join_state_by_plan_node_id(int target_plan_node_id) override
-	{
-		return left_ != nullptr ?
-			left_->find_parallel_hash_join_state_by_plan_node_id(target_plan_node_id) :
-			nullptr;
-	}
 	void release_jit_resources_for_proc_exit() override
 	{
 		if (left_ != nullptr)

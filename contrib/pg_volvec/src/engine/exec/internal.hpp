@@ -13,10 +13,9 @@
 #include "exec/lookup.hpp"
 #include "exec/project.hpp"
 #include "exec/limit.hpp"
-#include "exec/hash_join.hpp"
 #include "exec/sort.hpp"
 #include "exec/query_state.hpp"
-#include "parallel/parallel_runtime.hpp"
+#include "parallel/pipeline/worker_context.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -37,19 +36,6 @@ extern bool pg_volvec_disable_jit_for_parallel_worker;
 }
 
 namespace pg_volvec {
-
-struct CorrelatedLookupFilterSpec
-{
-	std::unique_ptr<VecPlanState> lookup_state;
-	Expr *rewritten_expr = nullptr;
-	uint16_t input_key_col = 0;
-	VecOutputColMeta input_key_meta;
-	uint16_t lookup_key_col = 0;
-	VecOutputColMeta lookup_key_meta;
-	uint16_t lookup_value_col = 0;
-	int output_resno = 0;
-	VecOutputColMeta output_meta;
-};
 
 struct CorrelatedLookupProjectSpec
 {
@@ -119,20 +105,9 @@ bool ShouldSuppressPartialAggQual(const ParallelWorkerContext *parallel_worker_c
 								  Agg *agg);
 bool HasProcessParallelTargetAggSubtree(const ParallelWorkerContext *parallel_worker_context,
 										VecPlanState *plan_state);
-void BuildBinaryJoinChildRequiredAttrs(Plan *join_plan,
-									   Node *key_clauses,
-									   Plan *outer_plan,
-									   Plan *inner_plan,
-									   Bitmapset **outer_required_attrs,
-									   Bitmapset **inner_required_attrs);
 Expr *BuildCombinedQualExpr(List *joinqual, List *planqual);
-bool ShouldSwapInnerJoinBuildSides(JoinType jointype, Plan *outer_plan, Plan *inner_plan);
-bool ShouldBuildSmallerSide(Plan *outer_plan, Plan *inner_plan);
 Oid FindPlanBaseRelid(Plan *plan, EState *estate);
 bool PlanContainsNodeId(Plan *plan, int target_plan_node_id);
-bool RewriteSemiJoinVisibleInnerOutputsToOuterKeys(VolVecVector<VecJoinOutputCol> *output_cols,
-												   const VolVecVector<VecHashJoinKeyCol> &key_cols,
-												   int visible_output_count);
 void BuildPrunedDeformProgram(Bitmapset *attrs, TupleDesc desc, DeformProgram *program);
 
 bool CanBuildDirectVarProjectTargetList(List *targetlist);
@@ -148,28 +123,6 @@ bool LookupPlanOutputMeta(Plan *plan,
 						  int target_resno,
 						  uint16_t *source_col,
 						  VecOutputColMeta *meta);
-bool BuildJoinOutputCols(List *targetlist,
-						 Plan *outer_plan,
-						 Plan *inner_plan,
-						 VecPlanState *outer,
-						 VecPlanState *inner,
-						 VolVecVector<VecJoinOutputCol> *output_cols,
-						 bool *needs_project);
-std::unique_ptr<VecPlanState> BuildJoinProject(std::unique_ptr<VecPlanState> left,
-											   List *targetlist,
-											   Plan *outer_plan,
-											   Plan *inner_plan,
-											   VecPlanState *outer,
-											   VecPlanState *inner,
-											   VolVecVector<VecJoinOutputCol> *output_cols,
-											   EState *estate);
-Expr *RewriteHashJoinFilterExpr(Expr *expr,
-								Plan *outer_plan,
-								Plan *inner_plan,
-								VecPlanState *outer,
-								VecPlanState *inner,
-								VolVecVector<VecJoinOutputCol> *output_cols);
-void PartitionJoinClauses(List *clauses, List **key_clauses, List **residual_clauses);
 bool TryBuildLookupMembershipFilterSpec(Expr *expr,
 										VecPlanState *input_state,
 										EState *estate,
@@ -178,15 +131,6 @@ bool TryBuildPlanCorrelatedLookupProjectSpec(Expr *expr,
 											 VecPlanState *input_state,
 											 EState *estate,
 											 CorrelatedLookupProjectSpec *spec_out);
-bool TryBuildCorrelatedLookupFilterSpec(Expr *expr,
-										Plan *outer_plan,
-										Plan *inner_plan,
-										VecPlanState *outer,
-										VecPlanState *inner,
-										VolVecVector<VecJoinOutputCol> *output_cols,
-										EState *estate,
-										CorrelatedLookupFilterSpec *spec_out,
-										const ParallelWorkerContext *parallel_worker_context);
 
 std::unique_ptr<VecPlanState> ExecInitVecPlanInternal(Plan *plan,
 													  EState *estate,

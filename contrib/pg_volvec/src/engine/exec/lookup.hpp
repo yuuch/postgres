@@ -126,17 +126,6 @@ public:
 		if (lookup_source_ != nullptr)
 			lookup_source_->release_jit_resources_for_proc_exit();
 	}
-	VecHashJoinState *find_parallel_hash_join_state_by_plan_node_id(int target_plan_node_id) override
-	{
-		VecHashJoinState *state = left_ != nullptr ?
-			left_->find_parallel_hash_join_state_by_plan_node_id(target_plan_node_id) :
-			nullptr;
-		if (state != nullptr)
-			return state;
-		return lookup_source_ != nullptr ?
-			lookup_source_->find_parallel_hash_join_state_by_plan_node_id(target_plan_node_id) :
-			nullptr;
-	}
 private:
 	bool build_lookup();
 	bool extract_lookup_key(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk,
@@ -214,17 +203,6 @@ public:
 			left_->release_jit_resources_for_proc_exit();
 		if (lookup_source_ != nullptr)
 			lookup_source_->release_jit_resources_for_proc_exit();
-	}
-	VecHashJoinState *find_parallel_hash_join_state_by_plan_node_id(int target_plan_node_id) override
-	{
-		VecHashJoinState *state = left_ != nullptr ?
-			left_->find_parallel_hash_join_state_by_plan_node_id(target_plan_node_id) :
-			nullptr;
-		if (state != nullptr)
-			return state;
-		return lookup_source_ != nullptr ?
-			lookup_source_->find_parallel_hash_join_state_by_plan_node_id(target_plan_node_id) :
-			nullptr;
 	}
 private:
 	bool build_lookup();
@@ -308,17 +286,6 @@ public:
 			left_->release_jit_resources_for_proc_exit();
 		if (lookup_source_ != nullptr)
 			lookup_source_->release_jit_resources_for_proc_exit();
-	}
-	VecHashJoinState *find_parallel_hash_join_state_by_plan_node_id(int target_plan_node_id) override
-	{
-		VecHashJoinState *state = left_ != nullptr ?
-			left_->find_parallel_hash_join_state_by_plan_node_id(target_plan_node_id) :
-			nullptr;
-		if (state != nullptr)
-			return state;
-		return lookup_source_ != nullptr ?
-			lookup_source_->find_parallel_hash_join_state_by_plan_node_id(target_plan_node_id) :
-			nullptr;
 	}
 private:
 	bool build_lookup();

@@ -829,38 +829,6 @@ PlanContainsNodeId(Plan *plan, int target_plan_node_id)
 		PlanContainsNodeId(plan->righttree, target_plan_node_id);
 }
 
-bool
-RewriteSemiJoinVisibleInnerOutputsToOuterKeys(VolVecVector<VecJoinOutputCol> *output_cols,
-											  const VolVecVector<VecHashJoinKeyCol> &key_cols,
-											  int visible_output_count)
-{
-	if (output_cols == nullptr)
-		return false;
-
-	for (auto &output_col : *output_cols)
-	{
-		bool matched = false;
-
-		if (output_col.output_resno > visible_output_count ||
-			output_col.side != VecJoinSide::Inner)
-			continue;
-		for (const auto &key_col : key_cols)
-		{
-			if (key_col.inner_col != output_col.input_col)
-				continue;
-			output_col.side = VecJoinSide::Outer;
-			output_col.input_col = key_col.outer_col;
-			output_col.meta = VecOutputColMeta{output_col.meta.sql_type, key_col.kind, output_col.meta.scale};
-			matched = true;
-			break;
-		}
-		if (!matched)
-			return false;
-	}
-
-	return true;
-}
-
 void
 BuildPrunedDeformProgram(Bitmapset *attrs, TupleDesc desc, DeformProgram *program)
 {

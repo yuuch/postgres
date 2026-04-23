@@ -8,7 +8,6 @@ extern bool pg_volvec_trace_hooks;
 }
 
 class VecAggState;
-class VecHashJoinState;
 
 class VecPlanState : public PgMemoryContextObject {
 public:
@@ -72,62 +71,6 @@ public:
 	{
 		return nullptr;
 	}
-	virtual VecHashJoinState *find_parallel_hash_join_state()
-	{
-		return nullptr;
-	}
-	virtual VecHashJoinState *find_parallel_hash_join_state_by_plan_node_id(int target_plan_node_id)
-	{
-		(void) target_plan_node_id;
-		return nullptr;
-	}
-};
-
-enum class ParallelPipelineDriverKind : uint8_t {
-	SourceScan,
-	SinkFinalize,
-	BridgeFinalize = SinkFinalize
-};
-
-enum class ParallelPipelineRole : uint8_t {
-	GenericSource,
-	AggFinalize,
-	SortMerge,
-	HashBuildSource,
-	HashBuildFinalize,
-	HashProbeSource,
-	HashOuterSource,
-	BuildPartitionSource,
-	ProbePartitionSource,
-	HashJoinPartitionSource
-};
-
-enum class ParallelPipelineStage : uint32_t {
-	PartialAgg = 1u << 0,
-	HashBuild = 1u << 1,
-	HashProbe = 1u << 2,
-	SortRun = 1u << 3
-};
-
-enum class ParallelSinkKind : uint8_t {
-	None,
-	Aggregate,
-	HashBuild,
-	HashTable,
-	SortRuns,
-	BuildPartitions,
-	ProbePartitions
-};
-
-using ParallelBridgeKind = ParallelSinkKind;
-
-enum class ParallelTaskKind : uint8_t {
-	SourceMorsel,
-	SinkFinalize,
-	BridgeFinalize = SinkFinalize,
-	HashBuildPartition,
-	HashPartitionFinalize,
-	HashProbePartition
 };
 
 struct ParallelAggPartialAccumulator {
@@ -181,51 +124,4 @@ struct ParallelAggPartialState {
 	char grouped_file_name[VOLVEC_PARALLEL_MAX_PARTIAL_FILE_NAME] = {0};
 	ParallelAggPartialAccumulator accs[16];
 	ParallelAggPartialGroupEntry groups[VOLVEC_PARALLEL_MAX_GROUPS];
-};
-
-struct ParallelHashBuildPartialState {
-	uint64_t init_time_us = 0;
-	uint64_t exec_time_us = 0;
-	uint64_t blocks_opened = 0;
-	uint64_t input_batches = 0;
-	uint64_t input_rows = 0;
-	uint64_t entry_count = 0;
-	uint64_t chunk_count = 0;
-	uint64_t row_count = 0;
-	uint64_t file_bytes = 0;
-	uint64_t row_file_bytes = 0;
-	uint64_t dsa_pack = 0;
-	char file_name[VOLVEC_PARALLEL_MAX_PARTIAL_FILE_NAME] = {0};
-};
-
-struct ParallelPipelineDesc {
-	/* Static plan-time descriptor for one lowered pipeline. */
-	uint32_t pipeline_id = 0;
-	ParallelPipelineDriverKind driver_kind = ParallelPipelineDriverKind::SourceScan;
-	ParallelPipelineRole role = ParallelPipelineRole::GenericSource;
-	ParallelSinkKind input_sink = ParallelSinkKind::None;
-	ParallelSinkKind output_sink = ParallelSinkKind::None;
-	uint32_t stage_mask = 0;
-	Oid scan_relid = InvalidOid;
-	int scan_plan_node_id = -1;
-	int agg_plan_node_id = -1;
-	int hash_join_plan_node_id = -1;
-	int input_hash_join_plan_node_id = -1;
-	double estimated_rows = -1.0;
-	bool source_morsel_driven = false;
-	bool has_filter = false;
-	bool has_projection = false;
-	bool has_limit = false;
-	bool grouped_agg = false;
-	VolVecVector<uint32_t> dependencies;
-	VolVecVector<uint32_t> successors;
-
-	ParallelSinkKind input_sink_compat() const { return input_sink; }
-	ParallelSinkKind output_sink_compat() const { return output_sink; }
-
-	explicit ParallelPipelineDesc(MemoryContext context)
-		: dependencies(PgMemoryContextAllocator<uint32_t>(context)),
-		  successors(PgMemoryContextAllocator<uint32_t>(context))
-	{
-	}
 };
