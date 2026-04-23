@@ -37,31 +37,6 @@ extern bool pg_volvec_disable_jit_for_parallel_worker;
 
 namespace pg_volvec {
 
-struct CorrelatedLookupProjectSpec
-{
-	std::unique_ptr<VecPlanState> lookup_state;
-	Expr *rewritten_expr = nullptr;
-	int num_keys = 0;
-	uint16_t input_key_cols[kMaxLookupKeys] = {0, 0, 0, 0};
-	VecOutputColMeta input_key_metas[kMaxLookupKeys];
-	uint16_t lookup_key_cols[kMaxLookupKeys] = {0, 0, 0, 0};
-	VecOutputColMeta lookup_key_metas[kMaxLookupKeys];
-	uint16_t lookup_value_col = 0;
-	int output_resno = 0;
-	VecOutputColMeta output_meta;
-};
-
-struct LookupMembershipFilterSpec
-{
-	std::unique_ptr<VecPlanState> lookup_state;
-	Expr *residual_expr = nullptr;
-	uint16_t input_key_col = 0;
-	VecOutputColMeta input_key_meta;
-	uint16_t lookup_key_col = 0;
-	VecOutputColMeta lookup_key_meta;
-	bool negate = false;
-};
-
 constexpr uint32 VOLVEC_GROUPED_PARTIAL_FILE_MAGIC = 0x56564750;
 constexpr uint32 VOLVEC_GROUPED_PARTIAL_FILE_VERSION = 2;
 
@@ -97,7 +72,6 @@ bool BufFileReadAllLocal(BufFile *file, void *ptr, size_t size, bool eof_ok,
 void AdjustProgramVarScales(VecExprProgram *program, VecPlanState *input_state);
 void CollectAttrNosFromExpr(Node *node, Bitmapset **attrs);
 bool MatchStringPrefixExpr(Expr *expr, uint16_t *input_col, uint32_t *prefix_len);
-int CountVisibleTargetEntries(List *targetlist);
 bool ResolveAggPassThroughExpr(Agg *node, Expr *expr, int *input_col, int *group_key_pos);
 void CollectRequiredAttrsForPlan(Plan *plan, Bitmapset **attrs);
 bool IsProcessParallelLocalContext(const ParallelWorkerContext *parallel_worker_context);
@@ -105,9 +79,6 @@ bool ShouldSuppressPartialAggQual(const ParallelWorkerContext *parallel_worker_c
 								  Agg *agg);
 bool HasProcessParallelTargetAggSubtree(const ParallelWorkerContext *parallel_worker_context,
 										VecPlanState *plan_state);
-Expr *BuildCombinedQualExpr(List *joinqual, List *planqual);
-Oid FindPlanBaseRelid(Plan *plan, EState *estate);
-bool PlanContainsNodeId(Plan *plan, int target_plan_node_id);
 void BuildPrunedDeformProgram(Bitmapset *attrs, TupleDesc desc, DeformProgram *program);
 
 bool CanBuildDirectVarProjectTargetList(List *targetlist);
@@ -123,14 +94,6 @@ bool LookupPlanOutputMeta(Plan *plan,
 						  int target_resno,
 						  uint16_t *source_col,
 						  VecOutputColMeta *meta);
-bool TryBuildLookupMembershipFilterSpec(Expr *expr,
-										VecPlanState *input_state,
-										EState *estate,
-										LookupMembershipFilterSpec *spec_out);
-bool TryBuildPlanCorrelatedLookupProjectSpec(Expr *expr,
-											 VecPlanState *input_state,
-											 EState *estate,
-											 CorrelatedLookupProjectSpec *spec_out);
 
 std::unique_ptr<VecPlanState> ExecInitVecPlanInternal(Plan *plan,
 													  EState *estate,

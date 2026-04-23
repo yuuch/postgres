@@ -2,64 +2,6 @@
 
 namespace pg_volvec {
 
-class VecMetadataOnlyState : public VecPlanState {
-public:
-	explicit VecMetadataOnlyState(Plan *plan)
-	{
-		ListCell *lc;
-
-		memset(has_meta_, 0, sizeof(has_meta_));
-		if (plan == nullptr)
-			return;
-		foreach(lc, plan->targetlist)
-		{
-			TargetEntry *tle = (TargetEntry *) lfirst(lc);
-			Oid typid;
-			int idx;
-
-			if (tle == nullptr || tle->resjunk ||
-				tle->resno <= 0 || tle->resno > 16 ||
-				tle->expr == nullptr)
-				continue;
-			idx = tle->resno - 1;
-			typid = exprType((Node *) tle->expr);
-			meta_[idx].sql_type = typid;
-			meta_[idx].storage_kind = DefaultOutputStorageKindForType(typid);
-			meta_[idx].scale = typid == NUMERICOID ?
-				GetNumericScaleFromTypmod(exprTypmod((Node *) tle->expr)) : 0;
-			has_meta_[idx] = true;
-		}
-	}
-
-	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override
-	{
-		chunk.reset();
-		return false;
-	}
-
-	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
-	{
-		int idx = target_resno - 1;
-
-		if (idx < 0 || idx >= 16 || !has_meta_[idx])
-			return false;
-		if (out != nullptr)
-			*out = meta_[idx];
-		return true;
-	}
-
-private:
-	VecOutputColMeta meta_[16];
-	bool has_meta_[16];
-};
-
-static std::unique_ptr<VecPlanState>
-BuildMetadataOnlyPlanState(Plan *plan)
-{
-	return std::make_unique<VecMetadataOnlyState>(plan);
-}
-
-
 static bool
 MatchFinalizePartialAggregateChainLocal(Plan *plan,
 										Plan **gather_out,
