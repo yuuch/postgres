@@ -87,14 +87,14 @@ RunPipelineWorkerBody(dsm_segment *seg, shm_toc *toc)
 	exec_ctx.vec_plan = state.root_plan.get();
 	exec_ctx.worker_index = (int) ParallelWorkerNumber;
 
-	Source *src   = bundle->pipeline.src;
-	Sink   *sink  = bundle->pipeline.sink;
+	Source *src   = bundle->primary()->pipeline.src;
+	Sink   *sink  = bundle->primary()->pipeline.sink;
 	auto    gsrc  = src->GetGlobalSourceState(exec_ctx);
 	auto    lsrc  = src->GetLocalSourceState(exec_ctx, *gsrc);
 	auto    gsink = sink->GetGlobalSinkState(exec_ctx);
 	auto    lsink = sink->GetLocalSinkState(exec_ctx, *gsink);
 
-	WorkerPipelineExecutor exec(src, bundle->pipeline.ops, sink);
+	WorkerPipelineExecutor exec(src, bundle->primary()->pipeline.ops, sink);
 	exec.Execute(exec_ctx, *gsrc, *lsrc, gsink.get(), lsink.get(), 0);
 
 	OperatorSinkCombineInput combine_input{*lsink, *gsink};

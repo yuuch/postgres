@@ -279,15 +279,16 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 					exec_ctx.vec_plan     = leader_state.root_plan.get();
 					exec_ctx.worker_index = LEADER_WORKER_INDEX;
 
-					Source *src   = bundle->pipeline.src;
-					Sink   *sink  = bundle->pipeline.sink;
+					OwnedPipeline *owned = bundle->primary();
+					Source *src   = owned->pipeline.src;
+					Sink   *sink  = owned->pipeline.sink;
 					auto    gsrc  = src->GetGlobalSourceState(exec_ctx);
 					auto    lsrc  = src->GetLocalSourceState(exec_ctx, *gsrc);
 					auto    gsink = sink->GetGlobalSinkState(exec_ctx);
 					auto    lsink = sink->GetLocalSinkState(exec_ctx, *gsink);
 
 					WorkerPipelineExecutor exec(src,
-												bundle->pipeline.ops,
+												owned->pipeline.ops,
 												sink);
 					exec.Execute(exec_ctx, *gsrc, *lsrc,
 								 gsink.get(), lsink.get(), 0);
