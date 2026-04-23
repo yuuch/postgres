@@ -4,8 +4,10 @@
 
 class VecFilterState : public VecPlanState {
 public:
-	VecFilterState(std::unique_ptr<VecPlanState> left, std::unique_ptr<VecExprProgram> prog) : left_(std::move(left)), program_(std::move(prog)) {}
-	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+		VecFilterState(std::unique_ptr<VecPlanState> left, std::unique_ptr<VecExprProgram> prog) : left_(std::move(left)), program_(std::move(prog)) {}
+		bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+		bool drain_to(VecPlanState *downstream) override;
+		bool push_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 		bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override
 		{
 			return left_ != nullptr && left_->lookup_output_col_meta(target_resno, out);
@@ -63,6 +65,7 @@ public:
 		if (program_ != nullptr)
 			program_->release_jit_resources_for_proc_exit();
 	}
-private:
-	std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
-};
+	private:
+		std::unique_ptr<VecPlanState> left_; std::unique_ptr<VecExprProgram> program_;
+		VecPlanState *push_downstream_ = nullptr;
+	};

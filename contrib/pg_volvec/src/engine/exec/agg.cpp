@@ -18,31 +18,17 @@ VecAggState::VecAggState(std::unique_ptr<VecPlanState> left, Agg *node)
 {
 	partitions_.resize(NUM_PARTITIONS, nullptr);
 	for (int i = 0; i < node->numCols; i++) {
-			VecOutputColMeta meta;
-			int target_resno = node->grpColIdx[i];
-			ListCell *meta_lc;
+				VecOutputColMeta meta;
+				int target_resno = node->grpColIdx[i];
 
-			grp_col_indices_.push_back(target_resno - 1);
+				grp_col_indices_.push_back(target_resno - 1);
 			if (left_ == nullptr || !left_->lookup_output_col_meta(target_resno, &meta))
 			{
 				meta.sql_type = InvalidOid;
 				meta.storage_kind = VecOutputStorageKind::Int32;
 				meta.scale = 0;
 			}
-			foreach(meta_lc, node->plan.targetlist)
-			{
-				TargetEntry *tle = (TargetEntry *) lfirst(meta_lc);
-
-				if (tle == nullptr || tle->resjunk ||
-					tle->resno != target_resno ||
-					tle->expr == nullptr)
-					continue;
-				meta.sql_type = exprType((Node *) tle->expr);
-				meta.storage_kind = DefaultOutputStorageKindForType(meta.sql_type);
-				meta.scale = meta.sql_type == NUMERICOID ?
-					GetNumericScaleFromTypmod(exprTypmod((Node *) tle->expr)) : 0;
-			}
-			grp_col_meta_.push_back(meta);
+				grp_col_meta_.push_back(meta);
 			if (pg_volvec_trace_hooks)
 				elog(LOG,
 					 "pg_volvec: agg group meta idx=%d target_resno=%d sql_type=%u storage=%u scale=%d",

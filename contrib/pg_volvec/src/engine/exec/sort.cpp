@@ -224,6 +224,7 @@ VecSortState::flush_buffer_to_run()
 	run.chunks = std::move(buffer_chunks_);
 	run.total_rows = buffer_rows_;
 	run.cursor = 0;
+	run.key_base = key_lanes_.empty() ? 0 : (uint32_t) key_lanes_[0].nulls.size();
 	
 	for (uint32_t chunk_id = 0; chunk_id < run.chunks.size(); chunk_id++)
 	{
@@ -282,12 +283,21 @@ VecSortState::compare_string_ref(const VecSortKeyLane &lane,
 int
 VecSortState::compare_global_rows(const SortedRun &run, uint64_t global_a, uint64_t global_b) const
 {
+	return compare_global_rows(run, global_a, run, global_b);
+}
+
+int
+VecSortState::compare_global_rows(const SortedRun &run_a,
+								  uint64_t global_a,
+								  const SortedRun &run_b,
+								  uint64_t global_b) const
+{
 	uint32_t chunk_a, offset_a, chunk_b, offset_b;
 	GlobalRowId::decode(global_a, chunk_a, offset_a);
 	GlobalRowId::decode(global_b, chunk_b, offset_b);
 	
-	uint32_t ordinal_a = chunk_a * DEFAULT_CHUNK_SIZE + offset_a;
-	uint32_t ordinal_b = chunk_b * DEFAULT_CHUNK_SIZE + offset_b;
+	uint32_t ordinal_a = run_a.key_base + chunk_a * DEFAULT_CHUNK_SIZE + offset_a;
+	uint32_t ordinal_b = run_b.key_base + chunk_b * DEFAULT_CHUNK_SIZE + offset_b;
 	
 	for (const auto &lane : key_lanes_)
 	{
@@ -300,32 +310,32 @@ VecSortState::compare_global_rows(const SortedRun &run, uint64_t global_a, uint6
 		if (left_null)
 			continue;
 
-		switch (lane.desc.storage_kind)
-		{
-			case VecOutputStorageKind::Int32:
-				if (lane.i32_values[ordinal_a] < lane.i32_values[ordinal_b])
-					cmp = -1;
-				else if (lane.i32_values[ordinal_a] > lane.i32_values[ordinal_b])
-					cmp = 1;
-				break;
-			case VecOutputStorageKind::Int64:
-			case VecOutputStorageKind::NumericScaledInt64:
-				if (lane.i64_values[ordinal_a] < lane.i64_values[ordinal_b])
-					cmp = -1;
-				else if (lane.i64_values[ordinal_a] > lane.i64_values[ordinal_b])
-					cmp = 1;
-				break;
-			case VecOutputStorageKind::Double:
-				if (lane.u64_values[ordinal_a] < lane.u64_values[ordinal_b])
-					cmp = -1;
-				else if (lane.u64_values[ordinal_a] > lane.u64_values[ordinal_b])
-					cmp = 1;
-				break;
-			case VecOutputStorageKind::StringRef:
-				cmp = compare_string_ref(lane,
-										 lane.string_values[ordinal_a],
-										 lane.string_values[ordinal_b]);
-				break;
+				switch (lane.desc.storage_kind)
+				{
+					case VecOutputStorageKind::Int32:
+						if (lane.i32_values[ordinal_a] < lane.i32_values[ordinal_b])
+							cmp = -1;
+						else if (lane.i32_values[ordinal_a] > lane.i32_values[ordinal_b])
+							cmp = 1;
+						break;
+					case VecOutputStorageKind::Int64:
+					case VecOutputStorageKind::NumericScaledInt64:
+						if (lane.i64_values[ordinal_a] < lane.i64_values[ordinal_b])
+							cmp = -1;
+						else if (lane.i64_values[ordinal_a] > lane.i64_values[ordinal_b])
+							cmp = 1;
+						break;
+					case VecOutputStorageKind::Double:
+						if (lane.u64_values[ordinal_a] < lane.u64_values[ordinal_b])
+							cmp = -1;
+						else if (lane.u64_values[ordinal_a] > lane.u64_values[ordinal_b])
+							cmp = 1;
+						break;
+					case VecOutputStorageKind::StringRef:
+						cmp = compare_string_ref(lane,
+												 lane.string_values[ordinal_a],
+												 lane.string_values[ordinal_b]);
+						break;
 			case VecOutputStorageKind::NumericAvgPair:
 				elog(ERROR, "pg_volvec vector sort does not yet support numeric average sort keys");
 				break;
@@ -455,7 +465,10 @@ VecSortState::MergeEntryComparator::operator()(const MergeEntry &a, const MergeE
 	const SortedRun &run_a = sort_state->runs_[a.run_id];
 	const SortedRun &run_b = sort_state->runs_[b.run_id];
 	
-	int cmp = sort_state->compare_global_rows(run_a, a.global_id, b.global_id);
+	int cmp = sort_state->compare_global_rows(run_a,
+											 a.global_id,
+											 run_b,
+											 b.global_id);
 	return cmp > 0;
 }
 

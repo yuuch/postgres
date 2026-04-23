@@ -1,4 +1,0 @@
-query	pg_parallel14_s	pg_status	pg_runs_ms	pg_volvec_parallel14_s	pg_volvec_parallel_status	pg_volvec_parallel_runs_ms	pg_volvec_serial_s	pg_volvec_serial_status	pg_volvec_serial_runs_ms
-q12	2.754	ok	2823,2754,2643	2.082	ok	2190,2082,1787	4.763	ok	5025,4763,4534
-q14	1.609	ok	1945,1609,1596	2.974	ok	3056,2974,2958	2.897	ok	2897,2952,2895
-q15	3.407	ok	3562,3407,3158	7.636	ok	7564,7636,8196	7.644	ok	7617,7644,8872

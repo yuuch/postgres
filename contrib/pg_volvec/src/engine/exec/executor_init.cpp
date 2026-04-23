@@ -725,7 +725,9 @@ ExecInitVecPlanInternal(Plan *plan, EState *estate, Bitmapset *required_attrs,
 
 				if (hash_build_target)
 				{
-					if (scan_in_outer)
+					if (parallel_worker_context->input_hash_join_plan_node_id >= 0)
+						build_outer_side = false;
+					else if (scan_in_outer)
 						build_outer_side = true;
 					else if (scan_in_inner)
 						build_outer_side = false;

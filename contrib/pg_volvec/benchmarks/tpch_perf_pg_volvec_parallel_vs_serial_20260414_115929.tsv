@@ -1,9 +1,0 @@
-query	serial_ms	parallel_ms	speedup	serial_status	parallel_status
-q1	7655	2809	2.7252	ok	ok
-q3	26875	26731	1.0054	ok	ok
-q4	40453	29	NA	error	error
-q5	29	3679	NA	error	ok
-q6	2850	2425	1.1753	ok	ok
-q7	3539	3118	1.1350	ok	ok
-q8	280	28	NA	error	error
-q9	13495	6984	1.9323	ok	ok

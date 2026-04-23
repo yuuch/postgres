@@ -53,10 +53,28 @@ Offloaded with narrower validation:
 - [x] Fixed Q3 SF10 initialization crash caused by over-eager aggregate hash
   table reserve (`invalid memory alloc request size 1107296256`). Initial
   aggregate reserve is now capped conservatively.
-- [x] Fixed Q3 QueryScheduler undercount after DSA/shared hash bridge changes:
-  single-partition shared bridges now route all probe keys to partition 0
-  instead of radix partition ids. Q3 now returns 114003 rows and exact native
-  diff passes.
+- [x] Fixed Q3 QueryScheduler radix hash-build correctness, 2026-04-22:
+  removed the single-partition routing workaround and restored true
+  multi-partition bridge/probe behavior. Fixes included push-driven radix
+  build consumption, partition-aware entry lookup, full partition scanning for
+  non-partitioned morsel probes, partitioned bridge row-layout sizing and
+  attach, global chunk indexes in serialized partition fragments, and aggregate
+  group metadata sourced from child output columns. Q3 now reaches
+  `path=query_scheduler`, returns 114003 rows at SF10, and exact native diff
+  passes.
+- [x] Converted the active QueryScheduler source pipelines to push execution,
+  2026-04-22. Source tasks now pull only from the source side and push batches
+  through Filter/Project/HashJoin into Agg or SortRun sinks. HashProbeSource
+  tasks are no longer multiplied by `VOLVEC_RADIX_FANOUT`; each morsel scans
+  once and probes all radix partitions in-batch. Q3 exact native diff still
+  passes and runtime dropped from ~80-99s to ~18s in the local SF10 check.
+- [ ] 3-pipeline global partition hash join construction started,
+  2026-04-22. Added `global_partition_data.hpp/.cpp` to the build and fixed
+  symbol/namespace wiring so the immutable DSA segment append model compiles.
+  The experimental 3-pipeline lowering is currently guarded off because the
+  HashJoinPartitionSource path still needs separate build/probe row-layout
+  metadata and probe output wiring; guarded Q3 continues to pass exact native
+  diff through the proven QueryScheduler path.
 - [ ] Q4/Q18 blocker: planner produces an internal HashAggregate/distinct-like
   build side for semi/exists shapes. Current vector aggregate tries to build
   millions of groups in a local hash table and hits a guarded 1GB allocation.

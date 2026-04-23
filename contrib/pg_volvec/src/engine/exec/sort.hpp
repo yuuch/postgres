@@ -30,12 +30,14 @@ struct SortedRun {
 	VolVecVector<uint64_t> global_sel;                     /* Sorted global row IDs */
 	uint32_t total_rows;
 	uint32_t cursor;  /* Current read position for merge */
+	uint32_t key_base;
 	
 	SortedRun(MemoryContext context)
 		: chunks(PgMemoryContextAllocator<DataChunk<DEFAULT_CHUNK_SIZE> *>(context)),
 		  global_sel(PgMemoryContextAllocator<uint64_t>(context)),
 		  total_rows(0),
-		  cursor(0)
+		  cursor(0),
+		  key_base(0)
 	{
 	}
 	
@@ -97,6 +99,11 @@ public:
 				 int output_ncols = -1);
 	~VecSortState() override;
 	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+	bool push_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override
+	{
+		append_external_batch(chunk);
+		return true;
+	}
 	void reset_external_input();
 	void append_external_batch(const DataChunk<DEFAULT_CHUNK_SIZE> &chunk);
 	void finish_external_input();
@@ -150,6 +157,10 @@ private:
 	void flush_buffer_to_run();
 	void sort_run(SortedRun &run);
 	int compare_global_rows(const SortedRun &run, uint64_t global_a, uint64_t global_b) const;
+	int compare_global_rows(const SortedRun &run_a,
+							uint64_t global_a,
+							const SortedRun &run_b,
+							uint64_t global_b) const;
 	int compare_string_ref(const VecSortKeyLane &lane,
 						  const VecStringRef &left,
 						  const VecStringRef &right) const;

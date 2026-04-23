@@ -10,505 +10,30 @@ extern "C" {
 
 #include "execute.h"
 #include "volvec_engine.hpp"
+#include "parallel/pipeline/pipeline_leader.hpp"
 
 #include <string>
 
 extern "C" {
-extern int pg_volvec_parallel_morsel_nblocks;
-extern bool pg_volvec_trace_hooks;
-extern bool pg_volvec_trace_execution_path;
-extern bool pg_volvec_parallel_leader_participation;
-extern bool pg_volvec_parallel_experimental_hash_pipeline;
-}
-
-namespace {
-
-const char *
-ParallelDriverKindName(pg_volvec::ParallelPipelineDriverKind kind)
-{
-	switch (kind)
-	{
-		case pg_volvec::ParallelPipelineDriverKind::SourceScan:
-			return "SourceScan";
-		case pg_volvec::ParallelPipelineDriverKind::BridgeFinalize:
-			return "BridgeFinalize";
-	}
-	return "Unknown";
-}
-
-const char *
-ParallelBridgeKindName(pg_volvec::ParallelBridgeKind kind)
-{
-	switch (kind)
-	{
-		case pg_volvec::ParallelBridgeKind::None:
-			return "None";
-		case pg_volvec::ParallelBridgeKind::Aggregate:
-			return "Aggregate";
-		case pg_volvec::ParallelBridgeKind::HashBuild:
-			return "HashBuild";
-		case pg_volvec::ParallelBridgeKind::HashTable:
-			return "HashTable";
-		case pg_volvec::ParallelBridgeKind::SortRuns:
-			return "SortRuns";
-	}
-	return "Unknown";
-}
-
-const char *
-ParallelPipelineRoleName(pg_volvec::ParallelPipelineRole role)
-{
-	switch (role)
-	{
-		case pg_volvec::ParallelPipelineRole::GenericSource:
-			return "GenericSource";
-		case pg_volvec::ParallelPipelineRole::AggFinalize:
-			return "AggFinalize";
-		case pg_volvec::ParallelPipelineRole::SortMerge:
-			return "SortMerge";
-		case pg_volvec::ParallelPipelineRole::HashBuildSource:
-			return "HashBuildSource";
-		case pg_volvec::ParallelPipelineRole::HashBuildFinalize:
-			return "HashBuildFinalize";
-		case pg_volvec::ParallelPipelineRole::HashProbeSource:
-			return "HashProbeSource";
-		case pg_volvec::ParallelPipelineRole::HashOuterSource:
-			return "HashOuterSource";
-	}
-	return "Unknown";
-}
-
-const char *
-ParallelTaskKindName(pg_volvec::ParallelTaskKind kind)
-{
-	switch (kind)
-	{
-		case pg_volvec::ParallelTaskKind::SourceMorsel:
-			return "SourceMorsel";
-		case pg_volvec::ParallelTaskKind::BridgeFinalize:
-			return "BridgeFinalize";
-		case pg_volvec::ParallelTaskKind::HashBuildPartition:
-			return "HashBuildPartition";
-		case pg_volvec::ParallelTaskKind::HashPartitionFinalize:
-			return "HashPartitionFinalize";
-		case pg_volvec::ParallelTaskKind::HashProbePartition:
-			return "HashProbePartition";
-	}
-	return "Unknown";
-}
-
-std::string
-ParallelStageMaskName(uint32_t stage_mask)
-{
-	std::string stages;
-	auto append_stage = [&stages](const char *name) {
-		if (!stages.empty())
-			stages += ",";
-		stages += name;
-	};
-
-	if ((stage_mask & (uint32_t) pg_volvec::ParallelPipelineStage::PartialAgg) != 0)
-		append_stage("PartialAgg");
-	if ((stage_mask & (uint32_t) pg_volvec::ParallelPipelineStage::HashBuild) != 0)
-		append_stage("HashBuild");
-	if ((stage_mask & (uint32_t) pg_volvec::ParallelPipelineStage::HashProbe) != 0)
-		append_stage("HashProbe");
-	if ((stage_mask & (uint32_t) pg_volvec::ParallelPipelineStage::SortRun) != 0)
-		append_stage("SortRun");
-	if (stages.empty())
-		stages = "None";
-	return stages;
-}
-
-std::string
-ParallelReadyTasksName(const pg_volvec::ParallelSchedulerState *scheduler)
-{
-		std::string ready_list;
-
-		if (scheduler == nullptr || scheduler->ready_task_count() == 0)
-			return "<none>";
-		for (const auto &task : scheduler->ready_tasks())
-		{
-			if (!ready_list.empty())
-				ready_list += ",";
-			ready_list += "{pipeline=" + std::to_string(task.pipeline_id) +
-					  ",task=" + ParallelTaskKindName(task.task_kind);
-			if (task.partition_id != UINT32_MAX)
-				ready_list += ",partition=" + std::to_string(task.partition_id);
-			if (task.task_kind == pg_volvec::ParallelTaskKind::SourceMorsel)
-				ready_list += ",start=" + std::to_string(task.morsel_start_block) +
-						  ",nblocks=" + std::to_string(task.morsel_nblocks);
-			ready_list += "}";
-		}
-		return ready_list;
-}
-
-void
-LogParallelPipelinePlan(const pg_volvec::ParallelPipelinePlan *parallel_plan)
-{
-	if (parallel_plan == nullptr)
-		return;
-
-	for (const auto &pipeline : parallel_plan->pipelines())
-	{
-		std::string stages = ParallelStageMaskName(pipeline.stage_mask);
-
-		elog(LOG,
-			 "pg_volvec: parallel pipeline %u driver=%s role=%s input_bridge=%s output_bridge=%s stages=%s deps=%zu succs=%zu rel=%u morsel=%s filter=%s project=%s limit=%s grouped=%s",
-			 pipeline.pipeline_id,
-			 ParallelDriverKindName(pipeline.driver_kind),
-			 ParallelPipelineRoleName(pipeline.role),
-			 ParallelBridgeKindName(pipeline.input_bridge),
-			 ParallelBridgeKindName(pipeline.output_bridge),
-			 stages.c_str(),
-			 pipeline.dependencies.size(),
-			 pipeline.successors.size(),
-			 pipeline.scan_relid,
-			 pipeline.source_morsel_driven ? "on" : "off",
-			 pipeline.has_filter ? "on" : "off",
-			 pipeline.has_projection ? "on" : "off",
-			 pipeline.has_limit ? "on" : "off",
-			 pipeline.grouped_agg ? "on" : "off");
-	}
-}
-
-void
-LogParallelSchedulerState(const pg_volvec::ParallelSchedulerState *scheduler)
-{
-	if (scheduler == nullptr)
-		return;
-
-	for (const auto &runtime : scheduler->pipeline_runtime())
-	{
-		elog(LOG,
-			 "pg_volvec: parallel runtime pipeline %u deps_remaining=%u deps_done=%u task=%s rel=%u total_blocks=%u morsels=%u next_block=%u ready=%s queued=%s running=%s completed=%s",
-			 runtime.pipeline_id,
-			 runtime.remaining_dependencies,
-			 runtime.completed_predecessors,
-			 ParallelTaskKindName(runtime.next_task_kind),
-			 runtime.scan_relid,
-			 runtime.total_blocks,
-			 runtime.estimated_morsels,
-			 runtime.next_morsel_block,
-			 runtime.ready ? "on" : "off",
-			 runtime.queued ? "on" : "off",
-			 runtime.running ? "on" : "off",
-			 runtime.completed ? "on" : "off");
-	}
-
-	for (const auto &bridge : scheduler->bridges())
-	{
-		elog(LOG,
-			 "pg_volvec: parallel bridge producer=%u kind=%s ready=%s finalized=%s",
-			 bridge.producer_pipeline_id,
-			 ParallelBridgeKindName(bridge.bridge_kind),
-			 bridge.ready ? "on" : "off",
-			 bridge.finalized ? "on" : "off");
-	}
-
-	if (scheduler->ready_task_count() > 0)
-	{
-		std::string ready_list = ParallelReadyTasksName(scheduler);
-		elog(LOG, "pg_volvec: parallel scheduler ready tasks=%s", ready_list.c_str());
-	}
-	else
-		elog(LOG, "pg_volvec: parallel scheduler ready tasks=<none>");
-}
-
-void
-TraceParallelSchedulerDryRun(const pg_volvec::ParallelPipelinePlan *parallel_plan,
-							 MemoryContext context)
-{
-	const char *failure_reason = nullptr;
-	MemoryContext old_context = MemoryContextSwitchTo(context);
-	std::unique_ptr<pg_volvec::ParallelSchedulerState> dry_run =
-		BuildParallelSchedulerState(parallel_plan,
-											   context,
-											   pg_volvec_parallel_morsel_nblocks,
-											   &failure_reason);
-	MemoryContextSwitchTo(old_context);
-
-	if (dry_run == nullptr)
-	{
-		elog(LOG,
-			 "pg_volvec: parallel scheduler dry-run skipped (%s)",
-			 failure_reason != nullptr ? failure_reason : "unknown reason");
-		return;
-	}
-
-	elog(LOG,
-		 "pg_volvec: parallel scheduler dry-run starting ready=%s",
-		 ParallelReadyTasksName(dry_run.get()).c_str());
-
-	const int kMaxDryRunDispatches = 16;
-	int dispatches = 0;
-
-	for (;;)
-	{
-		pg_volvec::ParallelTaskDesc task;
-		bool dequeued = dry_run->dequeue_ready_task(&task);
-		const pg_volvec::ParallelPipelineRuntimeState *runtime_after;
-
-		if (!dequeued)
-			break;
-		dispatches++;
-		elog(LOG,
-			 "pg_volvec: parallel scheduler dry-run dispatch pipeline=%u task=%s",
-			 task.pipeline_id,
-			 ParallelTaskKindName(task.task_kind));
-		if (task.task_kind == pg_volvec::ParallelTaskKind::SourceMorsel)
-			elog(LOG,
-				 "pg_volvec: parallel scheduler dry-run source morsel pipeline=%u start=%u nblocks=%u",
-				 task.pipeline_id,
-				 task.morsel_start_block,
-				 task.morsel_nblocks);
-		dry_run->finish_task(task);
-		runtime_after = dry_run->get_pipeline_runtime(task.pipeline_id);
-		if (runtime_after != nullptr)
-			elog(LOG,
-				 "pg_volvec: parallel scheduler dry-run state pipeline=%u next_block=%u queued=%s running=%s completed=%s",
-				 task.pipeline_id,
-				 runtime_after->next_morsel_block,
-				 runtime_after->queued ? "on" : "off",
-				 runtime_after->running ? "on" : "off",
-				 runtime_after->completed ? "on" : "off");
-		elog(LOG,
-			 "pg_volvec: parallel scheduler dry-run after pipeline=%u ready=%s",
-			 task.pipeline_id,
-			 ParallelReadyTasksName(dry_run.get()).c_str());
-		if (dispatches >= kMaxDryRunDispatches)
-		{
-			elog(LOG,
-				 "pg_volvec: parallel scheduler dry-run truncated after %d dispatches",
-				 dispatches);
-			break;
-		}
-	}
-}
-
-bool
-TryExecuteLeaderOnlyParallelAggregate(pg_volvec::PgVolVecQueryState *state_ptr)
-{
-	auto *scheduler = state_ptr->parallel_scheduler;
-	const auto *parallel_plan = state_ptr->parallel_plan;
-	const auto *source_pipeline = static_cast<const pg_volvec::ParallelPipelineDesc *>(nullptr);
-	pg_volvec::ParallelWorkerContext worker_context;
-	const int kMaxLoggedDispatches = 32;
-	int dispatch_count = 0;
-	bool started = false;
-	const char *failure_reason = nullptr;
-
-	if (!pg_volvec_parallel_leader_participation ||
-		scheduler == nullptr ||
-		parallel_plan == nullptr)
-		return false;
-	if (!TryInitializeLeaderOnlyAggregateWorkerContext(state_ptr,
-																  &worker_context,
-																  &source_pipeline,
-																  &failure_reason))
-		return false;
-
-	if (pg_volvec_trace_hooks)
-		elog(LOG,
-			 "pg_volvec: leader-only morsel execution enabled for aggregate source pipeline=%u root_pipeline=%u",
-			 source_pipeline->pipeline_id,
-			 parallel_plan->root_pipeline_id());
-
-	while (scheduler->ready_task_count() > 0)
-	{
-		pg_volvec::ParallelTaskDesc task;
-		const pg_volvec::ParallelTaskDesc &next_task = scheduler->ready_tasks().front();
-
-		if (next_task.task_kind != pg_volvec::ParallelTaskKind::SourceMorsel ||
-			next_task.pipeline_id != source_pipeline->pipeline_id)
-			break;
-		if (!scheduler->dequeue_ready_task(&task))
-			break;
-		started = true;
-		dispatch_count++;
-		if (pg_volvec_trace_hooks && dispatch_count <= kMaxLoggedDispatches)
-			elog(LOG,
-				 "pg_volvec: leader-only morsel dispatch pipeline=%u task=%s start=%u nblocks=%u",
-				 task.pipeline_id,
-				 ParallelTaskKindName(task.task_kind),
-				 task.morsel_start_block,
-				 task.morsel_nblocks);
-		switch (task.task_kind)
-		{
-			case pg_volvec::ParallelTaskKind::SourceMorsel:
-				if (!ExecuteParallelTask(task,
-												  parallel_plan,
-													  worker_context,
-													  &failure_reason))
-					elog(ERROR,
-						 "pg_volvec leader-only morsel task failed (%s)",
-						 failure_reason != nullptr ? failure_reason : "unknown reason");
-				scheduler->finish_task(task);
-				break;
-			case pg_volvec::ParallelTaskKind::BridgeFinalize:
-				elog(ERROR, "pg_volvec leader-only aggregate path received unexpected finalize task");
-				break;
-			case pg_volvec::ParallelTaskKind::HashBuildPartition:
-			case pg_volvec::ParallelTaskKind::HashPartitionFinalize:
-			case pg_volvec::ParallelTaskKind::HashProbePartition:
-				elog(ERROR,
-					 "pg_volvec leader-only aggregate path received unsupported partition task kind=%s partition=%u",
-					 ParallelTaskKindName(task.task_kind),
-					 task.partition_id);
-				break;
-		}
-	}
-	if (!started)
-		return false;
-	if (pg_volvec_trace_hooks && dispatch_count > kMaxLoggedDispatches)
-		elog(LOG,
-			 "pg_volvec: leader-only morsel dispatch truncated after %d tasks (total=%d)",
-			 kMaxLoggedDispatches,
-			 dispatch_count);
-	if (pg_volvec_trace_hooks && scheduler->ready_task_count() > 0)
-		elog(LOG,
-			 "pg_volvec: leader-only aggregate handoff to serial downstream ready=%s",
-			 ParallelReadyTasksName(scheduler).c_str());
-
-	return true;
-}
-
-bool
-ParallelPlanContainsHashBuild(const pg_volvec::ParallelPipelinePlan *parallel_plan)
-{
-	if (parallel_plan == nullptr)
-		return false;
-	for (const auto &pipeline : parallel_plan->pipelines())
-	{
-		if (pipeline.role == pg_volvec::ParallelPipelineRole::HashBuildSource ||
-			pipeline.role == pg_volvec::ParallelPipelineRole::HashBuildFinalize ||
-			pipeline.role == pg_volvec::ParallelPipelineRole::HashProbeSource ||
-			(pipeline.stage_mask & (uint32_t) pg_volvec::ParallelPipelineStage::HashBuild) != 0 ||
-			(pipeline.stage_mask & (uint32_t) pg_volvec::ParallelPipelineStage::HashProbe) != 0)
-			return true;
-	}
-	return false;
-}
-
-bool
-SupportsLeaderOnlyParallelPlan(const pg_volvec::ParallelPipelinePlan *parallel_plan)
-{
-	if (parallel_plan == nullptr)
-		return false;
-
-	for (const auto &pipeline : parallel_plan->pipelines())
-	{
-		switch (pipeline.role)
-		{
-			case pg_volvec::ParallelPipelineRole::GenericSource:
-			case pg_volvec::ParallelPipelineRole::AggFinalize:
-			case pg_volvec::ParallelPipelineRole::HashBuildSource:
-			case pg_volvec::ParallelPipelineRole::HashBuildFinalize:
-			case pg_volvec::ParallelPipelineRole::HashProbeSource:
-				break;
-			case pg_volvec::ParallelPipelineRole::SortMerge:
-			case pg_volvec::ParallelPipelineRole::HashOuterSource:
-				return false;
-		}
-	}
-	return true;
-}
-
-bool
-TryExecuteLeaderOnlyParallelPlan(pg_volvec::PgVolVecQueryState *state_ptr)
-{
-	auto *scheduler = state_ptr->parallel_scheduler;
-	const auto *parallel_plan = state_ptr->parallel_plan;
-	pg_volvec::ParallelWorkerContext worker_context;
-	const pg_volvec::ParallelPipelineDesc *source_pipeline = nullptr;
-	const int kMaxLoggedDispatches = 64;
-	int dispatch_count = 0;
-	bool started = false;
-	const char *failure_reason = nullptr;
-	int trace_elevel = pg_volvec_parallel_experimental_hash_pipeline ? WARNING : LOG;
-
-	if (!pg_volvec_parallel_leader_participation ||
-		scheduler == nullptr ||
-		parallel_plan == nullptr ||
-		!SupportsLeaderOnlyParallelPlan(parallel_plan))
-		return false;
-	if (!TryInitializeLeaderOnlyAggregateWorkerContext(state_ptr,
-																  &worker_context,
-																  &source_pipeline,
-																  &failure_reason))
-		return false;
-
-	if (pg_volvec_trace_hooks)
-		elog(trace_elevel,
-			 "pg_volvec: leader-only parallel plan execution enabled root_pipeline=%u ready=%s",
-			 parallel_plan->root_pipeline_id(),
-			 ParallelReadyTasksName(scheduler).c_str());
-
-	while (scheduler->ready_task_count() > 0)
-	{
-		pg_volvec::ParallelTaskDesc task;
-
-		if (!scheduler->dequeue_ready_task(&task))
-			break;
-		started = true;
-		dispatch_count++;
-		if (pg_volvec_trace_hooks && dispatch_count <= kMaxLoggedDispatches)
-		{
-						if (task.task_kind == pg_volvec::ParallelTaskKind::SourceMorsel)
-				elog(trace_elevel,
-					 "pg_volvec: leader-only parallel dispatch pipeline=%u task=%s start=%u nblocks=%u",
-					 task.pipeline_id,
-					 ParallelTaskKindName(task.task_kind),
-					 task.morsel_start_block,
-					 task.morsel_nblocks);
-			else
-				elog(trace_elevel,
-					 "pg_volvec: leader-only parallel dispatch pipeline=%u task=%s",
-					 task.pipeline_id,
-					 ParallelTaskKindName(task.task_kind));
-		}
-		if (!ExecuteParallelTask(task,
-											 parallel_plan,
-											 worker_context,
-											 &failure_reason))
-			elog(ERROR,
-				 "pg_volvec leader-only parallel task failed (%s)",
-				 failure_reason != nullptr ? failure_reason : "unknown reason");
-		scheduler->finish_task(task);
-	}
-	if (!started)
-		return false;
-	if (pg_volvec_trace_hooks && dispatch_count > kMaxLoggedDispatches)
-		elog(trace_elevel,
-			 "pg_volvec: leader-only parallel dispatch truncated after %d tasks (total=%d)",
-			 kMaxLoggedDispatches,
-			 dispatch_count);
-	if (pg_volvec_trace_hooks)
-		elog(trace_elevel,
-			 "pg_volvec: leader-only parallel plan completed ready=%s",
-			 ParallelReadyTasksName(scheduler).c_str());
-
-	return true;
-}
-
-} /* namespace */
-
-extern "C" {
-
 extern bool pg_volvec_trace_hooks;
 extern bool pg_volvec_trace_execution_path;
 extern bool pg_volvec_parallel;
-extern int pg_volvec_parallel_max_workers;
-extern int pg_volvec_parallel_morsel_nblocks;
-extern int pg_volvec_parallel_min_relation_blocks;
-extern bool pg_volvec_parallel_leader_participation;
-extern bool pg_volvec_parallel_experimental_hash_pipeline;
+}
+
+extern "C" {
+
+/*
+ * Opaque non-null sentinels that satisfy the admission gate in
+ * pg_volvec_execute_query(). The DuckDB-style pipeline runtime in
+ * pg_volvec::pipeline::PgvolvecPipelineRun() lowers from VecPlanState on
+ * demand, so the bridge only needs a truthy marker that parallel is enabled.
+ */
+static char pgvolvec_parallel_plan_sentinel;
+static char pgvolvec_parallel_scheduler_sentinel;
 
 bool pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *state_ptr)
 {
 	MemoryContext old_context = MemoryContextSwitchTo(state_ptr->context);
-	const char *parallel_failure_reason = nullptr;
-	const char *scheduler_failure_reason = nullptr;
 	Plan *root_plan = queryDesc != nullptr && queryDesc->plannedstmt != nullptr ?
 		queryDesc->plannedstmt->planTree : nullptr;
 
@@ -523,92 +48,28 @@ bool pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQuerySta
 	state_ptr->vec_plan = pg_volvec::ExecInitVecPlan(queryDesc->plannedstmt->planTree, queryDesc->estate).release();
 	state_ptr->parallel_plan = nullptr;
 	state_ptr->parallel_scheduler = nullptr;
-	if (pg_volvec_parallel)
+
+	if (pg_volvec_parallel && state_ptr->vec_plan != nullptr)
 	{
-		std::unique_ptr<pg_volvec::ParallelPipelinePlan> parallel_plan =
-						pg_volvec::BuildParallelPipelinePlan(queryDesc->plannedstmt->planTree,
-												 queryDesc->plannedstmt,
-												 queryDesc->estate,
-												 &parallel_failure_reason);
-		if (state_ptr->vec_plan != nullptr)
-		{
-			state_ptr->parallel_plan = parallel_plan.release();
-			if (state_ptr->parallel_plan != nullptr)
-			{
-				std::unique_ptr<pg_volvec::ParallelSchedulerState> parallel_scheduler =
-					BuildParallelSchedulerState(state_ptr->parallel_plan,
-														   state_ptr->context,
-														   pg_volvec_parallel_morsel_nblocks,
-														   &scheduler_failure_reason);
-				state_ptr->parallel_scheduler = parallel_scheduler.release();
-			}
-		}
-		else if (parallel_plan != nullptr && parallel_failure_reason == nullptr)
-		{
-			parallel_failure_reason =
-				"parallel lowering succeeded, but current executor bridge still requires vec_plan";
-		}
+		state_ptr->parallel_plan = &pgvolvec_parallel_plan_sentinel;
+		state_ptr->parallel_scheduler = &pgvolvec_parallel_scheduler_sentinel;
 	}
+
 	MemoryContextSwitchTo(old_context);
+
 	if (state_ptr->vec_plan == nullptr)
 		elog(WARNING,
-			 "pg_volvec: plan initialization returned null, falling back to PostgreSQL executor%s%s%s",
-			 parallel_failure_reason != nullptr ? " (parallel: " : "",
-			 parallel_failure_reason != nullptr ? parallel_failure_reason : "",
-			 parallel_failure_reason != nullptr ? ")" : "");
-	else if (pg_volvec_parallel && state_ptr->parallel_plan == nullptr)
-		elog(WARNING, "pg_volvec: vec_plan built but parallel lowering skipped, running volvec serially (reason: %s)",
-			 parallel_failure_reason != nullptr ? parallel_failure_reason : "scheduler init");
+			 "pg_volvec: plan initialization returned null, falling back to PostgreSQL executor");
 	else if (!pg_volvec_parallel)
-		elog(WARNING, "pg_volvec: pg_volvec.parallel=%s, running volvec serially",
-			 pg_volvec_parallel ? "on" : "off");
+		elog(WARNING, "pg_volvec: pg_volvec.parallel=off, running volvec serially");
 	else
-		elog(WARNING, "pg_volvec: parallel plan built, pipelines=%zu, sched=%s, running parallel",
-			 state_ptr->parallel_plan != nullptr ? state_ptr->parallel_plan->pipeline_count() : 0,
-			 state_ptr->parallel_scheduler != nullptr ? "ok" : "null");
-	if (pg_volvec_trace_hooks && state_ptr->parallel_plan != nullptr)
-	{
-		elog(LOG,
-			 "pg_volvec: parallel lowering initialized (pipelines=%zu, source_pipelines=%zu, root=%u, max_workers=%d, morsel_nblocks=%d, min_relation_blocks=%d, leader=%s)",
-			 state_ptr->parallel_plan->pipeline_count(),
-			 state_ptr->parallel_plan->source_pipeline_count(),
-			 state_ptr->parallel_plan->root_pipeline_id(),
-			 pg_volvec_parallel_max_workers,
-			 pg_volvec_parallel_morsel_nblocks,
-			 pg_volvec_parallel_min_relation_blocks,
-			 pg_volvec_parallel_leader_participation ? "on" : "off");
-		LogParallelPipelinePlan(state_ptr->parallel_plan);
-		if (state_ptr->parallel_scheduler != nullptr)
-		{
-			elog(LOG,
-				 "pg_volvec: parallel scheduler initialized (ready_pipelines=%zu, ready_tasks=%zu, bridges=%zu)",
-				 state_ptr->parallel_scheduler->ready_pipeline_count(),
-				 state_ptr->parallel_scheduler->ready_task_count(),
-				 state_ptr->parallel_scheduler->bridge_count());
-			LogParallelSchedulerState(state_ptr->parallel_scheduler);
-			TraceParallelSchedulerDryRun(state_ptr->parallel_plan, state_ptr->context);
-		}
-		else
-			elog(LOG,
-				 "pg_volvec: parallel scheduler initialization skipped (%s)",
-				 scheduler_failure_reason != nullptr ? scheduler_failure_reason : "unknown reason");
-	}
-	else if (pg_volvec_trace_hooks && pg_volvec_parallel)
-		elog(LOG,
-			 "pg_volvec: parallel lowering skipped (%s)",
-			 parallel_failure_reason != nullptr ? parallel_failure_reason : "unknown reason");
+		elog(WARNING, "pg_volvec: pipeline admission enabled, running parallel");
+
 	return state_ptr->vec_plan != nullptr;
 }
 
 void pg_volvec_delete_plan(pg_volvec::PgVolVecQueryState *state_ptr)
 {
-	/*
-	 * The parallel lowering metadata is allocated inside state_ptr->context and
-	 * only lives until pg_volvec_close_query_state() immediately deletes that
-	 * MemoryContext. Let the context reclaim it wholesale instead of walking the
-	 * container graph here, which is fragile while ParallelPipelineDesc stores
-	 * MemoryContext-backed std::vector members.
-	 */
 	state_ptr->parallel_scheduler = nullptr;
 	state_ptr->parallel_plan = nullptr;
 	if (state_ptr->vec_plan) {
@@ -690,82 +151,22 @@ bool pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState
 	if (state_ptr->parallel_plan != nullptr && state_ptr->parallel_scheduler != nullptr)
 	{
 		const char *parallel_failure_reason = nullptr;
-		bool has_hash_build = ParallelPlanContainsHashBuild(state_ptr->parallel_plan);
-		execution_path = "volvec_parallel_unclassified";
-		execution_detail = has_hash_build ? "hash_build_plan" : "non_hash_build_plan";
-
-		if (has_hash_build && pg_volvec_parallel_experimental_hash_pipeline)
+		if (pg_volvec::pipeline::PgvolvecPipelineRun(queryDesc, state_ptr, &parallel_failure_reason))
 		{
-			if (TryExecuteQuerySchedulerSkeleton(state_ptr,
-												 queryDesc,
-												 &parallel_failure_reason))
-			{
-				execution_path = "query_scheduler";
-				execution_detail = "experimental_hash_pipeline";
-			}
-			else
-			{
-				if (pg_volvec_trace_hooks)
-					elog(LOG,
-						 "pg_volvec: query scheduler skeleton path skipped (%s), falling back to leader-only experimental path",
-						 parallel_failure_reason != nullptr ? parallel_failure_reason : "no reason recorded");
-				if (TryExecuteLeaderOnlyParallelPlan(state_ptr))
-				{
-					execution_path = "leader_only_parallel_plan";
-					execution_detail = parallel_failure_reason != nullptr ?
-						parallel_failure_reason : "query_scheduler_skipped";
-				}
-				else
-				{
-					execution_path = "volvec_serial_after_parallel_skip";
-					execution_detail = parallel_failure_reason != nullptr ?
-						parallel_failure_reason : "experimental_hash_pipeline_skipped";
-					if (pg_volvec_trace_hooks)
-						elog(LOG,
-							 "pg_volvec: experimental hash pipeline path skipped, falling back to regular vec execution");
-				}
-			}
-		}
-		else if (!TryExecuteProcessParallelAggregate(state_ptr,
-																 queryDesc,
-																 &parallel_failure_reason))
-		{
-			if (pg_volvec_trace_hooks)
-				elog(LOG,
-					 "pg_volvec: process parallel aggregate path skipped (%s), falling back to leader-only",
-					 parallel_failure_reason != nullptr ? parallel_failure_reason : "no reason recorded");
-			if (has_hash_build && !pg_volvec_parallel_experimental_hash_pipeline)
-			{
-				if (pg_volvec_trace_execution_path)
-					elog(LOG,
-						 "pg_volvec_path: path=native_pg reason=hash_build_requires_experimental_hash_pipeline detail=%s",
-						 parallel_failure_reason != nullptr ? parallel_failure_reason :
-						 "process_parallel_aggregate_skipped");
-				return false;
-			}
-			if (TryExecuteLeaderOnlyParallelPlan(state_ptr))
-			{
-				execution_path = "leader_only_parallel_plan";
-				execution_detail = parallel_failure_reason != nullptr ?
-					parallel_failure_reason : "process_parallel_aggregate_skipped";
-			}
-			else if (TryExecuteLeaderOnlyParallelAggregate(state_ptr))
-			{
-				execution_path = "leader_only_parallel_aggregate";
-				execution_detail = parallel_failure_reason != nullptr ?
-					parallel_failure_reason : "process_parallel_aggregate_skipped";
-			}
-			else
-			{
-				execution_path = "volvec_serial_after_parallel_skip";
-				execution_detail = parallel_failure_reason != nullptr ?
-					parallel_failure_reason : "process_parallel_paths_skipped";
-			}
+			execution_path = "pipeline";
+			execution_detail = "duckdb_style_pipeline";
 		}
 		else
 		{
-			execution_path = "process_parallel_aggregate";
-			execution_detail = has_hash_build ? "hash_build_plan" : "non_hash_build_plan";
+			if (pg_volvec_trace_hooks)
+				elog(LOG,
+					 "pg_volvec: pipeline run skipped (%s), falling back to native pg",
+					 parallel_failure_reason != nullptr ? parallel_failure_reason : "no reason recorded");
+			if (pg_volvec_trace_execution_path)
+				elog(LOG,
+					 "pg_volvec_path: path=native_pg reason=pipeline_skipped detail=%s",
+					 parallel_failure_reason != nullptr ? parallel_failure_reason : "no_reason");
+			return false;
 		}
 	}
 

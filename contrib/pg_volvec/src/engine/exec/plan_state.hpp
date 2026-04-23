@@ -14,6 +14,28 @@ class VecPlanState : public PgMemoryContextObject {
 public:
 	virtual ~VecPlanState() = default;
 	virtual bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) = 0;
+	virtual bool drain_to(VecPlanState *downstream)
+	{
+		DataChunk<DEFAULT_CHUNK_SIZE> chunk;
+
+		if (downstream == nullptr)
+			return false;
+		while (get_next_batch(chunk))
+		{
+			int active_count = chunk.has_selection ? chunk.sel.count : chunk.count;
+
+			if (active_count <= 0)
+				continue;
+			if (!downstream->push_batch(chunk))
+				return false;
+		}
+		return true;
+	}
+	virtual bool push_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
+	{
+		(void) chunk;
+		return false;
+	}
 	virtual void release_jit_resources_for_proc_exit()
 	{
 	}
@@ -63,7 +85,8 @@ public:
 
 enum class ParallelPipelineDriverKind : uint8_t {
 	SourceScan,
-	BridgeFinalize
+	SinkFinalize,
+	BridgeFinalize = SinkFinalize
 };
 
 enum class ParallelPipelineRole : uint8_t {
@@ -73,7 +96,10 @@ enum class ParallelPipelineRole : uint8_t {
 	HashBuildSource,
 	HashBuildFinalize,
 	HashProbeSource,
-	HashOuterSource
+	HashOuterSource,
+	BuildPartitionSource,
+	ProbePartitionSource,
+	HashJoinPartitionSource
 };
 
 enum class ParallelPipelineStage : uint32_t {
@@ -83,17 +109,22 @@ enum class ParallelPipelineStage : uint32_t {
 	SortRun = 1u << 3
 };
 
-enum class ParallelBridgeKind : uint8_t {
+enum class ParallelSinkKind : uint8_t {
 	None,
 	Aggregate,
 	HashBuild,
 	HashTable,
-	SortRuns
+	SortRuns,
+	BuildPartitions,
+	ProbePartitions
 };
+
+using ParallelBridgeKind = ParallelSinkKind;
 
 enum class ParallelTaskKind : uint8_t {
 	SourceMorsel,
-	BridgeFinalize,
+	SinkFinalize,
+	BridgeFinalize = SinkFinalize,
 	HashBuildPartition,
 	HashPartitionFinalize,
 	HashProbePartition
@@ -172,8 +203,8 @@ struct ParallelPipelineDesc {
 	uint32_t pipeline_id = 0;
 	ParallelPipelineDriverKind driver_kind = ParallelPipelineDriverKind::SourceScan;
 	ParallelPipelineRole role = ParallelPipelineRole::GenericSource;
-	ParallelBridgeKind input_bridge = ParallelBridgeKind::None;
-	ParallelBridgeKind output_bridge = ParallelBridgeKind::None;
+	ParallelSinkKind input_sink = ParallelSinkKind::None;
+	ParallelSinkKind output_sink = ParallelSinkKind::None;
 	uint32_t stage_mask = 0;
 	Oid scan_relid = InvalidOid;
 	int scan_plan_node_id = -1;
@@ -188,6 +219,9 @@ struct ParallelPipelineDesc {
 	bool grouped_agg = false;
 	VolVecVector<uint32_t> dependencies;
 	VolVecVector<uint32_t> successors;
+
+	ParallelSinkKind input_sink_compat() const { return input_sink; }
+	ParallelSinkKind output_sink_compat() const { return output_sink; }
 
 	explicit ParallelPipelineDesc(MemoryContext context)
 		: dependencies(PgMemoryContextAllocator<uint32_t>(context)),

@@ -2,7 +2,7 @@
 
 #include "parallel/parallel_runtime.hpp"
 
-struct PgVolVecQueryState { MemoryContext context; VecPlanState* vec_plan; ParallelPipelinePlan* parallel_plan; ParallelSchedulerState* parallel_scheduler; };
+struct PgVolVecQueryState { MemoryContext context; VecPlanState* vec_plan; void* parallel_plan; void* parallel_scheduler; };
 
 void CompileExpr(Expr *expr, VecExprProgram &program, bool is_filter = false, EState *estate = nullptr);
 Plan *TryCanonicalizeFinalizePartialAggregate(Agg *finalize_agg,

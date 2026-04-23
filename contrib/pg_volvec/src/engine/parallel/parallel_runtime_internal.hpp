@@ -12,6 +12,8 @@
  */
 
 #include "exec/internal.hpp"
+#include "exec/hash_join_partition_source.hpp"
+#include "parallel/global_partition_data.hpp"
 
 extern "C" {
 #include "access/parallel.h"
@@ -120,7 +122,7 @@ struct SerializedSharedHashBridgePackHeader
 {
 	uint32 magic = VOLVEC_SHARED_HASH_BRIDGE_PACK_MAGIC;
 	uint32 version = VOLVEC_SHARED_HASH_BRIDGE_PACK_VERSION;
-	uint32 bridge_count = 0;
+	uint32 sink_count = 0;
 	uint32 reserved = 0;
 };
 
@@ -171,8 +173,8 @@ struct ParallelQueryPipelineShared
 	uint32 role = 0;
 	uint32 driver_kind = 0;
 	uint32 task_kind = 0;
-	uint32 input_bridge = 0;
-	uint32 output_bridge = 0;
+	uint32 input_sink = 0;
+	uint32 output_sink = 0;
 	uint32 total_dependencies = 0;
 	uint32 total_tasks = 0;
 	pg_atomic_uint32 remaining_dependencies;
@@ -195,6 +197,9 @@ struct ParallelQueryPipelineShared
 	uint64 hash_bridge_chunks = 0;
 	uint64 hash_bridge_dsa_pack = 0;
 	char hash_bridge_file_name[VOLVEC_PARALLEL_MAX_PARTIAL_FILE_NAME] = {0};
+	dsa_pointer build_global_partition_offset = 0;
+	dsa_pointer probe_global_partition_offset = 0;
+	dsa_pointer global_partition_data_offset = 0;
 };
 
 struct ParallelQueryTaskShared
@@ -324,7 +329,7 @@ bool BuildPublishedSharedHashBridgePack(PgVolVecQueryState *query_state,
 										const ParallelPipelineDesc *probe_pipeline,
 										uint8_t **buffer_out,
 										size_t *buffer_size_out,
-										uint32 *bridge_count_out,
+										uint32 *sink_count_out,
 										const char **failure_reason);
 
 double LookupPlannedStmtNodeRows(const PlannedStmt *plannedstmt, int target_plan_node_id);

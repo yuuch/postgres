@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exec/plan_state.hpp"
+#include "parallel/pipeline/worker_context.hpp"
 
 class ParallelPipelinePlan : public PgMemoryContextObject {
 public:
@@ -94,9 +95,9 @@ struct ParallelTaskDesc {
 	uint32_t morsel_nblocks = 0;
 };
 
-struct ParallelBridgeState {
-	/* Shared handoff state between a producer pipeline and its consumers. */
-	ParallelBridgeKind bridge_kind = ParallelBridgeKind::None;
+struct ParallelSinkState {
+	/* Sink handoff state between a producer pipeline and its consumers. */
+	ParallelSinkKind sink_kind = ParallelSinkKind::None;
 	uint32_t producer_pipeline_id = UINT32_MAX;
 	bool ready = false;
 	bool finalized = false;
@@ -132,7 +133,7 @@ public:
 		: plan_(plan),
 		  source_morsel_nblocks_(source_morsel_nblocks),
 		  pipeline_runtime_(PgMemoryContextAllocator<ParallelPipelineRuntimeState>(context)),
-		  bridges_(PgMemoryContextAllocator<ParallelBridgeState>(context)),
+		  sinks_(PgMemoryContextAllocator<ParallelSinkState>(context)),
 		  ready_pipeline_ids_(PgMemoryContextAllocator<uint32_t>(context)),
 		  ready_tasks_(PgMemoryContextAllocator<ParallelTaskDesc>(context))
 	{
@@ -157,22 +158,22 @@ public:
 		return &pipeline_runtime_[pipeline_id];
 	}
 
-	ParallelBridgeState *get_bridge_state(uint32_t producer_pipeline_id)
+	ParallelSinkState *get_sink_state(uint32_t producer_pipeline_id)
 	{
-		for (auto &bridge : bridges_)
+		for (auto &sink : sinks_)
 		{
-			if (bridge.producer_pipeline_id == producer_pipeline_id)
-				return &bridge;
+			if (sink.producer_pipeline_id == producer_pipeline_id)
+				return &sink;
 		}
 		return nullptr;
 	}
 
-	const ParallelBridgeState *get_bridge_state(uint32_t producer_pipeline_id) const
+	const ParallelSinkState *get_sink_state(uint32_t producer_pipeline_id) const
 	{
-		for (const auto &bridge : bridges_)
+		for (const auto &sink : sinks_)
 		{
-			if (bridge.producer_pipeline_id == producer_pipeline_id)
-				return &bridge;
+			if (sink.producer_pipeline_id == producer_pipeline_id)
+				return &sink;
 		}
 		return nullptr;
 	}
@@ -182,9 +183,9 @@ public:
 		return ready_pipeline_ids_.size();
 	}
 
-	size_t bridge_count() const
+	size_t sink_count() const
 	{
-		return bridges_.size();
+		return sinks_.size();
 	}
 
 	size_t ready_task_count() const
@@ -207,9 +208,9 @@ public:
 		return pipeline_runtime_;
 	}
 
-	const VolVecVector<ParallelBridgeState> &bridges() const
+	const VolVecVector<ParallelSinkState> &sinks() const
 	{
-		return bridges_;
+		return sinks_;
 	}
 
 	void append_pipeline_runtime(const ParallelPipelineRuntimeState &runtime)
@@ -217,9 +218,9 @@ public:
 		pipeline_runtime_.push_back(runtime);
 	}
 
-	void append_bridge(const ParallelBridgeState &bridge)
+	void append_sink(const ParallelSinkState &sink)
 	{
-		bridges_.push_back(bridge);
+		sinks_.push_back(sink);
 	}
 
 	void enqueue_ready_pipeline(uint32_t pipeline_id)
@@ -299,9 +300,9 @@ public:
 		runtime->running = false;
 		runtime->ready = false;
 		runtime->completed = true;
-		if (pipeline_desc != nullptr && pipeline_desc->output_bridge != ParallelBridgeKind::None)
+		if (pipeline_desc != nullptr && pipeline_desc->output_sink != ParallelSinkKind::None)
 		{
-			ParallelBridgeState *bridge = get_bridge_state(pipeline_id);
+			ParallelSinkState *bridge = get_sink_state(pipeline_id);
 
 			if (bridge != nullptr)
 			{
@@ -356,29 +357,7 @@ private:
 	const ParallelPipelinePlan *plan_;
 	uint32_t source_morsel_nblocks_;
 	VolVecVector<ParallelPipelineRuntimeState> pipeline_runtime_;
-	VolVecVector<ParallelBridgeState> bridges_;
+	VolVecVector<ParallelSinkState> sinks_;
 	VolVecVector<uint32_t> ready_pipeline_ids_;
 	VolVecVector<ParallelTaskDesc> ready_tasks_;
 };
-
-struct ParallelWorkerContext {
-	/*
-	 * Process-local execution context used by a leader or worker while running
-	 * one scheduled task. This intentionally holds local executor objects,
-	 * not DSM-visible state.
-	 */
-	MemoryContext memory_context = nullptr;
-	PlannedStmt *plannedstmt = nullptr;
-	EState *estate = nullptr;
-	VecPlanState *root_plan = nullptr;
-	VecAggState *agg_state = nullptr;
-	VecHashJoinState *hash_join_state = nullptr;
-	int agg_plan_node_id = -1;
-	int hash_join_plan_node_id = -1;
-		int input_hash_join_plan_node_id = -1;
-		Oid parallel_scan_relid = InvalidOid;
-		int parallel_scan_plan_node_id = -1;
-		ParallelTableScanDesc parallel_scan_desc = nullptr;
-		bool hash_build_execution = false;
-		bool leader = false;
-	};

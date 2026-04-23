@@ -9,6 +9,33 @@ bool VecFilterState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) {
 	}
 	return false;
 }
+
+bool
+VecFilterState::drain_to(VecPlanState *downstream)
+{
+	bool ok;
+
+	if (left_ == nullptr || downstream == nullptr)
+		return false;
+	push_downstream_ = downstream;
+	ok = left_->drain_to(this);
+	push_downstream_ = nullptr;
+	return ok;
+}
+
+bool
+VecFilterState::push_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
+{
+	int active_count;
+
+	if (program_ == nullptr || push_downstream_ == nullptr)
+		return false;
+	program_->evaluate(chunk);
+	active_count = chunk.has_selection ? chunk.sel.count : chunk.count;
+	if (active_count <= 0)
+		return true;
+	return push_downstream_->push_batch(chunk);
+}
 VecLookupFilterState::VecLookupFilterState(std::unique_ptr<VecPlanState> left,
 											 std::unique_ptr<VecPlanState> lookup_source,
 											 uint16_t input_key_col,

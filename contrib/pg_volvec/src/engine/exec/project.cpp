@@ -238,6 +238,96 @@ VecProjectState::get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 	return false;
 }
 
+bool
+VecProjectState::drain_to(VecPlanState *downstream)
+{
+	bool ok;
+
+	if (left_ == nullptr || downstream == nullptr)
+		return false;
+	push_downstream_ = downstream;
+	ok = left_->drain_to(this);
+	push_downstream_ = nullptr;
+	return ok;
+}
+
+bool
+VecProjectState::push_batch(DataChunk<DEFAULT_CHUNK_SIZE> &input)
+{
+	int active_count;
+
+	if (push_downstream_ == nullptr)
+		return false;
+	active_count = input.has_selection ? input.sel.count : input.count;
+	if (active_count <= 0)
+		return true;
+
+	push_chunk_.reset();
+	for (auto &column : columns_)
+	{
+		if (column.expr)
+			column.expr->evaluate(input);
+	}
+	for (int s = 0; s < active_count; s++)
+	{
+		int src_row = input.has_selection ? input.sel.row_ids[s] : s;
+		int dst_row = push_chunk_.count++;
+
+		for (const auto &column : columns_)
+		{
+			int out_col = column.target_resno - 1;
+			int reg = column.expr ? column.expr->get_final_res_idx() : -1;
+
+			if (out_col < 0 || out_col >= 16)
+				continue;
+			if (column.direct_var || column.string_prefix_var)
+				push_chunk_.nulls[out_col][dst_row] = input.nulls[column.input_col][src_row];
+			else
+				push_chunk_.nulls[out_col][dst_row] = column.expr->get_nulls_reg(reg)[src_row];
+			if (push_chunk_.nulls[out_col][dst_row])
+				continue;
+			switch (column.storage_kind)
+			{
+				case VecOutputStorageKind::Double:
+					push_chunk_.double_columns[out_col][dst_row] = column.direct_var ?
+						input.double_columns[column.input_col][src_row] :
+						column.expr->get_float8_reg(reg)[src_row];
+					break;
+				case VecOutputStorageKind::Int64:
+				case VecOutputStorageKind::NumericScaledInt64:
+					push_chunk_.int64_columns[out_col][dst_row] = column.direct_var ?
+						input.int64_columns[column.input_col][src_row] :
+						column.expr->get_int64_reg(reg)[src_row];
+					break;
+				case VecOutputStorageKind::Int32:
+					push_chunk_.int32_columns[out_col][dst_row] = column.direct_var ?
+						input.int32_columns[column.input_col][src_row] :
+						column.expr->get_int32_reg(reg)[src_row];
+					break;
+				case VecOutputStorageKind::StringRef:
+					if (column.string_prefix_var)
+					{
+						VecStringRef src_ref = input.string_columns[column.input_col][src_row];
+						uint32_t copy_len = Min(src_ref.len, column.string_prefix_len);
+
+						push_chunk_.string_columns[out_col][dst_row] =
+							push_chunk_.store_string_bytes(input.get_string_ptr(src_ref), copy_len);
+						break;
+					}
+					if (!column.direct_var)
+						elog(ERROR, "pg_volvec computed string projection is not supported");
+					push_chunk_.string_columns[out_col][dst_row] =
+						CopyStringRefToChunk(push_chunk_, input,
+											 input.string_columns[column.input_col][src_row]);
+					break;
+				default:
+					elog(ERROR, "pg_volvec project output kind is not supported");
+			}
+		}
+	}
+	return push_chunk_.count == 0 || push_downstream_->push_batch(push_chunk_);
+}
+
 VecLookupProjectState::VecLookupProjectState(std::unique_ptr<VecPlanState> left,
 											 std::unique_ptr<VecPlanState> lookup_source,
 											 uint16_t input_key_col,

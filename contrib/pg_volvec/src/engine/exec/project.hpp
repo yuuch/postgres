@@ -16,9 +16,11 @@ struct VecProjectColDesc {
 
 class VecProjectState : public VecPlanState {
 public:
-	VecProjectState(std::unique_ptr<VecPlanState> left,
-					VolVecVector<VecProjectColDesc> columns);
-	bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+		VecProjectState(std::unique_ptr<VecPlanState> left,
+						VolVecVector<VecProjectColDesc> columns);
+		bool get_next_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
+		bool drain_to(VecPlanState *downstream) override;
+		bool push_batch(DataChunk<DEFAULT_CHUNK_SIZE> &chunk) override;
 	bool lookup_output_col_meta(int target_resno, VecOutputColMeta *out) const override;
 	bool lookup_remapped_output_col_meta(int child_input_resno,
 										 uint16_t *output_col,
@@ -73,7 +75,9 @@ public:
 		}
 	}
 private:
-	std::unique_ptr<VecPlanState> left_;
-	VolVecVector<VecProjectColDesc> columns_;
-	DataChunk<DEFAULT_CHUNK_SIZE> input_chunk_;
-};
+		std::unique_ptr<VecPlanState> left_;
+		VolVecVector<VecProjectColDesc> columns_;
+		DataChunk<DEFAULT_CHUNK_SIZE> input_chunk_;
+		DataChunk<DEFAULT_CHUNK_SIZE> push_chunk_;
+		VecPlanState *push_downstream_ = nullptr;
+	};

@@ -57,7 +57,16 @@ public:
 	}
 	bool configure_input_block_range(BlockNumber start_block, uint32_t nblocks);
 	void clear_input_block_range();
-	void consume_left_input();
+		VecPlanState *input_plan()
+		{
+			return left_.get();
+		}
+		bool push_batch(DataChunk<DEFAULT_CHUNK_SIZE> &batch) override
+		{
+			consume_batch(batch);
+			return true;
+		}
+		void consume_left_input();
 	void consume_batch(DataChunk<DEFAULT_CHUNK_SIZE> &batch);
 	void finish_sink();
 	bool supports_parallel_partial_state() const;
@@ -262,4 +271,3 @@ private:
 
 	void do_sink();
 };
-
