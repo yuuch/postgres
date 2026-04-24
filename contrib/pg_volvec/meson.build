@@ -9,6 +9,8 @@ pg_volvec_sources = files(
   'src/engine/expr.cpp',
   'src/engine/parallel/pipeline/pipeline_worker_main.cpp',
   'src/engine/parallel/pipeline/pipeline_leader.cpp',
+  'src/engine/parallel/pipeline/physical_operator.cpp',
+  'src/engine/parallel/pipeline/meta_pipeline.cpp',
   'src/engine/parallel/pipeline/physical_seq_scan.cpp',
   'src/engine/parallel/pipeline/physical_hash_aggregate.cpp',
   'src/engine/parallel/pipeline/physical_order.cpp',

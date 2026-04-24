@@ -33,6 +33,7 @@ enum class PhysicalOperatorType : uint8_t {
 };
 
 class MetaPipeline;
+struct Pipeline;
 
 class PhysicalOperator {
 public:
@@ -104,11 +105,28 @@ public:
 	}
 
 	/*
-	 * BuildPipelines hook reserved for M-FRAME-MIN MetaPipeline construction.
-	 * Default no-op; concrete operators override only when they need custom
-	 * dependency wiring beyond the standard child-walk.
+	 * BuildPipelines — DuckDB-faithful default implementation that slices the
+	 * PhysicalOperator tree into Pipelines at IsSink() boundaries.
+	 *
+	 * Behaviour (mirrors duckdb/src/parallel/physical_operator.cpp lines
+	 * 285-325 of `BuildPipelines`):
+	 *
+	 *   - I am a Sink (pipeline-breaker): close the current pipeline using me
+	 *     as its sink, open a NEW child pipeline whose source is also me
+	 *     (dual-role), and recurse into my single child as the producer of
+	 *     that new pipeline's sink.
+	 *   - I am a pure Source (no children): set me as the source of the
+	 *     current pipeline; recursion stops.
+	 *   - I am a streaming Operator (single child, neither Sink nor Source):
+	 *     append me to the current pipeline's ops and recurse into my child.
+	 *
+	 * Concrete operators only override this when they need custom dependency
+	 * wiring beyond the standard child-walk (none in M-FRAME-MIN).
+	 *
+	 * Defined out-of-line in physical_operator.cpp because the body needs the
+	 * full MetaPipeline definition.
 	 */
-	virtual void BuildPipelines(MetaPipeline &meta) { (void) meta; }
+	virtual void BuildPipelines(Pipeline &current, MetaPipeline &meta);
 
 private:
 	PhysicalOperatorType                                  type_;

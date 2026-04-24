@@ -3,29 +3,34 @@
 /*
  * pipeline/pipeline.hpp
  *
- * Pipeline aggregate (P1: declarations only).
- * See PIPELINE_REFACTOR_DESIGN.md §4, §7.
+ * Pipeline aggregate (M-FRAME-MIN step 3b). A Pipeline is a maximal chain of
+ * PhysicalOperators executable without a blocking boundary: exactly one source,
+ * zero or more streaming operators, exactly one sink. Pipelines are produced by
+ * MetaPipeline::Build by slicing the PhysicalOperator tree at IsPipelineBreaker
+ * boundaries; dependencies (`depends_on`) form the inter-pipeline DAG.
+ *
+ * All PhysicalOperator* references here are non-owning views into the tree
+ * owned by the MetaPipelineBundle (see meta_pipeline.hpp).
+ *
+ * Spec: PIPELINE_PORT_PLAN.md §15.3.2; GLOBAL_LOCAL_STATE_DESIGN.md §8.3.
  */
 
+#include <cstdint>
 #include <vector>
 
-#include "parallel/pipeline/operator.hpp"
-#include "parallel/pipeline/sink.hpp"
-#include "parallel/pipeline/source.hpp"
 #include "parallel/pipeline/types.hpp"
 
 namespace pg_volvec {
 namespace pipeline {
 
-struct Pipeline {
-	PipelineId               id = INVALID_PIPELINE_ID;
-	Source                  *src   = nullptr;
-	std::vector<Operator *>  ops;
-	Sink                    *sink  = nullptr;             /* nullable: terminal pipeline */
-	std::vector<PipelineId>  depends_on;
+class PhysicalOperator;
 
-	GlobalSourceState       *global_src  = nullptr;
-	GlobalSinkState         *global_sink = nullptr;
+struct Pipeline {
+	PipelineId                       id          = INVALID_PIPELINE_ID;
+	PhysicalOperator                *source      = nullptr;
+	std::vector<PhysicalOperator *>  ops;
+	PhysicalOperator                *sink        = nullptr;
+	std::vector<PipelineId>          depends_on;
 };
 
 }  /* namespace pipeline */
