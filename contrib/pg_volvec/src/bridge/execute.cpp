@@ -29,6 +29,8 @@
 extern "C" {
 #include "postgres.h"
 #include "executor/executor.h"
+#include "utils/elog.h"
+#include "utils/memutils.h"
 }
 
 #include "execute.h"
@@ -69,11 +71,37 @@ pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *s
 			 queryDesc->plannedstmt->parallelModeNeeded ? "on" : "off",
 			 (int) queryDesc->operation);
 
-	std::unique_ptr<pg_volvec::pipeline::PhysicalOperator> root =
-		pg_volvec::pipeline::Translator::Translate(queryDesc->plannedstmt);
-
 	state_ptr->parallel_plan = nullptr;
 	state_ptr->parallel_scheduler = nullptr;
+
+	/*
+	 * B2.3 Layer A boundary: the C++ Translator may transitively call PG C
+	 * code that ereport(ERROR)s. PG_TRY/PG_CATCH translates that longjmp
+	 * into a clean WARNING + fallback so destructors of any half-built
+	 * PhysicalOperator subtree run via state->context teardown later.
+	 */
+	std::unique_ptr<pg_volvec::pipeline::PhysicalOperator> root;
+	volatile bool caught_error = false;
+
+	PG_TRY();
+	{
+		root = pg_volvec::pipeline::Translator::Translate(queryDesc->plannedstmt);
+	}
+	PG_CATCH();
+	{
+		caught_error = true;
+		FlushErrorState();
+		root.reset();
+	}
+	PG_END_TRY();
+
+	if (caught_error)
+	{
+		MemoryContextSwitchTo(old_context);
+		elog(WARNING,
+			 "pg_volvec: translator raised error, falling back to standard PostgreSQL executor");
+		return false;
+	}
 
 	if (root != nullptr)
 	{
@@ -108,8 +136,18 @@ pg_volvec_delete_plan(pg_volvec::PgVolVecQueryState *state_ptr)
 	if (state_ptr->parallel_plan != nullptr)
 	{
 		auto *root = static_cast<pg_volvec::pipeline::PhysicalOperator *>(state_ptr->parallel_plan);
-		delete root;
 		state_ptr->parallel_plan = nullptr;
+
+		PG_TRY();
+		{
+			delete root;
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+			elog(WARNING, "pg_volvec: error during PhysicalOperator teardown, suppressed");
+		}
+		PG_END_TRY();
 	}
 }
 
@@ -126,7 +164,27 @@ pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *sta
 		return false;
 
 	const char *failure_reason = nullptr;
-	bool ok = pg_volvec::pipeline::PgvolvecPipelineRun(queryDesc, state_ptr, &failure_reason);
+	volatile bool ok = false;
+	volatile bool caught_error = false;
+
+	PG_TRY();
+	{
+		ok = pg_volvec::pipeline::PgvolvecPipelineRun(queryDesc, state_ptr, &failure_reason);
+	}
+	PG_CATCH();
+	{
+		caught_error = true;
+		FlushErrorState();
+		ok = false;
+	}
+	PG_END_TRY();
+
+	if (caught_error)
+	{
+		elog(WARNING,
+			 "pg_volvec: pipeline run raised error, falling back to standard PostgreSQL executor");
+		return false;
+	}
 
 	if (!ok)
 	{
