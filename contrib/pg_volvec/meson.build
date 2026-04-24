@@ -15,6 +15,7 @@ pg_volvec_sources = files(
   'src/engine/parallel/pipeline/pipeline_run_event.cpp',
   'src/engine/parallel/pipeline/pipeline_combine_event.cpp',
   'src/engine/parallel/pipeline/pipeline_finalize_event.cpp',
+  'src/engine/parallel/pipeline/task.cpp',
   'src/engine/parallel/pipeline/physical_seq_scan.cpp',
   'src/engine/parallel/pipeline/physical_hash_aggregate.cpp',
   'src/engine/parallel/pipeline/physical_order.cpp',
