@@ -3,6 +3,9 @@
 #include "core/types.hpp"
 #include "core/memory.hpp"
 
+namespace pg_volvec
+{
+
 struct SelectionVector { uint16_t row_ids[DEFAULT_CHUNK_SIZE]; uint16_t count; void clear() { count = 0; } };
 struct VecStringRef { uint32_t len; uint32_t offset; uint64_t prefix; };
 static constexpr uint32_t kVecStringInlineOffset = UINT32_MAX;
@@ -129,4 +132,6 @@ struct DeformProgram {
 };
 struct DeformBindings { void *columns_data[kMaxDeformTargets]; uint8_t *columns_nulls[kMaxDeformTargets]; int ncolumns; DataChunk<DEFAULT_CHUNK_SIZE> *owner_chunk; };
 typedef void (*JitDeformFunc)(HeapTupleHeader tuphdr, void **col_data_ptrs, uint8_t **col_null_ptrs, uint32 row_idx, DataChunk<DEFAULT_CHUNK_SIZE> *owner_chunk);
+
+} // namespace pg_volvec
 

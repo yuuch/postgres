@@ -2,6 +2,9 @@
 
 #include "core/data_chunk.hpp"
 
+namespace pg_volvec
+{
+
 class DataChunkDeformer {
 public:
 	DataChunkDeformer(TupleDesc desc, const DeformProgram *program) : desc_(desc), program_(*program) {}
@@ -49,3 +52,5 @@ enum class VecOpCode {
 	EEOP_STR_LIKE_PATTERN,
 	EEOP_QUAL
 };
+
+} // namespace pg_volvec

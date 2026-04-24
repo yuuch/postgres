@@ -2,6 +2,9 @@
 
 #include "core/types.hpp"
 
+namespace pg_volvec
+{
+
 /*
  * Robin-Hood hash table with PG MemoryContext allocation.
  * Minimal interface - callers adapt to this, not vice versa.
@@ -247,3 +250,5 @@ public:
 	Iterator begin() const { return Iterator(const_cast<RobinHoodPgMap*>(this), 0); }
 	Iterator end() const { return Iterator(const_cast<RobinHoodPgMap*>(this), capacity_); }
 };
+
+} // namespace pg_volvec

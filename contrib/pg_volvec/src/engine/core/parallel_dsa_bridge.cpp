@@ -1,7 +1,7 @@
 #include "core/parallel_dsa_bridge.hpp"
 
-/* After includes, we are already inside namespace pg_volvec
- * (opened by types.hpp and never closed). Do NOT re-open it. */
+namespace pg_volvec
+{
 
 struct ParallelRowChunkHeader
 {

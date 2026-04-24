@@ -11,7 +11,6 @@ extern "C" {
 namespace pg_volvec {
 
 template <uint16_t Capacity> struct DataChunk;
-class VecPlanState;
 
 constexpr uint16_t PIPELINE_DEFAULT_CHUNK_SIZE = 1024;
 
@@ -56,7 +55,6 @@ constexpr int LEADER_WORKER_INDEX = -1;
 struct ExecCtx {
 	MemoryContext  mcxt;
 	dsa_area      *dsa;
-	VecPlanState  *vec_plan;
 	int            worker_index;
 };
 

@@ -573,3 +573,5 @@ TryFastNumericToScaledWideInt(Datum value, int target_scale, NumericWideInt *out
 	return true;
 }
 
+} // namespace pg_volvec
+

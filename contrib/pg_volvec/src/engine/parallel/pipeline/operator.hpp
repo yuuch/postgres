@@ -18,6 +18,18 @@ public:
 	virtual ~OperatorState() = default;
 };
 
+/*
+ * GlobalOperatorState — query-scoped, leader-owned state shared across all
+ * workers running the same Operator instance. Added in M-IR-MIN for the new
+ * PhysicalOperator IR (see PIPELINE_PORT_PLAN.md §15). Existing single-shape
+ * runtime (LoweredPipeline path) does not use this; it is consumed only by
+ * the new PhysicalOperator hierarchy.
+ */
+class GlobalOperatorState {
+public:
+	virtual ~GlobalOperatorState() = default;
+};
+
 class Operator {
 public:
 	virtual ~Operator() = default;

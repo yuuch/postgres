@@ -3,6 +3,9 @@
 #include "core/types.hpp"
 #include "core/memory.hpp"
 
+namespace pg_volvec
+{
+
 struct VecHashPartition {
 	uint64_t *keys;       /* join key values */
 	uint64_t *payloads;   /* payload columns compact storage */
@@ -206,3 +209,5 @@ struct ParallelHashBuildFragmentState {
 	uint64_t chunks_offset;
 	uint64_t chunks_size;
 };
+
+} // namespace pg_volvec

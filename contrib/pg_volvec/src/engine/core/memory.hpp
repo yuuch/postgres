@@ -3,6 +3,9 @@
 #include "core/types.hpp"
 #include "core/robin_hood_pg_adapter.hpp"
 
+namespace pg_volvec
+{
+
 class PgMemoryContextObject
 {
 public:
@@ -82,4 +85,6 @@ using VolVecHashMap = RobinHoodPgMap<Key, Value, Hash>;
 static constexpr int VOLVEC_RADIX_BITS = 8;
 static constexpr int VOLVEC_RADIX_FANOUT = (1 << VOLVEC_RADIX_BITS);  /* 256 partitions */
 static constexpr double VOLVEC_HT_LOAD_FACTOR = 0.75;
+
+} // namespace pg_volvec
 

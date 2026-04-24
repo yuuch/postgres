@@ -1,11 +1,9 @@
 #pragma once
 
-/* NOTE: data_chunk.hpp includes types.hpp which opens namespace pg_volvec.
- * All declarations here are automatically inside that namespace. */
 #include "core/data_chunk.hpp"
 
-/* These are already included by types.hpp, but listed here for clarity.
- * #pragma once / include guards prevent double-inclusion. */
+namespace pg_volvec
+{
 
 class DsaDataChunkBridge {
 public:
@@ -40,3 +38,5 @@ private:
 	size_t current_ptr_idx_;
 	BufFile *fallback_file_;
 };
+
+} // namespace pg_volvec

@@ -2,6 +2,9 @@
 
 #include "core/data_chunk.hpp"
 
+namespace pg_volvec
+{
+
 struct VecExprStep {
 	VecOpCode opcode;
 	int res_idx;
@@ -28,6 +31,9 @@ struct VecExprStep {
 	};
 typedef void (*VecExprJitFunc)(uint32_t count, double** col_f8, int64_t** col_i64, int32_t** col_i32, VecStringRef** col_str, uint8_t** col_nulls, const char *string_arena_base, double* res_f8, int64_t* res_i64, int32_t* res_i32, uint8_t* res_nulls, uint16_t* sel, bool has_sel);
 
+class VecExprProgram;
+bool pg_volvec_try_compile_jit_expr(const VecExprProgram *program, VecExprJitFunc *out_func, JitContext **out_context, const char **failure_reason);
+void pg_volvec_register_llvm_jit_context(JitContext *context);
 void pg_volvec_release_llvm_jit_context(JitContext *context);
 
 class VecExprProgram : public PgMemoryContextObject {
@@ -98,4 +104,6 @@ private:
 	int register_precisions[MAX_REGISTERS];
 	VecNumericWidth register_numeric_widths[MAX_REGISTERS];
 };
+
+} // namespace pg_volvec
 

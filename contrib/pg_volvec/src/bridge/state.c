@@ -15,9 +15,8 @@ extern bool pg_volvec_trace_hooks;
 struct PgVolVecQueryState
 {
 	MemoryContext context;
-	void *vec_plan; /* placeholder for C++ unique_ptr */
-	void *parallel_plan; /* placeholder for C++ pipeline plan */
-	void *parallel_scheduler; /* placeholder for C++ scheduler runtime */
+	void *parallel_plan;
+	void *parallel_scheduler;
 };
 
 typedef struct StateEntry
