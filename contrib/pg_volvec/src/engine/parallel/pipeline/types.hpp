@@ -50,6 +50,8 @@ enum class SinkFinalizeType : uint8_t {
 
 using PipelineId = uint16_t;
 constexpr PipelineId INVALID_PIPELINE_ID = static_cast<PipelineId>(-1);
+using EventId = uint32_t;
+constexpr EventId INVALID_EVENT_ID = static_cast<EventId>(-1);
 constexpr int LEADER_WORKER_INDEX = -1;
 
 struct ExecCtx {
