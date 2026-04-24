@@ -78,6 +78,42 @@ private:
 template <typename T>
 using VolVecVector = std::vector<T, PgMemoryContextAllocator<T>>;
 
+/*
+ * MemoryContext-aware STL aliases (M-FRAME-MIN A1).
+ *
+ * Use these in place of bare std::vector / std::unordered_map / std::make_shared
+ * anywhere the container's lifetime is bounded by a per-query MemoryContext.
+ *
+ * Rationale: ereport(ERROR) longjmps over C++ destructors. Bare std::vector
+ * holds its element storage in glibc/libc malloc heap, which the MemoryContext
+ * teardown does NOT reclaim — that is a true leak across every fallback path.
+ * PgMemoryContextAllocator routes allocate()/deallocate() through palloc/pfree
+ * tied to CurrentMemoryContext (or an explicit ctx), so the element storage
+ * dies with the context.
+ *
+ * shared_ptr requires a single combined allocation for control block + T to
+ * fully participate in the context — use AllocatePgShared, not make_shared.
+ *
+ * VolVecVector remains as a compatibility alias for older call sites.
+ */
+template <typename T>
+using PgVector = std::vector<T, PgMemoryContextAllocator<T>>;
+
+template <typename Key,
+          typename Value,
+          typename Hash = std::hash<Key>,
+          typename Eq   = std::equal_to<Key>>
+using PgUnorderedMap = std::unordered_map<
+    Key, Value, Hash, Eq,
+    PgMemoryContextAllocator<std::pair<const Key, Value>>>;
+
+template <typename T, typename... Args>
+inline std::shared_ptr<T> AllocatePgShared(Args &&...args)
+{
+	return std::allocate_shared<T>(PgMemoryContextAllocator<T>(),
+	                               std::forward<Args>(args)...);
+}
+
 template <typename Key, typename Value, typename Hash = std::hash<Key>>
 using VolVecHashMap = RobinHoodPgMap<Key, Value, Hash>;
 

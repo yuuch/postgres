@@ -31,6 +31,8 @@ extern "C" {
 #include "postgres.h"
 }
 
+#include "core/memory.hpp"
+
 namespace pg_volvec {
 namespace pipeline {
 
@@ -43,7 +45,7 @@ enum class TaskExecutionResult : uint8_t {
 	TASK_ERROR,
 };
 
-class Task {
+class Task : public PgMemoryContextObject {
 public:
 	Task(std::shared_ptr<Event> event, Pipeline *pipeline);
 	virtual ~Task() = default;

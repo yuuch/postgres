@@ -29,13 +29,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 extern "C" {
 #include "postgres.h"
 #include "utils/dsa.h"
 }
 
+#include "core/memory.hpp"
 #include "parallel/pipeline/event.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
@@ -108,7 +108,7 @@ private:
 	PipelineDsmLookup<Pipeline>                    pipelines_;
 	PipelineDsmLookup<Event>                       events_;
 
-	std::vector<std::shared_ptr<Event>>            events_owned_;
+	PgVector<std::shared_ptr<Event>>               events_owned_;
 	uint32_t                                       next_event_id_ = 0;
 };
 

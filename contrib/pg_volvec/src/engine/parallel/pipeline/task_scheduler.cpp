@@ -49,25 +49,29 @@ TaskScheduler::BuildEvents()
 
 	const auto &pipelines = bundle_->pipelines;
 
-	/*
-	 * Allocate 3 Events per Pipeline in build order. Build order from
-	 * MetaPipeline::Build is leaf-most-producer-first, so a Pipeline's
-	 * dependencies have lower ids and their Events are constructed first.
-	 */
-	std::vector<std::shared_ptr<PipelineRunEvent>>      run_events;
-	std::vector<std::shared_ptr<PipelineCombineEvent>>  combine_events;
-	std::vector<std::shared_ptr<PipelineFinalizeEvent>> finalize_events;
+	PgMemoryContextAllocator<std::shared_ptr<PipelineRunEvent>>      run_alloc(mcxt_);
+	PgMemoryContextAllocator<std::shared_ptr<PipelineCombineEvent>>  cmb_alloc(mcxt_);
+	PgMemoryContextAllocator<std::shared_ptr<PipelineFinalizeEvent>> fin_alloc(mcxt_);
+
+	std::vector<std::shared_ptr<PipelineRunEvent>,
+	            PgMemoryContextAllocator<std::shared_ptr<PipelineRunEvent>>>
+	    run_events(run_alloc);
+	std::vector<std::shared_ptr<PipelineCombineEvent>,
+	            PgMemoryContextAllocator<std::shared_ptr<PipelineCombineEvent>>>
+	    combine_events(cmb_alloc);
+	std::vector<std::shared_ptr<PipelineFinalizeEvent>,
+	            PgMemoryContextAllocator<std::shared_ptr<PipelineFinalizeEvent>>>
+	    finalize_events(fin_alloc);
 	run_events.reserve(pipelines.size());
 	combine_events.reserve(pipelines.size());
 	finalize_events.reserve(pipelines.size());
 
 	for (auto &p : pipelines)
 	{
-		auto run = std::make_shared<PipelineRunEvent>(p->id, p.get(), this);
-		auto cmb = std::make_shared<PipelineCombineEvent>(p->id, p.get(), this);
-		auto fin = std::make_shared<PipelineFinalizeEvent>(p->id, p.get(), this);
+		auto run = AllocatePgShared<PipelineRunEvent>(p->id, p.get(), this);
+		auto cmb = AllocatePgShared<PipelineCombineEvent>(p->id, p.get(), this);
+		auto fin = AllocatePgShared<PipelineFinalizeEvent>(p->id, p.get(), this);
 
-		/* Intra-pipeline edges: Run -> Combine -> Finalize. */
 		cmb->AddDependency(run);
 		fin->AddDependency(cmb);
 
@@ -76,8 +80,6 @@ TaskScheduler::BuildEvents()
 		finalize_events.push_back(fin);
 	}
 
-	/* Inter-pipeline edges: B.Run depends on every A.Finalize where
-	 * Pipeline B.depends_on contains A. */
 	for (size_t i = 0; i < pipelines.size(); i++)
 	{
 		for (PipelineId dep_pid : pipelines[i]->depends_on)
@@ -87,7 +89,6 @@ TaskScheduler::BuildEvents()
 		}
 	}
 
-	/* Assign EventIds and publish. Order: Run0, Combine0, Finalize0, Run1, ... */
 	auto publish = [&](const std::shared_ptr<Event> &ev) {
 		EventId id = next_event_id_++;
 		events_.Register(id, ev.get());

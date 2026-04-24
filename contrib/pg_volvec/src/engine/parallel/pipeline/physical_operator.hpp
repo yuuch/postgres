@@ -15,8 +15,8 @@
  */
 
 #include <memory>
-#include <vector>
 
+#include "core/memory.hpp"
 #include "parallel/pipeline/operator.hpp"
 #include "parallel/pipeline/sink.hpp"
 #include "parallel/pipeline/source.hpp"
@@ -35,13 +35,13 @@ enum class PhysicalOperatorType : uint8_t {
 class MetaPipeline;
 struct Pipeline;
 
-class PhysicalOperator {
+class PhysicalOperator : public PgMemoryContextObject {
 public:
 	explicit PhysicalOperator(PhysicalOperatorType type) : type_(type) {}
 	virtual ~PhysicalOperator() = default;
 
 	PhysicalOperatorType type() const { return type_; }
-	const std::vector<std::unique_ptr<PhysicalOperator>> &children() const { return children_; }
+	const PgVector<std::unique_ptr<PhysicalOperator>> &children() const { return children_; }
 
 	void AddChild(std::unique_ptr<PhysicalOperator> child) { children_.push_back(std::move(child)); }
 
@@ -130,7 +130,7 @@ public:
 
 private:
 	PhysicalOperatorType                                  type_;
-	std::vector<std::unique_ptr<PhysicalOperator>>        children_;
+	PgVector<std::unique_ptr<PhysicalOperator>>           children_;
 };
 
 }  /* namespace pipeline */

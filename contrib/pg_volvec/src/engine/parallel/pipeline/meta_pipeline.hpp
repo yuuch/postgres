@@ -24,8 +24,8 @@
  */
 
 #include <memory>
-#include <vector>
 
+#include "core/memory.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/types.hpp"
 
@@ -34,9 +34,9 @@ namespace pipeline {
 
 class PhysicalOperator;
 
-struct MetaPipelineBundle {
-	std::unique_ptr<PhysicalOperator>             root;
-	std::vector<std::unique_ptr<Pipeline>>        pipelines;
+struct MetaPipelineBundle : public PgMemoryContextObject {
+	std::unique_ptr<PhysicalOperator>  root;
+	PgVector<std::unique_ptr<Pipeline>> pipelines;
 };
 
 class MetaPipeline {

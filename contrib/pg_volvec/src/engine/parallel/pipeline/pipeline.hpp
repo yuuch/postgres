@@ -16,8 +16,8 @@
  */
 
 #include <cstdint>
-#include <vector>
 
+#include "core/memory.hpp"
 #include "parallel/pipeline/types.hpp"
 
 namespace pg_volvec {
@@ -25,12 +25,12 @@ namespace pipeline {
 
 class PhysicalOperator;
 
-struct Pipeline {
+struct Pipeline : public PgMemoryContextObject {
 	PipelineId                       id          = INVALID_PIPELINE_ID;
 	PhysicalOperator                *source      = nullptr;
-	std::vector<PhysicalOperator *>  ops;
+	PgVector<PhysicalOperator *>     ops;
 	PhysicalOperator                *sink        = nullptr;
-	std::vector<PipelineId>          depends_on;
+	PgVector<PipelineId>             depends_on;
 };
 
 }  /* namespace pipeline */

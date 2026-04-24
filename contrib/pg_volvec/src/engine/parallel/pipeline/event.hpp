@@ -30,12 +30,12 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 extern "C" {
 #include "postgres.h"
 }
 
+#include "core/memory.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/types.hpp"
 
@@ -53,7 +53,8 @@ enum class EventState : uint8_t {
 	ABORTED,
 };
 
-class Event : public std::enable_shared_from_this<Event> {
+class Event : public PgMemoryContextObject,
+              public std::enable_shared_from_this<Event> {
 public:
 	Event(PipelineId pid, TaskScheduler *scheduler);
 	virtual ~Event() = default;
@@ -87,7 +88,7 @@ protected:
 	std::atomic<EventState>                   state_{EventState::PENDING};
 	std::atomic<int32_t>                      pending_dependencies_{0};
 	std::atomic<bool>                         saw_aborted_dependency_{false};
-	std::vector<std::weak_ptr<Event>>         dependents_;
+	PgVector<std::weak_ptr<Event>>            dependents_;
 };
 
 }  /* namespace pipeline */
