@@ -11,6 +11,7 @@ pg_volvec_sources = files(
   'src/engine/parallel/pipeline/pipeline_leader.cpp',
   'src/engine/parallel/pipeline/physical_operator.cpp',
   'src/engine/parallel/pipeline/meta_pipeline.cpp',
+'src/engine/parallel/pipeline/pipeline_descriptor.cpp',
   'src/engine/parallel/pipeline/event.cpp',
   'src/engine/parallel/pipeline/pipeline_run_event.cpp',
   'src/engine/parallel/pipeline/pipeline_combine_event.cpp',
