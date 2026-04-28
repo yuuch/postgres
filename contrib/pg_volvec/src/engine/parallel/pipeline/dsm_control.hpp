@@ -6,8 +6,18 @@ extern "C" {
 #include "utils/dsa.h"
 }
 
+#include <sys/types.h>  /* pid_t */
+
 namespace pg_volvec {
 namespace pipeline {
+
+/*
+ * 3g.2-final extension (Oracle C7 design): worker-error message buffer length.
+ * Workers PG_CATCH then snprintf the error text into worker_error_msg[] under
+ * a CAS guard on worker_error before re-raising. Leader picks up the message
+ * verbatim in its event loop (vs. a plain "worker died" placeholder).
+ */
+static constexpr int PIPELINE_WORKER_ERROR_MSG_LEN = 256;
 
 /*
  * shm_toc keys for the MetaPipeline runtime DSM segment.
@@ -42,6 +52,69 @@ struct PipelineSharedControl
 	int32            num_pipelines;     /* length of PipelineDescriptor[] at pipelines_root */
 	pg_atomic_uint32 worker_error;      /* set by any worker on ERROR (§8.5.2 worker contract) */
 	dsa_pointer      pipelines_root;    /* DSA pointer to PipelineDescriptor[num_pipelines] */
+
+	/*
+	 * 3g.2-final additions (Oracle C7 design — see C7 leader event loop and
+	 * C8 worker pump):
+	 *
+	 *   leader_pid          - set by leader pre-launch; workers SetLatch the
+	 *                         corresponding PGPROC after task completion to
+	 *                         wake the leader's WaitLatch loop.
+	 *   shutdown_requested  - leader sets to 1 on error/cancel; workers poll
+	 *                         between tasks and exit cleanly. Workers also
+	 *                         set this on PG_CATCH so siblings drain.
+	 *   worker_error_msg    - first-writer-wins (gated by worker_error CAS):
+	 *                         the worker that flips worker_error from 0->1
+	 *                         is the sole owner of this buffer.
+	 *   event_states_root   - DSA pointer to EventShmState[event_count],
+	 *                         one slot per scheduled Event. Workers
+	 *                         pg_atomic_sub_fetch_u32 on tasks_remaining
+	 *                         after Task::Execute; the worker that brings
+	 *                         it to 0 SetLatch's the leader so the leader
+	 *                         calls FinishEvent() (Event objects are
+	 *                         leader-process-local; workers MUST NOT touch
+	 *                         them directly).
+	 *   event_count         - length of EventShmState[] at event_states_root.
+	 */
+	pid_t            leader_pid;
+	pg_atomic_uint32 shutdown_requested;
+	char             worker_error_msg[PIPELINE_WORKER_ERROR_MSG_LEN];
+	dsa_pointer      event_states_root;
+	uint32           event_count;
+
+	/*
+	 * 3g.2-final bgworker handoff: bgworker entry points have signature
+	 *   void(Datum main_arg)
+	 * (see bgworker.h:79 bgworker_main_type). We therefore cannot pass both
+	 * the dsm_handle and MyDatabaseId through bgw_main_arg. Convention:
+	 *   bgw_main_arg = UInt32GetDatum(dsm_segment_handle(runtime_dsm))
+	 * and the worker reads db_oid from this control block after attaching
+	 * the DSM segment. Set by leader in CreateRuntimeDsm.
+	 */
+	Oid              db_oid;
+};
+
+/*
+ * Per-Event shared completion counter (Oracle C7 design). One slot per
+ * scheduled Event lives in DSA at PipelineSharedControl::event_states_root.
+ *
+ * Protocol:
+ *   - Leader initializes tasks_remaining to N (number of Tasks the Event
+ *     enqueued) BEFORE pushing any of those Tasks to the queue.
+ *   - Workers pg_atomic_sub_fetch_u32(&slot.tasks_remaining, 1) after each
+ *     Task::Execute completes. The worker observing the result == 0 is the
+ *     sole completer; it SetLatch's leader_pid's PGPROC. Only the leader
+ *     then calls Event::FinishEvent() / Event::Abort() on its in-process
+ *     std::shared_ptr<Event> instance.
+ *
+ * Workers MUST NOT touch Event objects directly: those are
+ * leader-process-local std::shared_ptr instances and crossing the process
+ * boundary on them is undefined behavior.
+ */
+struct EventShmState
+{
+	pg_atomic_uint32 tasks_remaining;
+	pg_atomic_uint32 saw_error;     /* set by any failed worker so the leader knows to Abort */
 };
 
 }  /* namespace pipeline */

@@ -1,28 +1,240 @@
 /*
- * pipeline_worker_main.cpp — Step 2 stub.
- *
- * The legacy bgworker entry-point (DSM/DSA attach, PipelineWorkerState,
- * LowerToPipeline, WorkerPipelineExecutor, AggSink combine) was deleted in
- * the M-IR-MIN demolition. The leader stub never launches workers, so this
- * symbol is currently unreachable; it exists only to satisfy any lingering
- * dynamic background-worker registration string and to give the M-FRAME-MIN
- * rewrite a stable insertion point.
- *
- * If somehow invoked, fail loudly so the leader's worker_error path triggers
- * and the user does not get silent partial results.
+ * pipeline_worker_main.cpp
  */
 
 extern "C" {
 #include "postgres.h"
+#include "access/xact.h"
+#include "miscadmin.h"
+#include "pgstat.h"  // IWYU pragma: keep
+#include "postmaster/bgworker.h"
 #include "storage/dsm.h"
+#include "storage/ipc.h"  // IWYU pragma: keep
+#include "storage/latch.h"
+#include "storage/proc.h"  // IWYU pragma: keep
+#include "storage/procarray.h"
 #include "storage/shm_toc.h"
+#include "utils/dsa.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
+#include "utils/snapmgr.h"
 }
 
+#include <cstring>
+#include <memory>
+
+#include "core/memory.hpp"  // IWYU pragma: keep
+#include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/dsm_task_queue.hpp"
+#include "parallel/pipeline/pipeline.hpp"
+#include "parallel/pipeline/pipeline_descriptor.hpp"
+#include "parallel/pipeline/pipeline_dsm_lookup.hpp"
+#include "parallel/pipeline/task.hpp"
+#include "parallel/pipeline/types.hpp"
+
+namespace pg_volvec {
+namespace pipeline {
+
 extern "C" PGDLLEXPORT void
-pg_volvec_pipeline_worker_main(dsm_segment *seg, shm_toc *toc)
+pg_volvec_pipeline_worker_main(Datum main_arg);
+
+extern "C" PGDLLEXPORT void
+pg_volvec_pipeline_worker_main(Datum main_arg)
 {
-	(void) seg;
-	(void) toc;
-	elog(ERROR, "pg_volvec pipeline worker invoked but runtime not implemented");
+	static uint32 wait_event_extension = 0;
+
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: enter, main_arg=0x%lx\n",
+	        (int) getpid(), (unsigned long) main_arg); fflush(stderr);
+
+	BackgroundWorkerUnblockSignals();
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: signals unblocked\n", (int) getpid()); fflush(stderr);
+
+	dsm_handle handle = DatumGetUInt32(main_arg);
+	dsm_segment *seg = dsm_attach(handle);
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: dsm_attach(0x%08x) -> %p\n",
+	        (int) getpid(), handle, (void *) seg); fflush(stderr);
+	if (seg == nullptr)
+		ereport(ERROR,
+		        (errmsg("pg_volvec worker could not attach DSM segment 0x%08x",
+		                handle)));
+	dsm_pin_mapping(seg);
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: dsm_pin_mapping ok\n", (int) getpid()); fflush(stderr);
+
+	shm_toc *toc = shm_toc_attach(PIPELINE_DSM_MAGIC, dsm_segment_address(seg));
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: shm_toc_attach -> %p\n",
+	        (int) getpid(), (void *) toc); fflush(stderr);
+	if (toc == nullptr)
+		ereport(ERROR,
+		        (errmsg("pg_volvec worker shm_toc_attach failed (bad magic in DSM 0x%08x)",
+		                handle)));
+
+	PipelineSharedControl *ctl = static_cast<PipelineSharedControl *>(
+		shm_toc_lookup(toc, PIPELINE_DSM_KEY_CONTROL, false));
+	void *dsa_buf = shm_toc_lookup(toc, PIPELINE_DSM_KEY_DSA, false);
+	void *queue_buf = shm_toc_lookup(toc, PIPELINE_DSM_KEY_TASK_QUEUE, false);
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: toc lookups ctl=%p dsa=%p queue=%p\n",
+	        (int) getpid(), (void *) ctl, dsa_buf, queue_buf); fflush(stderr);
+
+	if (ctl->magic != PIPELINE_DSM_MAGIC)
+		ereport(ERROR,
+		        (errmsg("pg_volvec worker attached to DSM with bad magic 0x%08x",
+		                ctl->magic)));
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: magic ok db_oid=%u\n",
+	        (int) getpid(), ctl->db_oid); fflush(stderr);
+
+	BackgroundWorkerInitializeConnectionByOid(ctl->db_oid, InvalidOid, 0);
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: db conn ok\n", (int) getpid()); fflush(stderr);
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: snapshot ok\n", (int) getpid()); fflush(stderr);
+
+	dsa_area *dsa = dsa_attach_in_place(dsa_buf, seg);
+	DsmTaskQueue *queue = DsmTaskQueue::AttachInPlace(queue_buf);
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: dsa+queue attached\n", (int) getpid()); fflush(stderr);
+
+	int32_t worker_index = -1;
+	/* TODO(Step 11c): finalize worker_index handoff via bgw_extra layout. */
+	std::memcpy(&worker_index, MyBgworkerEntry->bgw_extra, sizeof(int32_t));
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: worker_index=%d\n",
+	        (int) getpid(), worker_index); fflush(stderr);
+	Assert(worker_index >= 0);
+
+	MemoryContext worker_mcxt = AllocSetContextCreate(TopMemoryContext,
+	                                                 "pg_volvec worker",
+	                                                 ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(worker_mcxt);
+	if (wait_event_extension == 0)
+		wait_event_extension = WaitEventExtensionNew("pg_volvec worker");
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: mcxt+wait_event ok\n", (int) getpid()); fflush(stderr);
+
+	WorkerTaskRuntime rt;
+	rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index};
+	rt.control = ctl;
+	rt.event_shm = static_cast<EventShmState *>(dsa_get_address(dsa, ctl->event_states_root));
+	PipelineDsmLookup<Pipeline> lookup(worker_mcxt);
+	rt.pipelines = &lookup;
+	rt.leader_qd = nullptr;
+	rt.final_output = nullptr;
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: rt initialized event_shm=%p\n",
+	        (int) getpid(), (void *) rt.event_shm); fflush(stderr);
+
+	PgVector<std::unique_ptr<Pipeline>> owned_pipelines{
+		PgMemoryContextAllocator<std::unique_ptr<Pipeline>>(worker_mcxt)};
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: about to WorkerReconstructPipelines\n",
+	        (int) getpid()); fflush(stderr);
+	WorkerReconstructPipelines(ctl, rt.exec_ctx, owned_pipelines);
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: reconstructed %zu pipelines\n",
+	        (int) getpid(), owned_pipelines.size()); fflush(stderr);
+	for (auto &pipeline : owned_pipelines)
+		lookup.Register(pipeline->id, pipeline.get());
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: entering main loop\n", (int) getpid()); fflush(stderr);
+
+	for (;;)
+	{
+		if (pg_atomic_read_u32(&ctl->shutdown_requested) != 0)
+			break;
+		if (pg_atomic_read_u32(&ctl->worker_error) != 0)
+			break;
+
+		TaskDescriptor desc;
+		if (!queue->TryPopForWorker(worker_index, &desc))
+		{
+			int rc = WaitLatch(MyLatch,
+			                   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+			                   1000,
+			                   wait_event_extension);
+			ResetLatch(MyLatch);
+			if (rc & WL_POSTMASTER_DEATH)
+				break;
+			continue;
+		}
+
+		Pipeline *pipeline = lookup.Resolve(desc.pipeline_id);
+		if (pipeline == nullptr)
+		{
+			uint32 expected = 0;
+			if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
+			{
+				snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
+				         "pg_volvec worker %d: unknown pipeline_id %u",
+				         worker_index, desc.pipeline_id);
+			}
+			break;
+		}
+
+		EventShmState *event_shm = &rt.event_shm[desc.event_id];
+
+		std::unique_ptr<Task> task;
+		switch (static_cast<TaskKind>(desc.kind))
+		{
+			case TaskKind::RUN:
+				task = std::make_unique<PipelineRunTask>(desc.event_id,
+				                                        pipeline,
+				                                        &rt,
+				                                        desc.worker_index);
+				break;
+			case TaskKind::COMBINE:
+				task = std::make_unique<PipelineCombineTask>(desc.event_id,
+				                                            pipeline,
+				                                            &rt,
+				                                            desc.worker_index);
+				break;
+			case TaskKind::FINALIZE:
+			{
+				uint32 expected = 0;
+				if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
+				{
+					snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
+					         "pg_volvec worker %d: received FINALIZE descriptor (forbidden)",
+					         worker_index);
+				}
+				goto exit_loop;
+			}
+		}
+
+		PG_TRY();
+		{
+			TaskExecutionResult tres = task->Execute();
+			if (tres == TaskExecutionResult::TASK_NOT_FINISHED)
+			{
+				bool re_pushed = queue->TryPush(desc);
+				if (!re_pushed)
+					ereport(ERROR,
+					        (errmsg("pg_volvec worker %d: TryPush re-enqueue failed",
+					                worker_index)));
+				continue;
+			}
+			uint32 remaining = pg_atomic_sub_fetch_u32(&event_shm->tasks_remaining, 1);
+			if (remaining == 0)
+			{
+				PGPROC *leader = BackendPidGetProc(ctl->leader_pid);
+				if (leader != nullptr)
+					SetLatch(&leader->procLatch);
+			}
+		}
+		PG_CATCH();
+		{
+			ErrorData *edata = CopyErrorData();
+			uint32 expected = 0;
+			if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
+			{
+				snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
+				         "%s", edata->message ? edata->message : "(no message)");
+			}
+			FreeErrorData(edata);
+			pg_atomic_write_u32(&ctl->shutdown_requested, 1u);
+			PGPROC *leader = BackendPidGetProc(ctl->leader_pid);
+			if (leader != nullptr)
+				SetLatch(&leader->procLatch);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+
+exit_loop:
+	PopActiveSnapshot();
+	CommitTransactionCommand();
 }
+
+}  /* namespace pipeline */
+}  /* namespace pg_volvec */
