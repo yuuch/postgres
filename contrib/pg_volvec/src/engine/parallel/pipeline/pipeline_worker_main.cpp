@@ -99,6 +99,24 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 	        (int) getpid(), worker_index); fflush(stderr);
 	Assert(worker_index >= 0);
 
+	/*
+	 * Publish startup-ready signal for the leader (Oracle race-fix). PGPROC is
+	 * now in ProcArray because BackgroundWorkerInitializeConnectionByOid has
+	 * returned, which internally drove InitPostgres -> InitProcessPhase2.
+	 * BackendPidGetProc(MyProcPid) is therefore safe from this point forward.
+	 */
+	{
+		auto *ready_array = static_cast<pg_atomic_uint32 *>(
+			shm_toc_lookup(toc, PIPELINE_DSM_KEY_WORKER_READY, false));
+		Assert(worker_index < ctl->num_workers);
+		pg_atomic_write_u32(&ready_array[worker_index], 1);
+		PGPROC *leader_proc = BackendPidGetProc(ctl->leader_pid);
+		if (leader_proc != nullptr)
+			SetLatch(&leader_proc->procLatch);
+	}
+	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: ready bit published\n",
+	        (int) getpid()); fflush(stderr);
+
 	MemoryContext worker_mcxt = AllocSetContextCreate(TopMemoryContext,
 	                                                 "pg_volvec worker",
 	                                                 ALLOCSET_DEFAULT_SIZES);

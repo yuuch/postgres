@@ -10,17 +10,22 @@ extern "C" {
 
 #include <cstring>
 #include <new>
+#include <algorithm>
 
 #include "parallel/pipeline/runtime_dsm.hpp"
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
+
+extern "C" {
+extern int pg_volvec_parallel_max_workers;
+}
 
 namespace pg_volvec {
 namespace pipeline {
 
 static constexpr uint32_t kRuntimeTaskQueueCapacity = 64;
 static constexpr size_t   kRuntimeDsaSizeBytes      = 256u * 1024u * 1024u;
-static constexpr int      kRuntimeTocNumKeys        = 3;
+static constexpr int      kRuntimeTocNumKeys        = 4;
 static constexpr const char *kRuntimeDsaTrancheName = "pg_volvec_runtime_dsa";
 
 bool
@@ -36,6 +41,10 @@ CreateRuntimeDsm(PgVolVecQueryState *state, const char **error_out)
 	shm_toc_estimate_chunk(&estimator, kRuntimeDsaSizeBytes);
 	shm_toc_estimate_chunk(&estimator,
 						   DsmTaskQueue::EstimateSize(kRuntimeTaskQueueCapacity));
+	const int num_workers = std::max(1, pg_volvec_parallel_max_workers);
+	const Size worker_ready_bytes =
+		static_cast<Size>(num_workers) * sizeof(pg_atomic_uint32);
+	shm_toc_estimate_chunk(&estimator, worker_ready_bytes);
 	shm_toc_estimate_keys(&estimator, kRuntimeTocNumKeys);
 	const Size segsize = shm_toc_estimate(&estimator);
 
@@ -63,7 +72,14 @@ CreateRuntimeDsm(PgVolVecQueryState *state, const char **error_out)
 	control->event_states_root = InvalidDsaPointer;
 	control->event_count = 0;
 	control->db_oid = MyDatabaseId;
+	control->num_workers = num_workers;
 	shm_toc_insert(toc, PIPELINE_DSM_KEY_CONTROL, control);
+
+	void *ready_mem = shm_toc_allocate(toc, worker_ready_bytes);
+	auto *ready_array = static_cast<pg_atomic_uint32 *>(ready_mem);
+	for (int i = 0; i < num_workers; ++i)
+		pg_atomic_init_u32(&ready_array[i], 0);
+	shm_toc_insert(toc, PIPELINE_DSM_KEY_WORKER_READY, ready_mem);
 
 	void *dsa_place = shm_toc_allocate(toc, kRuntimeDsaSizeBytes);
 	int tranche_id = LWLockNewTrancheId(kRuntimeDsaTrancheName);

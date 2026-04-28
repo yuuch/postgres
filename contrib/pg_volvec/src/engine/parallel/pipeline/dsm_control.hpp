@@ -32,9 +32,18 @@ static constexpr int PIPELINE_WORKER_ERROR_MSG_LEN = 256;
  * cross-attach to a stale (pre-greenfield) DSM segment impossible. Old key
  * IDs 0x...0002..0007 are intentionally retired and MUST NOT be re-used.
  */
-static constexpr uint64 PIPELINE_DSM_KEY_CONTROL    = UINT64CONST(0xD800000000000001);
-static constexpr uint64 PIPELINE_DSM_KEY_DSA        = UINT64CONST(0xD800000000000008);
-static constexpr uint64 PIPELINE_DSM_KEY_TASK_QUEUE = UINT64CONST(0xD800000000000009);
+static constexpr uint64 PIPELINE_DSM_KEY_CONTROL      = UINT64CONST(0xD800000000000001);
+static constexpr uint64 PIPELINE_DSM_KEY_DSA          = UINT64CONST(0xD800000000000008);
+static constexpr uint64 PIPELINE_DSM_KEY_TASK_QUEUE   = UINT64CONST(0xD800000000000009);
+/*
+ * Per-worker startup-ready bit array (Oracle race-fix design):
+ * pg_atomic_uint32[control->num_workers] in DSM. Workers set their slot to 1
+ * AFTER BackgroundWorkerInitializeConnectionByOid() returns (which internally
+ * runs InitPostgres -> InitProcessPhase2, making PGPROC discoverable via
+ * BackendPidGetProc). The leader polls this array before calling
+ * BackendPidGetProc(worker_pid), closing the BGWH_STARTED-vs-ProcArray race.
+ */
+static constexpr uint64 PIPELINE_DSM_KEY_WORKER_READY = UINT64CONST(0xD80000000000000A);
 
 static constexpr uint32 PIPELINE_DSM_MAGIC = 0x56505043;
 
@@ -92,6 +101,7 @@ struct PipelineSharedControl
 	 * the DSM segment. Set by leader in CreateRuntimeDsm.
 	 */
 	Oid              db_oid;
+	int32            num_workers;
 };
 
 /*

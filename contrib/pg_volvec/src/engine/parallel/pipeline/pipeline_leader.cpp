@@ -382,8 +382,14 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		}
 
 		registered_latches.reserve(handles.size() + (leader_participate ? 1 : 0));
-		for (BackgroundWorkerHandle *handle : handles)
+
+		auto *ready_array = static_cast<pg_atomic_uint32 *>(
+			shm_toc_lookup(toc, PIPELINE_DSM_KEY_WORKER_READY, false));
+		Assert(ready_array != nullptr);
+
+		for (size_t worker_idx = 0; worker_idx < handles.size(); ++worker_idx)
 		{
+			BackgroundWorkerHandle *handle = handles[worker_idx];
 			pid_t worker_pid = 0;
 			BgwHandleStatus status = WaitForBackgroundWorkerStartup(handle, &worker_pid);
 
@@ -400,11 +406,63 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 					state);
 			}
 
+			/*
+			 * BGWH_STARTED means the postmaster has assigned slot->pid only;
+			 * the worker may not yet have completed InitProcessPhase2, so its
+			 * PGPROC may not yet be visible to BackendPidGetProc. Wait for the
+			 * worker to publish its ready bit (set after
+			 * BackgroundWorkerInitializeConnectionByOid returns). Detect early
+			 * worker death via BGWH_STOPPED.
+			 */
+			while (pg_atomic_read_u32(&ready_array[worker_idx]) == 0)
+			{
+				CHECK_FOR_INTERRUPTS();
+
+				pid_t poll_pid = 0;
+				BgwHandleStatus poll_status = GetBackgroundWorkerPid(handle, &poll_pid);
+				if (poll_status == BGWH_STOPPED)
+				{
+					return FailEarly(failure_reason,
+						"pg_volvec: pipeline worker exited before reporting ready",
+						cleanup,
+						old_mcxt,
+						leader_mcxt,
+						state);
+				}
+				if (poll_status == BGWH_POSTMASTER_DIED)
+				{
+					return FailEarly(failure_reason,
+						"pg_volvec: postmaster died while waiting for worker ready",
+						cleanup,
+						old_mcxt,
+						leader_mcxt,
+						state);
+				}
+
+				if (pg_atomic_read_u32(&ready_array[worker_idx]) != 0)
+					break;
+
+				int rc = WaitLatch(MyLatch,
+								   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+								   1000,
+								   wait_event_id);
+				ResetLatch(MyLatch);
+				if (rc & WL_POSTMASTER_DEATH)
+				{
+					return FailEarly(failure_reason,
+						"pg_volvec: postmaster died while waiting for worker ready",
+						cleanup,
+						old_mcxt,
+						leader_mcxt,
+						state);
+				}
+			}
+
 			PGPROC *proc = BackendPidGetProc(worker_pid);
 			if (proc == nullptr)
 			{
 				return FailEarly(failure_reason,
-					"pg_volvec: BackendPidGetProc returned null for pipeline worker",
+					"pg_volvec: BackendPidGetProc returned null after worker ready",
 					cleanup,
 					old_mcxt,
 					leader_mcxt,
@@ -542,6 +600,9 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 
 		for (BackgroundWorkerHandle *handle : handles)
 			WaitForBackgroundWorkerShutdown(handle);
+
+		if (leader_rt.final_output != nullptr)
+			leader_rt.final_output->EmitGlobalTdcToDest(leader_rt.exec_ctx);
 
 		if (pg_atomic_read_u32(&control->worker_error) != 0)
 			RaiseWorkerFailure(control, handles, state);
