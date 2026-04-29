@@ -44,6 +44,10 @@ namespace pipeline {
 
 class TaskScheduler;
 
+/* Forward decl from dsm_task_queue.hpp (enum class with fixed underlying type
+ * is forward-declarable; full definition only needed where kind() is used). */
+enum class TaskKind : uint8_t;
+
 enum class EventState : uint8_t {
 	PENDING,
 	SCHEDULED,
@@ -79,6 +83,10 @@ public:
 
 	/* Subclass hook: enqueue the event's tasks to the scheduler. */
 	virtual void Schedule() = 0;
+
+	/* Subclass hook: report event kind so the scheduler can build the
+	 * correct TaskDescriptor without RTTI. Mirrors the 3-event lifecycle. */
+	virtual TaskKind kind() const = 0;
 
 protected:
 	void NotifyDependents(bool propagate_abort);

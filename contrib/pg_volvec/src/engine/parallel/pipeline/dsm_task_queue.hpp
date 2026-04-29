@@ -96,11 +96,21 @@ public:
 	static DsmTaskQueue *AttachInPlace(void *buffer);
 
 	/* Wait-free MPMC. Returns true on success, false if the queue is full
-	 * (caller decides whether to retry / yield / abort). */
+	 * (caller decides whether to retry / yield / abort). On successful Push
+	 * the queue calls SetLatch on every registered worker latch. */
 	bool TryPush(const TaskDescriptor &desc);
 
 	/* Wait-free MPMC. Returns true on success, false if empty. */
 	bool TryPop(TaskDescriptor *out);
+	bool TryPopForWorker(int32_t worker_index, TaskDescriptor *out);
+
+	/* Register the per-process Latch* table the queue should wake on every
+	 * successful Push. The latch table itself is owned by the scheduler in
+	 * the leader process; the queue stores only a pointer + count. The
+	 * pointer must remain valid for the lifetime of the queue (= per-query
+	 * DSM lifetime). Workers do NOT call this. */
+	void RegisterWorkerLatches(Latch **latches, uint32 count);
+	void WakeRegisteredLatches();
 
 	uint32_t Capacity() const { return capacity_; }
 
@@ -109,6 +119,8 @@ private:
 
 	uint32_t         capacity_;
 	uint32_t         mask_;
+	Latch          **worker_latches_;
+	uint32           num_worker_latches_;
 	pg_atomic_uint64 enqueue_pos_;
 	pg_atomic_uint64 dequeue_pos_;
 	/* DsmTaskQueueCell cells_[capacity_] follows immediately after this

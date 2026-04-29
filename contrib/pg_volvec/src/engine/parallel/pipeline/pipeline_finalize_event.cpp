@@ -1,5 +1,8 @@
 #include "parallel/pipeline/pipeline_finalize_event.hpp"
 
+#include "parallel/pipeline/dsm_task_queue.hpp"
+#include "parallel/pipeline/task_scheduler.hpp"
+
 namespace pg_volvec {
 namespace pipeline {
 
@@ -10,8 +13,14 @@ PipelineFinalizeEvent::PipelineFinalizeEvent(PipelineId pid, Pipeline *pipeline,
 void
 PipelineFinalizeEvent::Schedule()
 {
-	/* Leader Sink::Finalize call lands in step 3g; stub keeps lifecycle wired. */
-	FinishEvent();
+	Assert(pipeline_ != nullptr);
+	scheduler_->EnqueueTasks(*this);
+}
+
+TaskKind
+PipelineFinalizeEvent::kind() const
+{
+	return TaskKind::FINALIZE;
 }
 
 }  /* namespace pipeline */

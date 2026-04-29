@@ -30,6 +30,7 @@ enum class PhysicalOperatorType : uint8_t {
 	HASH_AGGREGATE,
 	ORDER,
 	OUTPUT,
+	PROJECTION,
 };
 
 class MetaPipeline;

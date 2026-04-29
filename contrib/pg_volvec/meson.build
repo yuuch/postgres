@@ -18,12 +18,18 @@ pg_volvec_sources = files(
   'src/engine/parallel/pipeline/pipeline_finalize_event.cpp',
   'src/engine/parallel/pipeline/task.cpp',
   'src/engine/parallel/pipeline/dsm_task_queue.cpp',
+  'src/engine/parallel/pipeline/runtime_dsm.cpp',
   'src/engine/parallel/pipeline/task_scheduler.cpp',
   'src/engine/parallel/pipeline/physical_seq_scan.cpp',
+  'src/engine/parallel/pipeline/physical_projection.cpp',
   'src/engine/parallel/pipeline/physical_hash_aggregate.cpp',
   'src/engine/parallel/pipeline/physical_order.cpp',
   'src/engine/parallel/pipeline/output_sink.cpp',
   'src/engine/parallel/pipeline/translator.cpp',
+  'src/engine/parallel/pipeline/tuple_data_layout.cpp',
+  'src/engine/parallel/pipeline/tuple_data_ops.cpp',
+  'src/engine/parallel/pipeline/tuple_data_collection.cpp',
+  'src/engine/parallel/pipeline/aggregate_hash_table.cpp',
   'src/engine/core/parallel_dsa_bridge.cpp',
 )
 

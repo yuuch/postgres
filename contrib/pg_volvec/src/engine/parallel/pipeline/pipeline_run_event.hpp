@@ -23,7 +23,8 @@ class PipelineRunEvent final : public Event {
 public:
 	PipelineRunEvent(PipelineId pid, Pipeline *pipeline, TaskScheduler *scheduler);
 
-	void Schedule() override;
+	void     Schedule() override;
+	TaskKind kind() const override;
 
 private:
 	Pipeline *pipeline_;

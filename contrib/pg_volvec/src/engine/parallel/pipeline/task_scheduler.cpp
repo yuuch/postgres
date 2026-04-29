@@ -1,17 +1,33 @@
 /*
- * pipeline/task_scheduler.cpp  (M-FRAME-MIN step 3g.1)
+ * pipeline/task_scheduler.cpp  (M-FRAME-MIN step 3g.2 / C1)
  *
- * Skeleton orchestrator. See task_scheduler.hpp for the contract.
+ * See task_scheduler.hpp banner for the full C1 contract. This TU implements:
+ *   - SchedulerState / PerPipelineState (lazy per-pipeline tables)
+ *   - BindRuntime (bind already-attached PipelineSharedControl + DsmTaskQueue
+ *     + dsa_area pointers; scheduler does not own DSM/DSA)
+ *   - AllocateEventShmStates (DSA-allocate the per-event counter array and
+ *     publish via PipelineSharedControl::event_states_root + event_count)
+ *   - EnqueueTasks (real body; dispatches by Event::kind() into RUN/COMBINE/
+ *     FINALIZE fan-out; initializes EventShmState.tasks_remaining BEFORE the
+ *     first push; pushes N TaskDescriptors via DsmTaskQueue::TryPush which
+ *     auto-wakes registered worker latches)
+ *   - EstimateDsmSize (corrected to sizeof(EventShmState); see below)
  *
- * 3g.1 ships: id assignment, event construction, DSM size estimation. The
- * EnqueueTasks body is intentionally a no-op until 3g.2 wires real dispatch.
+ * 3g.1 already shipped: ctor, BuildEvents, pipeline-id registration. Those
+ * bodies are preserved verbatim.
+ *
+ * Worker bgworker launch + leader Run() event loop are deferred to C7
+ * (pipeline_leader.cpp) per the user-locked C1 scope split.
  */
 
 #include "parallel/pipeline/task_scheduler.hpp"
 
 extern "C" {
 #include "port/atomics.h"
+#include "utils/dsa.h"
 }
+
+#include <algorithm>
 
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
@@ -22,6 +38,57 @@ extern "C" {
 namespace pg_volvec {
 namespace pipeline {
 
+/* ------------------------------------------------------------------------ */
+/* PerPipelineState                                                          */
+/* ------------------------------------------------------------------------ */
+
+PerPipelineState::PerPipelineState(MemoryContext mcxt)
+    : global_ops(PgMemoryContextAllocator<std::unique_ptr<GlobalOperatorState>>(mcxt))
+    , local_source_per_worker(PgMemoryContextAllocator<std::unique_ptr<LocalSourceState>>(mcxt))
+    , local_sink_per_worker(PgMemoryContextAllocator<std::unique_ptr<LocalSinkState>>(mcxt))
+    , local_op_states_per_worker(
+          PgMemoryContextAllocator<PgVector<std::unique_ptr<OperatorState>>>(mcxt))
+{
+}
+
+/* ------------------------------------------------------------------------ */
+/* SchedulerState                                                            */
+/* ------------------------------------------------------------------------ */
+
+SchedulerState::SchedulerState(MemoryContext mcxt, uint32_t worker_count)
+    : mcxt_(mcxt)
+    , worker_count_(worker_count)
+    , per_pipeline_(PgMemoryContextAllocator<std::unique_ptr<PerPipelineState>>(mcxt))
+{
+	Assert(mcxt_ != nullptr);
+	Assert(worker_count_ >= 1);
+}
+
+PerPipelineState &
+SchedulerState::GetOrCreate(PipelineId pid)
+{
+	Assert(pid != INVALID_PIPELINE_ID);
+	const size_t idx = static_cast<size_t>(pid);
+	if (per_pipeline_.size() <= idx)
+		per_pipeline_.resize(idx + 1);
+	if (!per_pipeline_[idx])
+		per_pipeline_[idx] = std::make_unique<PerPipelineState>(mcxt_);
+	return *per_pipeline_[idx];
+}
+
+PerPipelineState &
+SchedulerState::Get(PipelineId pid)
+{
+	const size_t idx = static_cast<size_t>(pid);
+	Assert(idx < per_pipeline_.size());
+	Assert(per_pipeline_[idx] != nullptr);
+	return *per_pipeline_[idx];
+}
+
+/* ------------------------------------------------------------------------ */
+/* TaskScheduler                                                             */
+/* ------------------------------------------------------------------------ */
+
 TaskScheduler::TaskScheduler(MemoryContext              mcxt,
                              std::unique_ptr<MetaPipelineBundle> bundle,
                              const TaskSchedulerSizing &sizing)
@@ -30,6 +97,8 @@ TaskScheduler::TaskScheduler(MemoryContext              mcxt,
     , sizing_(sizing)
     , pipelines_(mcxt)
     , events_(mcxt)
+    , events_owned_(PgMemoryContextAllocator<std::shared_ptr<Event>>(mcxt))
+    , state_(mcxt, sizing.worker_count)
 {
 	Assert(mcxt_ != nullptr);
 	Assert(bundle_ != nullptr);
@@ -106,12 +175,17 @@ TaskScheduler::BuildEvents()
 TaskSchedulerDsmLayout
 TaskScheduler::EstimateDsmSize() const
 {
+	/* C1 fix vs 3g.1: per-event counters are now full EventShmState structs
+	 * (tasks_remaining + saw_error), not bare pg_atomic_uint32. The array
+	 * lives in DSA (allocated by AllocateEventShmStates) so this byte count
+	 * is the DSA budget the leader must reserve, not part of the inline DSM
+	 * segment. */
 	TaskSchedulerDsmLayout layout{};
 	layout.control_bytes        = MAXALIGN(sizeof(PipelineSharedControl));
 	layout.task_queue_bytes     = MAXALIGN(
 		DsmTaskQueue::EstimateSize(sizing_.task_queue_capacity));
 	layout.event_counters_bytes = MAXALIGN(
-		(size_t) next_event_id_ * sizeof(pg_atomic_uint32));
+		(size_t) next_event_id_ * sizeof(EventShmState));
 	layout.total_bytes          = layout.control_bytes
 	                            + layout.task_queue_bytes
 	                            + layout.event_counters_bytes;
@@ -119,12 +193,160 @@ TaskScheduler::EstimateDsmSize() const
 }
 
 void
+TaskScheduler::BindRuntime(PipelineSharedControl *control,
+                           DsmTaskQueue          *task_queue,
+                           dsa_area              *dsa)
+{
+	Assert(control != nullptr);
+	Assert(task_queue != nullptr);
+	Assert(dsa != nullptr);
+	Assert(control_ == nullptr);
+	Assert(control->magic == PIPELINE_DSM_MAGIC);
+
+	control_    = control;
+	task_queue_ = task_queue;
+	dsa_        = dsa;
+}
+
+void
+TaskScheduler::AllocateEventShmStates()
+{
+	Assert(control_ != nullptr);
+	Assert(dsa_ != nullptr);
+	Assert(event_shm_ == nullptr);
+	Assert(next_event_id_ > 0);
+
+	const size_t bytes = (size_t) next_event_id_ * sizeof(EventShmState);
+	event_shm_dp_      = dsa_allocate0(dsa_, bytes);
+	event_shm_         = static_cast<EventShmState *>(
+		dsa_get_address(dsa_, event_shm_dp_));
+
+	for (uint32_t i = 0; i < next_event_id_; i++)
+	{
+		pg_atomic_init_u32(&event_shm_[i].tasks_remaining, 0);
+		pg_atomic_init_u32(&event_shm_[i].saw_error, 0);
+	}
+
+	control_->event_states_root = event_shm_dp_;
+	control_->event_count       = next_event_id_;
+}
+
+EventShmState &
+TaskScheduler::event_shm_slot(EventId id)
+{
+	Assert(event_shm_ != nullptr);
+	Assert(id < next_event_id_);
+	return event_shm_[id];
+}
+
+uint32_t
+TaskScheduler::DeriveRunTaskCount(Pipeline &pipeline) const
+{
+	Assert(pipeline.source != nullptr);
+	Assert(pipeline.sink != nullptr);
+	ExecCtx ctx{mcxt_, dsa_, LEADER_WORKER_INDEX};
+	uint32_t bound = sizing_.worker_count;
+	auto apply = [&](int v) {
+		if (v > 0)
+			bound = std::min(bound, static_cast<uint32_t>(v));
+	};
+	apply(pipeline.source->MaxThreads(ctx));
+	for (auto *op : pipeline.ops)
+		apply(op->MaxThreads(ctx));
+	apply(pipeline.sink->MaxThreads(ctx));
+	return bound == 0 ? 1u : bound;
+}
+
+void
 TaskScheduler::EnqueueTasks(Event &event)
 {
-	(void) event;
-	/* 3g.2 will: assign per-event outstanding_tasks count, push N
-	 * TaskDescriptors, SetLatch on each worker. Today: no-op. The 3c stub
-	 * Schedule() impls still go straight to FinishEvent(), so DAG drains. */
+	/* Preconditions: BindRuntime + AllocateEventShmStates already called by
+	 * the leader before any Event::Schedule() runs. EnqueueTasks is invoked
+	 * from PipelineRunEvent::Schedule / PipelineCombineEvent::Schedule /
+	 * PipelineFinalizeEvent::Schedule (3 cpp files, see C1 dispatch). */
+	Assert(control_ != nullptr);
+	Assert(task_queue_ != nullptr);
+	Assert(event_shm_ != nullptr);
+
+	const PipelineId pid = event.pipeline_id();
+	Assert(pid != INVALID_PIPELINE_ID);
+	Pipeline *pipeline = pipelines_.Resolve(static_cast<uint32_t>(pid));
+	Assert(pipeline != nullptr);
+
+	/* Resolve the EventId scheduler-side. BuildEvents publishes 3 events
+	 * per pipeline in the deterministic order (Run, Combine, Finalize)
+	 * starting at id = pid*3, so we recover the id by kind without needing
+	 * a reverse Resolve(). This stays consistent with PipelineDsmLookup since
+	 * Register() was called in the same order. */
+	EventId base_id = static_cast<EventId>(pid) * 3u;
+	EventId event_id;
+	uint32_t task_count;
+	const TaskKind kind = event.kind();
+	switch (kind)
+	{
+		case TaskKind::RUN:
+			event_id   = base_id + 0;
+			task_count = DeriveRunTaskCount(*pipeline);
+			break;
+		case TaskKind::COMBINE:
+			event_id   = base_id + 1;
+			/* One combine task per worker that participated in Run; matches
+			 * the Run fan-out. Step 11b reconstructs each concrete Task with
+			 * its WorkerTaskRuntime from this descriptor. */
+			task_count = DeriveRunTaskCount(*pipeline);
+			break;
+		case TaskKind::FINALIZE:
+			event_id   = base_id + 2;
+			/* Finalize is leader-only (Sink::Finalize is a leader op). The
+			 * leader's worker_index is LEADER_WORKER_INDEX; C7's event loop
+			 * runs Finalize inline rather than dispatching to the DSM
+			 * queue. We still publish 1 to tasks_remaining so the C7 loop
+			 * uses the same count==0 transition signal. */
+			task_count = 1;
+			break;
+		default:
+			Assert(false);
+			return;
+	}
+
+	Assert(events_.Resolve(event_id) == &event);
+
+	EventShmState &shm = event_shm_[event_id];
+
+	/* MUST init tasks_remaining BEFORE the first TryPush. Workers decrement
+	 * after each Task::Execute; if even one push happens before the counter
+	 * is set to N, a worker may observe tasks_remaining=0 and prematurely
+	 * trigger the leader's FinishEvent. */
+	pg_atomic_write_u32(&shm.tasks_remaining, task_count);
+
+	if (kind == TaskKind::FINALIZE)
+		return;
+
+	for (uint32_t i = 0; i < task_count; i++)
+	{
+		TaskDescriptor desc{};
+		desc.pipeline_id  = static_cast<uint32_t>(pid);
+		desc.event_id     = event_id;
+		desc.worker_index = static_cast<int32_t>(i);
+		desc.kind         = static_cast<uint8_t>(kind);
+
+		/* TryPush wakes every registered worker latch on success
+		 * (DsmTaskQueue C2). Capacity sized in EstimateDsmSize is
+		 * worst-case >= sum(task_count) across in-flight events, so the
+		 * loop never spuriously fails in M-FRAME-MIN. If it ever does
+		 * (capacity misconfigured), assert rather than spin: C7 will
+		 * surface this as a worker_error and Abort the query. */
+		const bool ok = task_queue_->TryPush(desc);
+		if (!ok)
+		{
+			pg_atomic_write_u32(&shm.tasks_remaining, 0);
+			elog(ERROR,
+			     "pg_volvec: task queue full while enqueuing event %u "
+			     "(pipeline %u, kind %u, capacity %u)",
+			     event_id, (unsigned) pid, (unsigned) kind,
+			     task_queue_->Capacity());
+		}
+	}
 }
 
 }  /* namespace pipeline */

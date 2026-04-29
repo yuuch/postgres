@@ -1,48 +1,21 @@
 /*-------------------------------------------------------------------------
  *
  * pipeline_descriptor.cpp
- *	  3g.2-prep skeleton bodies for the cross-process IR helpers declared in
- *	  pipeline_descriptor.hpp.
+ *	  Cross-process IR helpers (3g.2-final step 5/6).
  *
- * STATUS: 3g.2-prep (infrastructure scaffolding only). Function bodies in
- * this file are deliberate stubs that ereport(ERROR) as soon as they are
- * asked to do real work. Real implementations land in 3g.2-final together
- * with the rewritten pipeline_leader.cpp / pipeline_worker_main.cpp /
- * pipeline_*_event.cpp / translator.cpp / task.cpp set.
+ * Q1 runtime model after the Step 6 refactor:
+ *   - Exactly two pipelines are serialized.
+ *       P0: SeqScan(lineitem)+qual -> HashAggregate(sink)
+ *       P1: HashAggregate(source) -> Order(sink+source) -> OutputSink
+ *   - HashAggregate is one operator instance; the PARTIAL/FINAL split is gone.
+ *   - A COMBINE event runs between Sink Finalize and Source GetData on that
+ *     same PhysicalHashAggregate, DuckDB-faithful and leader-driven.
  *
- * DESIGN ANCHORS:
- *   docs/GLOBAL_LOCAL_STATE_DESIGN.md
- *	   §6.3   Sink global-state ABI (DSA-resident raw payload)
- *	   §8.5.4 PipelineDescriptor / OpDescriptor / *OpBody POD layout
- *	   §8.5.4.7 ExprBytecode constraints
- *
- * INVARIANTS (3g.2-prep, MUST be upheld in 3g.2-final too):
- *   - LeaderSerializePipelines() is leader-only. Workers MUST NOT call it.
- *   - WorkerReconstructPipelines() is worker-only. Leader MUST NOT call it.
- *   - StoreSharedPayloadOnDescriptor / LoadSharedPayloadFromDescriptor are
- *	   leader-only helpers used by PhysicalSink::GetGlobalSinkState() to
- *	   thread the leader-allocated raw payload back into the descriptor for
- *	   workers to attach to (lazy, single-init).
- *
- * 3g.2-prep BEHAVIOR (NOT a bug, intentional safety net):
- *   - LeaderSerializePipelines() with an empty bundle returns
- *	   InvalidDsaPointer (zero pipelines = nothing to publish; lets the
- *	   leader wire the call site without crashing during smoke tests).
- *   - All non-trivial inputs ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED).
- *   - WorkerReconstructPipelines() always validates the magic (defensive
- *	   even in prep) before ereport(ERROR).
- *
- * 3g.2-final TODO (next session, NOT this commit):
- *   - LeaderSerializePipelines: walk bundle.pipelines, dsa_allocate
- *	   PipelineDescriptor + OpDescriptor[] arrays, lower PhysicalOperator
- *	   tree to OpBody bodies, lower qual ExprProgram (§8.5.4.7), publish
- *	   pipelines_root dsa_pointer to PipelineSharedControl.
- *   - WorkerReconstructPipelines: dsa_get_address(pipelines_root), reverse
- *	   the lowering into Pipeline / PhysicalOperator instances under
- *	   worker_ctx.mcxt (MemoryContextSwitchTo'd by caller), rebuild the
- *	   PgVector<unique_ptr<Pipeline>> for the worker scheduler.
- *   - Store/Load helpers: write/read OpDescriptor.global_sink_state /
- *	   global_source_state dsa_pointer slots.
+ * Step 5 scope here is descriptor-only: we serialize already-built operator
+ * metadata (schemas, group keys, aggregate descriptors, TupleDataLayout DSA
+ * pointers) and reconstruct process-local operator objects on workers. Layout
+ * construction itself moves to Step 10 translator work, where Plan* is in
+ * scope; descriptor code remains plan-agnostic.
  *
  *-------------------------------------------------------------------------
  */
@@ -52,118 +25,481 @@ extern "C" {
 #include "utils/elog.h"
 }
 
-#include "core/memory.hpp"
+#include <cstring>
+
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
+#include "parallel/pipeline/output_sink.hpp"
+#include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
+#include "parallel/pipeline/physical_order.hpp"
+#include "parallel/pipeline/physical_projection.hpp"
+#include "parallel/pipeline/physical_seq_scan.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
-#include "parallel/pipeline/types.hpp"
 
 namespace pg_volvec {
 namespace pipeline {
 
-/*
- * Leader-only: serialize a fully-built MetaPipelineBundle into DSA, returning
- * the dsa_pointer to the root PipelineDescriptor[] array. The returned
- * pointer is what the leader writes into PipelineSharedControl.pipelines_root
- * before launching workers.
- *
- * 3g.2-prep: only the empty-bundle smoke path is allowed (returns
- * InvalidDsaPointer). Anything else raises ERRCODE_FEATURE_NOT_SUPPORTED.
- */
+namespace {
+
+static uint64
+DependencyMask(const Pipeline &pipeline)
+{
+	uint64 mask = 0;
+	for (PipelineId dep : pipeline.depends_on)
+	{
+		Assert(dep < 64);
+		mask |= (UINT64_C(1) << dep);
+	}
+	return mask;
+}
+
+static void
+SerializeUInt16Vector(const PgVector<uint16_t> &values,
+					   dsa_area *dsa,
+					   dsa_pointer *out_dp,
+					   uint16_t *out_count)
+{
+	*out_count = static_cast<uint16_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, sizeof(uint16_t) * values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), sizeof(uint16_t) * values.size());
+}
+
+static void
+SerializeAggFuncVector(const PgVector<AggFuncDesc> &values,
+					 dsa_area *dsa,
+					 dsa_pointer *out_dp,
+					 uint16_t *out_count)
+{
+	*out_count = static_cast<uint16_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, sizeof(AggFuncDesc) * values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), sizeof(AggFuncDesc) * values.size());
+}
+
+static void
+SerializeProjectExprVector(const PgVector<ProjectExprDesc> &values,
+					   dsa_area *dsa,
+					   dsa_pointer *out_dp,
+					   uint16_t *out_count)
+{
+	*out_count = static_cast<uint16_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, sizeof(ProjectExprDesc) * values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), sizeof(ProjectExprDesc) * values.size());
+}
+
+static void
+SerializeProjectStepVector(const PgVector<ProjectStep> &values,
+					   dsa_area *dsa,
+					   dsa_pointer *out_dp,
+					   uint16_t *out_count)
+{
+	*out_count = static_cast<uint16_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, sizeof(ProjectStep) * values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), sizeof(ProjectStep) * values.size());
+}
+
+static void
+EmitSeqScan(const PhysicalSeqScan &op, OpDescriptor &out)
+{
+	out.kind = OpKind::SEQ_SCAN;
+	out.n_children = 0;
+	out.body.seq_scan.relid = op.relid();
+	out.body.seq_scan.input_schema = op.input_schema_dp();
+	out.body.seq_scan.output_schema = op.output_schema_dp();
+	out.body.seq_scan.qual_bytecode = op.qual_desc_dp();
+	out.body.seq_scan.shared_payload = op.shared_payload_dp();
+}
+
+static void
+EmitHashAgg(const PhysicalHashAggregate &op, OpDescriptor &out, dsa_area *dsa)
+{
+	out.kind = OpKind::HASH_AGGREGATE;
+	out.n_children = 0;
+	out.body.hash_agg.input_schema = InvalidDsaPointer;
+	out.body.hash_agg.output_schema = InvalidDsaPointer;
+	out.body.hash_agg.layout = op.layout_dp();
+	out.body.hash_agg.shared_payload = op.shared_payload_dp();
+	out.body.hash_agg.max_groups = 256;
+	SerializeUInt16Vector(op.group_keys(), dsa, &out.body.hash_agg.group_keys, &out.body.hash_agg.n_group_keys);
+	SerializeAggFuncVector(op.agg_funcs(), dsa, &out.body.hash_agg.agg_funcs, &out.body.hash_agg.n_agg_funcs);
+}
+
+static void
+EmitOrder(const PhysicalOrder &op, OpDescriptor &out)
+{
+	out.kind = OpKind::ORDER;
+	out.n_children = 0;
+	out.body.order.input_schema = InvalidDsaPointer;
+	out.body.order.sort_keys = InvalidDsaPointer;
+	out.body.order.key_layout = op.key_layout_dp();
+	out.body.order.payload_layout = op.payload_layout_dp();
+	out.body.order.shared_payload = op.shared_payload_dp();
+	out.body.order.n_sort_keys = 0;
+	out.body.order._pad0 = 0;
+	out.body.order.max_rows = 256;
+}
+
+static void
+EmitOutput(const OutputSink &op, OpDescriptor &out)
+{
+	out.kind = OpKind::OUTPUT;
+	out.n_children = 0;
+	out.body.output.input_schema = op.input_schema_dp();
+	out.body.output.layout = op.layout_dp();
+	out.body.output.shared_payload = op.shared_payload_dp();
+	out.body.output.tdc_max_rows = op.tdc_max_rows();
+	out.body.output._pad0 = 0;
+}
+
+static void
+EmitProjection(const PhysicalProjection &op, OpDescriptor &out, dsa_area *dsa)
+{
+	out.kind = OpKind::PROJECTION;
+	out.n_children = 0;
+	out.body.project.input_schema = op.input_schema_dp();
+	out.body.project.output_schema = op.output_schema_dp();
+	SerializeProjectExprVector(op.expr_descs(), dsa,
+		&out.body.project.expr_descs, &out.body.project.n_exprs);
+	SerializeProjectStepVector(op.steps(), dsa,
+		&out.body.project.steps, &out.body.project.n_steps_total);
+	out.body.project._pad0 = 0;
+}
+
+static std::unique_ptr<PhysicalOperator>
+ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
+{
+	(void) ctx;
+	switch (op.kind)
+	{
+		case OpKind::SEQ_SCAN:
+			return std::make_unique<PhysicalSeqScan>(
+				op.body.seq_scan.relid,
+				op.body.seq_scan.input_schema,
+				op.body.seq_scan.output_schema,
+				op.body.seq_scan.qual_bytecode,
+				op.body.seq_scan.shared_payload,
+				const_cast<OpDescriptor *>(&op));
+
+		case OpKind::HASH_AGGREGATE:
+		{
+			PgVector<uint16_t> group_keys;
+			if (op.body.hash_agg.n_group_keys > 0 && DsaPointerIsValid(op.body.hash_agg.group_keys))
+			{
+				auto *keys = static_cast<uint16_t *>(dsa_get_address(ctx.dsa, op.body.hash_agg.group_keys));
+				group_keys.assign(keys, keys + op.body.hash_agg.n_group_keys);
+			}
+
+			PgVector<AggFuncDesc> agg_funcs;
+			if (op.body.hash_agg.n_agg_funcs > 0 && DsaPointerIsValid(op.body.hash_agg.agg_funcs))
+			{
+				auto *aggs = static_cast<AggFuncDesc *>(dsa_get_address(ctx.dsa, op.body.hash_agg.agg_funcs));
+				agg_funcs.assign(aggs, aggs + op.body.hash_agg.n_agg_funcs);
+			}
+
+			return std::make_unique<PhysicalHashAggregate>(
+				op.body.hash_agg.layout,
+				std::move(group_keys),
+				std::move(agg_funcs),
+				op.body.hash_agg.shared_payload,
+				const_cast<OpDescriptor *>(&op));
+		}
+
+		case OpKind::ORDER:
+			return std::make_unique<PhysicalOrder>(
+				op.body.order.key_layout,
+				op.body.order.payload_layout,
+				op.body.order.shared_payload,
+				const_cast<OpDescriptor *>(&op));
+
+		case OpKind::OUTPUT:
+			return std::make_unique<OutputSink>(
+				op.body.output.input_schema,
+				op.body.output.layout,
+				op.body.output.shared_payload,
+				op.body.output.tdc_max_rows,
+				const_cast<OpDescriptor *>(&op));
+
+		case OpKind::PROJECTION:
+		{
+			PgVector<ProjectExprDesc> expr_descs;
+			if (op.body.project.n_exprs > 0 && DsaPointerIsValid(op.body.project.expr_descs))
+			{
+				auto *exprs = static_cast<ProjectExprDesc *>(dsa_get_address(ctx.dsa, op.body.project.expr_descs));
+				expr_descs.assign(exprs, exprs + op.body.project.n_exprs);
+			}
+
+			PgVector<ProjectStep> steps;
+			if (op.body.project.n_steps_total > 0 && DsaPointerIsValid(op.body.project.steps))
+			{
+				auto *step_ptr = static_cast<ProjectStep *>(dsa_get_address(ctx.dsa, op.body.project.steps));
+				steps.assign(step_ptr, step_ptr + op.body.project.n_steps_total);
+			}
+
+			return std::make_unique<PhysicalProjection>(
+				op.body.project.input_schema,
+				op.body.project.output_schema,
+				std::move(expr_descs),
+				std::move(steps),
+				op.body.project.expr_descs,
+				op.body.project.steps,
+				const_cast<OpDescriptor *>(&op));
+		}
+	}
+
+	elog(ERROR, "pg_volvec: unknown OpKind %u during reconstruction", (unsigned) op.kind);
+	return nullptr;
+}
+
+}  /* namespace */
+
+dsa_pointer
+SerializeTupleDataLayout(const TupleDataLayout &layout, dsa_area *dsa)
+{
+	dsa_pointer layout_dp = dsa_allocate0(dsa, sizeof(TupleDataLayout));
+	std::memcpy(dsa_get_address(dsa, layout_dp), &layout, sizeof(TupleDataLayout));
+	return layout_dp;
+}
+
 dsa_pointer
 LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 {
-	if (dsa == nullptr)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("pg_volvec: LeaderSerializePipelines called with null dsa_area")));
-
 	if (bundle.pipelines.empty())
 		return InvalidDsaPointer;
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_volvec: LeaderSerializePipelines is not implemented in 3g.2-prep"),
-			 errdetail("Pipeline serialization (PipelineDescriptor + OpDescriptor lowering) lands in 3g.2-final.")));
+	const size_t pipeline_count = bundle.pipelines.size();
+	dsa_pointer root_dp = dsa_allocate0(dsa, sizeof(PipelineDescriptor) * pipeline_count);
+	auto *root = static_cast<PipelineDescriptor *>(dsa_get_address(dsa, root_dp));
 
-	return InvalidDsaPointer;
+	for (const auto &pipeline_uptr : bundle.pipelines)
+	{
+		const Pipeline &pipeline = *pipeline_uptr;
+		fprintf(stderr, "PGVOLVEC_DIAG[leader pid=%d]: serializing pipeline id=%d source=%p(type=%u) ops=%zu sink=%p(type=%u)\n",
+			(int) getpid(), pipeline.id,
+			(void*) pipeline.source, (unsigned) pipeline.source->type(),
+			pipeline.ops.size(),
+			(void*) pipeline.sink, (unsigned) pipeline.sink->type());
+		PipelineDescriptor &pd = root[pipeline.id];
+		pd.pipeline_id = pipeline.id;
+		pd.op_count = 2 + static_cast<int32>(pipeline.ops.size());
+		pd.dependency_mask = DependencyMask(pipeline);
+		pd.global_source_state = InvalidDsaPointer;
+		pd.global_sink_state = InvalidDsaPointer;
+		pg_atomic_init_u32(&pd.task_slot_next, 0);
+
+		pd.ops = dsa_allocate0(dsa, sizeof(OpDescriptor) * pd.op_count);
+		auto *ops = static_cast<OpDescriptor *>(dsa_get_address(dsa, pd.ops));
+
+		int32 idx = 0;
+		switch (pipeline.source->type())
+		{
+			case PhysicalOperatorType::SEQ_SCAN:
+				EmitSeqScan(static_cast<const PhysicalSeqScan &>(*pipeline.source), ops[idx]);
+				static_cast<PhysicalSeqScan &>(*pipeline.source).AttachDescriptor(&ops[idx]);
+				idx++;
+				break;
+			case PhysicalOperatorType::HASH_AGGREGATE:
+				EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*pipeline.source), ops[idx], dsa);
+				static_cast<PhysicalHashAggregate &>(*pipeline.source).AttachDescriptor(&ops[idx]);
+				idx++;
+				break;
+			case PhysicalOperatorType::ORDER:
+				EmitOrder(static_cast<const PhysicalOrder &>(*pipeline.source), ops[idx]);
+				static_cast<PhysicalOrder &>(*pipeline.source).AttachDescriptor(&ops[idx]);
+				idx++;
+				break;
+			case PhysicalOperatorType::PROJECTION:
+				EmitProjection(static_cast<const PhysicalProjection &>(*pipeline.source), ops[idx++], dsa);
+				break;
+			default:
+				elog(ERROR, "pg_volvec: unsupported source operator type %u", (unsigned) pipeline.source->type());
+		}
+
+		for (PhysicalOperator *mid : pipeline.ops)
+		{
+				switch (mid->type())
+				{
+					case PhysicalOperatorType::HASH_AGGREGATE:
+						EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*mid), ops[idx], dsa);
+						static_cast<PhysicalHashAggregate *>(mid)->AttachDescriptor(&ops[idx]);
+						idx++;
+						break;
+					case PhysicalOperatorType::PROJECTION:
+						EmitProjection(static_cast<const PhysicalProjection &>(*mid), ops[idx++], dsa);
+						break;
+					default:
+						elog(ERROR, "pg_volvec: unsupported mid-pipeline operator type %u", (unsigned) mid->type());
+				}
+		}
+
+		switch (pipeline.sink->type())
+		{
+			case PhysicalOperatorType::HASH_AGGREGATE:
+				EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*pipeline.sink), ops[idx], dsa);
+				static_cast<PhysicalHashAggregate &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
+				break;
+			case PhysicalOperatorType::ORDER:
+				EmitOrder(static_cast<const PhysicalOrder &>(*pipeline.sink), ops[idx]);
+				static_cast<PhysicalOrder &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
+				break;
+			case PhysicalOperatorType::OUTPUT:
+				EmitOutput(static_cast<const OutputSink &>(*pipeline.sink), ops[idx]);
+				static_cast<OutputSink &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
+				break;
+			default:
+				elog(ERROR, "pg_volvec: unsupported sink operator type %u", (unsigned) pipeline.sink->type());
+		}
+	}
+
+	return root_dp;
 }
 
-/*
- * Worker-only: reverse the leader's serialization. The caller (the worker
- * bgworker entry) MUST have already MemoryContextSwitchTo'd into a long-lived
- * per-query context before invoking this helper, so that PhysicalOperator
- * state and JIT contexts attach to the right context.
- *
- * 3g.2-prep: stub. Real workers do not run yet (pipeline_worker_main.cpp is
- * still a stub elog(ERROR)), so this function is unreachable in practice.
- * The defensive magic check is kept in prep to guarantee that any premature
- * caller fails loudly rather than silently corrupting unrelated DSM segments.
- */
 void
-WorkerReconstructPipelines(PipelineSharedControl                 *ctl,
-						   ExecCtx                               &worker_ctx,
-						   PgVector<std::unique_ptr<Pipeline>>   &out)
+WorkerReconstructPipelines(PipelineSharedControl *ctl,
+				   ExecCtx &worker_ctx,
+				   PgVector<std::unique_ptr<Pipeline>> &out)
 {
-	(void) worker_ctx;
-	(void) out;
+	if (ctl == nullptr || ctl->pipelines_root == InvalidDsaPointer || ctl->num_pipelines <= 0)
+		return;
 
-	if (ctl == nullptr)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("pg_volvec: WorkerReconstructPipelines called with null PipelineSharedControl")));
+	auto *root = static_cast<PipelineDescriptor *>(dsa_get_address(worker_ctx.dsa, ctl->pipelines_root));
+	for (int32 idx = 0; idx < ctl->num_pipelines; ++idx)
+	{
+		PipelineDescriptor &pd = root[idx];
+		auto pipeline = std::make_unique<Pipeline>();
+		pipeline->id = static_cast<PipelineId>(pd.pipeline_id);
 
-	if (ctl->magic != PIPELINE_DSM_MAGIC)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("pg_volvec: PipelineSharedControl magic mismatch (got 0x%08x, expected 0x%08x)",
-						ctl->magic, PIPELINE_DSM_MAGIC)));
+		auto *ops = static_cast<OpDescriptor *>(dsa_get_address(worker_ctx.dsa, pd.ops));
+		pipeline->source = ReconstructOp(ops[0], worker_ctx).release();
+		for (int32 op_idx = 1; op_idx < pd.op_count - 1; ++op_idx)
+			pipeline->ops.push_back(ReconstructOp(ops[op_idx], worker_ctx).release());
+		pipeline->sink = ReconstructOp(ops[pd.op_count - 1], worker_ctx).release();
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_volvec: WorkerReconstructPipelines is not implemented in 3g.2-prep"),
-			 errdetail("Worker-side PipelineDescriptor reconstruction lands in 3g.2-final.")));
+		for (PipelineId dep = 0; dep < 64; ++dep)
+			if (pd.dependency_mask & (UINT64_C(1) << dep))
+				pipeline->depends_on.push_back(dep);
+
+		out.push_back(std::move(pipeline));
+	}
 }
 
-/*
- * Leader-only: lazy-publish the leader-allocated raw payload (e.g. the
- * AggSharedPayload behind a HashAggregate, the SortSharedPayload behind an
- * Order) into the OpDescriptor.global_sink_state / global_source_state slot
- * so that workers can dsa_get_address it and attach.
- *
- * 3g.2-prep: stub. Real call sites in PhysicalHashAggregate::GetGlobalSinkState
- * and PhysicalOrder::GetGlobalSinkState arrive in 3g.2-final.
- */
 void
 StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_dp)
 {
-	(void) op;
-	(void) payload_dp;
+	if (op == nullptr)
+		return;
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_volvec: StoreSharedPayloadOnDescriptor is not implemented in 3g.2-prep"),
-			 errdetail("Lazy global-sink-state publication lands in 3g.2-final together with the Sink rewrite.")));
+	/*
+	 * Fix A2: fan out the payload pointer to EVERY DSA OpDescriptor slot this
+	 * operator was attached to. The same C++ instance can appear in multiple
+	 * pipelines (e.g. HashAgg as P_producer.sink and P_consumer.source), and
+	 * LeaderSerializePipelines allocated an independent slot per pipeline.
+	 * Workers reconstruct from per-pipeline slots, so a single-slot Store
+	 * leaves the other pipelines' workers reading InvalidDsaPointer.
+	 * See physical_hash_aggregate.hpp AttachDescriptor for the contract.
+	 */
+	switch (op->type())
+	{
+		case PhysicalOperatorType::SEQ_SCAN:
+		{
+			for (OpDescriptor *desc : static_cast<const PhysicalSeqScan *>(op)->descs())
+				if (desc != nullptr)
+					desc->body.seq_scan.shared_payload = payload_dp;
+			break;
+		}
+		case PhysicalOperatorType::HASH_AGGREGATE:
+		{
+			const auto &dl = static_cast<const PhysicalHashAggregate *>(op)->descs();
+			fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: Store HashAgg payload_dp=%lu op=%p desc_list_.size=%zu\n",
+				(int) getpid(), (unsigned long) payload_dp, (void*) op, dl.size());
+			size_t i = 0;
+			for (OpDescriptor *desc : dl)
+			{
+				fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]:   slot[%zu] desc=%p before=%lu\n",
+					(int) getpid(), i, (void*) desc, desc ? (unsigned long) desc->body.hash_agg.shared_payload : 0UL);
+				if (desc != nullptr)
+					desc->body.hash_agg.shared_payload = payload_dp;
+				i++;
+			}
+			break;
+		}
+		case PhysicalOperatorType::ORDER:
+		{
+			for (OpDescriptor *desc : static_cast<const PhysicalOrder *>(op)->descs())
+				if (desc != nullptr)
+					desc->body.order.shared_payload = payload_dp;
+			break;
+		}
+		case PhysicalOperatorType::OUTPUT:
+		{
+			for (OpDescriptor *desc : static_cast<const OutputSink *>(op)->descs())
+				if (desc != nullptr)
+					desc->body.output.shared_payload = payload_dp;
+			break;
+		}
+		case PhysicalOperatorType::PROJECTION:
+			break;
+	}
 }
 
-/*
- * Worker-and-leader: load the previously-published raw payload dsa_pointer.
- *
- * 3g.2-prep: stub. Real call sites in PhysicalHashAggregate::GetGlobalSinkState
- * (worker attach branch) and PhysicalSeqScan::GetGlobalSourceState arrive in
- * 3g.2-final.
- */
 dsa_pointer
 LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 {
-	(void) op;
+	if (op == nullptr)
+		return InvalidDsaPointer;
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_volvec: LoadSharedPayloadFromDescriptor is not implemented in 3g.2-prep"),
-			 errdetail("Lazy global-sink-state attach lands in 3g.2-final together with the Sink rewrite.")));
+	switch (op->type())
+	{
+		case PhysicalOperatorType::SEQ_SCAN:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalSeqScan *>(op)->desc();
+			return desc != nullptr ? desc->body.seq_scan.shared_payload : InvalidDsaPointer;
+		}
+		case PhysicalOperatorType::HASH_AGGREGATE:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalHashAggregate *>(op)->desc();
+			dsa_pointer ret = desc != nullptr ? desc->body.hash_agg.shared_payload : InvalidDsaPointer;
+			fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: Load HashAgg op=%p desc=%p -> payload_dp=%lu\n",
+				(int) getpid(), (void*) op, (void*) desc, (unsigned long) ret);
+			return ret;
+		}
+		case PhysicalOperatorType::ORDER:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalOrder *>(op)->desc();
+			return desc != nullptr ? desc->body.order.shared_payload : InvalidDsaPointer;
+		}
+		case PhysicalOperatorType::OUTPUT:
+		{
+			OpDescriptor *desc = static_cast<const OutputSink *>(op)->desc();
+			return desc != nullptr ? desc->body.output.shared_payload : InvalidDsaPointer;
+		}
+		case PhysicalOperatorType::PROJECTION:
+			return InvalidDsaPointer;
+	}
 
 	return InvalidDsaPointer;
 }

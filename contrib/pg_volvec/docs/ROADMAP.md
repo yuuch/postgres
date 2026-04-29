@@ -1,5 +1,7 @@
 # pg_volvec Roadmap
 
+> ⚠️ **STALE — Pre-greenfield (2026-04-17).** Most claims here are invalid post M-FRAME-MIN (`fd9a8aaf326`). For the current state see `contrib/pg_volvec/AGENTS.md` and `docs/PIPELINE_PORT_PLAN.md`.
+
 Status refreshed: `2026-04-17`
 
 This document captures the medium-term direction after the current module

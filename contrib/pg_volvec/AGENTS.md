@@ -1,16 +1,59 @@
 # pg_volvec KNOWLEDGE BASE
 
-**Refreshed:** 2026-04-26
-**HEAD:** `71cd856975d` ("pg_volvec: 3g.2-prep MetaPipeline runtime infra (DSM + descriptor IR scaffolding)")
-**Phase:** `M-FRAME-MIN` — step 3g.2-prep landed; step 3g.2-final (runtime end-to-end wiring for Q1) in progress.
+**Refreshed:** 2026-04-30
+**HEAD:** `6c344eb036d` ("pg_volvec: fix BGWH_STARTED-vs-ProcArray race in pipeline leader") + ~36 modified TUs / +4537/-1523 + 5 new source pairs (`aggregate_hash_table.{cpp,hpp}`, `tuple_data_collection.{cpp,hpp}`, `tuple_data_layout.{cpp,hpp}`, `tuple_data_ops.{cpp,hpp}`, `physical_projection.{cpp,hpp}`).
+**Phase:** `M-FRAME-MIN` step 3g.2-final — runtime end-to-end is **plumbed**: SeqScan → HashAgg → Order → OutputSink runs in leader+workers, descriptor publish/load works cross-process, leader drains the global TDC after FINALIZE. **Two open bugs** stop Q1 from emitting rows to the client:
+- **Bug G** — HashAgg dedupe wrong (row_count=3 vs expected 2, no group merge).
+- **Bug I** — OutputSink emits 3 rows internally but `psql` shows 0 (`EmitGlobalTdcToDest` → `DestReceiver` path drops them).
+
+Q1 still falls back to standard PG when run end-to-end (correct results).
 
 ## OVERVIEW
 
-PostgreSQL extension that hooks `ExecutorStart/Run/Finish/End` and offloads supported OLAP plan subtrees into a C++ columnar `DataChunk` executor with LLVM JIT on tuple deform and expression evaluation. Today the active scope is **Q1 only** (target milestone `M-Q1-PERF`); Q6 is parked at `M-Q6-RESTORE` (later).
+PostgreSQL extension that hooks `ExecutorStart/Run/Finish/End` and offloads supported OLAP plan subtrees into a C++ columnar `DataChunk` executor with LLVM JIT on tuple deform and expression evaluation. Active scope is **Q1 only** (target `M-Q1-PERF`); Q6 parked at `M-Q6-RESTORE`.
 
 The legacy broad TPC-H prototype (Q1–Q22, HashJoin, MergeJoin, SubqueryScan, the legacy serial vector executor under `src/engine/exec/`, and the legacy morsel parallel runtime) was **intentionally deleted** in commits `53ac06adcb7` (step 1) and `fd9a8aaf326` (step 2). The new runtime is a DuckDB-style `PhysicalOperator` + `MetaPipeline` design over PostgreSQL DSM/DSA + parallel bgworkers.
 
-**What runs through `pg_volvec` today:** **Nothing.** `Translator::TranslatePlan` returns `nullptr` for every nodeTag, the bridge logs `WARNING: pg_volvec: unsupported plan shape, falling back to standard PostgreSQL executor`, and `standard_ExecutorRun` produces the result. The `pg_volvec` runtime is being assembled in pieces; step 3g.2-final lights up the first end-to-end Q1 path.
+## RUNTIME STATE (HEAD + uncommitted)
+
+End-to-end Q1 reproduce (`/tmp/q1_diag.sql` against `~/data/pg_tpch`) walks the full pipeline:
+
+```
+SeqScan FP11 count=3                                          OK
+HashAgg.GetData ENTER tdc.finalized=1 row_count=3             OK (should be 2 → Bug G)
+RUN.GetData pipeline_id=1 sres=0 src_chunk.count=3            OK
+Order LEADER ALLOC payload_dp=1359872                         OK (worker0 alloc)
+Order LOAD     payload_dp=1359872 (leader RUN)                OK (cross-process publish)
+Order.Finalize ENTER row_count=3 / sort_indices_dp=667672     OK
+Output.Finalize ENTER global_tdc=… row_count=3                OK
+psql output rows                                              0  (Bug I)
+```
+
+Cross-process plumbing is solid; the two open bugs are local to HashAgg dedupe and OutputSink → DestReceiver emission.
+
+## BUGS LANDED THIS CYCLE
+
+| Bug | Where | Fix |
+|-----|-------|-----|
+| Race | `pipeline_leader.cpp` | `BGWH_STARTED`-vs-`ProcArray` race (committed at `6c344eb036d`). |
+| A | `pipeline_leader.cpp` | PostmasterDeath shutdown path: poll on `BGWH_STOPPED` + `WaitLatch` with no hard timeout; `worker_ready` array sized by GUC. |
+| B | `physical_seq_scan.cpp` | Leader self-allocates SeqScan local state; worker fallback via descriptor Load. |
+| B' | `translator.cpp` | `dsa_allocate0` for `SchemaDescriptor` + `QualDescriptor` BEFORE `PhysicalSeqScan` ctor (Store/Load symmetry). |
+| C-pre | `physical_seq_scan.cpp` | Removed stray `heap_prepare_pagescan` (caused leader/worker double-init). |
+| C | `pipeline_leader.cpp:73-101,125,616,634,651` | Split `SignalShutdownAndWait` from `ShutdownAndDestroy`; only success path keeps Wait. |
+| E | `physical_hash_aggregate.cpp:285-304` | `GetData` gating uses DSA-authoritative `global_tdc->finalized` flag (the `HashAggGlobalSourceState::finalized` field is a stale snapshot from `GetGlobalSourceState` time and must NOT be trusted across runtimes). |
+| F | `physical_hash_aggregate.cpp:206-244` | Removed leader-only guard from `Combine`. Each worker MUST run its own `Combine` because `local_tdc` lives in backend-private memory; a leader-only Combine would silently drop every other worker's partials. (Matches DuckDB.) |
+| H | `physical_order.cpp:78-113` | `GetGlobalSinkState` does `LoadSharedPayloadFromDescriptor` BEFORE considering `dsa_allocate0`. The `shared_payload_dp_` field on `PhysicalOperator` is per-process (each backend reconstructs its own instance), so it can never be cached as the source of truth — Load-before-alloc is now an invariant for every sink. |
+
+Open: **Bug G** (HashAgg dedupe), **Bug I** (OutputSink → DestReceiver emit 0). Ongoing diagnostic `fprintf(stderr, "PGVOLVEC_DIAG…")` lines remain in HashAgg/Order/Task and will be removed once both bugs are closed.
+
+## SESSION SIMPLIFICATIONS (acknowledged, deferred)
+
+- `tts_isnull` hardcoded `false` in OutputSink (Q1 columns are non-null).
+- AVG precision: `sum_scaled / count` at scale=2 (loses precision vs `numeric_div`).
+- Sort: `MaxThreads=1`, in-memory single-run.
+- HashAgg `Combine` serialized via `AggregateHashTable::mutex` (pg_duckdb uses partitioned lanes — see `docs/ARCHITECTURE_DEVIATIONS.md`).
+- bgworker entry uses **DSM/DSA + descriptor publish**, not `shm_mq` / `TupleQueueReader`.
 
 ## STRUCTURE
 
@@ -19,103 +62,92 @@ contrib/pg_volvec/
   src/bridge/                      # PG hook integration, GUCs, query-state HTAB     → bridge/AGENTS.md
     pg_volvec.c                    # _PG_init, GUC table, hook chaining
     state.{c,h}                    # PgVolVecQueryState HTAB + admission filter
-    execute.{cpp,h}                # Translator dispatch + (future) pipeline run
+    execute.{cpp,h}                # Translator dispatch + pipeline run
   src/engine/core/                 # DataChunk, types, memory, DSA bridge, robin-hood adapter → core/AGENTS.md
   src/engine/expr/                 # Expression IR header (expr.hpp)
   src/engine/                      # expr.cpp (lowering+interpreter), JIT pair, volvec_engine.hpp
   src/engine/parallel/             # Container only; no source files                 → parallel/AGENTS.md
   src/engine/parallel/pipeline/    # PhysicalOperator IR + MetaPipeline runtime      → parallel/pipeline/AGENTS.md
-                                   # (the only runtime; 41 files, 17 active TUs)
-  sql/, expected/                  # Regress (most pre-greenfield .sql/.out deleted; harness skeletal)
-  docs/                            # Mostly pre-greenfield; banner-marked STALE
+                                   # (the only runtime; ~52 files, 22 active TUs)
+  sql/, expected/                  # Regress: q1, q6, smoke
+  docs/                            # ARCHITECTURE_DEVIATIONS (NEW), GLOBAL_LOCAL_STATE_DESIGN, PIPELINE_PORT_PLAN; pre-greenfield files banner-marked STALE
+  pg_duckdb_architecture.md        # Reference architecture (untracked, 109 lines) — see docs/ARCHITECTURE_DEVIATIONS.md
   third_party/                     # Vendored robin-hood-hashing
   perf/                            # Q1 perf progression notes
 ```
 
-Built sources are listed in `meson.build` (lines 6–28 + LLVM JIT pair). 19 active translation units when LLVM is enabled:
-
-- C bridge: `src/bridge/pg_volvec.c`, `src/bridge/state.c`
-- C++ bridge: `src/bridge/execute.cpp`
-- Expression: `src/engine/expr.cpp`
-- Pipeline (17): `pipeline_worker_main.cpp`, `pipeline_leader.cpp`, `physical_operator.cpp`, `meta_pipeline.cpp`, `pipeline_descriptor.cpp`, `event.cpp`, `pipeline_run_event.cpp`, `pipeline_combine_event.cpp`, `pipeline_finalize_event.cpp`, `task.cpp`, `dsm_task_queue.cpp`, `task_scheduler.cpp`, `physical_seq_scan.cpp`, `physical_hash_aggregate.cpp`, `physical_order.cpp`, `output_sink.cpp`, `translator.cpp`
-- Core DSA: `src/engine/core/parallel_dsa_bridge.cpp`
-- LLVM JIT pair (when `llvm.found()`): `src/engine/llvmjit_deform_datachunk.cpp`, `src/engine/llvmjit_expr.cpp`
-
-`src/engine/llvmjit_deform_datachunk.h` (note `.h`, not `.hpp`) is a stale duplicate of `pg_volvec_try_compile_jit_expr` from `expr/expr.hpp`; cleanup deferred to JIT-wiring time. `src/engine/data_chunk_deform.hpp` duplicates `src/engine/core/data_chunk_deform.hpp` — ongoing refactor.
+Active translation units (per `meson.build`): C bridge (`pg_volvec.c`, `state.c`), C++ bridge (`execute.cpp`), expression (`expr.cpp`), pipeline runtime (`pipeline_worker_main.cpp`, `pipeline_leader.cpp`, `physical_operator.cpp`, `meta_pipeline.cpp`, `pipeline_descriptor.cpp`, `event.cpp`, `pipeline_run_event.cpp`, `pipeline_combine_event.cpp`, `pipeline_finalize_event.cpp`, `task.cpp`, `dsm_task_queue.cpp`, `task_scheduler.cpp`, `physical_seq_scan.cpp`, `physical_hash_aggregate.cpp`, `physical_order.cpp`, `physical_projection.cpp`, `output_sink.cpp`, `translator.cpp`, `aggregate_hash_table.cpp`, `tuple_data_collection.cpp`, `tuple_data_layout.cpp`, `tuple_data_ops.cpp`), core DSA (`parallel_dsa_bridge.cpp`), LLVM JIT pair (when `llvm.found()`).
 
 ## WHERE TO LOOK
 
 | Task | Location | Notes |
 |------|----------|-------|
 | Hook + GUC + admission | `src/bridge/` | See `bridge/AGENTS.md` |
-| Pipeline runtime / parallel | `src/engine/parallel/pipeline/` | See `parallel/pipeline/AGENTS.md`; bridge entry will be `pipeline::PgvolvecPipelineRun` (currently a stub returning `false`) |
+| Pipeline runtime / parallel | `src/engine/parallel/pipeline/` | See `parallel/pipeline/AGENTS.md` |
 | DataChunk / types / DSA bridge | `src/engine/core/` | See `core/AGENTS.md` |
 | Expression lowering | `src/engine/expr.cpp`, `expr/expr.hpp` | Linear IR + interpreter |
 | Expression JIT | `src/engine/llvmjit_expr.cpp` | LLVM, gated by `USE_LLVM` |
 | Deform JIT | `src/engine/llvmjit_deform_datachunk.cpp` | LLVM, gated by `USE_LLVM` |
-| Plan→PhysicalOperator translation | `parallel/pipeline/translator.cpp` | Returns `nullptr` for every nodeTag today |
-| Add a regress test | `sql/` + `expected/` + `meson.build` regress list | Most pre-greenfield .sql/.out files have been deleted; harness is intentionally skeletal until M-Q1-PERF |
+| Plan→PhysicalOperator translation | `parallel/pipeline/translator.cpp` | Q1 shape-matcher live |
+| TupleData / hash table | `parallel/pipeline/{tuple_data_*,aggregate_hash_table}.{cpp,hpp}` | NEW this cycle |
+| Architecture deviations | `docs/ARCHITECTURE_DEVIATIONS.md` | NEW — diff vs `pg_duckdb_architecture.md` |
+| Add a regress test | `sql/` + `expected/` + `meson.build` regress list | Harness intentionally minimal until M-Q1-PERF |
 
 ## CONVENTIONS
 
 - **C/C++ boundary**: C files use `pg_volvec_` prefix and `extern "C"` headers when included from C++. C++ uses `namespace pg_volvec` (and `pg_volvec::pipeline` for runtime). Engine `.hpp` files wrap PG includes in `extern "C" {}`.
 - **Include guards**: C headers `#ifndef PG_VOLVEC_*`. C++ headers `#pragma once`.
-- **Classes**: pipeline interfaces use plain names in `pg_volvec::pipeline` (`PhysicalOperator`, `MetaPipeline`, `Task`, `Event`, `Source`, `Sink`). The legacy `Vec*State` family from the deleted `src/engine/exec/` is gone — do not reintroduce it.
 - **Indent**: Tabs, 4-space width (`.editorconfig`).
 - **Build**: Meson only. Module-level `-O3 -march=native -ftree-vectorize -funroll-loops -ffast-math` applied to all C/C++.
 - **Memory**: PostgreSQL `MemoryContext` (palloc/pfree/AllocSetContextCreate) for per-query objects; `PgMemoryContextAllocator` for STL containers. Never raw malloc in hot paths.
-- **Cross-process state**: Leader-built objects that need to reach workers are serialized into DSA via `pipeline_descriptor.cpp` (Store/LoadSharedPayload). Atomics live in `PipelineSharedControl` directly (DSM-resident).
-- **JIT symbol resolution**: Prefer `dlopen(NULL)` + `dlsym` from running process before loading the provider library.
-- **Restart discipline**: Always `pg_ctl restart` after `meson install`. The backend will not pick up a freshly installed `pg_volvec.so` on its own.
+- **Cross-process state**: leader-built objects that need to reach workers are serialized into DSA via `pipeline_descriptor.cpp` (`StoreSharedPayloadOnDescriptor` / `LoadSharedPayloadFromDescriptor`). Atomics live in `PipelineSharedControl` directly (DSM-resident). **Invariant: every sink MUST `Load`-before-`alloc` for `shared_payload_dp` because the operator field is per-process** (Bug H lesson).
+- **JIT symbol resolution**: prefer `dlopen(NULL)` + `dlsym` from running process before loading the provider library.
+- **Restart discipline**: always `pg_ctl restart` after `meson install`. Backend will not pick up a freshly installed `pg_volvec.so` on its own.
 - **No `.inc` template files.** The pipeline runtime has none; the legacy `runtime_*.inc` family is deleted.
+- **Comment policy** (per CLAUDE.md priority guidelines): mode-1/3 comments must justify *why* (not what); compress mode-3 comment line counts where possible.
 
-## ANTI-PATTERNS (THIS PROJECT)
+## ANTI-PATTERNS
 
 - **Do NOT assume backend picks up new `.so` without restart.** Always `pg_ctl restart` after `meson install`.
 - **Do NOT reintroduce the legacy serial executor or morsel runtime.** `src/engine/exec/`, `Vec{SeqScan,Filter,Agg,Project,Sort,Limit}State`, `parallel_runtime.cpp`, `runtime_*.{cpp,hpp,inc}`, `ParallelPipelineRole/Desc/Driver/Sink`, `LoweredPipeline`, `WorkerPipelineExecutor`, `pipeline_lowering.{hpp,cpp}`, `q1_translator.*`, `partial_agg_op.*`, `agg_sink.*`, `seq_scan_source.*`, `worker_context.hpp` — all intentionally deleted.
-- **Do NOT widen Q1 translator to other queries.** Q2–Q22 are intentionally out of scope for `M-Q1-PERF`. Q6 is parked at `M-Q6-RESTORE`.
-- **Do NOT extend Sort beyond MaxThreads=1, in-memory single-run.** External sort is post-3g.2.
-- **Do NOT introduce ExprBytecode lowering for non-null quals** in 3g.2. Direct interpreter path is the in-scope baseline.
+- **Do NOT widen translator to non-Q1 shapes.** Q2–Q22 out of scope for `M-Q1-PERF`. Q6 belongs to `M-Q6-RESTORE`.
+- **Do NOT extend Sort beyond MaxThreads=1, in-memory single-run.**
 - **Do NOT change `PhysicalOperator` base virtual signatures** (locked in `eb7901b022a`). New per-operator state goes through descriptor-resident payloads, not new virtuals.
 - **Do NOT publish palloc'd pointers to DSA.** Use DSA offsets via `dsa_get_address`/`dsa_allocate`. Atomics go in DSM-resident `PipelineSharedControl`, not DSA.
-- **Do NOT call `elog(ERROR)` from a worker without first writing `PipelineSharedControl.worker_error{,_msg}`.** Otherwise the leader cannot distinguish worker death from clean FINISHED. The `worker_error_msg` buffer is `PIPELINE_WORKER_ERROR_MSG_LEN = 256` bytes (`dsm_control.hpp:20`).
-- **Do NOT skip `MemoryContextSwitchTo` before C++ object construction.** JIT and operator construction require the right context.
-- **Do NOT touch `parallel_plan` / `parallel_scheduler` void* fields outside `parallel/pipeline/`.** They are opaque sentinels everywhere else (the bridge stores the descriptor IR root and the scheduler this way; layout is shared via `query_state.hpp`).
+- **Do NOT trust per-process operator fields as cross-process state.** `shared_payload_dp_` on the operator instance is per-backend; always Load from descriptor first (Bug H invariant).
+- **Do NOT make `Combine` leader-only.** `local_tdc` is backend-private; every worker must run its own `Combine` against the `GlobalSinkState` (Bug F lesson).
+- **Do NOT trust `*GlobalSourceState::finalized` as authoritative.** It is a snapshot at `GetGlobalSourceState` time. Read `global_tdc->finalized` from DSA (Bug E lesson).
+- **Do NOT call `elog(ERROR)` from a worker without first writing `PipelineSharedControl.worker_error{,_msg}`.** Buffer is `PIPELINE_WORKER_ERROR_MSG_LEN = 256` bytes (`dsm_control.hpp:20`).
+- **Do NOT skip `MemoryContextSwitchTo` before C++ object construction.**
+- **Do NOT touch `parallel_plan` / `parallel_scheduler` void* fields outside `parallel/pipeline/`.**
 - **Do NOT enable JIT for Wide128 numeric expressions.** Interpreter-only for correctness.
-- **Experimental GUCs** (`parallel_experimental_hash_pipeline` etc.) registered in `pg_volvec.c` may be inert — delete callers, not the GUC.
 
 ## COMMANDS
 
 ```bash
-# Build
+# Build + install + restart
 CCACHE_DISABLE=1 PATH=/opt/homebrew/bin:$PATH meson compile -C build pg_volvec
-
-# Install + restart (always restart after install)
 CCACHE_DISABLE=1 PATH=/opt/homebrew/bin:$PATH meson install -C build --only-changed
 ./installed/bin/pg_ctl -D ~/data/pg_tpch restart -m fast -l ~/data/pg_tpch/logfile
 
-# Regress (skeletal today; harness predates M-FRAME-MIN refresh)
-meson test -C build --suite pg_volvec
+# Q1 reproduce (cross-process plumbing OK; emit blocked on Bug G/I)
+: > ~/data/pg_tpch/logfile
+./installed/bin/psql -h /tmp -p 5432 -d postgres -c "DROP TABLE IF EXISTS lineitem_q1;"
+./installed/bin/psql -h /tmp -p 5432 -d postgres -f contrib/pg_volvec/sql/q1.sql
 
-# Manual on the 10G TPC-H instance (executes through standard PG today)
-./installed/bin/psql -h /tmp -p 5432 -d tpch -f contrib/pg_volvec/sql/q1.sql
-
-# Disable PG parallel for fair single-thread benchmarks
+# Disable PG parallel for clean single-thread benchmarks
 SET max_parallel_workers_per_gather = 0;
 SET parallel_setup_cost = 1000000000;
 ```
 
-Expected results today (produced by **standard PG**, not `pg_volvec`):
-- Q1 on small fixture: 4 rows.
-- Q6 on 10G TPC-H: `1230113636.0101`.
-
 ## NOTES
 
-- **Active scope:** Q1 only (M-Q1-PERF). Q2–Q22 intentionally out of scope.
-- **Step 3g.2-prep delivered (HEAD):** descriptor IR scaffolding (`pipeline_descriptor.{hpp,cpp}`, `pipeline_dsm_lookup.hpp`), DSM keys retired and replaced (`PIPELINE_DSM_KEY_{CONTROL,DSA,TASK_QUEUE}` in `0xD8…` range, magic `0x56505043`), `EventShmState` array allocated through `PipelineSharedControl.event_states_root`, MPMC `DsmTaskQueue` (Vyukov), `Event` with atomic dependency machinery, `Task` triple (`PipelineRunEvent`/`PipelineCombineEvent`/`PipelineFinalizeEvent`) with header+ctor, `TaskScheduler` (`SchedulerState` + `BindRuntime` + `AllocateEventShmStates` + `EnqueueTasks` dispatching on `Event::kind()`), `worker_error_msg[256]` shipped per Oracle C7 design.
-- **Step 3g.2-final pending:** `PgvolvecPipelineRun` real implementation (replaces `pipeline_leader.cpp` 33-line stub returning `false`); worker `main` (replaces `pipeline_worker_main.cpp` 28-line `elog(ERROR)` stub); Task `Execute()` bodies (`task.cpp` 49-line stub returning `TASK_FINISHED`); `Translator::TranslatePlan` Q1 shape-matcher (`translator.cpp` 35-line stub returning `nullptr`); `physical_seq_scan` `AppendProjectedTupleToChunk` real body; `physical_hash_aggregate` `SinkChunk` `rf`/`ls` `'\0'` bug fix + `GetData` column writes; `physical_order` `SinkChunk`/`GetData` column writes; bridge wire-up at `src/bridge/execute.cpp` to call `PgvolvecPipelineRun` instead of falling through.
-- **Authoritative plans:** `.sisyphus/plans/3g2-final-delta-map.md` (3619 lines, v2; `§C6` lines 2900-3100 covers the runtime cut-over); `.sisyphus/plans/pipeline-port-plan.md` (`§6.5.6` Q1 shape).
-- **Authoritative design:** `contrib/pg_volvec/docs/GLOBAL_LOCAL_STATE_DESIGN.md` (`§6.3`, `§8.5.2-§8.5.4`, `§8.6`); `§8.7` is **not** to be implemented as written (per design doc line 1428).
-- **Test data:** 10G TPC-H lives at `~/data/pg_tpch` (socket `/tmp`, port 5432, db `tpch`).
-- **Profiling:** `/usr/bin/sample` on macOS; FlameGraph tools at `~/proj/postgres/FlameGraph/`.
-- **Pre-greenfield docs** under `docs/` (DESIGN.md, ROADMAP.md, LOCAL_RUNBOOK.md, jit_deform_datachunk.md, llvmjit_expr.md, page-wise-scan.md) reflect the old codebase; they are banner-marked `STALE` and should not be trusted for current-shape work.
+- **Active scope:** Q1 only (M-Q1-PERF). Q2–Q22 out of scope.
+- **bgworker model:** DSM keys `0xD8…0001/0008/0009/000A`, magic `0x56505043`. No `shm_mq` / `TupleQueueReader`. Workers DSA-attach, reconstruct descriptor, drain `DsmTaskQueue`, write `DataChunk` into DSA TDC; leader P0 does FINALIZE then `EmitGlobalTdcToDest` → `DestReceiver`.
+- **`EventId` convention:** `pid*3 + {0,1,2}`. Workers atomic-decrement `EventShmState.tasks_remaining` and `SetLatch` on the leader; only the leader calls `FinishEvent`.
+- **`LEADER_WORKER_INDEX = -1`.** GUC `pg_volvec.parallel_max_workers=4`; `morsel_nblocks=8`.
+- **Sort scope:** `MaxThreads=1`, in-memory single-run.
+- **Authoritative reference architecture:** `contrib/pg_volvec/pg_duckdb_architecture.md` (untracked, 109 lines). Deviations recorded in `docs/ARCHITECTURE_DEVIATIONS.md`.
+- **Pre-greenfield docs** under `docs/` (DESIGN.md, ROADMAP.md, LOCAL_RUNBOOK.md, jit_deform_datachunk.md, llvmjit_expr.md, page-wise-scan.md) are banner-marked `STALE`.
+- **Test data:** 10G TPC-H lives at `~/data/pg_tpch` (socket `/tmp`, port 5432, db `tpch`/`postgres`).
+- **Profiling:** `/usr/bin/sample` on macOS; FlameGraph at `~/proj/postgres/FlameGraph/`.

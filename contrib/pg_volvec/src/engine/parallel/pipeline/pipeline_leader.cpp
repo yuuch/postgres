@@ -85,6 +85,16 @@ SignalShutdownAndWait(const LeaderCleanupState &cleanup)
 		}
 	}
 
+	/* Invariant: DSA stays mapped after this returns. The success path drains
+	 * the global TDC via OutputSink::EmitGlobalTdcToDest after worker join,
+	 * which dereferences DSA-resident schema/layout/payload. Destruction is
+	 * the caller's responsibility (see ShutdownAndDestroy below). */
+}
+
+static void
+ShutdownAndDestroy(const LeaderCleanupState &cleanup)
+{
+	SignalShutdownAndWait(cleanup);
 	if (cleanup.state != nullptr)
 		DestroyRuntimeDsm(cleanup.state);
 }
@@ -112,7 +122,7 @@ FailEarly(const char **failure_reason,
 		state->parallel_plan = nullptr;
 		state->parallel_scheduler = nullptr;
 	}
-	SignalShutdownAndWait(cleanup);
+	ShutdownAndDestroy(cleanup);
 	DestroyLeaderMemoryContext(old_mcxt, leader_mcxt);
 	return false;
 }
@@ -136,16 +146,27 @@ RaiseWorkerFailure(PipelineSharedControl *control,
 			   const PgVector<BackgroundWorkerHandle *> &handles,
 			   PgVolVecQueryState *state)
 {
-	char errmsg_buf[PIPELINE_WORKER_ERROR_MSG_LEN];
+	/*
+	 * Snapshot the worker error message into stack memory before throwing.
+	 * After ereport(ERROR), the surrounding PG_CATCH (in PgvolvecPipelineRun)
+	 * will run SignalShutdownAndWait → DestroyRuntimeDsm, which detaches the
+	 * DSM segment that backs `control->worker_error_msg`. We must NOT do
+	 * cleanup here ourselves: doing so would leave the PG_CATCH path with
+	 * a stale `cleanup.control` pointing into an unmapped DSM segment and
+	 * SIGSEGV on the second `pg_atomic_write_u32(&control->shutdown_requested,...)`.
+	 *
+	 * Sole responsibility for cleanup belongs to PG_CATCH. We only ereport.
+	 *
+	 * Unused parameters (handles, state) are retained for caller-site
+	 * symmetry and to make the cleanup-ownership contract obvious at the
+	 * call site (line ~608).
+	 */
+	(void) handles;
+	(void) state;
 
+	char errmsg_buf[PIPELINE_WORKER_ERROR_MSG_LEN];
 	std::memcpy(errmsg_buf, control->worker_error_msg, sizeof(errmsg_buf));
 	errmsg_buf[sizeof(errmsg_buf) - 1] = '\0';
-
-	LeaderCleanupState cleanup{};
-	cleanup.control = control;
-	cleanup.handles = const_cast<PgVector<BackgroundWorkerHandle *> *>(&handles);
-	cleanup.state = state;
-	SignalShutdownAndWait(cleanup);
 
 	ereport(ERROR,
 			(errcode(ERRCODE_INTERNAL_ERROR),
@@ -592,14 +613,25 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			if (rc & WL_POSTMASTER_DEATH)
 			{
 				cleanup.control = control;
-				SignalShutdownAndWait(cleanup);
+				ShutdownAndDestroy(cleanup);
 				DestroyLeaderMemoryContext(old_mcxt, leader_mcxt);
 				proc_exit(1);
 			}
 		}
 
-		for (BackgroundWorkerHandle *handle : handles)
-			WaitForBackgroundWorkerShutdown(handle);
+		/*
+		 * Successful completion path: all events FINISHED. Workers are still
+		 * blocked in their main-loop WaitLatch (TryPopForWorker returned empty
+		 * + nobody SetLatch'd them since the queue is permanently drained).
+		 * We must signal shutdown and wake them, otherwise
+		 * WaitForBackgroundWorkerShutdown below blocks forever.
+		 *
+		 * SignalShutdownAndWait does exactly this: writes shutdown_requested=1,
+		 * wakes every started worker latch, then waits for BGWH_STOPPED on each
+		 * handle. Mirrors the error/PG_CATCH paths (lines 606, 630) which
+		 * already use it.
+		 */
+		SignalShutdownAndWait(cleanup);
 
 		if (leader_rt.final_output != nullptr)
 			leader_rt.final_output->EmitGlobalTdcToDest(leader_rt.exec_ctx);
@@ -616,7 +648,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 	{
 		state->parallel_plan = nullptr;
 		state->parallel_scheduler = nullptr;
-		SignalShutdownAndWait(cleanup);
+		ShutdownAndDestroy(cleanup);
 		DestroyLeaderMemoryContext(old_mcxt, leader_mcxt);
 		PG_RE_THROW();
 	}

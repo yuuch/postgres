@@ -1,177 +1,94 @@
 # pg_volvec
 
 `pg_volvec` is a PostgreSQL extension prototype that keeps PostgreSQL planning
-unchanged and offloads supported OLAP plan subtrees into a vectorized
-executor.
+unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
 
-## What It Is
+> **⚠️ Phase notice — M-FRAME-MIN step 3g.2-final (runtime plumbed end-to-end, two open bugs).**
+> The previous broad TPC-H prototype (Q1–Q22, HashJoin, MergeJoin,
+> SubqueryScan, the legacy serial vector executor under `src/engine/exec/`,
+> and the legacy morsel parallel runtime) was **intentionally deleted** in
+> commits `53ac06adcb7` (step 1) and `fd9a8aaf326` (step 2) and replaced
+> by a DuckDB-style `PhysicalOperator` + `MetaPipeline` runtime. As of HEAD
+> `6c344eb036d` plus this cycle's uncommitted work, the new runtime is
+> plumbed end-to-end: **SeqScan → HashAgg → Order → OutputSink** runs in
+> leader+workers, cross-process descriptor publish/load works, and the
+> leader drains the global TDC after FINALIZE. Two open bugs still cause
+> Q1 to emit 0 rows to `psql` (Bug G: HashAgg dedupe; Bug I: OutputSink →
+> `DestReceiver` emission), so the bridge currently still falls through to
+> `standard_ExecutorRun` for correct results. The current narrowed scope
+> is **Q1 only** (target: `M-Q1-PERF`); Q6 will be restored in a later
+> milestone (`M-Q6-RESTORE`). Anything in `docs/` dated `2026-04-17`
+> describes the pre-greenfield codebase and should not be trusted; see
+> `docs/ARCHITECTURE_DEVIATIONS.md` for the diff vs the reference
+> architecture in `pg_duckdb_architecture.md`.
+
+## What It Is (target architecture)
 
 - PostgreSQL still owns parsing, rewriting, planning, snapshots, and result
   delivery.
-- `pg_volvec` hooks `ExecutorStart` / `ExecutorRun` / `ExecutorEnd` and
-  replaces supported plan regions with a `DataChunk`-oriented columnar engine.
-- Scan hot paths use tuple deform JIT to decode heap tuples directly into
-  typed column arrays.
-- Expression evaluation lowers to a linear IR and, when supported, compiles to
-  fused LLVM row loops so intermediate vectors do not have to be materialized.
-- TPC-H-style `NUMERIC(15,2)` values run as scaled `int64` in the hot path,
-  with widened accumulation for aggregation.
-- Wider exact numeric expressions use a correctness-first `Wide128` path.
-  That path is intentionally interpreter-only today.
-- Process-parallel execution is lowered into a pipeline DAG plus
-  morsel-driven runtime, while PostgreSQL's own planner remains the source of
-  truth for the physical plan shape.
-
-In short: PostgreSQL planner on top, `pg_volvec` vector executor underneath,
-with JIT on both tuple deform and expression evaluation.
+- `pg_volvec` hooks `ExecutorStart` / `ExecutorRun` / `ExecutorFinish` /
+  `ExecutorEnd` and, for supported plan subtrees, replaces execution with a
+  `DataChunk`-oriented columnar engine.
+- Plans are translated into a `pg_volvec::pipeline::PhysicalOperator` IR
+  (DuckDB-faithful unified `Source/Operator/Sink` base, see
+  `src/engine/parallel/pipeline/physical_operator.hpp`).
+- The `PhysicalOperator` tree is sliced into `MetaPipeline` chains at
+  blocking operators (`HashAggregate`, `Order`); each chain is dispatched as
+  Tasks over a DSM `TaskQueue` to PostgreSQL parallel bgworkers.
+- Scan hot paths use **tuple deform JIT** (`llvmjit_deform_datachunk.cpp`) to
+  decode heap tuples directly into typed column arrays.
+- Expression evaluation lowers to a linear IR (`expr.cpp`) and, when
+  supported, compiles to fused LLVM row loops (`llvmjit_expr.cpp`).
+- TPC-H-style `NUMERIC(15,2)` runs as scaled `int64` in the hot path with
+  widened accumulation for aggregation. `Wide128` exact numerics stay on the
+  interpreter path (no JIT, by design, for correctness).
 
 ## Current Status
 
-Status refreshed: `2026-04-17`
+Status refreshed: `2026-04-30` (HEAD `6c344eb036d` + uncommitted M-FRAME-MIN step-3g.2-final runtime work; ~36 modified TUs, +4537/-1523, plus 5 new source pairs `aggregate_hash_table`, `tuple_data_collection`, `tuple_data_layout`, `tuple_data_ops`, `physical_projection`)
 
-Fully verified offloaded TPC-H queries:
+### What runs through `pg_volvec` today
 
-- Q1
-- Q3
-- Q4
-- Q5
-- Q6
-- Q7
-- Q8
-- Q9
-- Q10
-- Q11
-- Q12
-- Q13
-- Q14
-- Q15
-- Q16
-- Q18
-- Q19
-- Q20
-- Q22
+**End-to-end plumbing works; client emit blocked.** For Q1, `Translator::Translate`
+now produces a real `PhysicalOperator` tree, the bundle slices into 3
+`MetaPipeline` chains (`P0=[Order→Output]`, `P1=[HashAgg→Order]`,
+`P2=[SeqScan→HashAgg]`), workers attach DSA, drain `DsmTaskQueue`, write
+`DataChunk` into the global TDC, and the leader runs FINALIZE → drains the
+TDC into the `DestReceiver`. **However**, two open bugs (Bug G — HashAgg
+dedupe wrong; Bug I — `OutputSink → DestReceiver` emit 0) still cause `psql`
+to see 0 rows, so the bridge currently falls back to `standard_ExecutorRun`
+for correct results. See `AGENTS.md` for the full bug ledger.
 
-Offloaded with narrower validation:
+### Active milestone: `M-FRAME-MIN`
 
-- Q2
-- Q17
-- Q21
+Sequential rebuild on top of the greenfield deletion:
 
-Current executor surface:
+| Step | Status | Commit |
+|------|--------|--------|
+| Step 1: aggressive teardown of legacy executor + parallel runtime | ✅ done | `53ac06adcb7` |
+| Step 2: extract `Translator` + close namespace leak | ✅ done | `fd9a8aaf326` |
+| Step 3: `MetaPipeline` runtime (Event DAG, `Task`, DSM `TaskQueue`, `TaskScheduler`) | 🚧 plumbed end-to-end; closing Bug G + Bug I | `6c344eb036d` (last) |
+| Step 4: Q1 shape-matcher inside `Translator::TranslatePlan` | ✅ done (Q1 plumbed) | uncommitted |
 
-- `SeqScan`
-- `Filter`
-- grouped / ungrouped `Agg`
-- in-memory final `Sort`
-- constant-count `Limit`
-- `HashJoin`
-- current hash-backed right/left outer join subset
-- `SubqueryScan`
-- `MergeJoin`-planned shapes through a hash-backed fallback
-- current Q22-style right-anti-planned shapes through a hash-backed fallback
+### Subsequent milestones
 
-Important current boundaries:
+- **`M-Q1-PERF`** — drive Q1 to extreme single-shape performance through the
+  new pipeline runtime; perf tracked in `perf/q1_p3x_progression.md`.
+- **`M-Q6-RESTORE`** — re-introduce the Q6 plan shape. Q6 is currently parked
+  at "fallback to standard PG executor with WARNING" (verified correct).
 
-- `Wide128` exact numeric expression programs do not use expression JIT yet.
-- int-like comparison opcodes and numeric division currently stay on the
-  interpreter path for correctness.
-- `VecSortState` is still a first-cut in-memory single-run sort.
-- Process-parallel execution is live on the validated query family, but nested
-  hash-build dependency chains may still fall back to a leader-built shared
-  hash bridge. Q11 is the important example.
-- Q21 is no longer the default next executor target. The dominant local pain
-  point there looks more like PostgreSQL planner quality than a missing
-  executor primitive.
+### Out of scope (intentionally deleted, do not reintroduce)
 
-## Benchmark Artifacts
+HashJoin, MergeJoin, SubqueryScan, the legacy `src/engine/exec/` vector
+operators (`Vec{SeqScan,Filter,Agg,Project,Sort,Limit}State`), the legacy
+parallel runtime (`parallel_runtime.cpp`, `runtime_*.{cpp,hpp,inc}`,
+`ParallelPipelineRole/Desc/Driver/Sink`, `TaskKind`, all `PIPELINE_DSM_KEY_*`
+of the previous era), `LoweredPipeline`, `WorkerPipelineExecutor`,
+`ParallelAggPartialState`, `partial_agg_op.{hpp,cpp}`, `agg_sink.{hpp,cpp}`,
+`seq_scan_source.{hpp,cpp}`, `pipeline_lowering.{hpp,cpp}`, `q1_translator.*`.
 
-### Fair Three-Way Baseline
-
-Checked-in artifact:
-
-- [benchmarks/tpch_perf_snapshot.svg](benchmarks/tpch_perf_snapshot.svg)
-- [benchmarks/tpch_perf_snapshot.tsv](benchmarks/tpch_perf_snapshot.tsv)
-
-This sweep is the current broad three-way comparison across PostgreSQL,
-`pg_duckdb`, and `pg_volvec`.
-
-- Run date: `2026-04-09`
-- Method: median of 3 runs
-- PostgreSQL parallel query: disabled for all three engines
-- Timeout bucket: `180s`
-
-Quick read:
-
-- Across the direct `OK vs OK vs OK` comparisons, `pg_volvec` is fastest more
-  often than either native PostgreSQL or `pg_duckdb`.
-- `pg_volvec` is especially strong on Q1 / Q5 / Q6 / Q7 / Q8 / Q11 / Q12 /
-  Q14 / Q18 / Q19 / Q22 in this fair no-PG-parallel setting.
-- Q2 remains incomplete for `pg_volvec` in this sweep.
-
-![TPC-H timing comparison](benchmarks/tpch_perf_snapshot.svg)
-
-### PG Parallel vs pg_volvec Parallel
-
-Checked-in artifact:
-
-- [benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.svg](benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.svg)
-- [benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.tsv](benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.tsv)
-
-This sweep compares native PostgreSQL with `14` parallel workers against
-`pg_volvec`'s own process-parallel runtime with `14` workers.
-
-- Run date: `2026-04-14`
-- Method: median of 3 runs
-- This is not the same fairness criterion as the three-way baseline above
-- It is useful for identifying where `pg_volvec`'s current parallel runtime is
-  already competitive and where worker setup / hash-build strategy still
-  loses to PostgreSQL's native parallel executor
-
-Notable outcomes in this checkpoint:
-
-- `pg_volvec` clearly wins on Q1 / Q5 / Q9 / Q16 / Q17 / Q20 / Q21.
-- Native PostgreSQL still wins on Q3 / Q4 / Q6 / Q7 / Q8 / Q10 / Q11 / Q12 /
-  Q13 / Q14 / Q15 / Q18 / Q22.
-- Q4 and Q12 are the clearest reminders that current process-worker lowering
-  is functionally broad but not yet performance-closed.
-
-### Latest PostgreSQL Parallel Baseline
-
-Checked-in artifact:
-
-- [benchmarks/tpch_supported_twice_20260421_154310.tsv](benchmarks/tpch_supported_twice_20260421_154310.tsv)
-
-This is the latest checked-in native PostgreSQL parallel baseline snapshot in
-the `bench_supported_twice` format.
-
-- Run date: `2026-04-21`
-- Engine: native PostgreSQL parallel
-- Source artifact mode: `pg_parallel`
-- Measurement column: `best_ms`
-- Note: this artifact captures the PostgreSQL side only; `q20` hit statement
-  timeout in this run
-
-| Query | Best ms | Status |
-|---|---:|---|
-| Q1 | 4110 | ok |
-| Q3 | 3062 | ok |
-| Q4 | 3069 | ok |
-| Q5 | 2044 | ok |
-| Q6 | 2057 | ok |
-| Q7 | 2044 | ok |
-| Q8 | 4077 | ok |
-| Q9 | 8095 | ok |
-| Q10 | 3049 | ok |
-| Q11 | 1040 | ok |
-| Q12 | 2039 | ok |
-| Q13 | 12097 | ok |
-| Q14 | 2034 | ok |
-| Q15 | 4056 | ok |
-| Q16 | 1026 | ok |
-| Q18 | 57860 | ok |
-| Q19 | 3050 | ok |
-| Q20 | 360402 | error (statement timeout) |
-| Q22 | 1035 | ok |
+Q2 / Q3 / Q4 / Q5 / Q7 / Q8 / Q9 / Q10 / Q11 / Q12 / Q13 / Q14 / Q15 / Q16 /
+Q17 / Q18 / Q19 / Q20 / Q21 / Q22 are all out of scope for the current phase.
 
 ## Build And Install
 
@@ -194,45 +111,117 @@ CCACHE_DISABLE=1 PATH=/opt/homebrew/bin:$PATH meson install -C build --only-chan
 ./installed/bin/pg_ctl -D ~/data/pg_tpch restart -m fast -l ~/data/pg_tpch/logfile
 ```
 
-After every `meson install`, restart PostgreSQL before testing. Do not assume
-the backend will pick up a freshly installed `pg_volvec` binary without a
-restart.
+After every `meson install`, **always** restart PostgreSQL before testing.
+The backend will not pick up a freshly installed `pg_volvec.so` on its own.
+
+## Test
+
+```bash
+# Regress (smoke + q1 + q6 only) — invoked via the suite name
+meson test -C build --suite pg_volvec
+# NOTE: `meson test -C build pg_volvec` (bare test name) currently does NOT
+# match. expected/*.out is stale vs HEAD (it pre-dates the WARNING fall-through
+# and the harness's echo-mode change); test failures are intentional until
+# M-Q1-PERF.
+
+# Manual on the 10G TPC-H instance
+./installed/bin/psql -h /tmp -p 5432 -d tpch -f contrib/pg_volvec/sql/q1.sql
+./installed/bin/psql -h /tmp -p 5432 -d tpch -f contrib/pg_volvec/sql/q6.sql
+```
+
+Expected results today:
+
+- Q1 on the small fixture: 2 rows (`A/F`, `B/O`).
+- Q6 on 10G TPC-H: `1230113636.0101`.
+
+Both are produced by **standard PG execution** (not `pg_volvec`) until
+Bug G (HashAgg dedupe) and Bug I (`OutputSink → DestReceiver` emit) are
+closed. The runtime itself is wired and exercised — see `AGENTS.md`.
 
 ## Project Layout
 
-- `src/bridge/`: PostgreSQL hook integration, query-state registry, and
-  tuple/materialization handoff
-- `src/engine/core/`: low-level shared primitives such as `DataChunk`,
-  allocators, and serialized hash metadata
-- `src/engine/expr/` plus `src/engine/expr.cpp`: expression IR surface plus
-  lowering/interpreter
-- `src/engine/exec/`: vector operator and plan-state layer (`SeqScan`, `Agg`,
-  `HashJoin`, `Sort`, `Filter`, `Limit`, and helpers), built as separate
-  translation units
-- `src/engine/parallel/` plus `src/engine/parallel_runtime.cpp`: pipeline
-  lowering and process-parallel scheduler/runtime
-- `src/engine/llvmjit_expr.cpp`: expression JIT
-- `src/engine/llvmjit_deform_datachunk.cpp`: tuple deform JIT
-- `src/engine/executor.cpp`: reference file kept in-tree, but no longer built
-  by Meson
+```
+contrib/pg_volvec/
+  src/bridge/                        # PG hook integration, GUCs, query-state HTAB
+    pg_volvec.c                      # _PG_init, GUC table, hook chaining
+    state.{c,h}                      # PgVolVecQueryState HTAB + admission filter
+    execute.{cpp,h}                  # Translator dispatch + pipeline run
+    AGENTS.md
+  src/engine/core/                   # DataChunk, types, memory, DSA bridge,
+                                     #   robin-hood adapter (foundation layer)
+    AGENTS.md
+  src/engine/expr/                   # Expression IR header (expr.hpp)
+  src/engine/                        # expr.cpp (lowering+interpreter), JIT pair,
+                                     #   volvec_engine.hpp
+  src/engine/parallel/               # Container only; no source files
+    AGENTS.md
+  src/engine/parallel/pipeline/      # PhysicalOperator IR + (in-flight) MetaPipeline
+                                     #   runtime — the only runtime
+    AGENTS.md
+  sql/, expected/                    # Regress: smoke + q1 + q6 only
+  docs/                              # Mostly pre-greenfield; see banners
+  third_party/                       # Vendored robin-hood-hashing
+  perf/                              # Q1 perf progression notes
+```
+
+## Built sources (per `meson.build`)
+
+22 active translation units:
+
+- C bridge: `src/bridge/pg_volvec.c`, `src/bridge/state.c`
+- C++ bridge: `src/bridge/execute.cpp`
+- Expression: `src/engine/expr.cpp`
+- Pipeline IR + MetaPipeline runtime (15):
+  `src/engine/parallel/pipeline/{translator,physical_seq_scan,
+  physical_hash_aggregate,physical_order,physical_projection,
+  output_sink,pipeline_leader,pipeline_worker_main,
+  physical_operator,meta_pipeline,pipeline_descriptor,
+  event,pipeline_run_event,pipeline_combine_event,
+  pipeline_finalize_event,task,dsm_task_queue,task_scheduler,
+  aggregate_hash_table,tuple_data_collection,tuple_data_layout,
+  tuple_data_ops}.cpp`
+- Core DSA: `src/engine/core/parallel_dsa_bridge.cpp`
+- LLVM JIT pair (when `llvm.found()`):
+  `src/engine/llvmjit_deform_datachunk.cpp`,
+  `src/engine/llvmjit_expr.cpp`
+
+`src/engine/llvmjit_deform_datachunk.h` (note `.h`, not `.hpp`) is a stale
+duplicate decl of `pg_volvec_try_compile_jit_expr` from `expr/expr.hpp`;
+slated for cleanup at JIT-wiring time.
 
 ## Docs
 
-- [docs/LOCAL_RUNBOOK.md](docs/LOCAL_RUNBOOK.md): local build, install,
-  startup, smoke, benchmark, and profiling workflow
-- [docs/DESIGN.md](docs/DESIGN.md): current executor architecture
-- [docs/module_split.md](docs/module_split.md): module split record
-- [docs/morsel_parallel_design.md](docs/morsel_parallel_design.md): parallel
-  runtime model and current boundaries
-- [docs/parallel_plan_normalization.md](docs/parallel_plan_normalization.md):
-  how accepted PostgreSQL parallel plans are normalized into `pg_volvec`
-- [docs/llvmjit_expr.md](docs/llvmjit_expr.md): expression JIT notes
-- [docs/jit_deform_datachunk.md](docs/jit_deform_datachunk.md): deform JIT
-  notes
-- [docs/vecSortDesign.md](docs/vecSortDesign.md): current sort design
-- [docs/page-wise-scan.md](docs/page-wise-scan.md): scan/read-stream notes
-- [docs/ROADMAP.md](docs/ROADMAP.md): medium-term direction
-- [docs/TODO.md](docs/TODO.md): immediate actionable work
+Authoritative (refreshed for HEAD):
+
+- [AGENTS.md](AGENTS.md) — top-level knowledge base (refreshed `2026-04-30`, HEAD `6c344eb036d` + uncommitted runtime)
+- [src/bridge/AGENTS.md](src/bridge/AGENTS.md) — hook layer, GUCs,
+  admission, dispatch
+- [src/engine/parallel/pipeline/AGENTS.md](src/engine/parallel/pipeline/AGENTS.md)
+  — PhysicalOperator IR + Translator + MetaPipeline runtime (Bug A–H ledger)
+- [src/engine/parallel/AGENTS.md](src/engine/parallel/AGENTS.md) — pipeline
+  container conventions
+- [src/engine/core/AGENTS.md](src/engine/core/AGENTS.md) — `DataChunk`,
+  types, memory, DSA bridge
+- [docs/ARCHITECTURE_DEVIATIONS.md](docs/ARCHITECTURE_DEVIATIONS.md) — diff
+  between current implementation and the reference architecture in
+  `pg_duckdb_architecture.md` (D1–D16 + open Bug G/I)
+- [docs/PIPELINE_PORT_PLAN.md](docs/PIPELINE_PORT_PLAN.md) — M-FRAME-MIN
+  port plan (mirror of `.sisyphus/plans/pipeline-port-plan.md`)
+- [docs/GLOBAL_LOCAL_STATE_DESIGN.md](docs/GLOBAL_LOCAL_STATE_DESIGN.md) —
+  Global/Local state design (mirror of
+  `.sisyphus/plans/global-local-state-design.md`)
+
+Pre-greenfield (kept for reference, banner-marked `STALE`):
+
+- [docs/DESIGN.md](docs/DESIGN.md)
+- [docs/ROADMAP.md](docs/ROADMAP.md)
+- [docs/LOCAL_RUNBOOK.md](docs/LOCAL_RUNBOOK.md)
+- [docs/jit_deform_datachunk.md](docs/jit_deform_datachunk.md)
+- [docs/llvmjit_expr.md](docs/llvmjit_expr.md)
+- [docs/page-wise-scan.md](docs/page-wise-scan.md)
+
+Plans live in `.sisyphus/plans/{pipeline-port-plan,global-local-state-design}.md`
+(source of truth); `docs/` mirrors are kept in sync at milestone boundaries.
 
 ## License
 

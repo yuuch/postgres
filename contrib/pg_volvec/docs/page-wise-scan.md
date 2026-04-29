@@ -1,5 +1,7 @@
 # Page-wise Scan in pg_volvec
 
+> ⚠️ **STALE — Pre-greenfield (2026-04-17).** This describes the deleted `src/engine/exec/` serial executor path. The current scan path will live on `PhysicalSeqScan` once M-FRAME-MIN step 4 lands. See `contrib/pg_volvec/AGENTS.md` and `docs/PIPELINE_PORT_PLAN.md`.
+
 Status: current production path refreshed on `2026-04-17`
 
 ## 1. Why this exists

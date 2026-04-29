@@ -29,15 +29,66 @@
 
 extern "C" {
 #include "postgres.h"
+#include "executor/execdesc.h"
 }
 
 #include "core/memory.hpp"
+#include "parallel/pipeline/dsm_task_queue.hpp"
+#include "parallel/pipeline/operator.hpp"
+#include "parallel/pipeline/pipeline_dsm_lookup.hpp"
+#include "parallel/pipeline/sink.hpp"
+#include "parallel/pipeline/source.hpp"
+#include "parallel/pipeline/types.hpp"
 
 namespace pg_volvec {
 namespace pipeline {
 
-class Event;
+class OutputSink;
 struct Pipeline;
+struct PipelineSharedControl;
+struct EventShmState;
+
+struct ProcessPipelineExecState {
+	std::unique_ptr<GlobalSourceState> global_source;
+	std::unique_ptr<GlobalSinkState> global_sink;
+	PgVector<std::unique_ptr<GlobalOperatorState>> global_ops;
+	std::unique_ptr<LocalSourceState> local_source;
+	std::unique_ptr<LocalSinkState> local_sink;
+	PgVector<std::unique_ptr<OperatorState>> local_ops;
+	bool run_initialized = false;
+	bool combine_done = false;
+	bool leader_partial_pending = false;
+};
+
+struct WorkerTaskRuntime {
+	ExecCtx exec_ctx;
+	PipelineSharedControl *control;
+	EventShmState *event_shm;
+	PipelineDsmLookup<Pipeline> *pipelines;
+	PgVector<std::unique_ptr<ProcessPipelineExecState>> per_pipeline;
+	QueryDesc *leader_qd = nullptr;
+	OutputSink *final_output = nullptr;
+
+	ProcessPipelineExecState &GetOrCreatePipelineState(PipelineId pipeline_id)
+	{
+		Assert(pipeline_id != INVALID_PIPELINE_ID);
+		const size_t idx = static_cast<size_t>(pipeline_id);
+		if (per_pipeline.size() <= idx)
+			per_pipeline.resize(idx + 1);
+		if (!per_pipeline[idx])
+			per_pipeline[idx] = std::make_unique<ProcessPipelineExecState>();
+		return *per_pipeline[idx];
+	}
+
+	ProcessPipelineExecState &GetPipelineState(PipelineId pipeline_id)
+	{
+		Assert(pipeline_id != INVALID_PIPELINE_ID);
+		const size_t idx = static_cast<size_t>(pipeline_id);
+		Assert(idx < per_pipeline.size());
+		Assert(per_pipeline[idx] != nullptr);
+		return *per_pipeline[idx];
+	}
+};
 
 enum class TaskExecutionResult : uint8_t {
 	TASK_FINISHED,
@@ -47,7 +98,8 @@ enum class TaskExecutionResult : uint8_t {
 
 class Task : public PgMemoryContextObject {
 public:
-	Task(std::shared_ptr<Event> event, Pipeline *pipeline);
+	Task(EventId event_id, TaskKind kind, Pipeline *pipeline,
+	     WorkerTaskRuntime *runtime, int32_t worker_index);
 	virtual ~Task() = default;
 
 	Task(const Task &)            = delete;
@@ -55,43 +107,40 @@ public:
 
 	virtual TaskExecutionResult Execute() = 0;
 
-	const std::shared_ptr<Event> &event()    const { return event_; }
-	Pipeline                     *pipeline() const { return pipeline_; }
+	EventId event_id() const { return event_id_; }
+	TaskKind kind() const { return kind_; }
+	Pipeline *pipeline() const { return pipeline_; }
+	WorkerTaskRuntime *runtime() const { return runtime_; }
+	int32_t worker_index() const { return worker_index_; }
 
 protected:
-	std::shared_ptr<Event>  event_;
-	Pipeline               *pipeline_;
+	EventId event_id_;
+	TaskKind kind_;
+	Pipeline *pipeline_;
+	WorkerTaskRuntime *runtime_;
+	int32_t worker_index_;
 };
 
 class PipelineRunTask final : public Task {
 public:
-	PipelineRunTask(std::shared_ptr<Event> event, Pipeline *pipeline,
-	                int32_t worker_index);
+	PipelineRunTask(EventId event_id, Pipeline *pipeline,
+	                WorkerTaskRuntime *runtime, int32_t worker_index);
 
 	TaskExecutionResult Execute() override;
-
-	int32_t worker_index() const { return worker_index_; }
-
-private:
-	int32_t worker_index_;
 };
 
 class PipelineCombineTask final : public Task {
 public:
-	PipelineCombineTask(std::shared_ptr<Event> event, Pipeline *pipeline,
-	                    int32_t worker_index);
+	PipelineCombineTask(EventId event_id, Pipeline *pipeline,
+	                    WorkerTaskRuntime *runtime, int32_t worker_index);
 
 	TaskExecutionResult Execute() override;
-
-	int32_t worker_index() const { return worker_index_; }
-
-private:
-	int32_t worker_index_;
 };
 
 class PipelineFinalizeTask final : public Task {
 public:
-	PipelineFinalizeTask(std::shared_ptr<Event> event, Pipeline *pipeline);
+	PipelineFinalizeTask(EventId event_id, Pipeline *pipeline,
+	                     WorkerTaskRuntime *runtime, int32_t worker_index);
 
 	TaskExecutionResult Execute() override;
 };

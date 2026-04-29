@@ -3,7 +3,8 @@ CREATE EXTENSION IF NOT EXISTS pg_volvec;
 SET pg_volvec.enabled = on;
 SET pg_volvec.trace_hooks = off;
 
-CREATE TABLE lineitem_q1 (
+DROP TABLE IF EXISTS lineitem_q1;
+CREATE TABLE IF NOT EXISTS lineitem_q1 (
     l_returnflag char(1),
     l_linestatus char(1),
     l_quantity numeric(15,2),
@@ -40,4 +41,4 @@ ORDER BY
     l_returnflag,
     l_linestatus;
 
-DROP TABLE lineitem_q1;
+DROP TABLE IF EXISTS lineitem_q1;

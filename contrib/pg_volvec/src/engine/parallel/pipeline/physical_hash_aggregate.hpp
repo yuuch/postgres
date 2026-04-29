@@ -1,33 +1,106 @@
 #pragma once
 
-/*
- * pipeline/physical_hash_aggregate.hpp
- *
- * PhysicalHashAggregate (M-IR-MIN). Dual Sink+Source pipeline-breaker. Uses
- * cross-worker radix-partitioned hash table (per user decision §15 + handoff).
- *
- * NOT WIRED INTO RUNTIME YET. Real radix table + spill semantics land in
- * M-BM-MIN. M-IR-MIN only locks the API shape so M-FRAME-MIN can wire it.
- *
- * Spec: PIPELINE_PORT_PLAN.md §15.4.
- */
+extern "C" {
+#include "postgres.h"
+#include "utils/dsa.h"
+}
 
+#include "parallel/pipeline/aggregate_hash_table.hpp"
+#include "parallel/pipeline/operator.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
+#include "parallel/pipeline/pipeline_descriptor.hpp"
+#include "parallel/pipeline/sink.hpp"
+#include "parallel/pipeline/source.hpp"
+#include "parallel/pipeline/tuple_data_collection.hpp"
+#include "parallel/pipeline/tuple_data_layout.hpp"
 
 namespace pg_volvec {
-
-class VecAggState;
-
 namespace pipeline {
+
+struct OpDescriptor;
+
+class HashAggGlobalSinkState final : public GlobalSinkState {
+public:
+	/*
+	 * Single-instance HashAggregate contract: one operator is both sink and
+	 * source, with a COMBINE event between Finalize and GetData. The shared
+	 * payload therefore carries one global AHT/TDC published in DSA.
+	 */
+	dsa_area            *dsa = nullptr;
+	OpDescriptor        *desc = nullptr;
+	dsa_pointer          layout_dp = InvalidDsaPointer;
+	const TupleDataLayout *layout = nullptr;
+	dsa_pointer          shared_payload_dp = InvalidDsaPointer;
+	AggregateHashTable  *global_aht = nullptr;
+	TupleDataCollection *global_tdc = nullptr;
+	uint32_t             max_groups = 256;
+	bool                 finalized = false;
+};
+
+class HashAggGlobalSourceState final : public GlobalSourceState {
+public:
+	const TupleDataLayout *layout = nullptr;
+	AggregateHashTable   *global_aht = nullptr;
+	TupleDataCollection  *global_tdc = nullptr;
+	uint32_t              source_cursor = 0;
+	bool                  finalized = false;
+};
+
+class HashAggLocalSinkState final : public LocalSinkState {
+public:
+	/*
+	 * Per-worker local sink state is DSA-backed so the leader can read and merge
+	 * worker partials during the COMBINE event.
+	 */
+	dsa_pointer          local_aht_dp = InvalidDsaPointer;
+	dsa_pointer          local_tdc_dp = InvalidDsaPointer;
+	AggregateHashTable  *local_aht = nullptr;
+	TupleDataCollection *local_tdc = nullptr;
+	const TupleDataLayout *layout = nullptr;
+	uint32_t             max_groups = 256;
+
+	void *unsafe_borrow_partial(int worker_index) override
+	{
+		(void) worker_index;
+		return local_aht;
+	}
+};
+
+class HashAggLocalSourceState final : public LocalSourceState {
+public:
+	bool initialized = false;
+};
+
+class HashAggOperatorState final : public OperatorState {
+public:
+	bool initialized = false;
+};
 
 class PhysicalHashAggregate final : public PhysicalOperator {
 public:
-	explicit PhysicalHashAggregate(VecAggState *agg)
-		: PhysicalOperator(PhysicalOperatorType::HASH_AGGREGATE), agg_(agg) {}
+	/*
+	 * Step 6 contract delta: HashAggregate no longer splits PARTIAL/FINAL into
+	 * two operator instances. One PhysicalHashAggregate owns the sink, COMBINE,
+	 * Finalize, and source phases, so descriptor reconstruction only needs the
+	 * serialized layout + aggregate metadata + shared payload pointer.
+	 */
+	PhysicalHashAggregate(dsa_pointer layout_dp,
+	                      PgVector<uint16_t> group_keys,
+	                      PgVector<AggFuncDesc> agg_funcs,
+	                      dsa_pointer shared_payload_dp,
+	                      OpDescriptor *desc = nullptr)
+		: PhysicalOperator(PhysicalOperatorType::HASH_AGGREGATE)
+		, layout_dp_(layout_dp)
+		, group_keys_(std::move(group_keys))
+		, agg_funcs_(std::move(agg_funcs))
+		, shared_payload_dp_(shared_payload_dp)
+		, desc_(desc)
+	{}
 
 	bool IsSource() const override { return true; }
 	bool IsSink() const override { return true; }
 	bool IsPipelineBreaker() const override { return true; }
+	int  MaxThreads(ExecCtx &ctx) const override;
 
 	std::unique_ptr<GlobalSinkState>   GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState>    GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
@@ -39,8 +112,50 @@ public:
 	std::unique_ptr<LocalSourceState>  GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate) override;
 	SourceResultType                   GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &input) override;
 
+	std::unique_ptr<OperatorState>     GetOperatorState(ExecCtx &ctx) override;
+	OperatorResultType                 Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state) override;
+
+	dsa_pointer                        layout_dp() const { return layout_dp_; }
+	const PgVector<uint16_t>          &group_keys() const { return group_keys_; }
+	const PgVector<AggFuncDesc>       &agg_funcs() const { return agg_funcs_; }
+	dsa_pointer                        shared_payload_dp() const { return shared_payload_dp_; }
+	OpDescriptor                      *desc() const { return desc_; }
+	const PgVector<OpDescriptor *>    &descs() const { return desc_list_; }
+
+	/*
+	 * Fix A2 (cross-pipeline shared instance): a single PhysicalHashAggregate
+	 * C++ instance is referenced by BOTH the producer pipeline (as sink) and
+	 * the consumer pipeline (as source) — Translator builds one tree, and
+	 * MetaPipeline's slicing reuses the same operator pointer in two Pipeline
+	 * objects (see pipeline_descriptor.cpp LeaderSerializePipelines source/
+	 * mid/sink switch arms calling AttachDescriptor on this same `this`).
+	 *
+	 * LeaderSerializePipelines allocates an INDEPENDENT DSA OpDescriptor
+	 * array per pipeline, so each AttachDescriptor call here corresponds to
+	 * a DIFFERENT DSA slot. We therefore record EVERY attached slot in
+	 * desc_list_ (push_back, never overwrite), and StoreSharedPayloadOnDescriptor
+	 * iterates desc_list_ to publish the shared payload pointer into ALL
+	 * slots — so workers reading from EITHER pipeline's slot see the same
+	 * leader-allocated AHT/TDC. desc_ retains the last-attached slot for
+	 * single-attach Resolve helpers (worker side attaches once → list size 1).
+	 *
+	 * Without per-slot fan-out, the leader writes to the LAST attach (P2.sink
+	 * slot) but workers running P1.source read from the P1 slot → mismatch →
+	 * ERROR "hash aggregate source payload not initialized".
+	 */
+	void AttachDescriptor(OpDescriptor *desc)
+	{
+		desc_ = desc;
+		desc_list_.push_back(desc);
+	}
+
 private:
-	VecAggState *agg_;
+	dsa_pointer              layout_dp_;
+	PgVector<uint16_t>       group_keys_;
+	PgVector<AggFuncDesc>    agg_funcs_;
+	dsa_pointer              shared_payload_dp_;
+	OpDescriptor            *desc_;
+	PgVector<OpDescriptor *> desc_list_;
 };
 
 }  /* namespace pipeline */

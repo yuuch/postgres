@@ -1,5 +1,7 @@
 # LLVM JIT Expression Evaluation in pg_volvec
 
+> ⚠️ **STALE — Pre-greenfield (2026-04-17).** The JIT itself (`llvmjit_expr.cpp`) survives and is still built, but it is **not currently wired** into any operator after the greenfield demolition. It will rewire into the future `PhysicalFilter::Init()` at JIT-wiring time. See `contrib/pg_volvec/AGENTS.md`.
+
 Status: implemented and in active use, refreshed on `2026-04-17`
 
 ## 1. What problem this solves

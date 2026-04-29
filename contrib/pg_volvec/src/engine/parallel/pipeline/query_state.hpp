@@ -16,7 +16,10 @@
 
 extern "C" {
 #include "postgres.h"
+#include "utils/dsa.h"
 #include "utils/memutils.h"
+
+struct dsm_segment;
 }
 
 namespace pg_volvec {
@@ -25,6 +28,9 @@ struct PgVolVecQueryState {
 	MemoryContext context;
 	void *parallel_plan;       /* owned by pipeline runtime (PhysicalOperator tree) */
 	void *parallel_scheduler;  /* owned by pipeline runtime (TaskScheduler) */
+
+	struct dsm_segment *runtime_dsm;
+	dsa_area *runtime_dsa;
 };
 
 }  /* namespace pg_volvec */

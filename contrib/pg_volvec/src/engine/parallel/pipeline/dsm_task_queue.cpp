@@ -35,6 +35,8 @@ DsmTaskQueue::InitInPlace(void *buffer, uint32_t capacity)
 	DsmTaskQueue *q = reinterpret_cast<DsmTaskQueue *>(buffer);
 	q->capacity_ = capacity;
 	q->mask_     = capacity - 1;
+	q->worker_latches_     = nullptr;
+	q->num_worker_latches_ = 0;
 	pg_atomic_init_u64(&q->enqueue_pos_, 0);
 	pg_atomic_init_u64(&q->dequeue_pos_, 0);
 
@@ -55,6 +57,21 @@ DsmTaskQueue::AttachInPlace(void *buffer)
 	Assert(PG_VOLVEC_IS_POW2(q->capacity_));
 	Assert(q->mask_ == q->capacity_ - 1);
 	return q;
+}
+
+void
+DsmTaskQueue::RegisterWorkerLatches(Latch **latches, uint32 count)
+{
+	worker_latches_     = latches;
+	num_worker_latches_ = count;
+}
+
+void
+DsmTaskQueue::WakeRegisteredLatches()
+{
+	for (uint32 i = 0; i < num_worker_latches_; ++i)
+		if (worker_latches_[i] != nullptr)
+			SetLatch(worker_latches_[i]);
 }
 
 bool
@@ -84,6 +101,7 @@ DsmTaskQueue::TryPush(const TaskDescriptor &desc)
 				 * sequence == pos + 1.
 				 */
 				pg_atomic_write_u32(&cell->sequence, (uint32_t) (pos + 1));
+				WakeRegisteredLatches();
 				return true;
 			}
 			/* CAS failure; pos has been refreshed by pg_atomic API. */
@@ -131,6 +149,51 @@ DsmTaskQueue::TryPop(TaskDescriptor *out)
 		else if (diff < 0)
 		{
 			return false;            /* Queue empty at this slot. */
+		}
+		else
+		{
+			pos = pg_atomic_read_u64(&dequeue_pos_);
+		}
+	}
+}
+
+bool
+DsmTaskQueue::TryPopForWorker(int32_t worker_index, TaskDescriptor *out)
+{
+	Assert(out != nullptr);
+
+	DsmTaskQueueCell *cells = Cells();
+	uint64_t          pos   = pg_atomic_read_u64(&dequeue_pos_);
+
+	for (;;)
+	{
+		DsmTaskQueueCell *cell = &cells[pos & mask_];
+		uint32_t          seq  = pg_atomic_read_u32(&cell->sequence);
+		int64_t           diff = (int64_t) seq - (int64_t) (uint32_t) (pos + 1);
+
+		if (diff == 0)
+		{
+			/*
+			 * Worker-affine COMBINE tasks may sit at the dequeue head until the
+			 * matching worker claims them. That head-of-line blocking is
+			 * acceptable for the current Q1 contract because producer ordering
+			 * enqueues COMBINE-N only after all RUN-N tasks complete, and Q1 has
+			 * only one pipeline emitting COMBINE at a time.
+			 */
+			if (cell->desc.worker_index != worker_index)
+				return false;
+
+			if (pg_atomic_compare_exchange_u64(&dequeue_pos_, &pos, pos + 1))
+			{
+				*out = cell->desc;
+				pg_atomic_write_u32(&cell->sequence,
+				                    (uint32_t) (pos + capacity_));
+				return true;
+			}
+		}
+		else if (diff < 0)
+		{
+			return false;
 		}
 		else
 		{

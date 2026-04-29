@@ -1,0 +1,155 @@
+#pragma once
+
+/*
+ * pipeline/tuple_data_ops.hpp
+ *
+ * 3g.2-final — stateless row<->chunk codec + hash/match/agg-update primitives
+ * over TupleDataLayout-described row buffers. No DSA awareness, no allocation,
+ * no PhysicalOperator coupling: every function takes a layout + raw row bytes
+ * + a PipelineChunk. Reusable by HashAggregate sink (TDC + AHT), Sort sink
+ * (TDC), and the Output sink's gather-then-materialize path.
+ *
+ * Modeled on duckdb::TupleDataCollection::{Scatter,Gather} +
+ * GroupedAggregateHashTable::{HashGroup,MatchGroup,Update,Combine}, collapsed
+ * for v1 (fixed-width-only, NOT NULL only, no validity bitmap, no heap).
+ *
+ * Chunk layout convention (set by translator + SeqScan, see
+ * .sisyphus/plans/3g2-tuple-data-collection-design.md §6):
+ *
+ *   Input chunk for HashAggregate sink =
+ *     [ group_col_0, ..., group_col_{N-1}, agg_input_0, ..., agg_input_{M-1} ]
+ *
+ *   - layout->columns[i] (i = 0..N-1) sources from chunk col `i`.
+ *   - layout->aggregates[j] (j = 0..M-1) sources its update value from
+ *     chunk col `aggregates[j].src_col_idx` (typically N+j, but the
+ *     translator may share one input col across multiple aggs, e.g. Q1
+ *     uses extendedprice for two SUMs).
+ *
+ * All functions are header-stable across operators. v1 dispatch is on
+ * TdcColumnKind / TdcAggKind (no fn-ptrs, DSA-portable).
+ *
+ * Spec: .sisyphus/plans/3g2-tuple-data-collection-design.md §3.2, §4, §10
+ *       step 2.
+ */
+
+#include "parallel/pipeline/tuple_data_layout.hpp"
+#include "parallel/pipeline/types.hpp"
+
+#include <cstdint>
+
+namespace pg_volvec {
+namespace pipeline {
+
+/*
+ * Scatter:
+ *   Write row[row_idx] of `chunk` into the row buffer at `row_ptr`, using
+ *   `layout->columns` only (aggregates are NOT written here — they are
+ *   zero-initialized at row creation time, see TupleDataCollection alloc).
+ *
+ * Preconditions:
+ *   - row_ptr points to layout->row_width zero-filled bytes.
+ *   - chunk.count > row_idx.
+ *   - For each col i in 0..layout->column_count-1: columns[i].src_col_idx
+ *     in chunk is < 16 (DataChunk fixed cap).
+ */
+void Scatter(const TupleDataLayout *layout,
+             uint8_t *row_ptr,
+             const PipelineChunk &chunk,
+             uint16_t row_idx);
+
+/*
+ * Gather:
+ *   Read row at `row_ptr` and write into `chunk` slot `row_idx`. Writes
+ *   ALL group columns + ALL aggregate state columns into the chunk in
+ *   order: chunk col `c` (c = 0..N-1) gets columns[c]; chunk col `N+a`
+ *   (a = 0..M-1) gets aggregates[a].
+ *
+ * Preconditions:
+ *   - chunk has capacity for row_idx.
+ *   - layout->column_count + layout->aggregate_count <= 16.
+ *   - Caller bumps chunk.count itself (Gather does NOT touch count).
+ */
+void Gather(const TupleDataLayout *layout,
+            const uint8_t *row_ptr,
+            PipelineChunk &chunk,
+            uint16_t row_idx);
+
+/*
+ * HashGroup:
+ *   FNV-1a hash over the group columns (layout->columns[0..column_count-1])
+ *   of chunk[row_idx]. Aggregate state columns are NOT hashed.
+ *
+ *   FNV-1a 64-bit, offset basis 0xcbf29ce484222325, prime 0x100000001b3.
+ *   Each column contributes its in-row width bytes (4 for INT32, 8 for
+ *   INT64/DOUBLE) in little-endian order — matches the in-row encoding
+ *   so MatchGroup byte-compare can use memcmp on the same range.
+ */
+uint64_t HashGroup(const TupleDataLayout *layout,
+                   const PipelineChunk &chunk,
+                   uint16_t row_idx);
+
+/*
+ * MatchGroup:
+ *   Returns true iff the group columns of chunk[row_idx] equal the
+ *   group columns at row_ptr. Aggregate state columns are NOT compared.
+ *   Uses memcmp on the column byte ranges — equivalent to per-kind
+ *   compare since v1 layouts are fixed-width and host endianness
+ *   matches on Scatter.
+ */
+bool MatchGroup(const TupleDataLayout *layout,
+                const uint8_t *row_ptr,
+                const PipelineChunk &chunk,
+                uint16_t row_idx);
+
+/*
+ * MatchGroupRow:
+ *   Row-vs-row variant of MatchGroup. Returns true iff the group columns
+ *   in row_a equal the group columns in row_b. Aggregate state columns
+ *   are NOT compared. Per-column typed compare on col.width bytes (same
+ *   semantics as MatchGroup, just both sides are row buffers). Used by
+ *   AggregateHashTable probe to compare a candidate just-Scattered row
+ *   against an existing canonical row.
+ */
+bool MatchGroupRow(const TupleDataLayout *layout,
+                   const uint8_t *row_a,
+                   const uint8_t *row_b);
+
+/*
+ * UpdateAggregates:
+ *   For each aggregate a in layout->aggregates[0..aggregate_count-1]:
+ *     - SUM_INT64    : *(int64*)&row[a.offset] += chunk[a.src_col_idx][row_idx]
+ *                      (input read as int64; NUMERIC carried as scaled int64
+ *                      with caller-managed scale).
+ *     - COUNT_STAR   : *(int64*)&row[a.offset] += 1.
+ *
+ * Aggregate state is plain int64 in v1 (no Wide128 in DSA — out of scope
+ * per design §3.1). Overflow is undefined for v1 (Q1 fits comfortably);
+ * Wide128 widening lands at Q3+.
+ *
+ * Preconditions: chunk.count > row_idx; src_col_idx < 16.
+ */
+void UpdateAggregates(const TupleDataLayout *layout,
+                      uint8_t *row_ptr,
+                      const PipelineChunk &chunk,
+                      uint16_t row_idx);
+
+/*
+ * CombineAggregates:
+ *   For each aggregate a:
+ *     - SUM_INT64 / COUNT_STAR : *(int64*)&dst_row[a.offset] +=
+ *                                *(int64*)&src_row[a.offset].
+ *
+ * Used by HashAgg.Combine when merging per-thread local AHTs into the
+ * global AHT. v1 single-mutex AHT means SinkChunk merges directly and
+ * Combine is a no-op at the operator level — but this primitive lives
+ * here for Q3+ when per-thread local AHTs land.
+ *
+ * Group columns at dst_row are assumed already equal to src_row (caller
+ * verified via MatchGroup against src's group payload).
+ */
+void CombineAggregates(const TupleDataLayout *layout,
+                       uint8_t *dst_row,
+                       const uint8_t *src_row);
+
+}  /* namespace pipeline */
+}  /* namespace pg_volvec */

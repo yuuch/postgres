@@ -1,5 +1,7 @@
 # pg_volvec Local Runbook
 
+> ⚠️ **STALE — Pre-greenfield (2026-04-17).** Most claims here are invalid post M-FRAME-MIN (`fd9a8aaf326`). For the current build/run/test commands see `contrib/pg_volvec/README.md` and `contrib/pg_volvec/AGENTS.md`.
+
 Last refreshed: `2026-04-17`
 
 This is the local development runbook for the `contrib/pg_volvec` prototype in

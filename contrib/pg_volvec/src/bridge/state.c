@@ -6,17 +6,22 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
+#include "utils/dsa.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
+struct dsm_segment;
+
 extern bool pg_volvec_trace_hooks;
 
-/* Definition of PgVolVecQueryState for C code */
+/* Layout MUST match query_state.hpp PgVolVecQueryState (C++ mirror). */
 struct PgVolVecQueryState
 {
 	MemoryContext context;
 	void *parallel_plan;
 	void *parallel_scheduler;
+	struct dsm_segment *runtime_dsm;
+	dsa_area *runtime_dsa;
 };
 
 typedef struct StateEntry

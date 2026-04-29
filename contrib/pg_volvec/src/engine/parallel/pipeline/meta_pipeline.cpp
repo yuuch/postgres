@@ -39,7 +39,15 @@ MetaPipeline::CreateChildPipeline(Pipeline &parent, PhysicalOperator &sink)
 {
 	Pipeline &child = CreatePipeline();
 	child.source = &sink;
-	child.depends_on.push_back(parent.id);
+	/*
+	 * Dependency direction: the parent pipeline (consumer) reads from `sink`
+	 * which is produced by the child pipeline. Therefore the parent's RUN
+	 * event must wait for the child's FINALIZE. depends_on encodes "this
+	 * pipeline waits for X", so we push child.id onto parent.depends_on
+	 * (NOT the reverse). Previously this was inverted, causing consumer
+	 * RUN tasks to be scheduled before producer sinks initialized payload.
+	 */
+	parent.depends_on.push_back(child.id);
 	return child;
 }
 
@@ -52,7 +60,8 @@ MetaPipeline::AddOperator(Pipeline &p, PhysicalOperator &op)
 void
 MetaPipeline::SetSource(Pipeline &p, PhysicalOperator &source)
 {
-	p.source = &source;
+	if (p.source == nullptr)
+		p.source = &source;
 }
 
 void

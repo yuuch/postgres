@@ -38,6 +38,7 @@ extern "C" {
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline_leader.hpp"
 #include "parallel/pipeline/query_state.hpp"
+#include "parallel/pipeline/runtime_dsm.hpp"
 #include "parallel/pipeline/translator.hpp"
 
 extern "C" {
@@ -74,34 +75,20 @@ pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *s
 	state_ptr->parallel_plan = nullptr;
 	state_ptr->parallel_scheduler = nullptr;
 
-	/*
-	 * B2.3 Layer A boundary: the C++ Translator may transitively call PG C
-	 * code that ereport(ERROR)s. PG_TRY/PG_CATCH translates that longjmp
-	 * into a clean WARNING + fallback so destructors of any half-built
-	 * PhysicalOperator subtree run via state->context teardown later.
-	 */
-	std::unique_ptr<pg_volvec::pipeline::PhysicalOperator> root;
-	volatile bool caught_error = false;
+	{
+		const char *dsm_err = nullptr;
+		if (!pg_volvec::pipeline::CreateRuntimeDsm(state_ptr, &dsm_err))
+		{
+			MemoryContextSwitchTo(old_context);
+			elog(WARNING,
+				 "pg_volvec: %s; falling back to standard PostgreSQL executor",
+				 dsm_err != nullptr ? dsm_err : "runtime DSM/DSA allocation failed");
+			return false;
+		}
+	}
 
-	PG_TRY();
-	{
-		root = pg_volvec::pipeline::Translator::Translate(queryDesc->plannedstmt);
-	}
-	PG_CATCH();
-	{
-		caught_error = true;
-		FlushErrorState();
-		root.reset();
-	}
-	PG_END_TRY();
-
-	if (caught_error)
-	{
-		MemoryContextSwitchTo(old_context);
-		elog(WARNING,
-			 "pg_volvec: translator raised error, falling back to standard PostgreSQL executor");
-		return false;
-	}
+	std::unique_ptr<pg_volvec::pipeline::PhysicalOperator> root =
+		pg_volvec::pipeline::Translator::Translate(queryDesc, state_ptr);
 
 	if (root != nullptr)
 	{
@@ -114,6 +101,7 @@ pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *s
 
 	if (state_ptr->parallel_plan == nullptr)
 	{
+		pg_volvec::pipeline::DestroyRuntimeDsm(state_ptr);
 		elog(WARNING,
 			 "pg_volvec: unsupported plan shape, falling back to standard PostgreSQL executor");
 		return false;
@@ -149,6 +137,8 @@ pg_volvec_delete_plan(pg_volvec::PgVolVecQueryState *state_ptr)
 		}
 		PG_END_TRY();
 	}
+
+	pg_volvec::pipeline::DestroyRuntimeDsm(state_ptr);
 }
 
 bool
@@ -164,27 +154,7 @@ pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *sta
 		return false;
 
 	const char *failure_reason = nullptr;
-	volatile bool ok = false;
-	volatile bool caught_error = false;
-
-	PG_TRY();
-	{
-		ok = pg_volvec::pipeline::PgvolvecPipelineRun(queryDesc, state_ptr, &failure_reason);
-	}
-	PG_CATCH();
-	{
-		caught_error = true;
-		FlushErrorState();
-		ok = false;
-	}
-	PG_END_TRY();
-
-	if (caught_error)
-	{
-		elog(WARNING,
-			 "pg_volvec: pipeline run raised error, falling back to standard PostgreSQL executor");
-		return false;
-	}
+	bool ok = pg_volvec::pipeline::PgvolvecPipelineRun(queryDesc, state_ptr, &failure_reason);
 
 	if (!ok)
 	{

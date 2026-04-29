@@ -1,5 +1,7 @@
 # LLVM JIT Deform to DataChunk in pg_volvec
 
+> ⚠️ **STALE — Pre-greenfield (2026-04-17).** The JIT itself (`llvmjit_deform_datachunk.cpp`) survives and is still built, but it is **not currently wired** into any operator after the greenfield demolition. It will rewire into `PhysicalSeqScan::Init()` at JIT-wiring time. See `contrib/pg_volvec/AGENTS.md`.
+
 Status: implemented and in active use, refreshed on `2026-04-17`
 
 ## 1. Goal

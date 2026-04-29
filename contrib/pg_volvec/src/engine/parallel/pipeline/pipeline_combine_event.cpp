@@ -1,5 +1,8 @@
 #include "parallel/pipeline/pipeline_combine_event.hpp"
 
+#include "parallel/pipeline/dsm_task_queue.hpp"
+#include "parallel/pipeline/task_scheduler.hpp"
+
 namespace pg_volvec {
 namespace pipeline {
 
@@ -10,8 +13,14 @@ PipelineCombineEvent::PipelineCombineEvent(PipelineId pid, Pipeline *pipeline,
 void
 PipelineCombineEvent::Schedule()
 {
-	/* Sink::Combine fan-out lands in step 3g; stub keeps lifecycle wired. */
-	FinishEvent();
+	Assert(pipeline_ != nullptr);
+	scheduler_->EnqueueTasks(*this);
+}
+
+TaskKind
+PipelineCombineEvent::kind() const
+{
+	return TaskKind::COMBINE;
 }
 
 }  /* namespace pipeline */
