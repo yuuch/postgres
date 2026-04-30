@@ -18,6 +18,7 @@ extern "C" {
 
 extern "C" {
 extern int pg_volvec_parallel_max_workers;
+extern int pg_volvec_runtime_dsa_tranche_id(void);
 }
 
 namespace pg_volvec {
@@ -26,7 +27,6 @@ namespace pipeline {
 static constexpr uint32_t kRuntimeTaskQueueCapacity = 64;
 static constexpr size_t   kRuntimeDsaSizeBytes      = 256u * 1024u * 1024u;
 static constexpr int      kRuntimeTocNumKeys        = 4;
-static constexpr const char *kRuntimeDsaTrancheName = "pg_volvec_runtime_dsa";
 
 bool
 CreateRuntimeDsm(PgVolVecQueryState *state, const char **error_out)
@@ -82,7 +82,7 @@ CreateRuntimeDsm(PgVolVecQueryState *state, const char **error_out)
 	shm_toc_insert(toc, PIPELINE_DSM_KEY_WORKER_READY, ready_mem);
 
 	void *dsa_place = shm_toc_allocate(toc, kRuntimeDsaSizeBytes);
-	int tranche_id = LWLockNewTrancheId(kRuntimeDsaTrancheName);
+	int tranche_id = pg_volvec_runtime_dsa_tranche_id();
 	dsa_area *area = dsa_create_in_place(dsa_place,
 										 kRuntimeDsaSizeBytes,
 										 tranche_id,

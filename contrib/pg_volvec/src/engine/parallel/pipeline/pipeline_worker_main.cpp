@@ -43,26 +43,16 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 {
 	static uint32 wait_event_extension = 0;
 
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: enter, main_arg=0x%lx\n",
-	        (int) getpid(), (unsigned long) main_arg); fflush(stderr);
-
 	BackgroundWorkerUnblockSignals();
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: signals unblocked\n", (int) getpid()); fflush(stderr);
-
 	dsm_handle handle = DatumGetUInt32(main_arg);
 	dsm_segment *seg = dsm_attach(handle);
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: dsm_attach(0x%08x) -> %p\n",
-	        (int) getpid(), handle, (void *) seg); fflush(stderr);
 	if (seg == nullptr)
 		ereport(ERROR,
 		        (errmsg("pg_volvec worker could not attach DSM segment 0x%08x",
 		                handle)));
 	dsm_pin_mapping(seg);
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: dsm_pin_mapping ok\n", (int) getpid()); fflush(stderr);
 
 	shm_toc *toc = shm_toc_attach(PIPELINE_DSM_MAGIC, dsm_segment_address(seg));
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: shm_toc_attach -> %p\n",
-	        (int) getpid(), (void *) toc); fflush(stderr);
 	if (toc == nullptr)
 		ereport(ERROR,
 		        (errmsg("pg_volvec worker shm_toc_attach failed (bad magic in DSM 0x%08x)",
@@ -72,31 +62,22 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 		shm_toc_lookup(toc, PIPELINE_DSM_KEY_CONTROL, false));
 	void *dsa_buf = shm_toc_lookup(toc, PIPELINE_DSM_KEY_DSA, false);
 	void *queue_buf = shm_toc_lookup(toc, PIPELINE_DSM_KEY_TASK_QUEUE, false);
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: toc lookups ctl=%p dsa=%p queue=%p\n",
-	        (int) getpid(), (void *) ctl, dsa_buf, queue_buf); fflush(stderr);
 
 	if (ctl->magic != PIPELINE_DSM_MAGIC)
 		ereport(ERROR,
 		        (errmsg("pg_volvec worker attached to DSM with bad magic 0x%08x",
 		                ctl->magic)));
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: magic ok db_oid=%u\n",
-	        (int) getpid(), ctl->db_oid); fflush(stderr);
 
 	BackgroundWorkerInitializeConnectionByOid(ctl->db_oid, InvalidOid, 0);
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: db conn ok\n", (int) getpid()); fflush(stderr);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: snapshot ok\n", (int) getpid()); fflush(stderr);
 
 	dsa_area *dsa = dsa_attach_in_place(dsa_buf, seg);
 	DsmTaskQueue *queue = DsmTaskQueue::AttachInPlace(queue_buf);
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: dsa+queue attached\n", (int) getpid()); fflush(stderr);
 
 	int32_t worker_index = -1;
 	/* TODO(Step 11c): finalize worker_index handoff via bgw_extra layout. */
 	std::memcpy(&worker_index, MyBgworkerEntry->bgw_extra, sizeof(int32_t));
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: worker_index=%d\n",
-	        (int) getpid(), worker_index); fflush(stderr);
 	Assert(worker_index >= 0);
 
 	/*
@@ -114,8 +95,6 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 		if (leader_proc != nullptr)
 			SetLatch(&leader_proc->procLatch);
 	}
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: ready bit published\n",
-	        (int) getpid()); fflush(stderr);
 
 	MemoryContext worker_mcxt = AllocSetContextCreate(TopMemoryContext,
 	                                                 "pg_volvec worker",
@@ -123,7 +102,6 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 	MemoryContextSwitchTo(worker_mcxt);
 	if (wait_event_extension == 0)
 		wait_event_extension = WaitEventExtensionNew("pg_volvec worker");
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: mcxt+wait_event ok\n", (int) getpid()); fflush(stderr);
 
 	WorkerTaskRuntime rt;
 	rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index};
@@ -133,19 +111,12 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 	rt.pipelines = &lookup;
 	rt.leader_qd = nullptr;
 	rt.final_output = nullptr;
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: rt initialized event_shm=%p\n",
-	        (int) getpid(), (void *) rt.event_shm); fflush(stderr);
 
 	PgVector<std::unique_ptr<Pipeline>> owned_pipelines{
 		PgMemoryContextAllocator<std::unique_ptr<Pipeline>>(worker_mcxt)};
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: about to WorkerReconstructPipelines\n",
-	        (int) getpid()); fflush(stderr);
 	WorkerReconstructPipelines(ctl, rt.exec_ctx, owned_pipelines);
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: reconstructed %zu pipelines\n",
-	        (int) getpid(), owned_pipelines.size()); fflush(stderr);
 	for (auto &pipeline : owned_pipelines)
 		lookup.Register(pipeline->id, pipeline.get());
-	fprintf(stderr, "PGVOLVEC_WORKER[pid=%d]: entering main loop\n", (int) getpid()); fflush(stderr);
 
 	for (;;)
 	{

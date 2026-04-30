@@ -107,12 +107,45 @@ DestroyLeaderMemoryContext(MemoryContext old_mcxt, MemoryContext leader_mcxt)
 		MemoryContextDelete(leader_mcxt);
 }
 
+/*
+ * Bug L: stack-local C++ containers in PgvolvecPipelineRun hold storage
+ * palloc'd in leader_mcxt; their destructors call pfree(), which reads the
+ * owning context from the chunk header (mcxt.c:1619). If leader_mcxt has
+ * already been MemoryContextDelete'd, that lookup hits freed memory and
+ * corrupts the parent context's freelist → next AllocSetAlloc SEGVs at
+ * aset.c:1060. The guard ties teardown to scope-exit so it runs AFTER
+ * containers declared later in the same scope are destroyed.
+ *
+ * PG_CATCH path: PG_RE_THROW longjmps over destructors, so PG_CATCH must
+ * call DestroyLeaderMemoryContext explicitly and Disarm() the guard.
+ */
+class LeaderMemoryContextGuard
+{
+public:
+	LeaderMemoryContextGuard(MemoryContext old_mcxt, MemoryContext leader_mcxt)
+		: old_mcxt_(old_mcxt), leader_mcxt_(leader_mcxt) {}
+
+	~LeaderMemoryContextGuard()
+	{
+		if (armed_)
+			DestroyLeaderMemoryContext(old_mcxt_, leader_mcxt_);
+	}
+
+	void Disarm() noexcept { armed_ = false; }
+
+	LeaderMemoryContextGuard(const LeaderMemoryContextGuard &) = delete;
+	LeaderMemoryContextGuard &operator=(const LeaderMemoryContextGuard &) = delete;
+
+private:
+	MemoryContext old_mcxt_;
+	MemoryContext leader_mcxt_;
+	bool armed_ = true;
+};
+
 static bool
 FailEarly(const char **failure_reason,
 		  const char *reason,
 		  const LeaderCleanupState &cleanup,
-		  MemoryContext old_mcxt,
-		  MemoryContext leader_mcxt,
 		  PgVolVecQueryState *state)
 {
 	if (failure_reason != nullptr)
@@ -123,7 +156,6 @@ FailEarly(const char **failure_reason,
 		state->parallel_scheduler = nullptr;
 	}
 	ShutdownAndDestroy(cleanup);
-	DestroyLeaderMemoryContext(old_mcxt, leader_mcxt);
 	return false;
 }
 
@@ -244,6 +276,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 									 ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(leader_mcxt);
 
+	LeaderMemoryContextGuard mcxt_guard{old_mcxt, leader_mcxt};
+
 	LeaderCleanupState cleanup{};
 	cleanup.state = state;
 
@@ -275,21 +309,11 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		root = nullptr;
 		if (bundle == nullptr)
 		{
-			return FailEarly(failure_reason,
-				"pg_volvec: MetaPipeline::Build returned null",
-				cleanup,
-				old_mcxt,
-				leader_mcxt,
-				state);
+			return FailEarly(failure_reason, "pg_volvec: MetaPipeline::Build returned null", cleanup, state);
 		}
 		if (bundle->pipelines.empty())
 		{
-			return FailEarly(failure_reason,
-				"pg_volvec: BuildPipelines produced no pipelines",
-				cleanup,
-				old_mcxt,
-				leader_mcxt,
-				state);
+			return FailEarly(failure_reason, "pg_volvec: BuildPipelines produced no pipelines", cleanup, state);
 		}
 
 		for (size_t i = 0; i < bundle->pipelines.size(); ++i)
@@ -300,12 +324,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			const char *err = nullptr;
 			if (!CreateRuntimeDsm(state, &err))
 			{
-				return FailEarly(failure_reason,
-					err != nullptr ? err : "pg_volvec: runtime DSM creation failed",
-					cleanup,
-					old_mcxt,
-					leader_mcxt,
-					state);
+				return FailEarly(failure_reason, err != nullptr ? err : "pg_volvec: runtime DSM creation failed", cleanup, state);
 			}
 		}
 
@@ -313,12 +332,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 						  dsm_segment_address(state->runtime_dsm));
 		if (toc == nullptr)
 		{
-			return FailEarly(failure_reason,
-				"pg_volvec: failed to attach runtime shm_toc",
-				cleanup,
-				old_mcxt,
-				leader_mcxt,
-				state);
+			return FailEarly(failure_reason, "pg_volvec: failed to attach runtime shm_toc", cleanup, state);
 		}
 
 		control = static_cast<PipelineSharedControl *>(
@@ -349,12 +363,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		const int bgworker_count = pg_volvec_parallel_max_workers;
 		if (bgworker_count <= 0)
 		{
-			return FailEarly(failure_reason,
-				"pg_volvec: pg_volvec.parallel_max_workers must be >= 1",
-				cleanup,
-				old_mcxt,
-				leader_mcxt,
-				state);
+			return FailEarly(failure_reason, "pg_volvec: pg_volvec.parallel_max_workers must be >= 1", cleanup, state);
 		}
 
 		TaskScheduler scheduler(leader_mcxt,
@@ -391,12 +400,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 
 			if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
 			{
-				return FailEarly(failure_reason,
-					"pg_volvec: RegisterDynamicBackgroundWorker failed (worker slots exhausted?)",
-					cleanup,
-					old_mcxt,
-					leader_mcxt,
-					state);
+				return FailEarly(failure_reason, "pg_volvec: RegisterDynamicBackgroundWorker failed (worker slots exhausted?)", cleanup, state);
 			}
 
 			handles.push_back(handle);
@@ -419,12 +423,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 				const char *reason = (status == BGWH_POSTMASTER_DIED)
 					? "pg_volvec: postmaster died while starting pipeline worker"
 					: "pg_volvec: pipeline worker exited before startup completed";
-				return FailEarly(failure_reason,
-					reason,
-					cleanup,
-					old_mcxt,
-					leader_mcxt,
-					state);
+				return FailEarly(failure_reason, reason, cleanup, state);
 			}
 
 			/*
@@ -443,21 +442,11 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 				BgwHandleStatus poll_status = GetBackgroundWorkerPid(handle, &poll_pid);
 				if (poll_status == BGWH_STOPPED)
 				{
-					return FailEarly(failure_reason,
-						"pg_volvec: pipeline worker exited before reporting ready",
-						cleanup,
-						old_mcxt,
-						leader_mcxt,
-						state);
+					return FailEarly(failure_reason, "pg_volvec: pipeline worker exited before reporting ready", cleanup, state);
 				}
 				if (poll_status == BGWH_POSTMASTER_DIED)
 				{
-					return FailEarly(failure_reason,
-						"pg_volvec: postmaster died while waiting for worker ready",
-						cleanup,
-						old_mcxt,
-						leader_mcxt,
-						state);
+					return FailEarly(failure_reason, "pg_volvec: postmaster died while waiting for worker ready", cleanup, state);
 				}
 
 				if (pg_atomic_read_u32(&ready_array[worker_idx]) != 0)
@@ -470,24 +459,14 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 				ResetLatch(MyLatch);
 				if (rc & WL_POSTMASTER_DEATH)
 				{
-					return FailEarly(failure_reason,
-						"pg_volvec: postmaster died while waiting for worker ready",
-						cleanup,
-						old_mcxt,
-						leader_mcxt,
-						state);
+					return FailEarly(failure_reason, "pg_volvec: postmaster died while waiting for worker ready", cleanup, state);
 				}
 			}
 
 			PGPROC *proc = BackendPidGetProc(worker_pid);
 			if (proc == nullptr)
 			{
-				return FailEarly(failure_reason,
-					"pg_volvec: BackendPidGetProc returned null after worker ready",
-					cleanup,
-					old_mcxt,
-					leader_mcxt,
-					state);
+				return FailEarly(failure_reason, "pg_volvec: BackendPidGetProc returned null after worker ready", cleanup, state);
 			}
 
 			registered_latches.push_back(&proc->procLatch);
@@ -614,7 +593,6 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			{
 				cleanup.control = control;
 				ShutdownAndDestroy(cleanup);
-				DestroyLeaderMemoryContext(old_mcxt, leader_mcxt);
 				proc_exit(1);
 			}
 		}
@@ -647,7 +625,6 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 
 		DestroyRuntimeDsm(state);
 		state->parallel_scheduler = nullptr;
-		DestroyLeaderMemoryContext(old_mcxt, leader_mcxt);
 		return true;
 	}
 	PG_CATCH();
@@ -655,7 +632,12 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		state->parallel_plan = nullptr;
 		state->parallel_scheduler = nullptr;
 		ShutdownAndDestroy(cleanup);
-		DestroyLeaderMemoryContext(old_mcxt, leader_mcxt);
+		/*
+		 * Bug L: do NOT DestroyLeaderMemoryContext here. PG_RE_THROW
+		 * longjmps over C++ destructors, so PgVector containers above
+		 * never pfree(). leader_mcxt is a child of the caller's context
+		 * and dies on AbortCurrentTransaction / ExecutorEnd cleanup.
+		 */
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

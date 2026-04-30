@@ -2,6 +2,8 @@
 
 #include "access/parallel.h"
 #include "executor/executor.h"
+#include "storage/dsm_registry.h"
+#include "storage/lwlock.h"
 #include "utils/guc.h"
 #include "nodes/print.h"
 #include "utils/snapmgr.h"
@@ -34,6 +36,8 @@ static void pg_volvec_ExecutorRun(QueryDesc *queryDesc,
 							   uint64 count);
 static void pg_volvec_ExecutorFinish(QueryDesc *queryDesc);
 static void pg_volvec_ExecutorEnd(QueryDesc *queryDesc);
+
+extern int pg_volvec_runtime_dsa_tranche_id(void);
 
 void            _PG_init(void);
 void            _PG_fini(void);
@@ -68,6 +72,35 @@ pg_volvec_plan_node_name(Plan *plan)
 	if (IsA(plan, Hash))
 		return "Hash";
 	return "Other";
+}
+
+/*
+ * Bug M (2026-04-30): runtime DSA tranche id must be allocated ONCE per
+ * cluster, not per query. Per-query LWLockNewTrancheId leaks into the
+ * 256-tranche-per-backend hard cap and kills sessions after ~50 parallel
+ * queries. Using GetNamedDSMSegment guarantees a single allocation across
+ * all backends without requiring shared_preload_libraries semantics —
+ * matches the canonical pattern in src/test/modules/test_dsa.
+ */
+static void
+pg_volvec_init_runtime_dsa_tranche(void *ptr, void *arg)
+{
+	int *tranche_id = (int *) ptr;
+	*tranche_id = LWLockNewTrancheId("pg_volvec_runtime_dsa");
+}
+
+int
+pg_volvec_runtime_dsa_tranche_id(void)
+{
+	bool		found;
+	int		   *tranche_id;
+
+	tranche_id = (int *) GetNamedDSMSegment("pg_volvec_runtime_dsa_tranche_id",
+											sizeof(int),
+											pg_volvec_init_runtime_dsa_tranche,
+											&found,
+											NULL);
+	return *tranche_id;
 }
 
 void
