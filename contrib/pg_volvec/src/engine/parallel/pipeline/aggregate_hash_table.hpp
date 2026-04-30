@@ -144,5 +144,30 @@ bool AggregateHashTableFindOrInsert(AggregateHashTable *aht,
                                     uint64_t hash,
                                     uint32_t *out_existing_row_idx);
 
+/*
+ * Atomic combine: probe AHT for a row matching src_row's group cols; on
+ * miss, append a new canonical row to tdc, copy group cols into it, and
+ * mark it claimed; on hit, locate the existing canonical row. Either way,
+ * merge src_row's aggregate state into the canonical row via
+ * CombineAggregates(layout, ...).
+ *
+ * Bug P: serializes probe + (optional) append + group-col copy + agg merge
+ * under aht->mutex so concurrent COMBINE workers cannot strand a
+ * partially-populated row at the tail of the global TDC. Replaces the
+ * pre-Bug-P pattern in PhysicalHashAggregate::Combine that did
+ * speculative AppendRow → FindOrInsert → RollbackLastAppend (rollback
+ * was racy under wake-on-pop).
+ *
+ * Caller MUST NOT hold aht->mutex. CombineAggregates() is invoked while
+ * the mutex is held; for v1 (single global AHT) this also serializes
+ * canonical-row aggregate updates — necessary to prevent lost-update
+ * races on the same group across workers.
+ */
+void AggregateHashTableCombineRow(AggregateHashTable *aht,
+                                  TupleDataCollection *tdc,
+                                  const TupleDataLayout *layout,
+                                  const uint8_t *src_row,
+                                  uint64_t hash);
+
 }  /* namespace pipeline */
 }  /* namespace pg_volvec */

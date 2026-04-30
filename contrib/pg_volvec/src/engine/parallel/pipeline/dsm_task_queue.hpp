@@ -31,6 +31,7 @@ extern "C" {
 #include "postgres.h"
 #include "port/atomics.h"
 #include "storage/latch.h"
+#include <sys/types.h>            /* pid_t */
 }
 
 namespace pg_volvec {
@@ -97,30 +98,35 @@ public:
 
 	/* Wait-free MPMC. Returns true on success, false if the queue is full
 	 * (caller decides whether to retry / yield / abort). On successful Push
-	 * the queue calls SetLatch on every registered worker latch. */
+	 * the queue wakes every registered worker via PID lookup. */
 	bool TryPush(const TaskDescriptor &desc);
 
 	/* Wait-free MPMC. Returns true on success, false if empty. */
 	bool TryPop(TaskDescriptor *out);
 	bool TryPopForWorker(int32_t worker_index, TaskDescriptor *out);
 
-	/* Register the per-process Latch* table the queue should wake on every
-	 * successful Push. The latch table itself is owned by the scheduler in
-	 * the leader process; the queue stores only a pointer + count. The
-	 * pointer must remain valid for the lifetime of the queue (= per-query
-	 * DSM lifetime). Workers do NOT call this. */
-	void RegisterWorkerLatches(Latch **latches, uint32 count);
-	void WakeRegisteredLatches();
+	/* Register PIDs the queue should wake on every successful Push and on
+	 * every successful affine Pop. PIDs (vs Latch*) are DSM-safe across
+	 * processes: workers resolve them via BackendPidGetProc each wake.
+	 * Caller (leader) must call this after all worker PIDs are known and
+	 * before EnqueueTasks runs. Workers do NOT call this. */
+	void RegisterWorkerPids(const pid_t *pids, uint32 count);
+	void WakeRegisteredWorkers();
 
 	uint32_t Capacity() const { return capacity_; }
 
 private:
 	DsmTaskQueue() = default;
 
+	/* Cap matches max bgworker fan-out we ever schedule for a single
+	 * pipeline; well above pg_volvec.parallel_max_workers default. Inline
+	 * array keeps the registry DSM-resident with no extra allocation. */
+	static constexpr uint32_t kMaxWorkerPids = 64;
+
 	uint32_t         capacity_;
 	uint32_t         mask_;
-	Latch          **worker_latches_;
-	uint32           num_worker_latches_;
+	pid_t            worker_pids_[kMaxWorkerPids];
+	uint32           worker_pid_count_;
 	pg_atomic_uint64 enqueue_pos_;
 	pg_atomic_uint64 dequeue_pos_;
 	/* DsmTaskQueueCell cells_[capacity_] follows immediately after this

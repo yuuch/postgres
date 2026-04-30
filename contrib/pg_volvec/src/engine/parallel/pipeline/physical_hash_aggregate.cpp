@@ -64,16 +64,6 @@ HashGroupRow(const TupleDataLayout *layout, const uint8_t *row_ptr)
 }
 
 static void
-CopyGroupColumns(const TupleDataLayout *layout, uint8_t *dst_row, const uint8_t *src_row)
-{
-	for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
-	{
-		const TdcColumnDesc &col = layout->columns[col_idx];
-		std::memcpy(dst_row + col.offset, src_row + col.offset, col.width);
-	}
-}
-
-static void
 RollbackLastAppend(TupleDataCollection *tdc, uint32_t appended_row_idx)
 {
 	const uint32_t current = pg_atomic_read_u32(&tdc->row_count);
@@ -202,36 +192,23 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	auto &local = static_cast<HashAggLocalSinkState &>(input.local_state);
 	(void) ctx;
 
-	/* Each worker (and the leader if it participated) merges its own
-	 * process-local local_tdc into the DSA-resident global_tdc. local_tdc
-	 * lives in backend-private memory and is unreachable from other
-	 * processes, so a leader-only Combine would silently drop every
-	 * worker's partials. AggregateHashTable::mutex inside
-	 * AggregateHashTableFindOrInsert serializes concurrent global writers. */
+	/* Per-worker (incl. leader if it RAN) merge of process-private local_tdc
+	 * into the DSA-resident global_tdc. Bug F: leader-only Combine drops
+	 * worker partials. Bug P: AggregateHashTableCombineRow holds the AHT
+	 * mutex across probe + (optional) append + group-col copy + agg merge,
+	 * preventing the speculative-append rollback race that wake-on-pop
+	 * (Bug O) exposed — concurrent COMBINE workers must not strand a
+	 * partially-populated row at the global TDC tail. */
 	const uint32_t local_row_count = pg_atomic_read_u32(&local.local_tdc->row_count);
 	for (uint32_t local_row_idx = 0; local_row_idx < local_row_count; ++local_row_idx)
 	{
 		const uint8_t *src_row = TupleDataCollectionGetRowConst(local.local_tdc, local_row_idx);
-		uint8_t *candidate_row = nullptr;
-		const uint32_t candidate_idx = TupleDataCollectionAppendRow(global.global_tdc, &candidate_row);
-		if (candidate_idx == TDC_INVALID_ROW_INDEX)
-			elog(ERROR, "pg_volvec: global hash aggregate row capacity exceeded");
-
-		CopyGroupColumns(global.layout, candidate_row, src_row);
 		const uint64_t hash = HashGroupRow(global.layout, src_row);
-		uint32_t canonical_idx = TDC_INVALID_ROW_INDEX;
-		const bool inserted = AggregateHashTableFindOrInsert(global.global_aht,
+		AggregateHashTableCombineRow(global.global_aht,
 			global.global_tdc,
 			global.layout,
-			candidate_idx,
-			candidate_row,
-			hash,
-			&canonical_idx);
-		if (!inserted)
-			RollbackLastAppend(global.global_tdc, candidate_idx);
-
-		uint8_t *canonical_row = TupleDataCollectionGetRow(global.global_tdc, canonical_idx);
-		CombineAggregates(global.layout, canonical_row, src_row);
+			src_row,
+			hash);
 	}
 
 	return SinkCombineResultType::FINISHED;

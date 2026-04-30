@@ -8,6 +8,11 @@
 
 #include <cstring>
 
+extern "C" {
+#include "storage/proc.h"
+#include "storage/procarray.h"
+}
+
 namespace pg_volvec {
 namespace pipeline {
 
@@ -35,8 +40,9 @@ DsmTaskQueue::InitInPlace(void *buffer, uint32_t capacity)
 	DsmTaskQueue *q = reinterpret_cast<DsmTaskQueue *>(buffer);
 	q->capacity_ = capacity;
 	q->mask_     = capacity - 1;
-	q->worker_latches_     = nullptr;
-	q->num_worker_latches_ = 0;
+	q->worker_pid_count_ = 0;
+	for (uint32_t i = 0; i < DsmTaskQueue::kMaxWorkerPids; i++)
+		q->worker_pids_[i] = 0;
 	pg_atomic_init_u64(&q->enqueue_pos_, 0);
 	pg_atomic_init_u64(&q->dequeue_pos_, 0);
 
@@ -60,18 +66,34 @@ DsmTaskQueue::AttachInPlace(void *buffer)
 }
 
 void
-DsmTaskQueue::RegisterWorkerLatches(Latch **latches, uint32 count)
+DsmTaskQueue::RegisterWorkerPids(const pid_t *pids, uint32 count)
 {
-	worker_latches_     = latches;
-	num_worker_latches_ = count;
+	Assert(count <= kMaxWorkerPids);
+	worker_pid_count_ = count;
+	for (uint32 i = 0; i < count; ++i)
+		worker_pids_[i] = pids[i];
 }
 
 void
-DsmTaskQueue::WakeRegisteredLatches()
+DsmTaskQueue::WakeRegisteredWorkers()
 {
-	for (uint32 i = 0; i < num_worker_latches_; ++i)
-		if (worker_latches_[i] != nullptr)
-			SetLatch(worker_latches_[i]);
+	for (uint32 i = 0; i < worker_pid_count_; ++i)
+	{
+		pid_t pid = worker_pids_[i];
+		if (pid == 0)
+			continue;
+		/*
+		 * BackendPidGetProc resolves the live PGPROC for any backend in the
+		 * cluster (including bgworkers). Cross-process safe by construction:
+		 * the lookup walks ProcArray by PID, so the queue does not have to
+		 * cache a leader-private Latch* (which DSM cannot validly publish).
+		 * Returns NULL if the worker has exited; skip silently in that case
+		 * (the pop loop guarantees forward progress without that wake).
+		 */
+		PGPROC *p = BackendPidGetProc(pid);
+		if (p != NULL)
+			SetLatch(&p->procLatch);
+	}
 }
 
 bool
@@ -101,7 +123,7 @@ DsmTaskQueue::TryPush(const TaskDescriptor &desc)
 				 * sequence == pos + 1.
 				 */
 				pg_atomic_write_u32(&cell->sequence, (uint32_t) (pos + 1));
-				WakeRegisteredLatches();
+				WakeRegisteredWorkers();
 				return true;
 			}
 			/* CAS failure; pos has been refreshed by pg_atomic API. */
@@ -174,11 +196,14 @@ DsmTaskQueue::TryPopForWorker(int32_t worker_index, TaskDescriptor *out)
 		if (diff == 0)
 		{
 			/*
-			 * Worker-affine COMBINE tasks may sit at the dequeue head until the
-			 * matching worker claims them. That head-of-line blocking is
-			 * acceptable for the current Q1 contract because producer ordering
-			 * enqueues COMBINE-N only after all RUN-N tasks complete, and Q1 has
-			 * only one pipeline emitting COMBINE at a time.
+			 * Strict worker affinity for RUN/COMBINE: the COMBINE task at
+			 * worker W consumes ProcessPipelineExecState (local TDC, local
+			 * AHT) that the matching RUN at the same W produced in
+			 * process-private memory. Stealing across workers crashes the
+			 * backend (verified empirically — Bug O attempt #1). HOL is the
+			 * only safe option here; we mitigate the WaitLatch staircase by
+			 * waking all registered workers on every successful pop below
+			 * (see Wake call after the cursor advance).
 			 */
 			if (cell->desc.worker_index != worker_index)
 				return false;
@@ -188,6 +213,17 @@ DsmTaskQueue::TryPopForWorker(int32_t worker_index, TaskDescriptor *out)
 				*out = cell->desc;
 				pg_atomic_write_u32(&cell->sequence,
 				                    (uint32_t) (pos + capacity_));
+				/*
+				 * KEY Bug O fix: advancing the dequeue cursor exposes the
+				 * NEXT cell at the head, which may be affine to a different
+				 * worker that is currently sleeping in WaitLatch. Without
+				 * this wake, that worker only learns about its task when
+				 * its 1000ms timeout fires — producing the 1s/2s/5s tail
+				 * staircase Bug N exposed. The pop side wake is symmetric
+				 * with TryPush's WakeRegisteredWorkers and closes the
+				 * lost-wakeup window.
+				 */
+				WakeRegisteredWorkers();
 				return true;
 			}
 		}

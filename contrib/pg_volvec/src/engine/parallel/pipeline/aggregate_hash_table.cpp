@@ -28,6 +28,8 @@ extern "C" {
 #include "utils/elog.h"
 }
 
+#include <cstring>
+
 #include "tuple_data_ops.hpp"
 
 namespace pg_volvec {
@@ -142,6 +144,83 @@ AggregateHashTableFindOrInsert(AggregateHashTable *aht,
 
 	*out_existing_row_idx = found_idx;
 	return inserted;
+}
+
+void
+AggregateHashTableCombineRow(AggregateHashTable *aht,
+                             TupleDataCollection *tdc,
+                             const TupleDataLayout *layout,
+                             const uint8_t *src_row,
+                             uint64_t hash)
+{
+	Assert(aht != nullptr && tdc != nullptr && layout != nullptr && src_row != nullptr);
+
+	const uint16_t our_salt = static_cast<uint16_t>(hash & 0xFFFFu);
+	const uint32_t mask     = aht->capacity_mask;
+	uint32_t       slot     = static_cast<uint32_t>(hash) & mask;
+
+	uint8_t *canonical_row = nullptr;
+	bool     overflow      = false;
+
+	SpinLockAcquire(&aht->mutex);
+	{
+		for (uint32_t tries = 0; tries < aht->capacity; ++tries)
+		{
+			AggHtEntry &e = aht->entries[slot];
+			if (e.row_index == AHT_INVALID_ROW_INDEX)
+			{
+				/* Miss: allocate a fresh canonical row, copy group cols, claim
+				 * the slot. The new row's aggregate slots are zero from
+				 * dsa_allocate0; CombineAggregates() below merges src into
+				 * that zero state, leaving a fully-initialized canonical row
+				 * before we drop the mutex. No window for a peer worker to
+				 * see a half-built row. */
+				uint8_t *new_row = nullptr;
+				const uint32_t new_idx = TupleDataCollectionAppendRow(tdc, &new_row);
+				if (new_idx == TDC_INVALID_ROW_INDEX)
+				{
+					overflow = true;
+					break;
+				}
+				for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
+				{
+					const TdcColumnDesc &col = layout->columns[col_idx];
+					std::memcpy(new_row + col.offset, src_row + col.offset, col.width);
+				}
+				e.row_index   = new_idx;
+				e.salt        = our_salt;
+				e._pad        = 0;
+				canonical_row = new_row;
+				break;
+			}
+			if (e.salt == our_salt)
+			{
+				const uint8_t *existing_ptr =
+					TupleDataCollectionGetRowConst(tdc, e.row_index);
+				if (MatchGroupRow(layout, src_row, existing_ptr))
+				{
+					canonical_row = TupleDataCollectionGetRow(tdc, e.row_index);
+					break;
+				}
+			}
+			slot = (slot + 1u) & mask;
+		}
+
+		if (canonical_row != nullptr)
+			CombineAggregates(layout, canonical_row, src_row);
+	}
+	SpinLockRelease(&aht->mutex);
+
+	if (overflow)
+		ereport(ERROR,
+		        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		         errmsg("pg_volvec: AggregateHashTableCombineRow TDC full")));
+
+	if (canonical_row == nullptr)
+		ereport(ERROR,
+		        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		         errmsg("pg_volvec: AggregateHashTableCombineRow AHT full (capacity=%u)",
+		                aht->capacity)));
 }
 
 }  /* namespace pipeline */

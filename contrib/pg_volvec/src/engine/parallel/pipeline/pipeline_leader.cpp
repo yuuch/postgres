@@ -293,8 +293,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 	PipelineDsmLookup<Pipeline> leader_lookup(leader_mcxt);
 	PgVector<BackgroundWorkerHandle *> handles{
 		PgMemoryContextAllocator<BackgroundWorkerHandle *>(leader_mcxt)};
-	PgVector<Latch *> registered_latches{
-		PgMemoryContextAllocator<Latch *>(leader_mcxt)};
+	PgVector<pid_t> registered_pids{
+		PgMemoryContextAllocator<pid_t>(leader_mcxt)};
 	PgVector<char> event_scheduled{PgMemoryContextAllocator<char>(leader_mcxt)};
 	PgVector<char> event_finished{PgMemoryContextAllocator<char>(leader_mcxt)};
 
@@ -406,7 +406,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			handles.push_back(handle);
 		}
 
-		registered_latches.reserve(handles.size() + (leader_participate ? 1 : 0));
+		registered_pids.reserve(handles.size() + (leader_participate ? 1 : 0));
 
 		auto *ready_array = static_cast<pg_atomic_uint32 *>(
 			shm_toc_lookup(toc, PIPELINE_DSM_KEY_WORKER_READY, false));
@@ -469,14 +469,14 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 				return FailEarly(failure_reason, "pg_volvec: BackendPidGetProc returned null after worker ready", cleanup, state);
 			}
 
-			registered_latches.push_back(&proc->procLatch);
+			registered_pids.push_back(worker_pid);
 		}
 
 		if (leader_participate)
-			registered_latches.push_back(MyLatch);
+			registered_pids.push_back(MyProcPid);
 
-		queue->RegisterWorkerLatches(registered_latches.data(),
-						 static_cast<uint32>(registered_latches.size()));
+		queue->RegisterWorkerPids(registered_pids.data(),
+						 static_cast<uint32>(registered_pids.size()));
 
 		leader_rt.exec_ctx = ExecCtx{leader_mcxt, dsa, LEADER_WORKER_INDEX};
 		leader_rt.control = control;
