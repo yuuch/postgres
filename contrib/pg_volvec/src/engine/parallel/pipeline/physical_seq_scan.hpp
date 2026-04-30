@@ -42,6 +42,10 @@ public:
 	BlockNumber     current_block = InvalidBlockNumber;
 	BlockNumber     end_block = InvalidBlockNumber;
 	bool            exhausted = false;
+	/* morsel_active: current morsel partially consumed; resume scan_desc
+	 * instead of fetching a new morsel and rescanning (Bug K: tail-drop
+	 * when morsel rows > PIPELINE_DEFAULT_CHUNK_SIZE). */
+	bool            morsel_active = false;
 	bool            diag_first_call_logged = false;
 
 	~SeqScanLocalState()

@@ -13,6 +13,7 @@ extern "C" {
 #include "varatt.h"
 
 extern int pg_volvec_parallel_max_workers;
+extern int pg_volvec_parallel_morsel_nblocks;
 
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
 extern Datum numeric_mul(PG_FUNCTION_ARGS);
@@ -252,13 +253,9 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 			dsa_get_address(ctx.dsa, state->shared_payload_dp));
 		pg_atomic_init_u64(&payload->next_block, 0);
 		payload->total_blocks = total;
-		/*
-		 * Morsel size: small enough for parallel fan-out, large enough to
-		 * amortise atomic-fetch-add cost. PostgreSQL parallel SeqScan uses
-		 * a similar small constant (8 blocks). Tuned for Q1 single-table
-		 * scan; revisit at M-Q1-PERF.
-		 */
-		payload->morsel_nblocks = 8;
+		/* Bug K: morsel size from GUC; source drains across morsels inside
+		 * one GetData call (DuckDB-faithful), so chunk-size is decoupled. */
+		payload->morsel_nblocks = (uint32) Max(1, pg_volvec_parallel_morsel_nblocks);
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
 	}
 
@@ -311,28 +308,36 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 
 	for (;;)
 	{
-		uint64 start = pg_atomic_fetch_add_u64(&global.shared->next_block,
-		                                      global.shared->morsel_nblocks);
-		if (start >= global.shared->total_blocks)
+		if (!local.morsel_active)
 		{
-			local.exhausted = true;
-			return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
-			                      : SourceResultType::FINISHED;
-		}
+			uint64 start = pg_atomic_fetch_add_u64(&global.shared->next_block,
+			                                      global.shared->morsel_nblocks);
+			if (start >= global.shared->total_blocks)
+			{
+				local.exhausted = true;
+				return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
+				                      : SourceResultType::FINISHED;
+			}
 
-		local.current_block = (BlockNumber) start;
-		local.end_block = Min((BlockNumber) (start + global.shared->morsel_nblocks),
-		                     global.shared->total_blocks);
+			local.current_block = (BlockNumber) start;
+			local.end_block = Min((BlockNumber) (start + global.shared->morsel_nblocks),
+			                     global.shared->total_blocks);
 
-		BlockNumber numBlks = local.end_block - local.current_block;
-		if (numBlks == 0)
-		{
-			local.exhausted = true;
-			return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
-			                      : SourceResultType::FINISHED;
+			BlockNumber numBlks = local.end_block - local.current_block;
+			if (numBlks == 0)
+			{
+				local.exhausted = true;
+				return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
+				                      : SourceResultType::FINISHED;
+			}
+			/* Bug K': heap_rescan(set_params=true) calls initscan() which
+			 * unconditionally resets rs_numblocks=InvalidBlockNumber
+			 * (heapam.c:459). heap_setscanlimits MUST run AFTER heap_rescan
+			 * or the per-morsel range is wiped and the scan runs to EOF. */
+			heap_rescan(local.scan_desc, NULL, true, false, false, true);
+			heap_setscanlimits(local.scan_desc, local.current_block, numBlks);
+			local.morsel_active = true;
 		}
-		heap_setscanlimits(local.scan_desc, local.current_block, numBlks);
-		heap_rescan(local.scan_desc, NULL, true, false, false, true);
 
 		while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE &&
 		       heap_getnextslot(local.scan_desc, ForwardScanDirection, local.slot))
@@ -348,11 +353,9 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 			return SourceResultType::HAVE_MORE_OUTPUT;
 
-		if (out.count > 0)
-			return SourceResultType::HAVE_MORE_OUTPUT;
-
-		local.exhausted = true;
-		return SourceResultType::FINISHED;
+		/* Inner loop exited because heap_getnextslot returned false:
+		 * current morsel fully drained. Loop back to fetch the next morsel. */
+		local.morsel_active = false;
 	}
 }
 
