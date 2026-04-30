@@ -5,6 +5,7 @@ extern "C" {
 #include "access/relation.h"
 #include "access/tupdesc.h"
 #include "catalog/pg_type_d.h"
+#include "datatype/timestamp.h"
 #include "executor/execdesc.h"
 #include "fmgr.h"
 #include "nodes/nodes.h"
@@ -14,6 +15,7 @@ extern "C" {
 #include "nodes/pg_list.h"
 #include "parser/parsetree.h"
 #include "storage/lockdefs.h"
+#include "utils/date.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
@@ -951,19 +953,60 @@ ExtractQual(SeqScan *scan, QualDescriptor &out)
 		return false;
 	if (c->constisnull || !c->constbyval)
 		return false;
-	if (c->consttype != DATEOID || v->vartype != DATEOID)
+	if (v->vartype != DATEOID)
 		return false;
 
 	QualOp qop;
 	if (!MapOpnoToQualOp(op->opno, qop))
 		return false;
 
+	/* Bug Q — accept TIMESTAMPOID const against DATEOID column.
+	 * Planner folds `date - interval` to TIMESTAMP (interval may carry sub-day
+	 * units). Runtime EvalTypedCompare only knows DATEOID; normalize here. */
+	DateADT date_const;
+	if (c->consttype == DATEOID)
+	{
+		date_const = DatumGetDateADT(c->constvalue);
+	}
+	else if (c->consttype == TIMESTAMPOID)
+	{
+		Timestamp ts = DatumGetTimestamp(c->constvalue);
+		int64 days = ts / USECS_PER_DAY;
+		int64 rem  = ts % USECS_PER_DAY;
+		if (rem < 0) { days -= 1; rem += USECS_PER_DAY; }
+
+		if (rem != 0)
+		{
+			/* Op-aware floor/ceil preserves date-vs-timestamp semantics; EQ/NE
+			 * on non-zero TOD has no date answer (single-bool runtime). */
+			switch (qop)
+			{
+				case QualOp::LT: qop = QualOp::LE; date_const = (DateADT) days; break;
+				case QualOp::LE:                   date_const = (DateADT) days; break;
+				case QualOp::GT: qop = QualOp::GE; date_const = (DateADT) (days + 1); break;
+				case QualOp::GE:                   date_const = (DateADT) (days + 1); break;
+				case QualOp::EQ:
+				case QualOp::NE:
+				default:
+					return false;
+			}
+		}
+		else
+		{
+			date_const = (DateADT) days;
+		}
+	}
+	else
+	{
+		return false;
+	}
+
 	out.kind = QualKind::COL_OP_CONST;
 	out.op = qop;
 	out.col_attno = (uint16_t) v->varattno;
 	out._pad0 = 0;
-	out.const_typoid = c->consttype;
-	out.const_value = (uint64_t) c->constvalue;
+	out.const_typoid = DATEOID;
+	out.const_value = (uint64_t) DateADTGetDatum(date_const);
 	return true;
 }
 
