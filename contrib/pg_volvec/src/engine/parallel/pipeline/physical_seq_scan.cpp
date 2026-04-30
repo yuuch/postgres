@@ -3,12 +3,14 @@
 extern "C" {
 #include "access/heapam.h"
 #include "access/tableam.h"
+#include "catalog/pg_type_d.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "utils/date.h"
 #include "utils/elog.h"
 #include "utils/numeric.h"
 #include "utils/snapmgr.h"
+#include "varatt.h"
 
 extern int pg_volvec_parallel_max_workers;
 
@@ -165,8 +167,21 @@ AppendProjectedTupleToChunk(PipelineChunk &out,
 		switch (col.decode_kind)
 		{
 			case ColumnDecodeKind::INT32_CHAR:
-				out.int32_columns[slot_idx][row] = isnull ? 0 : (int32_t) DatumGetChar(d);
-				out.nulls[slot_idx][row]         = isnull ? 1 : 0;
+				if (isnull)
+					out.int32_columns[slot_idx][row] = 0;
+				else if (col.type_oid == BPCHAROID)
+				{
+					/* bpchar(1) Datum is varlena*; first payload byte is the char.
+					 * DatumGetChar would read the low byte of the pointer (Bug G). */
+					out.int32_columns[slot_idx][row] =
+						(int32_t)(uint8_t) *(VARDATA_ANY(DatumGetPointer(d)));
+				}
+				else
+				{
+					/* "char" type — true 1-byte by-value. */
+					out.int32_columns[slot_idx][row] = (int32_t) DatumGetChar(d);
+				}
+				out.nulls[slot_idx][row] = isnull ? 1 : 0;
 				break;
 
 			case ColumnDecodeKind::INT32_DATE:
@@ -278,31 +293,19 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 
 	if (!local.diag_first_call_logged)
 	{
-		fprintf(stderr,
-			"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: SeqScan.GetData FIRST_CALL this=%p shared=%p exhausted=%d\n",
-			ctx.worker_index, (int) getpid(), (void *) this,
-			(void *) global.shared, (int) local.exhausted);
 		local.diag_first_call_logged = true;
 	}
 
-	fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP1 before out.reset\n", (int)getpid());
 	out.reset();
-	fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP2 after out.reset\n", (int)getpid());
 
 	if (local.exhausted || global.shared == nullptr)
 		return SourceResultType::FINISHED;
 
 	SchemaDescriptor *out_schema = ResolveSchemaDescriptor(global.dsa, output_schema_dp_);
-	fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP3 out_schema=%p output_schema_dp=%lu\n",
-		(int)getpid(), (void*)out_schema, (unsigned long)output_schema_dp_);
 	if (out_schema == nullptr)
 		elog(ERROR, "pg_volvec: PhysicalSeqScan output_schema_dp not published");
-	fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP4 n_columns=%u\n",
-		(int)getpid(), (unsigned)out_schema->n_columns);
 
 	QualDescriptor *qual = ResolveQualDescriptor(global.dsa, qual_desc_dp_);
-	fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP5 qual=%p qual_desc_dp=%lu\n",
-		(int)getpid(), (void*)qual, (unsigned long)qual_desc_dp_);
 
 	(void) ctx;
 
@@ -310,9 +313,6 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	{
 		uint64 start = pg_atomic_fetch_add_u64(&global.shared->next_block,
 		                                      global.shared->morsel_nblocks);
-		fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP6 fetch_add start=%llu total=%u morsel=%u\n",
-			(int)getpid(), (unsigned long long)start,
-			global.shared->total_blocks, global.shared->morsel_nblocks);
 		if (start >= global.shared->total_blocks)
 		{
 			local.exhausted = true;
@@ -331,12 +331,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
 			                      : SourceResultType::FINISHED;
 		}
-		fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP7 setscanlimits scan_desc=%p cur=%u nblks=%u\n",
-			(int)getpid(), (void*)local.scan_desc, local.current_block, numBlks);
 		heap_setscanlimits(local.scan_desc, local.current_block, numBlks);
-		fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP9 rescan\n", (int)getpid());
 		heap_rescan(local.scan_desc, NULL, true, false, false, true);
-		fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP10 enter row loop\n", (int)getpid());
 
 		while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE &&
 		       heap_getnextslot(local.scan_desc, ForwardScanDirection, local.slot))
@@ -348,8 +344,6 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				continue;
 			AppendProjectedTupleToChunk(out, local.slot, local.scan_tupdesc, out_schema);
 		}
-		fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: SeqScan FP11 exit row loop count=%u\n",
-			(int)getpid(), (unsigned)out.count);
 
 		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 			return SourceResultType::HAVE_MORE_OUTPUT;

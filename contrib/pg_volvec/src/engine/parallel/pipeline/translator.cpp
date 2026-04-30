@@ -1362,6 +1362,7 @@ Translator::TranslatePlan(Plan *plan, QueryDesc *qd, PgVolVecQueryState *state)
 	auto output_op = std::make_unique<OutputSink>(
 		qd->dest,
 		qd->tupDesc,
+		static_cast<int>(qd->operation),
 		output_input_schema_dp,
 		shape.sort_payload_layout_dp,
 		output_payload_dp,

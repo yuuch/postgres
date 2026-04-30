@@ -634,7 +634,13 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		SignalShutdownAndWait(cleanup);
 
 		if (leader_rt.final_output != nullptr)
+		{
+			leader_rt.final_output->RefreshDestFromQueryDesc(
+				queryDesc->dest,
+				queryDesc->tupDesc,
+				static_cast<int>(queryDesc->operation));
 			leader_rt.final_output->EmitGlobalTdcToDest(leader_rt.exec_ctx);
+		}
 
 		if (pg_atomic_read_u32(&control->worker_error) != 0)
 			RaiseWorkerFailure(control, handles, state);

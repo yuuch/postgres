@@ -53,6 +53,7 @@ public:
 	 * for the alloc shape mirrored here. */
 	OutputSink(DestReceiver *dest,
 	           TupleDesc tupdesc,
+	           int operation,
 	           dsa_pointer input_schema_dp,
 	           dsa_pointer layout_dp,
 	           dsa_pointer shared_payload_dp,
@@ -61,6 +62,7 @@ public:
 		: PhysicalOperator(PhysicalOperatorType::OUTPUT)
 		, dest_(dest)
 		, tupdesc_(tupdesc)
+		, operation_(operation)
 		, input_schema_dp_(input_schema_dp)
 		, layout_dp_(layout_dp)
 		, shared_payload_dp_(shared_payload_dp)
@@ -78,6 +80,7 @@ public:
 		: PhysicalOperator(PhysicalOperatorType::OUTPUT)
 		, dest_(nullptr)
 		, tupdesc_(nullptr)
+		, operation_(0)  /* unused on worker (no DestReceiver) */
 		, input_schema_dp_(input_schema_dp)
 		, layout_dp_(layout_dp)
 		, shared_payload_dp_(shared_payload_dp)
@@ -108,9 +111,22 @@ public:
 	 * via input_schema → forwards to dest_. No-op when dest_ is nullptr. */
 	void EmitGlobalTdcToDest(ExecCtx &ctx);
 
+	/* Refresh DestReceiver/TupleDesc/operation captured at translate-time
+	 * (ExecutorStart) with the live values from QueryDesc at ExecutorRun.
+	 * PortalRunSelect assigns queryDesc->dest just before ExecutorRun, so
+	 * the translate-time qd->dest is always DestNone. Caller must invoke
+	 * this on the leader before EmitGlobalTdcToDest. */
+	void RefreshDestFromQueryDesc(DestReceiver *dest, TupleDesc tupdesc, int operation)
+	{
+		dest_ = dest;
+		tupdesc_ = tupdesc;
+		operation_ = operation;
+	}
+
 private:
 	DestReceiver *dest_;
 	TupleDesc     tupdesc_;
+	int           operation_;
 	dsa_pointer   input_schema_dp_;
 	dsa_pointer   layout_dp_;
 	dsa_pointer   shared_payload_dp_;

@@ -32,15 +32,12 @@ extern "C" {
 namespace pg_volvec {
 namespace pipeline {
 
-void
-Scatter(const TupleDataLayout *layout,
-        uint8_t *row_ptr,
-        const PipelineChunk &chunk,
-        uint16_t row_idx)
+static inline void
+ScatterGroupColumns(const TupleDataLayout *layout,
+                    uint8_t *row_ptr,
+                    const PipelineChunk &chunk,
+                    uint16_t row_idx)
 {
-	Assert(layout != nullptr && row_ptr != nullptr);
-	Assert(row_idx < chunk.count);
-
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
@@ -67,6 +64,42 @@ Scatter(const TupleDataLayout *layout,
 				std::memcpy(row_ptr + col.offset, &v, sizeof(v));
 				break;
 			}
+		}
+	}
+}
+
+void
+ScatterGroupOnly(const TupleDataLayout *layout,
+                 uint8_t *row_ptr,
+                 const PipelineChunk &chunk,
+                 uint16_t row_idx)
+{
+	Assert(layout != nullptr && row_ptr != nullptr);
+	Assert(row_idx < chunk.count);
+	ScatterGroupColumns(layout, row_ptr, chunk, row_idx);
+}
+
+void
+Scatter(const TupleDataLayout *layout,
+        uint8_t *row_ptr,
+        const PipelineChunk &chunk,
+        uint16_t row_idx)
+{
+	Assert(layout != nullptr && row_ptr != nullptr);
+	Assert(row_idx < chunk.count);
+
+	ScatterGroupColumns(layout, row_ptr, chunk, row_idx);
+
+	const uint16_t agg_chunk_base = layout->column_count;
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		int64_t v = chunk.int64_columns[agg_chunk_base + a][row_idx];
+		std::memcpy(row_ptr + agg.offset, &v, sizeof(v));
+		if (agg.kind == TdcAggKind::AVG_NUMERIC)
+		{
+			const int64_t one = 1;
+			std::memcpy(row_ptr + agg.offset + 8, &one, sizeof(one));
 		}
 	}
 }
@@ -118,6 +151,24 @@ Gather(const TupleDataLayout *layout,
 		const TdcAggregateDesc &agg = layout->aggregates[a];
 		int64_t v;
 		std::memcpy(&v, row_ptr + agg.offset, sizeof(v));
+
+		/* AVG_NUMERIC stores {sum:int64, count:int64} as a 16B pair; the
+		 * downstream chunk only has one slot per aggregate, and Scatter only
+		 * round-trips the first 8B. Finalize the average here so the count
+		 * half is consumed at the producer (HashAgg) where it is still
+		 * authoritative, instead of trying to thread a second chunk slot
+		 * through Order/Output. Result is a scale=2 scaled-int64; div-by-zero
+		 * becomes 0 to match SQL's "no rows produces NULL" only at the
+		 * EncodeColumn boundary - here we still emit 0, and OutputSink turns
+		 * the NULL signal off via tts_isnull (currently hardcoded false; if we
+		 * later add NULL tracking the count==0 case is the place to flip it). */
+		if (agg.kind == TdcAggKind::AVG_NUMERIC)
+		{
+			int64_t count;
+			std::memcpy(&count, row_ptr + agg.offset + 8, sizeof(count));
+			v = (count != 0) ? (v / count) : 0;
+		}
+
 		chunk.int64_columns[agg_chunk_base + a][row_idx] = v;
 	}
 }
@@ -260,9 +311,6 @@ UpdateAggregates(const TupleDataLayout *layout,
 			case TdcAggKind::SUM_INT64:
 			{
 				Assert(agg.src_col_idx < 16);
-				/* Input column kind is not stored on the agg desc in v1;
-				 * by convention the translator places SUM_INT64 inputs on
-				 * int64 chunk columns (NUMERIC scaled-int64 for Q1). */
 				int64_t add = chunk.int64_columns[agg.src_col_idx][row_idx];
 				int64_t acc;
 				std::memcpy(&acc, row_ptr + agg.offset, sizeof(acc));
@@ -280,7 +328,6 @@ UpdateAggregates(const TupleDataLayout *layout,
 			}
 			case TdcAggKind::SUM_NUMERIC:
 			{
-				// TODO(Wide128): int64 accumulator overflows at TPC-H scale factor 100+.
 				Assert(agg.src_col_idx < 16);
 				int64_t add = chunk.int64_columns[agg.src_col_idx][row_idx];
 				int64_t acc;
@@ -291,7 +338,6 @@ UpdateAggregates(const TupleDataLayout *layout,
 			}
 			case TdcAggKind::AVG_NUMERIC:
 			{
-				// TODO(Wide128): int64 sum accumulator overflows at TPC-H scale factor 100+.
 				Assert(agg.src_col_idx < 16);
 				int64_t add = chunk.int64_columns[agg.src_col_idx][row_idx];
 				int64_t acc_sum;

@@ -43,19 +43,48 @@ namespace pipeline {
 /*
  * Scatter:
  *   Write row[row_idx] of `chunk` into the row buffer at `row_ptr`, using
- *   `layout->columns` only (aggregates are NOT written here — they are
- *   zero-initialized at row creation time, see TupleDataCollection alloc).
+ *   `layout->columns` AND `layout->aggregates`. Group cols copy from
+ *   `chunk.{int32,int64,double}_columns[i]`; aggregate state copies from
+ *   `chunk.int64_columns[layout->column_count + a]` (matching Gather's
+ *   output convention). For AVG_NUMERIC, the count tail at offset+8 is
+ *   stamped to 1 so chained Gather→Scatter→Gather over Order/Output TDCs
+ *   stays idempotent (count=1 means downstream Gather's sum/count divide
+ *   is a no-op on an already-finalized scaled value).
+ *
+ * USE FOR: Order.SinkChunk, OutputSink staging — chunks produced by an
+ *          upstream Gather that carry both group cols AND agg state.
+ *
+ * DO NOT USE FOR: HashAgg.SinkChunk — the input chunk carries only source
+ *          columns (no agg slots); the upstream chunk's int64 slots in the
+ *          aggregate-state index range hold src column data and would
+ *          corrupt the freshly-zeroed agg state. Use ScatterGroupOnly.
  *
  * Preconditions:
  *   - row_ptr points to layout->row_width zero-filled bytes.
  *   - chunk.count > row_idx.
  *   - For each col i in 0..layout->column_count-1: columns[i].src_col_idx
  *     in chunk is < 16 (DataChunk fixed cap).
+ *   - column_count + aggregate_count <= 16.
  */
 void Scatter(const TupleDataLayout *layout,
              uint8_t *row_ptr,
              const PipelineChunk &chunk,
              uint16_t row_idx);
+
+/*
+ * ScatterGroupOnly:
+ *   Same as Scatter but writes ONLY group columns; aggregate state slots
+ *   are left at their dsa_allocate0 zero values for UpdateAggregates to
+ *   accumulate into. Used by HashAgg.SinkChunk where the input chunk is
+ *   raw source data (qty/extprice/discount/...) and the chunk's int64
+ *   slots in the [column_count, column_count + aggregate_count) range
+ *   hold src column values, NOT agg state — copying them would seed the
+ *   aggregate accumulator with unrelated row data.
+ */
+void ScatterGroupOnly(const TupleDataLayout *layout,
+                      uint8_t *row_ptr,
+                      const PipelineChunk &chunk,
+                      uint16_t row_idx);
 
 /*
  * Gather:

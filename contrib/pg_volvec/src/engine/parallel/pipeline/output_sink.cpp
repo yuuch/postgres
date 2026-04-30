@@ -11,6 +11,7 @@ extern "C" {
 #include "utils/dsa.h"
 #include "utils/elog.h"
 #include "utils/numeric.h"
+#include "catalog/pg_type_d.h"
 }
 
 #include "core/data_chunk.hpp"
@@ -160,11 +161,6 @@ OutputSink::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 	auto &global = static_cast<OutputGlobalState &>(input.global_state);
 	auto &local = static_cast<OutputLocalState &>(input.local_state);
 
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: Output.SinkChunk ENTER count=%u global_tdc=%p\n",
-		ctx.worker_index, (int) getpid(), (unsigned) in.count,
-		(void *) global.global_tdc);
-
 	if (global.global_tdc == nullptr || global.layout == nullptr)
 		elog(ERROR, "pg_volvec: output sink not initialized");
 
@@ -201,11 +197,6 @@ OutputSink::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 {
 	(void) ctx;
 	auto &global = static_cast<OutputGlobalState &>(gstate);
-
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: Output.Finalize ENTER global_tdc=%p row_count=%u\n",
-		ctx.worker_index, (int) getpid(), (void *) global.global_tdc,
-		global.global_tdc != nullptr ? pg_atomic_read_u32(&global.global_tdc->row_count) : 0u);
 
 	/* Publish sink->source handoff: Output has no downstream operator, but
 	 * EmitGlobalTdcToDest gates on this flag so the leader cannot drain a
@@ -250,6 +241,12 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 
 	TupleTableSlot *slot = MakeSingleTupleTableSlot(tupdesc_, &TTSOpsVirtual);
 
+	/* DestReceiver lifecycle: ExecutorRun normally calls rStartup before the
+	 * first row and rShutdown after the last. We bypass standard_ExecutorRun,
+	 * so we MUST drive it here, otherwise printtup never sends RowDescription
+	 * ('T') and libpq drops every data row. */
+	dest_->rStartup(dest_, operation_, tupdesc_);
+
 	/* Stage one TDC row at a time into a single-row PipelineChunk so we can
 	 * reuse Gather + EncodeColumn (both consume PipelineChunk-shaped input).
 	 * One-row staging is intentional for v1: avoids allocating a 1024-row
@@ -282,24 +279,48 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 				if (a < layout->aggregate_count &&
 				    layout->aggregates[a].kind == TdcAggKind::AVG_NUMERIC)
 				{
-					const uint8_t *agg_ptr = row_ptr + layout->aggregates[a].offset;
-					int64 sum, count;
-					std::memcpy(&sum,   agg_ptr,     sizeof(int64));
-					std::memcpy(&count, agg_ptr + 8, sizeof(int64));
-					const int64 avg_scaled = (count != 0) ? (sum / count) : 0;
+					/* Scatter (tuple_data_ops.cpp) finalizes AVG_NUMERIC at
+					 * the HashAgg→Order boundary by dividing sum/count and
+					 * writing the scale=2 quotient into row_ptr+agg.offset;
+					 * the count tail at +8 is intentionally NOT propagated
+					 * past HashAgg's TDC. So here we read the finalized
+					 * scaled-int64 directly and emit at scale=2. NULL is
+					 * unrecoverable here (count discarded upstream) and Q1
+					 * group-by guarantees count >= 1, so we surface 0 rather
+					 * than NULL on the (impossible-for-Q1) zero case. */
+					int64 avg_scaled;
+					std::memcpy(&avg_scaled,
+					            row_ptr + layout->aggregates[a].offset,
+					            sizeof(int64));
 					slot->tts_values[c] = NumericGetDatum(
 						int64_div_fast_to_numeric(avg_scaled, 2));
-					slot->tts_isnull[c] = (count == 0);
+					slot->tts_isnull[c] = false;
 					continue;
 				}
 			}
 
 			slot->tts_values[c] = EncodeColumn(col, layout, *staging, 0);
 			slot->tts_isnull[c] = false;
+
+			/* Q1 stores l_returnflag/l_linestatus as INT32_CHAR (single byte)
+			 * but the SQL column type is bpchar(1) (varlena). printtup calls
+			 * bpcharsend which dereferences the Datum as a varlena pointer;
+			 * passing the raw byte segfaults. Wrap in a 1-char bpchar here. */
+			Oid atttypid = TupleDescAttr(tupdesc_, c)->atttypid;
+			if (atttypid == BPCHAROID && col.decode_kind == ColumnDecodeKind::INT32_CHAR)
+			{
+				char ch = (char) DatumGetChar(slot->tts_values[c]);
+				BpChar *bp = (BpChar *) palloc(VARHDRSZ + 1);
+				SET_VARSIZE(bp, VARHDRSZ + 1);
+				VARDATA(bp)[0] = ch;
+				slot->tts_values[c] = PointerGetDatum(bp);
+			}
 		}
 		ExecStoreVirtualTuple(slot);
 		dest_->receiveSlot(slot, dest_);
 	}
+
+	dest_->rShutdown(dest_);
 
 	ExecDropSingleTupleTableSlot(slot);
 }

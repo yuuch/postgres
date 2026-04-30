@@ -298,11 +298,6 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 	for (const auto &pipeline_uptr : bundle.pipelines)
 	{
 		const Pipeline &pipeline = *pipeline_uptr;
-		fprintf(stderr, "PGVOLVEC_DIAG[leader pid=%d]: serializing pipeline id=%d source=%p(type=%u) ops=%zu sink=%p(type=%u)\n",
-			(int) getpid(), pipeline.id,
-			(void*) pipeline.source, (unsigned) pipeline.source->type(),
-			pipeline.ops.size(),
-			(void*) pipeline.sink, (unsigned) pipeline.sink->type());
 		PipelineDescriptor &pd = root[pipeline.id];
 		pd.pipeline_id = pipeline.id;
 		pd.op_count = 2 + static_cast<int32>(pipeline.ops.size());
@@ -431,20 +426,14 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 					desc->body.seq_scan.shared_payload = payload_dp;
 			break;
 		}
-		case PhysicalOperatorType::HASH_AGGREGATE:
+	case PhysicalOperatorType::HASH_AGGREGATE:
+	{
+		const auto &dl = static_cast<const PhysicalHashAggregate *>(op)->descs();
+		for (OpDescriptor *desc : dl)
 		{
-			const auto &dl = static_cast<const PhysicalHashAggregate *>(op)->descs();
-			fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: Store HashAgg payload_dp=%lu op=%p desc_list_.size=%zu\n",
-				(int) getpid(), (unsigned long) payload_dp, (void*) op, dl.size());
-			size_t i = 0;
-			for (OpDescriptor *desc : dl)
-			{
-				fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]:   slot[%zu] desc=%p before=%lu\n",
-					(int) getpid(), i, (void*) desc, desc ? (unsigned long) desc->body.hash_agg.shared_payload : 0UL);
-				if (desc != nullptr)
-					desc->body.hash_agg.shared_payload = payload_dp;
-				i++;
-			}
+			if (desc != nullptr)
+				desc->body.hash_agg.shared_payload = payload_dp;
+		}
 			break;
 		}
 		case PhysicalOperatorType::ORDER:
@@ -479,14 +468,12 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 			OpDescriptor *desc = static_cast<const PhysicalSeqScan *>(op)->desc();
 			return desc != nullptr ? desc->body.seq_scan.shared_payload : InvalidDsaPointer;
 		}
-		case PhysicalOperatorType::HASH_AGGREGATE:
-		{
-			OpDescriptor *desc = static_cast<const PhysicalHashAggregate *>(op)->desc();
-			dsa_pointer ret = desc != nullptr ? desc->body.hash_agg.shared_payload : InvalidDsaPointer;
-			fprintf(stderr, "PGVOLVEC_DIAG[pid=%d]: Load HashAgg op=%p desc=%p -> payload_dp=%lu\n",
-				(int) getpid(), (void*) op, (void*) desc, (unsigned long) ret);
-			return ret;
-		}
+	case PhysicalOperatorType::HASH_AGGREGATE:
+	{
+		OpDescriptor *desc = static_cast<const PhysicalHashAggregate *>(op)->desc();
+		dsa_pointer ret = desc != nullptr ? desc->body.hash_agg.shared_payload : InvalidDsaPointer;
+		return ret;
+	}
 		case PhysicalOperatorType::ORDER:
 		{
 			OpDescriptor *desc = static_cast<const PhysicalOrder *>(op)->desc();

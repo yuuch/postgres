@@ -72,9 +72,6 @@ PipelineRunTask::Execute()
 	auto &ctx = rt.exec_ctx;
 	auto &ps = rt.GetOrCreatePipelineState(pipeline_->id);
 
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: RUN.Execute ENTER pipeline_id=%u\n",
-		worker_index_, (int) getpid(), (unsigned) pipeline_->id);
 	EnsureGlobalStates(ps, *pipeline_, ctx);
 	EnsureRunLocalStates(ps, *pipeline_, ctx);
 
@@ -92,10 +89,6 @@ PipelineRunTask::Execute()
 
 		OperatorSourceInput src_in{*ps.global_source, *ps.local_source};
 		SourceResultType sres = pipeline_->source->GetData(ctx, src_chunk, src_in);
-		fprintf(stderr,
-			"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: RUN.GetData pipeline_id=%u sres=%d src_chunk.count=%u\n",
-			worker_index_, (int) getpid(), (unsigned) pipeline_->id,
-			(int) sres, (unsigned) src_chunk.count);
 
 		if (sres == SourceResultType::BLOCKED)
 			RaiseBlockedForbidden();
@@ -151,9 +144,6 @@ PipelineCombineTask::Execute()
 	auto &rt = *runtime_;
 	auto &ctx = rt.exec_ctx;
 	auto &ps = rt.GetPipelineState(pipeline_->id);
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: COMBINE.Execute ENTER pipeline_id=%u\n",
-		worker_index_, (int) getpid(), (unsigned) pipeline_->id);
 	Assert(ps.local_sink != nullptr);
 	Assert(ps.global_sink != nullptr);
 	Assert(!ps.combine_done);
@@ -198,10 +188,6 @@ PipelineFinalizeTask::Execute()
 	 * COMBINE.
 	 */
 	auto &ps = rt.GetOrCreatePipelineState(pipeline_->id);
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: FINALIZE.Execute ENTER pipeline_id=%u leader_partial_pending=%d\n",
-		worker_index_, (int) getpid(), (unsigned) pipeline_->id,
-		(int) ps.leader_partial_pending);
 	EnsureGlobalStates(ps, *pipeline_, ctx);
 
 	if (ps.leader_partial_pending && ps.local_sink)
@@ -216,9 +202,6 @@ PipelineFinalizeTask::Execute()
 		ps.local_ops.clear();
 	}
 	SinkFinalizeType fres = pipeline_->sink->Finalize(ctx, *ps.global_sink);
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: FINALIZE.Execute Sink->Finalize returned pipeline_id=%u fres=%d\n",
-		worker_index_, (int) getpid(), (unsigned) pipeline_->id, (int) fres);
 	if (fres == SinkFinalizeType::BLOCKED)
 		RaiseBlockedForbidden();
 	return TaskExecutionResult::TASK_FINISHED;

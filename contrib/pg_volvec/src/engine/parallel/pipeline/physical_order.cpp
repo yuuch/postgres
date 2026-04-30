@@ -54,10 +54,6 @@ CompareKeyColumn(TdcColumnKind kind, const uint8_t *a, const uint8_t *b)
 std::unique_ptr<GlobalSinkState>
 PhysicalOrder::GetGlobalSinkState(ExecCtx &ctx)
 {
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: Order.GetGlobalSinkState ENTER this=%p shared_payload_dp_=%llu\n",
-		ctx.worker_index, (int) getpid(), (void *) this,
-		(unsigned long long) shared_payload_dp_);
 	auto state = std::make_unique<OrderGlobalState>();
 	state->dsa = ctx.dsa;
 	state->desc = desc_;
@@ -89,28 +85,14 @@ PhysicalOrder::GetGlobalSinkState(ExecCtx &ctx)
 			row_width,
 			state->payload_layout_dp);
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
-		fprintf(stderr,
-			"PGVOLVEC_DIAG[pid=%d]: Order LEADER ALLOC payload_dp=%llu this=%p desc_=%p row_width=%u max_rows=%u\n",
-			(int) getpid(), (unsigned long long) state->shared_payload_dp,
-			(void *) this, (void *) desc_, row_width, state->max_rows);
 	}
 	else if (DsaPointerIsValid(state->shared_payload_dp) ||
 			 (state->shared_payload_dp = LoadSharedPayloadFromDescriptor(this), DsaPointerIsValid(state->shared_payload_dp)))
 	{
 		state->payload = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, state->shared_payload_dp));
-		fprintf(stderr,
-			"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: Order LOAD payload_dp=%llu this=%p desc_=%p\n",
-			ctx.worker_index, (int) getpid(),
-			(unsigned long long) state->shared_payload_dp,
-			(void *) this, (void *) desc_);
 	}
 	else
 	{
-		fprintf(stderr,
-			"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: Order NEITHER-BRANCH this=%p desc_=%p shared_payload_dp_=%llu\n",
-			ctx.worker_index, (int) getpid(),
-			(void *) this, (void *) desc_,
-			(unsigned long long) shared_payload_dp_);
 	}
 
 	return state;
@@ -159,12 +141,6 @@ PhysicalOrder::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 {
 	auto &global = static_cast<OrderGlobalState &>(gstate);
 
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: Order.Finalize ENTER this=%p payload=%p row_count=%u\n",
-		ctx.worker_index, (int) getpid(), (void *) this,
-		(void *) global.payload,
-		global.payload != nullptr ? pg_atomic_read_u32(&global.payload->row_count) : 0u);
-
 	if (global.payload == nullptr)
 		return SinkFinalizeType::READY;
 	if (global.key_layout == nullptr || global.payload_layout == nullptr)
@@ -211,10 +187,6 @@ PhysicalOrder::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 	});
 
 	global.payload->finalized = true;
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: Order.Finalize EXIT row_count=%u sort_indices_dp=%llu\n",
-		ctx.worker_index, (int) getpid(), row_count,
-		(unsigned long long) global.sort_indices_dp);
 	return SinkFinalizeType::READY;
 }
 

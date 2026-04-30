@@ -109,8 +109,6 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 
 	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
 	{
-		fprintf(stderr, "PGVOLVEC_DIAG[leader pid=%d]: HashAgg GetGlobalSinkState ENTER leader-self-alloc branch this=%p desc_=%p\n",
-			(int) getpid(), (void*) this, (void*) desc_);
 		dsa_pointer tdc_dp = dsa_allocate0(ctx.dsa,
 			TupleDataCollectionAllocSize(state->max_groups, state->layout->row_width));
 		state->global_tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, tdc_dp));
@@ -123,17 +121,12 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		state->shared_payload_dp = dsa_allocate0(ctx.dsa, AggregateHashTableAllocSize(capacity));
 		state->global_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, state->shared_payload_dp));
 		AggregateHashTableInit(state->global_aht, capacity, tdc_dp);
-		fprintf(stderr, "PGVOLVEC_DIAG[leader pid=%d]: HashAgg about to Store payload_dp=%lu this=%p\n",
-			(int) getpid(), (unsigned long) state->shared_payload_dp, (void*) this);
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
 	}
 	else
 	{
 		if (!DsaPointerIsValid(state->shared_payload_dp))
 			state->shared_payload_dp = LoadSharedPayloadFromDescriptor(this);
-		fprintf(stderr, "PGVOLVEC_DIAG[worker_idx=%d pid=%d]: HashAgg GetGlobalSinkState NON-leader branch this=%p desc_=%p shared_payload_dp_(ctor)=%lu loaded=%lu\n",
-			ctx.worker_index, (int) getpid(), (void*) this, (void*) desc_,
-			(unsigned long) shared_payload_dp_, (unsigned long) state->shared_payload_dp);
 		state->global_aht = ResolveAht(ctx.dsa, state->shared_payload_dp);
 		state->global_tdc = ResolveTdc(ctx.dsa, state->global_aht);
 	}
@@ -181,7 +174,7 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		if (candidate_idx == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_volvec: local hash aggregate row capacity exceeded");
 
-		Scatter(local.layout, candidate_row, in, row_idx);
+		ScatterGroupOnly(local.layout, candidate_row, in, row_idx);
 		const uint64_t hash = HashGroup(local.layout, in, row_idx);
 
 		uint32_t canonical_idx = TDC_INVALID_ROW_INDEX;
@@ -260,9 +253,6 @@ PhysicalHashAggregate::GetGlobalSourceState(ExecCtx &ctx)
 	auto state = std::make_unique<HashAggGlobalSourceState>();
 	dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_) ? shared_payload_dp_ :
 		LoadSharedPayloadFromDescriptor(this);
-	fprintf(stderr, "PGVOLVEC_DIAG[worker_idx=%d pid=%d]: HashAgg GetGlobalSourceState this=%p desc_=%p shared_payload_dp_(ctor)=%lu loaded=%lu\n",
-		ctx.worker_index, (int) getpid(), (void*) this, (void*) desc_,
-		(unsigned long) shared_payload_dp_, (unsigned long) payload_dp);
 	state->global_aht = ResolveAht(ctx.dsa, payload_dp);
 	state->global_tdc = ResolveTdc(ctx.dsa, state->global_aht);
 	if (state->global_tdc == nullptr)
@@ -289,14 +279,6 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 	(void) input.local_state;
 	(void) ctx;
 	out.reset();
-
-	fprintf(stderr,
-		"PGVOLVEC_DIAG[worker_idx=%d pid=%d]: HashAgg.GetData ENTER this=%p tdc=%p tdc.finalized=%d row_count=%u source_cursor=%u\n",
-		ctx.worker_index, (int) getpid(), (void*) this,
-		(void*) global.global_tdc,
-		(int) global.global_tdc->finalized,
-		(unsigned) pg_atomic_read_u32(&global.global_tdc->row_count),
-		(unsigned) global.source_cursor);
 
 	/* global.finalized is a stale snapshot from GetGlobalSourceState() time
 	 * (leader pre-init runs before sink Finalize); only the DSA-resident
