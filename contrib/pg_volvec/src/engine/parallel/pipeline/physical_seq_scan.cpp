@@ -362,7 +362,18 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 int
 PhysicalSeqScan::MaxThreads(ExecCtx &ctx) const
 {
-	SeqScanSharedPayload *shared = ResolveSeqScanPayload(ctx, shared_payload_dp_);
+	/* Bug N: shared_payload_dp_ ctor field is InvalidDsaPointer until the
+	 * leader self-allocates inside GetGlobalSourceState; reading it here
+	 * collapsed RUN fan-out to 1 and serialized the entire scan onto
+	 * worker 0 (loop_wait == active_w_task across w in {1,2,4,8}).
+	 * Load-from-descriptor is the canonical cross-process channel
+	 * (Bug H invariant). PipelineRunEvent::Schedule pre-invokes
+	 * GetGlobalSourceState on the leader before EnqueueTasks calls
+	 * MaxThreads, so the descriptor slot is populated by this point. */
+	dsa_pointer dp = DsaPointerIsValid(shared_payload_dp_)
+		? shared_payload_dp_
+		: LoadSharedPayloadFromDescriptor(this);
+	SeqScanSharedPayload *shared = ResolveSeqScanPayload(ctx, dp);
 	return (int) ComputeMaxThreadsFromPayload(shared);
 }
 
