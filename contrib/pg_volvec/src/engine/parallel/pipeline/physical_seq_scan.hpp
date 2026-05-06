@@ -10,8 +10,16 @@ extern "C" {
 #include "utils/rel.h"
 }
 
+#include <memory>
+
 #include "parallel/pipeline/physical_operator.hpp"
 #include "core/data_chunk.hpp"
+#include "core/data_chunk_deform.hpp"
+#include "expr/expr.hpp"  /* pg_volvec_release_llvm_jit_context */
+
+extern "C" {
+#include "jit/jit.h"  /* JitContext */
+}
 
 namespace pg_volvec {
 
@@ -42,14 +50,50 @@ public:
 	BlockNumber     current_block = InvalidBlockNumber;
 	BlockNumber     end_block = InvalidBlockNumber;
 	bool            exhausted = false;
-	/* morsel_active: current morsel partially consumed; resume scan_desc
-	 * instead of fetching a new morsel and rescanning (Bug K: tail-drop
-	 * when morsel rows > PIPELINE_DEFAULT_CHUNK_SIZE). */
+	/* morsel_active: see Bug K — chunk fills mid-morsel, must resume scan_desc. */
 	bool            morsel_active = false;
 	bool            diag_first_call_logged = false;
 
+	/* M-Q1-PERF B.1: split deform into qual-side (1-row scratch chunk, written
+	 * at row 0 every tuple, evaluated inline) + projection-side (written at
+	 * out.count and only advanced on qual survival). Kills nocachegetattr
+	 * (15.4% of worker time) on rejected rows by short-circuiting projection
+	 * deform after the qual fails. Both deformers JIT-compile via the same
+	 * factory; gated by pg_volvec.jit_deform. */
+	DeformProgram                          proj_deform_program{};
+	DeformProgram                          qual_deform_program{};
+	bool                                   deform_programs_built = false;
+	std::unique_ptr<DataChunkDeformer>     proj_deformer;
+	std::unique_ptr<DataChunkDeformer>     qual_deformer;
+	/* qual_chunk: heap-allocated 1024-row scratch (uses DataChunk's
+	 * MemoryContext-backed operator new, ~600KB). Always written at row 0;
+	 * size matches PIPELINE_DEFAULT_CHUNK_SIZE so it shares the existing
+	 * deformer/JIT instantiation (no new template). qual_dst_col records the
+	 * single column the qual program writes (resolved at build time so the
+	 * inline predicate evaluator skips a search). */
+	std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>> qual_chunk;
+	uint16_t                               qual_dst_col = 0;
+	JitContext                            *proj_jit_context = nullptr;
+	JitDeformFunc                          proj_jit_func = nullptr;
+	JitContext                            *qual_jit_context = nullptr;
+	JitDeformFunc                          qual_jit_func = nullptr;
+
 	~SeqScanLocalState()
 	{
+#ifdef USE_LLVM
+		if (proj_jit_context != nullptr)
+		{
+			pg_volvec_release_llvm_jit_context(proj_jit_context);
+			proj_jit_context = nullptr;
+			proj_jit_func = nullptr;
+		}
+		if (qual_jit_context != nullptr)
+		{
+			pg_volvec_release_llvm_jit_context(qual_jit_context);
+			qual_jit_context = nullptr;
+			qual_jit_func = nullptr;
+		}
+#endif
 		if (slot != nullptr)
 			ExecDropSingleTupleTableSlot(slot);
 		if (scan_desc != nullptr)

@@ -206,6 +206,22 @@ pg_volvec_jit_store_stringref_owned(const char *ptr, void *dst, void *chunk_ptr)
 	memcpy(dst, &ref, sizeof(ref));
 }
 
+/*
+ * Bug G: BPCHAR(1) payload lives behind the varlena header; emitting the raw
+ * datum byte yields garbage and breaks HashAgg dedupe. This helper performs
+ * the varlena header skip that the JIT switch case for kBpchar1 calls into,
+ * so that l_returnflag / l_linestatus reach the int32 column as the actual
+ * character byte.
+ */
+static void pg_volvec_jit_store_bpchar1_int32(const char *ptr, void *dst)
+{
+	struct varlena *v = (struct varlena *) ptr;
+	const char *vptr = VARDATA_ANY(v);
+	int len = VARSIZE_ANY_EXHDR(v);
+	int32_t ch = (len > 0) ? (int32_t) (uint8_t) vptr[0] : 0;
+	*((int32_t *) dst) = ch;
+}
+
 static LLVMValueRef
 build_numeric_scale2_fast_store_helper(LLVMModuleRef mod,
 										 LLVMContextRef lc,
@@ -737,13 +753,16 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 
 	LLVMTypeRef num_fn_args[2] = { l_ptr(type_i8), l_ptr(type_i64) };
 	LLVMTypeRef str_fn_args[3] = { l_ptr(type_i8), l_ptr(type_i8), l_ptr(type_i8) };
+	LLVMTypeRef bpchar1_fn_args[2] = { l_ptr(type_i8), l_ptr(type_i8) };
 	LLVMTypeRef num_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(lc), num_fn_args, 2, 0);
 	LLVMTypeRef str_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(lc), str_fn_args, 3, 0);
+	LLVMTypeRef bpchar1_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(lc), bpchar1_fn_args, 2, 0);
 
 	LLVMTypeRef varsize_any_args[1] = { l_ptr(type_i8) };
 	LLVMTypeRef varsize_any_ty = LLVMFunctionType(type_sizet, varsize_any_args, 1, 0);
 	LLVMValueRef v_num_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&pg_volvec_jit_store_numeric_int64_fast), l_ptr(num_fn_ty));
 	LLVMValueRef v_str_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&pg_volvec_jit_store_stringref_owned), l_ptr(str_fn_ty));
+	LLVMValueRef v_bpchar1_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&pg_volvec_jit_store_bpchar1_int32), l_ptr(bpchar1_fn_ty));
 	LLVMValueRef v_varsize_any_fn = pg_volvec_l_ptr_const(type_sizet, reinterpret_cast<void*>(&varsize_any), l_ptr(varsize_any_ty));
 	LLVMValueRef v_num_fast_s2_fn = build_numeric_scale2_fast_store_helper(mod, lc, num_fn_ty, v_num_fn, funcname);
 
@@ -873,19 +892,29 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 					LLVMBuildStore(b, v_val, v_dest);
 					break;
 				}
-					case DeformDecodeKind::kNumeric:
-					{
-						int target_scale = GetNumericScaleFromTypmod(TupleDescAttr(desc, target.att_index)->atttypmod);
-						LLVMValueRef v_dest = LLVMBuildGEP2(b, type_i64,
-							LLVMBuildBitCast(b, v_data_array, l_ptr(type_i64), ""),
-							&v_row_idx, 1, "dest_num");
-						LLVMValueRef args[] = {v_attdatap, v_dest};
-						LLVMValueRef v_call = l_call(b, num_fn_ty,
-													 target_scale == DEFAULT_NUMERIC_SCALE ? v_num_fast_s2_fn : v_num_fn,
-													 args, 2, "");
-						l_callsite_alwaysinline(v_call);
-						break;
-					}
+				case DeformDecodeKind::kBpchar1:
+				{
+					LLVMValueRef v_dest = LLVMBuildGEP2(b, type_i32,
+						LLVMBuildBitCast(b, v_data_array, l_ptr(type_i32), ""),
+						&v_row_idx, 1, "dest_bpchar1");
+					LLVMValueRef v_dest_i8 = LLVMBuildBitCast(b, v_dest, l_ptr(type_i8), "");
+					LLVMValueRef args[] = {v_attdatap, v_dest_i8};
+					l_call(b, bpchar1_fn_ty, v_bpchar1_fn, args, 2, "");
+					break;
+				}
+				case DeformDecodeKind::kNumeric:
+				{
+					int target_scale = GetNumericScaleFromTypmod(TupleDescAttr(desc, target.att_index)->atttypmod);
+					LLVMValueRef v_dest = LLVMBuildGEP2(b, type_i64,
+						LLVMBuildBitCast(b, v_data_array, l_ptr(type_i64), ""),
+						&v_row_idx, 1, "dest_num");
+					LLVMValueRef args[] = {v_attdatap, v_dest};
+					LLVMValueRef v_call = l_call(b, num_fn_ty,
+										 target_scale == DEFAULT_NUMERIC_SCALE ? v_num_fast_s2_fn : v_num_fn,
+										 args, 2, "");
+					l_callsite_alwaysinline(v_call);
+					break;
+				}
 				case DeformDecodeKind::kStringRef:
 				{
 					LLVMTypeRef type_arr16 = LLVMArrayType(type_i8, 16);

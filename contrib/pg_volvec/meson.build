@@ -21,6 +21,7 @@ pg_volvec_sources = files(
   'src/engine/parallel/pipeline/runtime_dsm.cpp',
   'src/engine/parallel/pipeline/task_scheduler.cpp',
   'src/engine/parallel/pipeline/physical_seq_scan.cpp',
+  'src/engine/parallel/pipeline/columnar_filter.cpp',
   'src/engine/parallel/pipeline/physical_projection.cpp',
   'src/engine/parallel/pipeline/physical_hash_aggregate.cpp',
   'src/engine/parallel/pipeline/physical_order.cpp',
@@ -31,6 +32,7 @@ pg_volvec_sources = files(
   'src/engine/parallel/pipeline/tuple_data_collection.cpp',
   'src/engine/parallel/pipeline/aggregate_hash_table.cpp',
   'src/engine/core/parallel_dsa_bridge.cpp',
+  'src/engine/core/data_chunk_deform.cpp',
 )
 
 pg_volvec_optimize_args = [

@@ -111,7 +111,14 @@ struct alignas(16) DataChunk {
 };
 
 static constexpr int kMaxDeformTargets = 16;
-enum class DeformDecodeKind : uint8_t { kInt32, kInt64, kDate32, kFloat8, kNumeric, kStringRef };
+/*
+ * kBpchar1 — BPCHAR(1) varlena payload decoded as a single int32 character
+ * value. Required because Q1's `l_returnflag`/`l_linestatus` (BPCHAR(1)) are
+ * stored as varlenas whose payload byte IS the character (Bug G fix); a plain
+ * 4-byte load past the varlena header reads garbage. Decoded into the int32
+ * column slot, identical destination layout to kInt32.
+ */
+enum class DeformDecodeKind : uint8_t { kInt32, kInt64, kDate32, kFloat8, kNumeric, kStringRef, kBpchar1 };
 struct DeformTarget { int att_index; uint16_t dst_col; DeformDecodeKind decode_kind; };
 struct DeformProgram {
 	int ntargets; int last_att_index; DeformTarget targets[kMaxDeformTargets];

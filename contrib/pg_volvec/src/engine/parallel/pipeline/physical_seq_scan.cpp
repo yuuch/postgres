@@ -2,6 +2,7 @@
 
 extern "C" {
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/tableam.h"
 #include "catalog/pg_type_d.h"
 #include "executor/tuptable.h"
@@ -12,8 +13,10 @@ extern "C" {
 #include "utils/snapmgr.h"
 #include "varatt.h"
 
-extern int pg_volvec_parallel_max_workers;
-extern int pg_volvec_parallel_morsel_nblocks;
+extern int  pg_volvec_parallel_max_workers;
+extern int  pg_volvec_parallel_morsel_nblocks;
+extern bool pg_volvec_jit_deform;
+extern bool pg_volvec_disable_jit_for_parallel_worker;
 
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
 extern Datum numeric_mul(PG_FUNCTION_ARGS);
@@ -24,6 +27,9 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 #include <cmath>
 
 #include "parallel/pipeline/pipeline_descriptor.hpp"
+#ifdef USE_LLVM
+#include "llvmjit_deform_datachunk.h"
+#endif
 
 namespace pg_volvec {
 namespace pipeline {
@@ -65,24 +71,30 @@ ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared)
 	return (uint32) std::max(1, std::min(pg_volvec_parallel_max_workers, (int) want));
 }
 
-static inline int64_t
-DatumNumericToScaledInt64(Datum d)
-{
-	Datum hundred = DirectFunctionCall1(int8_numeric, Int64GetDatum(100));
-	Datum scaled  = DirectFunctionCall2(numeric_mul, d, hundred);
-	return DatumGetInt64(DirectFunctionCall1(numeric_int8, scaled));
-}
-
+/*
+ * Inline single-row predicate evaluator. Reads from qual_chunk at row 0
+ * (the qual deformer always writes there) using the dst_col resolved at
+ * build time. NULL → false; QualKind::NONE → true short-circuits before
+ * any deform happens (caller skips the qual deform entirely in that
+ * case). Type dispatch is the same set as EvalTypedCompare's by-value
+ * Datum path (DATEOID/INT4/INT8 × 6 ops); we read pre-decoded typed
+ * values from the chunk so no Datum unpacking is needed here.
+ */
 static inline bool
-EvalTypedCompare(Oid typoid, uint64_t lhs_datum, QualOp op, uint64_t rhs_datum)
+EvalSinglePredicate(const QualDescriptor *qual,
+                    const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
+                    uint16_t dst_col)
 {
-	switch (typoid)
+	if (qchunk.nulls[dst_col][0])
+		return false;
+
+	switch (qual->const_typoid)
 	{
 		case DATEOID:
 		{
-			DateADT l = DatumGetDateADT((Datum) lhs_datum);
-			DateADT r = DatumGetDateADT((Datum) rhs_datum);
-			switch (op)
+			DateADT l = (DateADT) qchunk.int32_columns[dst_col][0];
+			DateADT r = DatumGetDateADT((Datum) qual->const_value);
+			switch (qual->op)
 			{
 				case QualOp::LE: return l <= r;
 				case QualOp::LT: return l <  r;
@@ -95,9 +107,9 @@ EvalTypedCompare(Oid typoid, uint64_t lhs_datum, QualOp op, uint64_t rhs_datum)
 		}
 		case INT4OID:
 		{
-			int32 l = DatumGetInt32((Datum) lhs_datum);
-			int32 r = DatumGetInt32((Datum) rhs_datum);
-			switch (op)
+			int32 l = qchunk.int32_columns[dst_col][0];
+			int32 r = DatumGetInt32((Datum) qual->const_value);
+			switch (qual->op)
 			{
 				case QualOp::LE: return l <= r;
 				case QualOp::LT: return l <  r;
@@ -110,9 +122,9 @@ EvalTypedCompare(Oid typoid, uint64_t lhs_datum, QualOp op, uint64_t rhs_datum)
 		}
 		case INT8OID:
 		{
-			int64 l = DatumGetInt64((Datum) lhs_datum);
-			int64 r = DatumGetInt64((Datum) rhs_datum);
-			switch (op)
+			int64 l = qchunk.int64_columns[dst_col][0];
+			int64 r = DatumGetInt64((Datum) qual->const_value);
+			switch (qual->op)
 			{
 				case QualOp::LE: return l <= r;
 				case QualOp::LT: return l <  r;
@@ -125,97 +137,216 @@ EvalTypedCompare(Oid typoid, uint64_t lhs_datum, QualOp op, uint64_t rhs_datum)
 		}
 		default:
 			elog(ERROR, "pg_volvec: QualDescriptor const_typoid=%u not supported in v1 (by-value only)",
-			     typoid);
+			     qual->const_typoid);
 	}
 	return false;
 }
 
-static bool
-EvalQualOnTuple(const QualDescriptor *qual, HeapTuple tuple, TupleDesc tupdesc)
+/*
+ * Map planner-published per-column decode kind onto the deformer's
+ * physical decode kind. The two enums are intentionally distinct:
+ * ColumnDecodeKind is the projection-layer contract (lives in the
+ * descriptor IR, must stay stable across processes); DeformDecodeKind
+ * is the physical decoder's per-target tag and may add new kinds
+ * (e.g. kBpchar1) without touching the descriptor format. Returns
+ * false for ColumnDecodeKind::NONE so caller can hard-error.
+ */
+static inline bool
+MapColumnToDeformKind(const ColumnSchema &col, DeformDecodeKind &out_kind)
 {
-	if (qual == nullptr || qual->kind == QualKind::NONE)
-		return true;
-
-	bool isnull = false;
-	Datum d = heap_getattr(tuple, qual->col_attno, tupdesc, &isnull);
-	if (isnull)
-		return false;
-
-	return EvalTypedCompare(qual->const_typoid,
-	                        (uint64_t) d,
-	                        qual->op,
-	                        qual->const_value);
+	switch (col.decode_kind)
+	{
+		case ColumnDecodeKind::INT32_CHAR:
+			out_kind = (col.type_oid == BPCHAROID)
+				? DeformDecodeKind::kBpchar1
+				: DeformDecodeKind::kInt32;
+			return true;
+		case ColumnDecodeKind::INT32_DATE:
+			out_kind = DeformDecodeKind::kDate32;
+			return true;
+		case ColumnDecodeKind::INT32_INT4:
+			out_kind = DeformDecodeKind::kInt32;
+			return true;
+		case ColumnDecodeKind::INT64_INT8:
+			out_kind = DeformDecodeKind::kInt64;
+			return true;
+		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+			out_kind = DeformDecodeKind::kNumeric;
+			return true;
+		case ColumnDecodeKind::DOUBLE_FLOAT8:
+			out_kind = DeformDecodeKind::kFloat8;
+			return true;
+		case ColumnDecodeKind::NONE:
+		default:
+			return false;
+	}
 }
 
+/*
+ * Build per-schema-column DeformBindings for the given output chunk.
+ * Invariant: BuildDeformProgramFromSchema stamps target.dst_col with the
+ * source schema column index (NOT chunk_slot), and the deformer writes
+ * bindings.columns_data[dst_col]. We therefore index bindings by schema
+ * column index s in [0, n_columns), and route each schema column to its
+ * per-storage chunk array via columns[s].chunk_slot + decode_kind.
+ *
+ * Heads point at row 0; the deformer offsets by row_idx.
+ */
 static inline void
-AppendProjectedTupleToChunk(PipelineChunk &out,
-                            TupleTableSlot *slot,
-                            TupleDesc tupdesc,
-                            const SchemaDescriptor *out_schema)
+BuildDeformBindings(const SchemaDescriptor *out_schema,
+                    PipelineChunk &out,
+                    DeformBindings &bindings)
 {
-	HeapTuple tuple = ExecFetchSlotHeapTuple(slot, false, nullptr);
-	uint16_t  row   = out.count++;
-
 	const uint16_t n = out_schema->n_columns;
-	for (uint16_t i = 0; i < n; ++i)
+	bindings.ncolumns = n;
+	bindings.owner_chunk = &out;
+	for (uint16_t s = 0; s < n; ++s)
 	{
-		const ColumnSchema &col = out_schema->columns[i];
+		const ColumnSchema &col = out_schema->columns[s];
 		const uint8_t       slot_idx = col.chunk_slot;
-
-		bool  isnull = false;
-		Datum d = heap_getattr(tuple, col.src_attno, tupdesc, &isnull);
-
+		void *data_head;
 		switch (col.decode_kind)
 		{
 			case ColumnDecodeKind::INT32_CHAR:
-				if (isnull)
-					out.int32_columns[slot_idx][row] = 0;
-				else if (col.type_oid == BPCHAROID)
-				{
-					/* bpchar(1) Datum is varlena*; first payload byte is the char.
-					 * DatumGetChar would read the low byte of the pointer (Bug G). */
-					out.int32_columns[slot_idx][row] =
-						(int32_t)(uint8_t) *(VARDATA_ANY(DatumGetPointer(d)));
-				}
-				else
-				{
-					/* "char" type — true 1-byte by-value. */
-					out.int32_columns[slot_idx][row] = (int32_t) DatumGetChar(d);
-				}
-				out.nulls[slot_idx][row] = isnull ? 1 : 0;
-				break;
-
 			case ColumnDecodeKind::INT32_DATE:
-				out.int32_columns[slot_idx][row] = isnull ? 0 : (int32_t) DatumGetDateADT(d);
-				out.nulls[slot_idx][row]         = isnull ? 1 : 0;
-				break;
-
 			case ColumnDecodeKind::INT32_INT4:
-				out.int32_columns[slot_idx][row] = isnull ? 0 : DatumGetInt32(d);
-				out.nulls[slot_idx][row]         = isnull ? 1 : 0;
+				data_head = static_cast<void *>(out.int32_columns[slot_idx]);
 				break;
-
 			case ColumnDecodeKind::INT64_INT8:
-				out.int64_columns[slot_idx][row] = isnull ? 0 : DatumGetInt64(d);
-				out.nulls[slot_idx][row]         = isnull ? 1 : 0;
-				break;
-
 			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
-				out.int64_columns[slot_idx][row] = isnull ? 0 : DatumNumericToScaledInt64(d);
-				out.nulls[slot_idx][row]         = isnull ? 1 : 0;
+				data_head = static_cast<void *>(out.int64_columns[slot_idx]);
 				break;
-
 			case ColumnDecodeKind::DOUBLE_FLOAT8:
-				out.double_columns[slot_idx][row] = isnull ? 0.0 : DatumGetFloat8(d);
-				out.nulls[slot_idx][row]          = isnull ? 1 : 0;
+				data_head = static_cast<void *>(out.double_columns[slot_idx]);
 				break;
-
-			case ColumnDecodeKind::NONE:
 			default:
-				elog(ERROR, "pg_volvec: ColumnSchema.decode_kind=%u invalid for SeqScan output column %u",
-				     (unsigned) col.decode_kind, (unsigned) i);
+				elog(ERROR, "pg_volvec: unsupported ColumnDecodeKind=%u in SeqScan deform binding",
+				     (unsigned) col.decode_kind);
 		}
+		bindings.columns_data[s]  = data_head;
+		bindings.columns_nulls[s] = out.nulls[slot_idx];
 	}
+}
+
+/*
+ * Native + JIT deform path. Replaces the per-column heap_getattr loop
+ * (which called nocachegetattr — Q1's dominant hot leaf at 16.7K samples
+ * pre-B.1) with a single offset-walking deform that emits all targets
+ * in one pass. The deformer dispatches to the JIT'd function if
+ * proj_jit_func is set, else interprets. Caller is responsible for
+ * having qual already evaluated and survived; out.count is incremented
+ * here on append.
+ */
+static inline void
+AppendProjectedTupleViaDeformer(PipelineChunk &out,
+                                 HeapTuple tuple,
+                                 const SchemaDescriptor *out_schema,
+                                 SeqScanLocalState &local)
+{
+	uint16_t row = out.count++;
+
+	DeformBindings bindings;
+	BuildDeformBindings(out_schema, out, bindings);
+	local.proj_deformer->deform_tuple_header(tuple->t_data, row, bindings);
+}
+
+/*
+ * Build DeformProgram from SchemaDescriptor (projection side). Stamps
+ * target.dst_col with the SCHEMA column index s, NOT chunk_slot —
+ * matches the contract used by BuildDeformBindings above and consumed
+ * by data_chunk_deform.cpp's `bindings.columns_data[t.dst_col]` writes.
+ * att_index uses 0-based convention (PG's attnum-1) to match
+ * TupleDescCompactAttr indexing inside DataChunkDeformer::deform_tuple_header.
+ */
+static bool
+BuildProjDeformProgramFromSchema(const SchemaDescriptor *out_schema,
+                                  DeformProgram &program)
+{
+	program.reset();
+	const uint16_t n = out_schema->n_columns;
+	if (n > kMaxDeformTargets)
+		return false;
+	for (uint16_t s = 0; s < n; ++s)
+	{
+		const ColumnSchema &col = out_schema->columns[s];
+		DeformDecodeKind    kind;
+		if (col.src_attno <= 0)
+			return false;
+		if (!MapColumnToDeformKind(col, kind))
+			return false;
+		program.add_target((int) col.src_attno - 1, (int) s, kind);
+	}
+	program.finalize();
+	return true;
+}
+
+/*
+ * Build DeformProgram for the qual column (qual side). v1 supports a
+ * single col_op_const predicate so the program has exactly 1 target.
+ * out_dst_col=0 is hard-coded (the qual chunk has only this one column
+ * we care about) and stored in local.qual_dst_col so EvalSinglePredicate
+ * skips a search per tuple. Decode kind chosen from const_typoid (the
+ * column's type matches by construction — translator gates the extract).
+ *
+ * Routes the qual_chunk's int32_columns[0] / int64_columns[0] storage
+ * via dst_col=0 so the binding builder's chunk_slot=0 default works
+ * without a SchemaDescriptor.
+ */
+static bool
+BuildQualDeformProgramFromQual(const QualDescriptor *qual,
+                                DeformProgram &program,
+                                uint16_t &out_dst_col)
+{
+	program.reset();
+	if (qual == nullptr || qual->kind == QualKind::NONE)
+		return false;
+	if (qual->col_attno <= 0)
+		return false;
+
+	DeformDecodeKind kind;
+	switch (qual->const_typoid)
+	{
+		case DATEOID: kind = DeformDecodeKind::kDate32; break;
+		case INT4OID: kind = DeformDecodeKind::kInt32;  break;
+		case INT8OID: kind = DeformDecodeKind::kInt64;  break;
+		default:
+			return false;
+	}
+	program.add_target((int) qual->col_attno - 1, 0, kind);
+	program.finalize();
+	out_dst_col = 0;
+	return true;
+}
+
+/*
+ * Build qual-side DeformBindings against qual_chunk slot 0. The qual
+ * deformer writes one column per tuple at row 0; the chunk type used
+ * is the same PIPELINE_DEFAULT_CHUNK_SIZE template so the existing
+ * deformer/JIT instantiation works without widening.
+ */
+static inline void
+BuildQualDeformBindings(DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
+                         DeformDecodeKind kind,
+                         DeformBindings &bindings)
+{
+	bindings.ncolumns = 1;
+	bindings.owner_chunk = &qchunk;
+	void *data_head;
+	switch (kind)
+	{
+		case DeformDecodeKind::kInt32:
+		case DeformDecodeKind::kDate32:
+			data_head = static_cast<void *>(qchunk.int32_columns[0]);
+			break;
+		case DeformDecodeKind::kInt64:
+			data_head = static_cast<void *>(qchunk.int64_columns[0]);
+			break;
+		default:
+			elog(ERROR, "pg_volvec: qual deform kind=%u unsupported (v1 by-value only)",
+			     (unsigned) kind);
+	}
+	bindings.columns_data[0]  = data_head;
+	bindings.columns_nulls[0] = qchunk.nulls[0];
 }
 
 } // namespace
@@ -306,6 +437,100 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 
 	(void) ctx;
 
+	/*
+	 * First-call deformer build. Why here (not in GetLocalSourceState):
+	 * out_schema is resolved from a DSA pointer that is only valid after
+	 * descriptor publish; the local-state ctor runs before that for
+	 * leader-self-allocate paths. Builds BOTH proj and qual programs
+	 * (qual only when present), allocates qual_chunk lazily, and JITs
+	 * each independently. JIT compile is opportunistic and silently
+	 * falls back to native interpreter on failure. JIT for the qual
+	 * deformer is identical to proj — same factory, same dispatch.
+	 */
+	if (!local.deform_programs_built)
+	{
+		if (BuildProjDeformProgramFromSchema(out_schema, local.proj_deform_program))
+		{
+			local.proj_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
+			                                                           &local.proj_deform_program);
+#ifdef USE_LLVM
+			if (pg_volvec_jit_deform &&
+			    !(ctx.worker_index != LEADER_WORKER_INDEX &&
+			      pg_volvec_disable_jit_for_parallel_worker))
+			{
+				JitDeformFunc fn = nullptr;
+				JitContext   *jc = nullptr;
+				const char   *err = nullptr;
+				if (pg_volvec_try_compile_jit_deform_to_datachunk(local.scan_tupdesc,
+				                                                    &local.proj_deform_program,
+				                                                    &fn, &jc, &err) &&
+				    fn != nullptr)
+				{
+					local.proj_jit_func    = fn;
+					local.proj_jit_context = jc;
+					local.proj_deformer->set_jit_func(fn);
+					if (jc != nullptr)
+						pg_volvec_register_llvm_jit_context(jc);
+				}
+			}
+#endif
+		}
+
+		/* Qual side: only built if a real predicate exists. NONE qual
+		 * skips this entire block; inner loop calls projection directly. */
+		if (qual != nullptr && qual->kind != QualKind::NONE)
+		{
+			if (BuildQualDeformProgramFromQual(qual, local.qual_deform_program,
+			                                    local.qual_dst_col))
+			{
+				local.qual_chunk = std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>(
+					new DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>());
+				local.qual_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
+				                                                            &local.qual_deform_program);
+#ifdef USE_LLVM
+				if (pg_volvec_jit_deform &&
+				    !(ctx.worker_index != LEADER_WORKER_INDEX &&
+				      pg_volvec_disable_jit_for_parallel_worker))
+				{
+					JitDeformFunc fn = nullptr;
+					JitContext   *jc = nullptr;
+					const char   *err = nullptr;
+					if (pg_volvec_try_compile_jit_deform_to_datachunk(local.scan_tupdesc,
+					                                                    &local.qual_deform_program,
+					                                                    &fn, &jc, &err) &&
+					    fn != nullptr)
+					{
+						local.qual_jit_func    = fn;
+						local.qual_jit_context = jc;
+						local.qual_deformer->set_jit_func(fn);
+						if (jc != nullptr)
+							pg_volvec_register_llvm_jit_context(jc);
+					}
+				}
+#endif
+			}
+		}
+		local.deform_programs_built = true;
+	}
+
+	/* Pre-build qual bindings once per GetData call (heads point at row 0
+	 * of the persistent qual_chunk; deformer always writes there). */
+	DeformBindings qual_bindings;
+	const bool has_qual = (qual != nullptr && qual->kind != QualKind::NONE
+	                       && local.qual_deformer != nullptr);
+	if (has_qual)
+	{
+		DeformDecodeKind kind;
+		switch (qual->const_typoid)
+		{
+			case DATEOID: kind = DeformDecodeKind::kDate32; break;
+			case INT4OID: kind = DeformDecodeKind::kInt32;  break;
+			case INT8OID: kind = DeformDecodeKind::kInt64;  break;
+			default:      kind = DeformDecodeKind::kInt64;  break;  /* unreachable: BuildQual… would have refused */
+		}
+		BuildQualDeformBindings(*local.qual_chunk, kind, qual_bindings);
+	}
+
 	for (;;)
 	{
 		if (!local.morsel_active)
@@ -330,10 +555,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
 				                      : SourceResultType::FINISHED;
 			}
-			/* Bug K': heap_rescan(set_params=true) calls initscan() which
-			 * unconditionally resets rs_numblocks=InvalidBlockNumber
-			 * (heapam.c:459). heap_setscanlimits MUST run AFTER heap_rescan
-			 * or the per-morsel range is wiped and the scan runs to EOF. */
+			/* Bug K': heap_setscanlimits MUST run AFTER heap_rescan
+			 * (initscan() resets rs_numblocks=Invalid). */
 			heap_rescan(local.scan_desc, NULL, true, false, false, true);
 			heap_setscanlimits(local.scan_desc, local.current_block, numBlks);
 			local.morsel_active = true;
@@ -345,9 +568,19 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			HeapTuple tuple = ExecFetchSlotHeapTuple(local.slot, false, nullptr);
 			if (tuple == nullptr)
 				continue;
-			if (!EvalQualOnTuple(qual, tuple, local.scan_tupdesc))
-				continue;
-			AppendProjectedTupleToChunk(out, local.slot, local.scan_tupdesc, out_schema);
+
+			/* B.1 Option C: deform qual cols first (1-row scratch at row 0),
+			 * evaluate predicate inline; only on survival do we deform the
+			 * full projection at out.count and increment. Q1 rejects ~96.6%
+			 * of rows so the projection deform is short-circuited for the
+			 * vast majority of tuples. */
+			if (has_qual)
+			{
+				local.qual_deformer->deform_tuple_header(tuple->t_data, 0, qual_bindings);
+				if (!EvalSinglePredicate(qual, *local.qual_chunk, local.qual_dst_col))
+					continue;
+			}
+			AppendProjectedTupleViaDeformer(out, tuple, out_schema, local);
 		}
 
 		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
