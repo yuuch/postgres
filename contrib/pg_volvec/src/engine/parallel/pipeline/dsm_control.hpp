@@ -102,6 +102,17 @@ struct PipelineSharedControl
 	 */
 	Oid              db_oid;
 	int32            num_workers;
+
+	/*
+	 * Optional per-query profiling storage. The leader allocates the records
+	 * after TaskScheduler has built the Event DAG, because event_count is not
+	 * known when the runtime DSM is first created. Workers only write their own
+	 * worker slot; the leader aggregates after all workers have stopped.
+	 */
+	pg_atomic_uint32 profile_enabled;
+	dsa_pointer      profile_records_root;
+	uint32           profile_event_count;
+	uint32           profile_worker_slots;
 };
 
 /*

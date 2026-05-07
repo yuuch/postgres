@@ -73,6 +73,10 @@ CreateRuntimeDsm(PgVolVecQueryState *state, const char **error_out)
 	control->event_count = 0;
 	control->db_oid = MyDatabaseId;
 	control->num_workers = num_workers;
+	pg_atomic_init_u32(&control->profile_enabled, 0);
+	control->profile_records_root = InvalidDsaPointer;
+	control->profile_event_count = 0;
+	control->profile_worker_slots = 0;
 	shm_toc_insert(toc, PIPELINE_DSM_KEY_CONTROL, control);
 
 	void *ready_mem = shm_toc_allocate(toc, worker_ready_bytes);

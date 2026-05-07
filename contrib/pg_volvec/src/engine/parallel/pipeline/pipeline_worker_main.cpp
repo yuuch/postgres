@@ -7,6 +7,7 @@ extern "C" {
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "pgstat.h"  // IWYU pragma: keep
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"  // IWYU pragma: keep
@@ -20,6 +21,8 @@ extern "C" {
 #include "utils/snapmgr.h"
 }
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -29,6 +32,7 @@ extern "C" {
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
+#include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/task.hpp"
 #include "parallel/pipeline/types.hpp"
 
@@ -38,12 +42,16 @@ namespace pipeline {
 extern "C" PGDLLEXPORT void
 pg_volvec_pipeline_worker_main(Datum main_arg);
 
+extern "C" void
+pg_volvec_proc_exit_release_jit_contexts(int code, Datum arg);
+
 extern "C" PGDLLEXPORT void
 pg_volvec_pipeline_worker_main(Datum main_arg)
 {
 	static uint32 wait_event_extension = 0;
 
 	BackgroundWorkerUnblockSignals();
+	before_shmem_exit(pg_volvec_proc_exit_release_jit_contexts, (Datum) 0);
 	dsm_handle handle = DatumGetUInt32(main_arg);
 	dsm_segment *seg = dsm_attach(handle);
 	if (seg == nullptr)
@@ -104,7 +112,7 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 		wait_event_extension = WaitEventExtensionNew("pg_volvec worker");
 
 	WorkerTaskRuntime rt;
-	rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index};
+	rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index, ctl, INVALID_EVENT_ID};
 	rt.control = ctl;
 	rt.event_shm = static_cast<EventShmState *>(dsa_get_address(dsa, ctl->event_states_root));
 	PipelineDsmLookup<Pipeline> lookup(worker_mcxt);
@@ -128,10 +136,26 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 		TaskDescriptor desc;
 		if (!queue->TryPopForWorker(worker_index, &desc))
 		{
+			instr_time wait_start;
+			if (pg_atomic_read_u32(&ctl->profile_enabled) != 0)
+				INSTR_TIME_SET_CURRENT(wait_start);
 			int rc = WaitLatch(MyLatch,
 			                   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
 			                   1000,
 			                   wait_event_extension);
+			if (pg_atomic_read_u32(&ctl->profile_enabled) != 0)
+			{
+				instr_time wait_end;
+				INSTR_TIME_SET_CURRENT(wait_end);
+				instr_time elapsed = wait_end;
+				INSTR_TIME_SUBTRACT(elapsed, wait_start);
+				PipelineProfileAddElapsed(ctl,
+									  dsa,
+									  worker_index,
+									  0,
+									  PipelineProfileStage::WORKER_WAIT_TASK,
+									  elapsed);
+			}
 			ResetLatch(MyLatch);
 			if (rc & WL_POSTMASTER_DEATH)
 				break;

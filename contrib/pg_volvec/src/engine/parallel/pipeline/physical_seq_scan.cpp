@@ -1,4 +1,5 @@
 #include "parallel/pipeline/physical_seq_scan.hpp"
+#include "parallel/pipeline/pipeline_profile.hpp"
 
 extern "C" {
 #include "access/heapam.h"
@@ -7,6 +8,8 @@ extern "C" {
 #include "catalog/pg_type_d.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "storage/bufmgr.h"
+#include "storage/read_stream.h"
 #include "utils/date.h"
 #include "utils/elog.h"
 #include "utils/numeric.h"
@@ -14,7 +17,6 @@ extern "C" {
 #include "varatt.h"
 
 extern int  pg_volvec_parallel_max_workers;
-extern int  pg_volvec_parallel_morsel_nblocks;
 extern bool pg_volvec_jit_deform;
 extern bool pg_volvec_disable_jit_for_parallel_worker;
 
@@ -63,12 +65,32 @@ ResolveQualDescriptor(dsa_area *dsa, dsa_pointer dp)
 static uint32
 ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared)
 {
-	if (shared == nullptr || shared->morsel_nblocks == 0)
+	if (shared == nullptr || shared->total_blocks == 0)
 		return 1;
 
-	double chunks = std::ceil((double) shared->total_blocks / (double) shared->morsel_nblocks);
-	uint32 want = static_cast<uint32>(std::max(1.0, chunks));
+	uint32 want = (uint32) std::min<uint64>(shared->total_blocks, (uint64) UINT32_MAX);
 	return (uint32) std::max(1, std::min(pg_volvec_parallel_max_workers, (int) want));
+}
+
+struct SeqScanBlockStreamState {
+	SeqScanSharedPayload *shared = nullptr;
+};
+
+static BlockNumber
+SeqScanReadStreamNextBlock(ReadStream *stream,
+                           void *callback_private_data,
+                           void *per_buffer_data)
+{
+	(void) stream;
+	(void) per_buffer_data;
+	auto *state = static_cast<SeqScanBlockStreamState *>(callback_private_data);
+	if (state == nullptr || state->shared == nullptr)
+		return InvalidBlockNumber;
+
+	uint64 block = pg_atomic_fetch_add_u64(&state->shared->next_block, 1);
+	if (block >= state->shared->total_blocks)
+		return InvalidBlockNumber;
+	return (BlockNumber) block;
 }
 
 /*
@@ -318,6 +340,90 @@ BuildQualDeformProgramFromQual(const QualDescriptor *qual,
 	return true;
 }
 
+static inline void
+ReleaseSeqScanPage(SeqScanLocalState &local)
+{
+	if (local.scan_desc != nullptr && BufferIsValid(local.scan_desc->rs_cbuf))
+	{
+		ReleaseBuffer(local.scan_desc->rs_cbuf);
+		local.scan_desc->rs_cbuf = InvalidBuffer;
+	}
+	if (local.scan_desc != nullptr)
+	{
+		local.scan_desc->rs_cblock = InvalidBlockNumber;
+		local.scan_desc->rs_ntuples = 0;
+	}
+	local.page_visible_index = 0;
+}
+
+static bool
+LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
+{
+	Assert(local.scan_desc != nullptr);
+	Assert(local.read_stream != nullptr);
+
+	ReleaseSeqScanPage(local);
+	CHECK_FOR_INTERRUPTS();
+	local.scan_desc->rs_dir = ForwardScanDirection;
+
+	const bool profile_on = PipelineProfileEnabled(ctx);
+	instr_time load_start;
+	if (profile_on)
+		INSTR_TIME_SET_CURRENT(load_start);
+	local.scan_desc->rs_cbuf = read_stream_next_buffer(local.read_stream, NULL);
+	if (profile_on)
+	{
+		instr_time load_end;
+		INSTR_TIME_SET_CURRENT(load_end);
+		PipelineProfileAddDiff(ctx,
+			PipelineProfileStage::SCAN_LOAD_PAGE,
+			load_end,
+			load_start);
+	}
+
+	if (!BufferIsValid(local.scan_desc->rs_cbuf))
+	{
+		local.scan_desc->rs_cblock = InvalidBlockNumber;
+		local.scan_desc->rs_ntuples = 0;
+		local.page_visible_index = 0;
+		return false;
+	}
+
+	local.scan_desc->rs_cblock = BufferGetBlockNumber(local.scan_desc->rs_cbuf);
+
+	instr_time prepare_start;
+	if (profile_on)
+		INSTR_TIME_SET_CURRENT(prepare_start);
+	heap_prepare_pagescan((TableScanDesc) local.scan_desc);
+	if (profile_on)
+	{
+		instr_time prepare_end;
+		INSTR_TIME_SET_CURRENT(prepare_end);
+		PipelineProfileAddDiff(ctx,
+			PipelineProfileStage::SCAN_PREPARE_PAGE,
+			prepare_end,
+			prepare_start,
+			local.scan_desc->rs_ntuples);
+	}
+
+	local.page_visible_index = 0;
+	return true;
+}
+
+static bool
+EnsureSeqScanPageLoaded(SeqScanLocalState &local, ExecCtx &ctx)
+{
+	while (true)
+	{
+		if (BufferIsValid(local.scan_desc->rs_cbuf) &&
+			local.page_visible_index < local.scan_desc->rs_ntuples)
+			return true;
+
+		if (!LoadNextSeqScanPage(local, ctx))
+			return false;
+	}
+}
+
 /*
  * Build qual-side DeformBindings against qual_chunk slot 0. The qual
  * deformer writes one column per tuple at row 0; the chunk type used
@@ -384,9 +490,6 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 			dsa_get_address(ctx.dsa, state->shared_payload_dp));
 		pg_atomic_init_u64(&payload->next_block, 0);
 		payload->total_blocks = total;
-		/* Bug K: morsel size from GUC; source drains across morsels inside
-		 * one GetData call (DuckDB-faithful), so chunk-size is decoupled. */
-		payload->morsel_nblocks = (uint32) Max(1, pg_volvec_parallel_morsel_nblocks);
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
 	}
 
@@ -405,8 +508,27 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 
 	local->rel = relation_open(relid_, AccessShareLock);
 	local->scan_tupdesc = RelationGetDescr(local->rel);
-	local->slot = MakeSingleTupleTableSlot(local->scan_tupdesc, &TTSOpsBufferHeapTuple);
-	local->scan_desc = table_beginscan(local->rel, GetActiveSnapshot(), 0, nullptr);
+	local->scan_desc = (HeapScanDesc) heap_beginscan(local->rel,
+		GetActiveSnapshot(),
+		0,
+		nullptr,
+		nullptr,
+		SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
+	if (local->scan_desc->rs_read_stream != nullptr)
+	{
+		read_stream_end(local->scan_desc->rs_read_stream);
+		local->scan_desc->rs_read_stream = nullptr;
+	}
+	auto *stream_state = static_cast<SeqScanBlockStreamState *>(palloc0(sizeof(SeqScanBlockStreamState)));
+	stream_state->shared = global.shared;
+	local->read_stream = read_stream_begin_relation(READ_STREAM_SEQUENTIAL |
+	                                                READ_STREAM_USE_BATCHING,
+	                                                local->scan_desc->rs_strategy,
+	                                                local->rel,
+	                                                MAIN_FORKNUM,
+	                                                SeqScanReadStreamNextBlock,
+	                                                stream_state,
+	                                                0);
 	local->exhausted = (global.shared == nullptr || global.shared->total_blocks == 0);
 	local->qual_program = nullptr;
 
@@ -531,65 +653,105 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		BuildQualDeformBindings(*local.qual_chunk, kind, qual_bindings);
 	}
 
-	for (;;)
+	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
-		if (!local.morsel_active)
+		if (!EnsureSeqScanPageLoaded(local, ctx))
 		{
-			uint64 start = pg_atomic_fetch_add_u64(&global.shared->next_block,
-			                                      global.shared->morsel_nblocks);
-			if (start >= global.shared->total_blocks)
-			{
-				local.exhausted = true;
-				return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
-				                      : SourceResultType::FINISHED;
-			}
-
-			local.current_block = (BlockNumber) start;
-			local.end_block = Min((BlockNumber) (start + global.shared->morsel_nblocks),
-			                     global.shared->total_blocks);
-
-			BlockNumber numBlks = local.end_block - local.current_block;
-			if (numBlks == 0)
-			{
-				local.exhausted = true;
-				return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
-				                      : SourceResultType::FINISHED;
-			}
-			/* Bug K': heap_setscanlimits MUST run AFTER heap_rescan
-			 * (initscan() resets rs_numblocks=Invalid). */
-			heap_rescan(local.scan_desc, NULL, true, false, false, true);
-			heap_setscanlimits(local.scan_desc, local.current_block, numBlks);
-			local.morsel_active = true;
+			local.exhausted = true;
+			break;
 		}
 
-		while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE &&
-		       heap_getnextslot(local.scan_desc, ForwardScanDirection, local.slot))
+		instr_time tuple_iter_start;
+		const bool tuple_profile_on = PipelineProfileEnabled(ctx);
+		if (tuple_profile_on)
+			INSTR_TIME_SET_CURRENT(tuple_iter_start);
+
+		OffsetNumber offnum = local.scan_desc->rs_vistuples[local.page_visible_index++];
+		Page page = BufferGetPage(local.scan_desc->rs_cbuf);
+		ItemId lpp = PageGetItemId(page, offnum);
+		HeapTupleData tuple;
+		tuple.t_data = (HeapTupleHeader) PageGetItem(page, lpp);
+		tuple.t_len = ItemIdGetLength(lpp);
+		tuple.t_tableOid = RelationGetRelid(local.scan_desc->rs_base.rs_rd);
+		ItemPointerSet(&(tuple.t_self), local.scan_desc->rs_cblock, offnum);
+
+		if (tuple_profile_on)
 		{
-			HeapTuple tuple = ExecFetchSlotHeapTuple(local.slot, false, nullptr);
-			if (tuple == nullptr)
+			instr_time tuple_iter_end;
+			INSTR_TIME_SET_CURRENT(tuple_iter_end);
+			PipelineProfileAddDiff(ctx,
+				PipelineProfileStage::SCAN_VISIBLE_TUPLE,
+				tuple_iter_end,
+				tuple_iter_start,
+				1);
+		}
+
+		if (tuple.t_data == nullptr)
+			continue;
+
+		/* B.1 Option C: deform qual cols first (1-row scratch at row 0),
+		 * evaluate predicate inline; only on survival do we deform the
+		 * full projection at out.count and increment. Q1 rejects ~96.6%
+		 * of rows so the projection deform is short-circuited for the
+		 * vast majority of tuples. */
+		if (has_qual)
+		{
+			instr_time qual_deform_start;
+			const bool profile_on = PipelineProfileEnabled(ctx);
+			if (profile_on)
+				INSTR_TIME_SET_CURRENT(qual_deform_start);
+			local.qual_deformer->deform_tuple_header(tuple.t_data, 0, qual_bindings);
+			if (profile_on)
+			{
+				instr_time qual_deform_end;
+				INSTR_TIME_SET_CURRENT(qual_deform_end);
+				PipelineProfileAddDiff(ctx,
+					PipelineProfileStage::SCAN_QUAL_DEFORM,
+					qual_deform_end,
+					qual_deform_start,
+					1);
+			}
+
+			instr_time filter_start;
+			if (profile_on)
+				INSTR_TIME_SET_CURRENT(filter_start);
+			const bool pass = EvalSinglePredicate(qual, *local.qual_chunk, local.qual_dst_col);
+			if (profile_on)
+			{
+				instr_time filter_end;
+				INSTR_TIME_SET_CURRENT(filter_end);
+				PipelineProfileAddDiff(ctx,
+					PipelineProfileStage::SCAN_FILTER,
+					filter_end,
+					filter_start,
+					1);
+			}
+			if (!pass)
 				continue;
-
-			/* B.1 Option C: deform qual cols first (1-row scratch at row 0),
-			 * evaluate predicate inline; only on survival do we deform the
-			 * full projection at out.count and increment. Q1 rejects ~96.6%
-			 * of rows so the projection deform is short-circuited for the
-			 * vast majority of tuples. */
-			if (has_qual)
-			{
-				local.qual_deformer->deform_tuple_header(tuple->t_data, 0, qual_bindings);
-				if (!EvalSinglePredicate(qual, *local.qual_chunk, local.qual_dst_col))
-					continue;
-			}
-			AppendProjectedTupleViaDeformer(out, tuple, out_schema, local);
 		}
-
-		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
-			return SourceResultType::HAVE_MORE_OUTPUT;
-
-		/* Inner loop exited because heap_getnextslot returned false:
-		 * current morsel fully drained. Loop back to fetch the next morsel. */
-		local.morsel_active = false;
+		instr_time proj_start;
+		const bool profile_on = PipelineProfileEnabled(ctx);
+		if (profile_on)
+			INSTR_TIME_SET_CURRENT(proj_start);
+		AppendProjectedTupleViaDeformer(out, &tuple, out_schema, local);
+		if (profile_on)
+		{
+			instr_time proj_end;
+			INSTR_TIME_SET_CURRENT(proj_end);
+			PipelineProfileAddDiff(ctx,
+				PipelineProfileStage::SCAN_PROJ_DEFORM,
+				proj_end,
+				proj_start,
+				1);
+		}
 	}
+
+	if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+		return SourceResultType::HAVE_MORE_OUTPUT;
+
+	ReleaseSeqScanPage(local);
+	return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
+	                    : SourceResultType::FINISHED;
 }
 
 int

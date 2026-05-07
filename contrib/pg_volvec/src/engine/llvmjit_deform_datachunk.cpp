@@ -1009,17 +1009,51 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 				LLVMValueRef v_new_off;
 				if (att->attlen > 0) {
 					v_new_off = LLVMBuildAdd(b, v_off, pg_volvec_l_sizet_const(type_sizet, att->attlen), "next_off");
+					LLVMBuildStore(b, v_new_off, v_offp);
 				} else {
-					LLVMValueRef v_incby = l_call(b,
-												  varsize_any_ty,
-												  v_varsize_any_fn,
-												  &v_attdatap, 1,
-												  "varsize_any");
-					l_callsite_ro(v_incby);
-					l_callsite_alwaysinline(v_incby);
-					v_new_off = LLVMBuildAdd(b, v_off, v_incby, "next_off");
+					/* Task A: inline VARATT_IS_1B fast path (byte0&1 ⇒ len=(byte0>>1)&0x7F);
+					 * Q1 NUMERIC(15,2) is always short-header (was 57 samples in varsize_any).
+					 * Long/external/compressed fall through to varsize_any for correctness. */
+					LLVMBasicBlockRef bb_short = l_bb_append_v(v_func, "att.%d.varshort", att_index);
+					LLVMBasicBlockRef bb_long = l_bb_append_v(v_func, "att.%d.varlong", att_index);
+					LLVMBasicBlockRef bb_merge = l_bb_append_v(v_func, "att.%d.varmerge", att_index);
+
+					LLVMValueRef v_byte0 = LLVMBuildLoad2(b, type_i8, v_attdatap, "varhdr_byte0");
+					LLVMValueRef v_is_short = LLVMBuildICmp(b, LLVMIntEQ,
+															 LLVMBuildAnd(b, v_byte0, LLVMConstInt(type_i8, 0x01, false), ""),
+															 LLVMConstInt(type_i8, 0x01, false),
+															 "is_1b_hdr");
+					LLVMBuildCondBr(b, v_is_short, bb_short, bb_long);
+
+					LLVMPositionBuilderAtEnd(b, bb_short);
+					LLVMValueRef v_short_len = LLVMBuildAnd(b,
+															 LLVMBuildLShr(b, v_byte0, LLVMConstInt(type_i8, 1, false), ""),
+															 LLVMConstInt(type_i8, 0x7F, false),
+															 "short_len");
+					LLVMValueRef v_short_incby = LLVMBuildZExt(b, v_short_len, type_sizet, "short_incby");
+					LLVMBuildBr(b, bb_merge);
+
+					LLVMPositionBuilderAtEnd(b, bb_long);
+					/* Task A: no callsite attrs on the long path. The pre-B.2 straight-line
+					 * call had alwaysinline+ro, but adding a phi-merge after the call invalidated
+					 * the inliner's predecessor map intermittently (cold-cache 1/10 PANIC repro).
+					 * varsize_any is an external function pointer constant; alwaysinline cannot
+					 * actually inline it, so dropping the attr is functionally equivalent. */
+					LLVMValueRef v_long_incby = l_call(b,
+													   varsize_any_ty,
+													   v_varsize_any_fn,
+													   &v_attdatap, 1,
+													   "varsize_any");
+					LLVMBuildBr(b, bb_merge);
+
+					LLVMPositionBuilderAtEnd(b, bb_merge);
+					LLVMValueRef v_incby_phi = LLVMBuildPhi(b, type_sizet, "incby_phi");
+					LLVMValueRef incby_vals[2] = { v_short_incby, v_long_incby };
+					LLVMBasicBlockRef incby_bbs[2] = { bb_short, bb_long };
+					LLVMAddIncoming(v_incby_phi, incby_vals, incby_bbs, 2);
+					v_new_off = LLVMBuildAdd(b, v_off, v_incby_phi, "next_off");
+					LLVMBuildStore(b, v_new_off, v_offp);
 				}
-				LLVMBuildStore(b, v_new_off, v_offp);
 			}
 			LLVMBuildBr(b, b_next);
 

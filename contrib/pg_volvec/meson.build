@@ -17,6 +17,7 @@ pg_volvec_sources = files(
   'src/engine/parallel/pipeline/pipeline_combine_event.cpp',
   'src/engine/parallel/pipeline/pipeline_finalize_event.cpp',
   'src/engine/parallel/pipeline/task.cpp',
+  'src/engine/parallel/pipeline/pipeline_profile.cpp',
   'src/engine/parallel/pipeline/dsm_task_queue.cpp',
   'src/engine/parallel/pipeline/runtime_dsm.cpp',
   'src/engine/parallel/pipeline/task_scheduler.cpp',

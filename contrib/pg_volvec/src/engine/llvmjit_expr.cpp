@@ -148,6 +148,21 @@ pg_volvec_release_all_registered_llvm_jit_contexts_for_proc_exit()
 	return released;
 }
 
+}  /* namespace pg_volvec */
+
+/* before_shmem_exit shim: drains live JIT contexts before llvm_shutdown's
+ * on_proc_exit refcount PANIC fires (workers can skip ~SeqScanLocalState on
+ * signal-driven proc_exit mid-compile; before_shmem_exit precedes on_proc_exit). */
+extern "C" void pg_volvec_proc_exit_release_jit_contexts(int code, Datum arg);
+
+extern "C" void
+pg_volvec_proc_exit_release_jit_contexts(int /*code*/, Datum /*arg*/)
+{
+	(void) pg_volvec::pg_volvec_release_all_registered_llvm_jit_contexts_for_proc_exit();
+}
+
+namespace pg_volvec {
+
 static inline int64_t
 pg_volvec_jit_pow10_int64(int scale)
 {

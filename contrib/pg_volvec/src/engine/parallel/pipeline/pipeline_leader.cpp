@@ -2,6 +2,7 @@ extern "C" {
 #include "postgres.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
@@ -27,6 +28,7 @@ extern "C" {
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
 #include "parallel/pipeline/pipeline_leader.hpp"
+#include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/query_state.hpp"
 #include "parallel/pipeline/runtime_dsm.hpp"
 #include "parallel/pipeline/task.hpp"
@@ -44,6 +46,33 @@ namespace pipeline {
 namespace {
 
 static constexpr uint32_t kTaskQueueCapacity = 64;
+
+/* B.2 startup-tax probe: one-shot phase timer to localize the ~2700 ms cold-
+ * cache fixed cost in PgvolvecPipelineRun. Toggle via env PG_VOLVEC_PHASE=1.
+ * Compiled in always (cheap: 2 instr_time reads + an fprintf per phase, only
+ * when env set). Remove once B.2 lever is identified and committed. */
+struct PhaseTimer {
+	instr_time t0;
+	instr_time prev;
+	bool       on;
+	PhaseTimer() {
+		const char *e = getenv("PG_VOLVEC_PHASE");
+		on = (e != nullptr && e[0] == '1');
+		if (on) { INSTR_TIME_SET_CURRENT(t0); prev = t0; }
+	}
+	void mark(const char *tag) {
+		if (!on) return;
+		instr_time now; INSTR_TIME_SET_CURRENT(now);
+		instr_time d_total = now; INSTR_TIME_SUBTRACT(d_total, t0);
+		instr_time d_step  = now; INSTR_TIME_SUBTRACT(d_step,  prev);
+		fprintf(stderr, "PG_VOLVEC_PHASE pid=%d tag=%-22s step=%6.1f ms total=%7.1f ms\n",
+		        MyProcPid, tag,
+		        INSTR_TIME_GET_MILLISEC(d_step),
+		        INSTR_TIME_GET_MILLISEC(d_total));
+		fflush(stderr);
+		prev = now;
+	}
+};
 
 struct LeaderCleanupState {
 	PipelineSharedControl *control = nullptr;
@@ -281,6 +310,9 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 	LeaderCleanupState cleanup{};
 	cleanup.state = state;
 
+	PhaseTimer phase{};
+	phase.mark("T0_entry");
+
 	auto *root = static_cast<PhysicalOperator *>(state->parallel_plan);
 	state->parallel_plan = nullptr;
 
@@ -319,6 +351,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		for (size_t i = 0; i < bundle->pipelines.size(); ++i)
 			Assert(bundle->pipelines[i]->id == static_cast<PipelineId>(i));
 
+		phase.mark("T1_build_done");
+
 		if (state->runtime_dsm == nullptr || state->runtime_dsa == nullptr)
 		{
 			const char *err = nullptr;
@@ -327,6 +361,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 				return FailEarly(failure_reason, err != nullptr ? err : "pg_volvec: runtime DSM creation failed", cleanup, state);
 			}
 		}
+
+		phase.mark("T2_dsm_dsa_ready");
 
 		toc = shm_toc_attach(PIPELINE_DSM_MAGIC,
 						  dsm_segment_address(state->runtime_dsm));
@@ -352,6 +388,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		control->pipelines_root = LeaderSerializePipelines(*bundle, dsa);
 		control->num_pipelines = static_cast<int32>(bundle->pipelines.size());
 
+		phase.mark("T3_descriptor_pub");
+
 		const bool leader_participate_requested =
 			pg_volvec_parallel_leader_participation;
 		const bool leader_participate = false;
@@ -373,6 +411,13 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		scheduler.BuildEvents();
 		scheduler.BindRuntime(control, queue, dsa);
 		scheduler.AllocateEventShmStates();
+		PipelineProfileAllocate(control,
+						 dsa,
+						 scheduler.event_count(),
+						 static_cast<uint32>(bgworker_count));
+		instr_time profile_query_start;
+		if (pg_atomic_read_u32(&control->profile_enabled) != 0)
+			INSTR_TIME_SET_CURRENT(profile_query_start);
 
 		/* Shared payload publication happens during descriptor serialization;
 		 * there is no separate leader pre-bind virtual in the current operator
@@ -405,6 +450,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 
 			handles.push_back(handle);
 		}
+
+		phase.mark("T4_bgw_registered");
 
 		registered_pids.reserve(handles.size() + (leader_participate ? 1 : 0));
 
@@ -452,10 +499,26 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 				if (pg_atomic_read_u32(&ready_array[worker_idx]) != 0)
 					break;
 
+				instr_time wait_start;
+				if (pg_atomic_read_u32(&control->profile_enabled) != 0)
+					INSTR_TIME_SET_CURRENT(wait_start);
 				int rc = WaitLatch(MyLatch,
 								   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
 								   1000,
 								   wait_event_id);
+				if (pg_atomic_read_u32(&control->profile_enabled) != 0)
+				{
+					instr_time wait_end;
+					INSTR_TIME_SET_CURRENT(wait_end);
+					instr_time elapsed = wait_end;
+					INSTR_TIME_SUBTRACT(elapsed, wait_start);
+					PipelineProfileAddElapsed(control,
+										  dsa,
+										  LEADER_WORKER_INDEX,
+										  0,
+										  PipelineProfileStage::LEADER_WAIT_READY,
+										  elapsed);
+				}
 				ResetLatch(MyLatch);
 				if (rc & WL_POSTMASTER_DEATH)
 				{
@@ -478,7 +541,9 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		queue->RegisterWorkerPids(registered_pids.data(),
 						 static_cast<uint32>(registered_pids.size()));
 
-		leader_rt.exec_ctx = ExecCtx{leader_mcxt, dsa, LEADER_WORKER_INDEX};
+		phase.mark("T5_workers_ready");
+
+		leader_rt.exec_ctx = ExecCtx{leader_mcxt, dsa, LEADER_WORKER_INDEX, control, INVALID_EVENT_ID};
 		leader_rt.control = control;
 		leader_rt.event_shm = static_cast<EventShmState *>(
 			dsa_get_address(dsa, control->event_states_root));
@@ -511,6 +576,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			event->Schedule();
 			event_scheduled[event_id] = 1;
 		}
+
+		phase.mark("T6_first_enqueue");
 
 		for (;;)
 		{
@@ -584,10 +651,26 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			if (AllEventsFinished(scheduler))
 				break;
 
+			instr_time wait_start;
+			if (pg_atomic_read_u32(&control->profile_enabled) != 0)
+				INSTR_TIME_SET_CURRENT(wait_start);
 			int rc = WaitLatch(MyLatch,
 						   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
 						   1000,
 						   wait_event_id);
+			if (pg_atomic_read_u32(&control->profile_enabled) != 0)
+			{
+				instr_time wait_end;
+				INSTR_TIME_SET_CURRENT(wait_end);
+				instr_time elapsed = wait_end;
+				INSTR_TIME_SUBTRACT(elapsed, wait_start);
+				PipelineProfileAddElapsed(control,
+									  dsa,
+									  LEADER_WORKER_INDEX,
+									  0,
+									  PipelineProfileStage::LEADER_WAIT_EVENT,
+									  elapsed);
+			}
 			ResetLatch(MyLatch);
 			if (rc & WL_POSTMASTER_DEATH)
 			{
@@ -611,17 +694,43 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		 */
 		SignalShutdownAndWait(cleanup);
 
+		phase.mark("T7_events_done");
+
 		if (leader_rt.final_output != nullptr)
 		{
 			leader_rt.final_output->RefreshDestFromQueryDesc(
 				queryDesc->dest,
 				queryDesc->tupDesc,
 				static_cast<int>(queryDesc->operation));
-			leader_rt.final_output->EmitGlobalTdcToDest(leader_rt.exec_ctx);
+			EventId previous_profile_event = leader_rt.exec_ctx.profile_event_id;
+			leader_rt.exec_ctx.profile_event_id = 0;
+			{
+				PipelineProfileScope emit_scope(leader_rt.exec_ctx,
+					PipelineProfileStage::OUTPUT_EMIT);
+				leader_rt.final_output->EmitGlobalTdcToDest(leader_rt.exec_ctx);
+			}
+			leader_rt.exec_ctx.profile_event_id = previous_profile_event;
 		}
+
+		phase.mark("T8_emit_done");
 
 		if (pg_atomic_read_u32(&control->worker_error) != 0)
 			RaiseWorkerFailure(control, handles, state);
+
+		if (pg_atomic_read_u32(&control->profile_enabled) != 0)
+		{
+			instr_time profile_query_end;
+			INSTR_TIME_SET_CURRENT(profile_query_end);
+			instr_time elapsed = profile_query_end;
+			INSTR_TIME_SUBTRACT(elapsed, profile_query_start);
+			PipelineProfileAddElapsed(control,
+								  dsa,
+								  LEADER_WORKER_INDEX,
+								  0,
+								  PipelineProfileStage::TOTAL,
+								  elapsed);
+		}
+		PipelineProfileReport(control, dsa);
 
 		DestroyRuntimeDsm(state);
 		state->parallel_scheduler = nullptr;

@@ -5,6 +5,7 @@
 #include "core/data_chunk.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
+#include "parallel/pipeline/pipeline_profile.hpp"
 
 namespace pg_volvec {
 namespace pipeline {
@@ -50,6 +51,28 @@ EnsureRunLocalStates(ProcessPipelineExecState &ps, Pipeline &pipeline, ExecCtx &
 	ps.run_initialized = true;
 }
 
+class TaskProfileEventGuard
+{
+public:
+	TaskProfileEventGuard(ExecCtx &ctx, EventId event_id)
+		: ctx_(ctx), previous_(ctx.profile_event_id)
+	{
+		ctx_.profile_event_id = event_id;
+	}
+
+	~TaskProfileEventGuard()
+	{
+		ctx_.profile_event_id = previous_;
+	}
+
+	TaskProfileEventGuard(const TaskProfileEventGuard &) = delete;
+	TaskProfileEventGuard &operator=(const TaskProfileEventGuard &) = delete;
+
+private:
+	ExecCtx &ctx_;
+	EventId previous_;
+};
+
 }  /* namespace */
 
 Task::Task(EventId event_id, TaskKind kind, Pipeline *pipeline,
@@ -70,6 +93,8 @@ PipelineRunTask::Execute()
 {
 	auto &rt = *runtime_;
 	auto &ctx = rt.exec_ctx;
+	TaskProfileEventGuard event_guard(ctx, event_id_);
+	PipelineProfileScope task_scope(ctx, PipelineProfileStage::TASK_RUN_TOTAL);
 	auto &ps = rt.GetOrCreatePipelineState(pipeline_->id);
 
 	EnsureGlobalStates(ps, *pipeline_, ctx);
@@ -88,7 +113,14 @@ PipelineRunTask::Execute()
 			return TaskExecutionResult::TASK_NOT_FINISHED;
 
 		OperatorSourceInput src_in{*ps.global_source, *ps.local_source};
-		SourceResultType sres = pipeline_->source->GetData(ctx, src_chunk, src_in);
+		SourceResultType sres;
+		{
+			PipelineProfileScope source_scope(ctx,
+				PipelineProfileSourceStage(pipeline_->source->type()));
+			sres = pipeline_->source->GetData(ctx, src_chunk, src_in);
+			if (sres == SourceResultType::HAVE_MORE_OUTPUT)
+				source_scope.AddRows(src_chunk.count);
+		}
 
 		if (sres == SourceResultType::BLOCKED)
 			RaiseBlockedForbidden();
@@ -105,8 +137,15 @@ PipelineRunTask::Execute()
 			for (;;)
 			{
 				current_out->reset();
-				OperatorResultType ores = op->Execute(ctx, *current_in, *current_out,
-				                                     op_state);
+				OperatorResultType ores;
+				{
+					PipelineProfileScope op_scope(ctx,
+						PipelineProfileOperatorStage(op->type()));
+					ores = op->Execute(ctx, *current_in, *current_out,
+											op_state);
+					if (ores == OperatorResultType::HAVE_MORE_OUTPUT)
+						op_scope.AddRows(current_out->count);
+				}
 				if (ores == OperatorResultType::BLOCKED)
 					RaiseBlockedForbidden();
 				if (ores == OperatorResultType::FINISHED)
@@ -120,8 +159,14 @@ PipelineRunTask::Execute()
 		}
 		{
 			OperatorSinkInput sink_in{*ps.global_sink, *ps.local_sink};
-			SinkResultType kres = pipeline_->sink->SinkChunk(ctx, *current_in,
-			                                                sink_in);
+			SinkResultType kres;
+			{
+				PipelineProfileScope sink_scope(ctx,
+					PipelineProfileSinkStage(pipeline_->sink->type()));
+				kres = pipeline_->sink->SinkChunk(ctx, *current_in,
+											 sink_in);
+				sink_scope.AddRows(current_in->count);
+			}
 			if (kres == SinkResultType::BLOCKED)
 				RaiseBlockedForbidden();
 			if (kres == SinkResultType::FINISHED)
@@ -143,12 +188,19 @@ PipelineCombineTask::Execute()
 {
 	auto &rt = *runtime_;
 	auto &ctx = rt.exec_ctx;
+	TaskProfileEventGuard event_guard(ctx, event_id_);
+	PipelineProfileScope task_scope(ctx, PipelineProfileStage::TASK_COMBINE_TOTAL);
 	auto &ps = rt.GetPipelineState(pipeline_->id);
 	Assert(ps.local_sink != nullptr);
 	Assert(ps.global_sink != nullptr);
 	Assert(!ps.combine_done);
 	OperatorSinkCombineInput in{*ps.local_sink, *ps.global_sink};
-	SinkCombineResultType cres = pipeline_->sink->Combine(ctx, in);
+	SinkCombineResultType cres;
+	{
+		PipelineProfileScope combine_scope(ctx,
+			PipelineProfileCombineStage(pipeline_->sink->type()));
+		cres = pipeline_->sink->Combine(ctx, in);
+	}
 	if (cres == SinkCombineResultType::BLOCKED)
 		RaiseBlockedForbidden();
 	ps.combine_done = true;
@@ -169,6 +221,8 @@ PipelineFinalizeTask::Execute()
 {
 	auto &rt = *runtime_;
 	auto &ctx = rt.exec_ctx;
+	TaskProfileEventGuard event_guard(ctx, event_id_);
+	PipelineProfileScope task_scope(ctx, PipelineProfileStage::TASK_FINALIZE_TOTAL);
 	/*
 	 * GetOrCreatePipelineState (not strict GetPipelineState):
 	 * FINALIZE is allowed to be the first touch on a pipeline for a given
@@ -201,7 +255,12 @@ PipelineFinalizeTask::Execute()
 		ps.local_sink.reset();
 		ps.local_ops.clear();
 	}
-	SinkFinalizeType fres = pipeline_->sink->Finalize(ctx, *ps.global_sink);
+	SinkFinalizeType fres;
+	{
+		PipelineProfileScope finalize_scope(ctx,
+			PipelineProfileFinalizeStage(pipeline_->sink->type()));
+		fres = pipeline_->sink->Finalize(ctx, *ps.global_sink);
+	}
 	if (fres == SinkFinalizeType::BLOCKED)
 		RaiseBlockedForbidden();
 	return TaskExecutionResult::TASK_FINISHED;

@@ -3,6 +3,7 @@
 #include "access/parallel.h"
 #include "executor/executor.h"
 #include "storage/dsm_registry.h"
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "utils/guc.h"
 #include "nodes/print.h"
@@ -24,11 +25,11 @@ bool pg_volvec_trace_execution_path = false;
 bool pg_volvec_jit_deform = true;
 bool pg_volvec_parallel = false;
 int pg_volvec_parallel_max_workers = 4;
-int pg_volvec_parallel_morsel_nblocks = 512;
 int pg_volvec_parallel_min_relation_blocks = 1024;
 bool pg_volvec_parallel_leader_participation = true;
 bool pg_volvec_parallel_experimental_hash_pipeline = false;
 bool pg_volvec_disable_jit_for_parallel_worker = false;
+bool pg_volvec_profile = false;
 
 static void pg_volvec_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_volvec_ExecutorRun(QueryDesc *queryDesc,
@@ -38,6 +39,7 @@ static void pg_volvec_ExecutorFinish(QueryDesc *queryDesc);
 static void pg_volvec_ExecutorEnd(QueryDesc *queryDesc);
 
 extern int pg_volvec_runtime_dsa_tranche_id(void);
+extern void pg_volvec_proc_exit_release_jit_contexts(int code, Datum arg);
 
 void            _PG_init(void);
 void            _PG_fini(void);
@@ -151,7 +153,7 @@ _PG_init(void)
 							 NULL);
 
 	DefineCustomBoolVariable("pg_volvec.parallel",
-							 "Enable experimental morsel-driven parallel lowering inside pg_volvec.",
+							 "Enable experimental block-pool parallel lowering inside pg_volvec.",
 							 NULL,
 							 &pg_volvec_parallel,
 							 false,
@@ -174,19 +176,6 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	DefineCustomIntVariable("pg_volvec.parallel_morsel_nblocks",
-							"Block range size used for experimental pg_volvec morsel scheduling.",
-							NULL,
-							&pg_volvec_parallel_morsel_nblocks,
-							512,
-							1,
-							1048576,
-							PGC_USERSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
 	DefineCustomIntVariable("pg_volvec.parallel_min_relation_blocks",
 							"Minimum relation size in blocks before experimental pg_volvec parallel lowering is considered.",
 							NULL,
@@ -201,7 +190,7 @@ _PG_init(void)
 							NULL);
 
 	DefineCustomBoolVariable("pg_volvec.parallel_leader_participation",
-							 "Allow the leader to participate in experimental pg_volvec morsel execution.",
+							 "Allow the leader to participate in experimental pg_volvec block-pool execution.",
 							 NULL,
 							 &pg_volvec_parallel_leader_participation,
 							 true,
@@ -222,7 +211,20 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("pg_volvec.profile",
+							 "Emit pg_volvec per-stage pipeline timing after each offloaded query.",
+							 NULL,
+							 &pg_volvec_profile,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	pg_volvec_init_state_table();
+
+	before_shmem_exit(pg_volvec_proc_exit_release_jit_contexts, (Datum) 0);
 
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = pg_volvec_ExecutorStart;

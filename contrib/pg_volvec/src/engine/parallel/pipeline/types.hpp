@@ -16,6 +16,8 @@ constexpr uint16_t PIPELINE_DEFAULT_CHUNK_SIZE = 1024;
 
 namespace pipeline {
 
+struct PipelineSharedControl;
+
 using PipelineChunk = DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>;
 
 enum class OperatorResultType : uint8_t {
@@ -58,6 +60,8 @@ struct ExecCtx {
 	MemoryContext  mcxt;
 	dsa_area      *dsa;
 	int            worker_index;
+	PipelineSharedControl *control = nullptr;
+	EventId        profile_event_id = INVALID_EVENT_ID;
 };
 
 }

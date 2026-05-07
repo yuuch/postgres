@@ -220,7 +220,6 @@ struct ProjectOpBody {
 struct SeqScanSharedPayload {
 	pg_atomic_uint64 next_block;
 	BlockNumber      total_blocks;
-	uint32_t         morsel_nblocks;
 };
 
 /*

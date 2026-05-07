@@ -2,10 +2,12 @@
 
 extern "C" {
 #include "postgres.h"
+#include "access/heapam.h"
 #include "access/relscan.h"
 #include "catalog/pg_type_d.h"
 #include "executor/execdesc.h"
 #include "storage/block.h"
+#include "storage/read_stream.h"
 #include "utils/dsa.h"
 #include "utils/rel.h"
 }
@@ -43,15 +45,12 @@ public:
 class SeqScanLocalState final : public LocalSourceState {
 public:
 	Relation        rel = nullptr;
-	TableScanDesc   scan_desc = nullptr;
+	HeapScanDesc    scan_desc = nullptr;
+	ReadStream     *read_stream = nullptr;
 	TupleDesc       scan_tupdesc = nullptr;
-	TupleTableSlot *slot = nullptr;
 	VecExprProgram *qual_program = nullptr;   /* interpreter-only; built from POD qual desc */
-	BlockNumber     current_block = InvalidBlockNumber;
-	BlockNumber     end_block = InvalidBlockNumber;
+	uint32          page_visible_index = 0;
 	bool            exhausted = false;
-	/* morsel_active: see Bug K — chunk fills mid-morsel, must resume scan_desc. */
-	bool            morsel_active = false;
 	bool            diag_first_call_logged = false;
 
 	/* M-Q1-PERF B.1: split deform into qual-side (1-row scratch chunk, written
@@ -94,10 +93,16 @@ public:
 			qual_jit_func = nullptr;
 		}
 #endif
-		if (slot != nullptr)
-			ExecDropSingleTupleTableSlot(slot);
 		if (scan_desc != nullptr)
-			table_endscan(scan_desc);
+		{
+			if (read_stream != nullptr)
+			{
+				read_stream_end(read_stream);
+				read_stream = nullptr;
+				scan_desc->rs_read_stream = nullptr;
+			}
+			heap_endscan((TableScanDesc) scan_desc);
+		}
 		if (rel != nullptr)
 			relation_close(rel, AccessShareLock);
 	}
