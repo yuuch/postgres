@@ -45,8 +45,9 @@ Current capabilities:
 - expression JIT with fused loops on the currently safe opcode family
 - exact numeric hot path for TPC-H-style `NUMERIC(15,2)`
 - owned string storage across join/agg/sort/output
-- process-based pipeline DAG plus morsel-driven runtime for the currently
-  accepted parallel shapes
+- process-based pipeline DAG; this stale doc predates the current block-pool
+  SeqScan runtime where workers claim heap blocks through a local read stream
+  callback
 
 Current important limits:
 

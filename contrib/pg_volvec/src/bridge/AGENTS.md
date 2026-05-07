@@ -47,7 +47,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 
 ## GUCs (defined in `pg_volvec.c::_PG_init`)
 
-10 GUCs are registered. All are `PGC_USERSET`.
+9 GUCs are registered. All are `PGC_USERSET`.
 
 | GUC | Default | Range | Purpose |
 |-----|---------|-------|---------|
@@ -57,10 +57,14 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 | `pg_volvec.jit_deform` | `true` | bool | Enable LLVM tuple-deform JIT. Consumed inside the engine, not the bridge. |
 | `pg_volvec.parallel` | `false` | bool | Enable pipeline runtime dispatch. **Required `on` for any pg_volvec execution today** (see `pg_volvec_initialize_plan`: returns `false` when off). |
 | `pg_volvec.parallel_max_workers` | `4` | 0–1024 | Max bgworkers per query. |
-| `pg_volvec.parallel_morsel_nblocks` | `512` | 1–1048576 | Blocks per morsel claim. |
 | `pg_volvec.parallel_min_relation_blocks` | `1024` | 0–`INT_MAX` | Min relation size before parallel lowering is considered. |
 | `pg_volvec.parallel_leader_participation` | `true` | bool | Leader runs pipeline tasks alongside workers. |
 | `pg_volvec.parallel_experimental_hash_pipeline` | `false` | bool | Reserved; **no effect in greenfield** (HashJoin removed). Kept registered to avoid breaking existing config files. |
+| `pg_volvec.profile` | `false` | bool | Emit per-stage pipeline timing after each offloaded query. Fine-grained scan stages add visible overhead; use for diagnosis, not benchmark timing. |
+
+`pg_volvec.parallel_morsel_nblocks` is no longer registered. The active SeqScan
+path uses an atomic block pool consumed by each worker's local read stream
+callback, not a tunable block-range morsel scheduler.
 
 ### Dead-code GUC variable
 

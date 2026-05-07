@@ -107,17 +107,20 @@ Current user-facing `pg_volvec` GUCs:
 
 - `pg_volvec.enabled`
 - `pg_volvec.trace_hooks`
+- `pg_volvec.trace_execution_path`
 - `pg_volvec.jit_deform`
 - `pg_volvec.parallel`
 - `pg_volvec.parallel_max_workers`
-- `pg_volvec.parallel_morsel_nblocks`
 - `pg_volvec.parallel_min_relation_blocks`
 - `pg_volvec.parallel_leader_participation`
 - `pg_volvec.parallel_experimental_hash_pipeline`
+- `pg_volvec.profile`
 
-Current default `pg_volvec.parallel_morsel_nblocks` is `512`. A 2026-04-18
-Q7/Q12 sweep showed `512` cuts task/block-range overhead versus `128`, while
-`2048` can regress Q7 due to coarser load balancing.
+SeqScan parallel work distribution is now a block pool: each worker's local
+read stream callback atomically claims the next heap block from shared
+`next_block` until `total_blocks` is exhausted. There is no user-facing morsel
+size GUC; `pg_volvec.parallel_morsel_nblocks` was removed with the old
+block-range scheduler.
 
 Most common serial validation session:
 
@@ -143,6 +146,7 @@ LOAD 'pg_volvec';
 SET pg_volvec.enabled = on;
 SET pg_volvec.parallel = on;
 SET pg_volvec.parallel_max_workers = 4;
+SET pg_volvec.profile = off;
 SET max_parallel_workers = 8;
 SET max_parallel_workers_per_gather = 4;
 SET pg_volvec.trace_hooks = on;
