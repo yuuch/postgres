@@ -24,15 +24,16 @@ public:
 	/*
 	 * Single-instance HashAggregate contract: one operator is both sink and
 	 * source, with a COMBINE event between Finalize and GetData. The shared
-	 * payload therefore carries one global AHT/TDC published in DSA.
+	 * payload is a DSA wrapper with partition-local AHT/TDC pairs.
 	 */
 	dsa_area            *dsa = nullptr;
 	OpDescriptor        *desc = nullptr;
 	dsa_pointer          layout_dp = InvalidDsaPointer;
 	const TupleDataLayout *layout = nullptr;
 	dsa_pointer          shared_payload_dp = InvalidDsaPointer;
-	AggregateHashTable  *global_aht = nullptr;
-	TupleDataCollection *global_tdc = nullptr;
+	HashAggSharedPayload *payload = nullptr;
+	HashAggPartition    *partitions = nullptr;
+	uint32_t             partition_count = 0;
 	uint32_t             max_groups = 256;
 	bool                 finalized = false;
 };
@@ -40,30 +41,28 @@ public:
 class HashAggGlobalSourceState final : public GlobalSourceState {
 public:
 	const TupleDataLayout *layout = nullptr;
-	AggregateHashTable   *global_aht = nullptr;
-	TupleDataCollection  *global_tdc = nullptr;
+	HashAggSharedPayload *payload = nullptr;
+	HashAggPartition     *partitions = nullptr;
+	uint32_t              partition_count = 0;
+	uint32_t              source_partition = 0;
 	uint32_t              source_cursor = 0;
 	bool                  finalized = false;
 };
 
 class HashAggLocalSinkState final : public LocalSinkState {
 public:
-	/*
-	 * Per-worker local sink state is DSA-backed so the leader can read and merge
-	 * worker partials during the COMBINE event.
-	 */
-	dsa_pointer          local_aht_dp = InvalidDsaPointer;
-	dsa_pointer          local_tdc_dp = InvalidDsaPointer;
-	AggregateHashTable  *local_aht = nullptr;
-	TupleDataCollection *local_tdc = nullptr;
+	/* Per-worker local sink state is partition-major; the runtime still owns a
+	 * single LocalSinkState object, but HashAgg routes each row to one local
+	 * radix partition before dedupe/update. */
+	dsa_pointer          local_partitions_dp = InvalidDsaPointer;
+	HashAggPartition    *local_partitions = nullptr;
 	const TupleDataLayout *layout = nullptr;
+	dsa_pointer          layout_dp = InvalidDsaPointer;
+	uint32_t             partition_count = 0;
+	uint32_t             partition_mask = 0;
+	uint32_t             partition_shift = 64;
 	uint32_t             max_groups = 256;
 
-	void *unsafe_borrow_partial(int worker_index) override
-	{
-		(void) worker_index;
-		return local_aht;
-	}
 };
 
 class HashAggLocalSourceState final : public LocalSourceState {
@@ -88,12 +87,14 @@ public:
 	                      PgVector<uint16_t> group_keys,
 	                      PgVector<AggFuncDesc> agg_funcs,
 	                      dsa_pointer shared_payload_dp,
+	                      uint32_t max_groups = 256,
 	                      OpDescriptor *desc = nullptr)
 		: PhysicalOperator(PhysicalOperatorType::HASH_AGGREGATE)
 		, layout_dp_(layout_dp)
 		, group_keys_(std::move(group_keys))
 		, agg_funcs_(std::move(agg_funcs))
 		, shared_payload_dp_(shared_payload_dp)
+		, max_groups_(max_groups)
 		, desc_(desc)
 	{}
 
@@ -119,6 +120,7 @@ public:
 	const PgVector<uint16_t>          &group_keys() const { return group_keys_; }
 	const PgVector<AggFuncDesc>       &agg_funcs() const { return agg_funcs_; }
 	dsa_pointer                        shared_payload_dp() const { return shared_payload_dp_; }
+	uint32_t                           max_groups() const { return max_groups_; }
 	OpDescriptor                      *desc() const { return desc_; }
 	const PgVector<OpDescriptor *>    &descs() const { return desc_list_; }
 
@@ -154,6 +156,7 @@ private:
 	PgVector<uint16_t>       group_keys_;
 	PgVector<AggFuncDesc>    agg_funcs_;
 	dsa_pointer              shared_payload_dp_;
+	uint32_t                 max_groups_;
 	OpDescriptor            *desc_;
 	PgVector<OpDescriptor *> desc_list_;
 };

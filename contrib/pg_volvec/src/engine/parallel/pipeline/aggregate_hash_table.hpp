@@ -11,10 +11,9 @@
  * v1 scope (per design §3.4, §10 step 4):
  *   - Single global AHT under a coarse spinlock — workers contend directly.
  *     Per-thread local AHTs land at Q3+.
- *   - Capacity is fixed at Init time (power of two, ≥ 2 * max_rows). Default
- *     max_rows=256, hard cap 1024 → capacity ≤ 2048 entries (16 KB).
- *     Overflow on insert = elog(ERROR) in v1.
- *   - Linear probe on collision (Robin-Hood / quadratic deferred to Q3+).
+ *   - Capacity is fixed at Init time (power of two, sized from estimated
+ *     groups). Overflow on insert = elog(ERROR) in v1.
+ *   - DuckDB-style odd-step probing on collision; Robin-Hood deferred.
  *   - Hash function = FNV-1a over col.width bytes per group col (consistent
  *     with TupleDataMatchGroup's typed compare width).
  *   - 16-bit salt stored alongside row_index for early reject during probe.
@@ -23,9 +22,9 @@
  *
  *   | AggregateHashTable header | entries[capacity] |
  *
- * Each entry is 8 bytes; row_index = INVALID_ROW_INDEX (UINT32_MAX) marks
- * empty. Caller MUST re-init entries[] to INVALID_ROW_INDEX after
- * dsa_allocate0 (which gives row_index=0, a VALID index — bug landmine).
+ * Each entry is 8 bytes; UINT64_MAX marks empty. Caller MUST re-init
+ * entries[] after dsa_allocate0 (which gives 0, a valid [salt=0,row=0]
+ * encoding — bug landmine).
  *
  * Spec: .sisyphus/plans/3g2-tuple-data-collection-design.md §3.4, §10 step 4.
  */
@@ -40,29 +39,29 @@ extern "C" {
 
 #include "tuple_data_collection.hpp"
 #include "tuple_data_layout.hpp"
+#include "types.hpp"
 
 namespace pg_volvec {
 namespace pipeline {
 
 /*
- * Sentinel marking an empty AHT slot. Note dsa_allocate0 gives 0 which is a
- * VALID row index; AggregateHashTableInit MUST overwrite all entries to
- * this value before the table is usable.
+ * Sentinels marking an empty AHT slot. dsa_allocate0 gives value=0, which is
+ * a valid packed [salt=0,row=0] entry, so AggregateHashTableInit overwrites
+ * every entry with AHT_EMPTY_ENTRY_VALUE before use.
  */
 static constexpr uint32_t AHT_INVALID_ROW_INDEX = UINT32_MAX;
+static constexpr uint64_t AHT_EMPTY_ENTRY_VALUE = UINT64_MAX;
+static constexpr uint64_t AHT_ROW_INDEX_MASK = UINT64CONST(0x0000FFFFFFFFFFFF);
 
 /*
  * Directory entry. 8 bytes — fits a cache line worth (8 entries / 64B).
- *   - row_index: index into the backing TupleDataCollection.
- *   - salt:      low 16 bits of the hash, used to early-reject during
- *                linear probe before the full row compare.
- *   - _pad:      explicit padding for ABI stability across compilers.
+ * DuckDB-style packing:
+ *   - upper 16 bits: salt from the hash high bits.
+ *   - lower 48 bits: row index into the backing TupleDataCollection.
  */
 struct AggHtEntry
 {
-	uint32_t row_index;
-	uint16_t salt;
-	uint16_t _pad;
+	uint64_t value;
 };
 static_assert(sizeof(AggHtEntry) == 8, "AggHtEntry must be 8 bytes");
 
@@ -82,6 +81,38 @@ struct AggregateHashTable
 	AggHtEntry entries[1];
 };
 
+struct HashAggPartition
+{
+	slock_t     mutex;
+	dsa_pointer aht_dp;
+	dsa_pointer tdc_dp;
+};
+
+struct HashAggSharedPayload
+{
+	uint32_t    partition_count;
+	uint32_t    partition_mask;
+	uint32_t    max_groups;
+	uint32_t    local_state_slot_count;
+	bool        finalized;
+	uint8_t     _pad[3];
+	dsa_pointer partitions_dp;  /* HashAggPartition[partition_count] */
+	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
+};
+
+struct AggregateHashTableBatchProbeInput
+{
+	uint16_t row_idx;
+	uint64_t hash;
+};
+
+struct AggregateHashTableBatchProbeResult
+{
+	uint16_t row_idx;
+	uint32_t canonical_row_idx;
+	bool inserted;
+};
+
 /*
  * Allocation size. Use with dsa_allocate0; then call AggregateHashTableInit
  * to overwrite the zero-init row_index fields with AHT_INVALID_ROW_INDEX.
@@ -96,20 +127,31 @@ AggregateHashTableAllocSize(uint32_t capacity)
 
 /*
  * Choose AHT capacity for a given expected max distinct group count.
- * Returns the next power of two ≥ 2 * max_groups, clamped to a v1 hard cap.
- * Hard cap = 2048 entries (covers max_rows=1024 at 50% load). Q3+ relaxes.
+ * Returns the next power of two at roughly DuckDB's 1.5x load headroom.
  */
 uint32_t AggregateHashTableChooseCapacity(uint32_t max_groups);
+
+uint32_t HashAggChoosePartitionCount(uint32_t worker_count, uint32_t row_width);
+
+uint32_t HashAggPartitionIndex(uint64_t hash, uint32_t partition_mask);
+
+uint32_t HashAggPartitionShift(uint32_t partition_mask);
 
 /*
  * Initialize an already-zeroed AHT in place. Sets capacity / mask /
  * spinlock, publishes the backing TupleDataCollection pointer, and overwrites
- * entries[].row_index = AHT_INVALID_ROW_INDEX.
- * Salt bits stay zero (don't care; only inspected when row_index != INVALID).
+ * entries[] with AHT_EMPTY_ENTRY_VALUE.
  */
 void AggregateHashTableInit(AggregateHashTable *aht,
 						 uint32_t capacity,
 						 dsa_pointer tdc_dp = InvalidDsaPointer);
+
+void AggregateHashTableRehash(AggregateHashTable *aht,
+                              TupleDataCollection *tdc,
+                              const TupleDataLayout *layout);
+
+bool AggregateHashTableShouldResize(const AggregateHashTable *aht,
+                                    TupleDataCollection *tdc);
 
 /*
  * Lookup-or-insert: given group_row_ptr (a fully-Scattered row in tdc that
@@ -143,6 +185,14 @@ bool AggregateHashTableFindOrInsert(AggregateHashTable *aht,
                                     const uint8_t *group_row_ptr,
                                     uint64_t hash,
                                     uint32_t *out_existing_row_idx);
+
+void AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
+                                         TupleDataCollection *tdc,
+                                         const TupleDataLayout *layout,
+                                         PipelineChunk &chunk,
+                                         const AggregateHashTableBatchProbeInput *inputs,
+                                         uint16_t count,
+                                         AggregateHashTableBatchProbeResult *results);
 
 /*
  * Atomic combine: probe AHT for a row matching src_row's group cols; on
