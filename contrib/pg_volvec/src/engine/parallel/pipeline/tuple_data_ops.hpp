@@ -105,17 +105,18 @@ void Gather(const TupleDataLayout *layout,
 
 /*
  * HashGroup:
- *   FNV-1a hash over the group columns (layout->columns[0..column_count-1])
- *   of chunk[row_idx]. Aggregate state columns are NOT hashed.
- *
- *   FNV-1a 64-bit, offset basis 0xcbf29ce484222325, prime 0x100000001b3.
- *   Each column contributes its in-row width bytes (4 for INT32, 8 for
- *   INT64/DOUBLE) in little-endian order — matches the in-row encoding
- *   so MatchGroup byte-compare can use memcmp on the same range.
+ *   Typed 64-bit hash over group columns (layout->columns[0..column_count-1])
+ *   of chunk[row_idx]. Aggregate state columns are NOT hashed. INT32/INT64
+ *   avoid byte-at-a-time hashing; DOUBLE hashes its bit representation.
  */
 uint64_t HashGroup(const TupleDataLayout *layout,
                    const PipelineChunk &chunk,
                    uint16_t row_idx);
+
+/* Row-buffer variant used by HashAgg combine and AHT rehash. Must stay
+ * bit-identical to HashGroup for rows produced by ScatterGroupOnly. */
+uint64_t HashGroupRow(const TupleDataLayout *layout,
+                      const uint8_t *row_ptr);
 
 /*
  * MatchGroup:
@@ -143,6 +144,8 @@ bool MatchGroupRow(const TupleDataLayout *layout,
                    const uint8_t *row_a,
                    const uint8_t *row_b);
 
+bool IsCanonicalQ1HashAggLayout(const TupleDataLayout *layout);
+
 /*
  * UpdateAggregates:
  *   For each aggregate a in layout->aggregates[0..aggregate_count-1]:
@@ -161,6 +164,12 @@ void UpdateAggregates(const TupleDataLayout *layout,
                       uint8_t *row_ptr,
                       const PipelineChunk &chunk,
                       uint16_t row_idx);
+
+void UpdateAggregatesBatch(const TupleDataLayout *layout,
+                           uint8_t **row_ptrs,
+                           const PipelineChunk &chunk,
+                           const uint16_t *row_indices,
+                           uint16_t count);
 
 /*
  * CombineAggregates:
