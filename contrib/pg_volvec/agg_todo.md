@@ -116,9 +116,9 @@
 ## Phase 4 — Perfect HT（Q1 杀手级，3-5 天）
 
 ### P4.1 PerfectAggregateHashTable
-- [ ] translator 检测：固定窄域 group cols 且总组数 < 1024
-- [ ] 直接索引数组：`states[encode(g1, g2, ...)]`
-- [ ] 新 operator `PhysicalPerfectHashAggregate`
+- [x] translator/descriptor 检测：所有 group cols 为单字节 `CHAR/BPCHAR` 窄域且编码空间 ≤1024（不硬编码 Q1）
+- [x] local sink 直接索引数组：`row_ids[encode(g1, g2, ...)]`，miss 才 append canonical row
+- [ ] 新 operator `PhysicalPerfectHashAggregate`（v1 先内嵌为 `PhysicalHashAggregate` perfect mode；global combine 仍复用 AHT）
 
 预期：Q1 单线程再 2×；多线程 combine 几乎零成本
 
@@ -156,7 +156,7 @@ Phase 5:  按 query 覆盖按需推进
 | Phase 1 | ✅ 完成 | P1.1/P1.2/P1.3 已落地；P2 partition-owner merge 另行推进 |
 | Phase 2 | ✅ 完成 | Phase 2B partition-owner merge 已完成并通过 canonical Q1；spill-ready P2.4 仅保留未来 spill 铺路 |
 | Phase 3 | ✅ 完成 | typed hash mixer、batch lookup API、prefetch metadata、多槽 vector salt compare、layout-driven multi-candidate group compare、generic row-id gather update、generic grouped-delta update 已落地；不再依赖 canonical Q1 layout 特判 |
-| Phase 4 | ⏳ 未开始 | |
+| Phase 4 | 🚧 进行中 | v1 perfect local sink 已落地：CHAR/BPCHAR 单字节窄域由 translator 生成 descriptor spec；未新增独立 operator，global combine 仍复用 AHT |
 | Phase 5 | ⏳ 未开始 | |
 
 ### Changelog
@@ -176,3 +176,4 @@ Phase 5:  按 query 覆盖按需推进
 - 2026-05-07: 完成 P3.1 batch group compare 的 Q1 fast path：导出 `IsCanonicalQ1HashAggLayout()`，`MatchGroupRow()` 命中 canonical Q1 时直接比较 offset 0/8 的两个 int32 group key，跳过逐列 `memcmp` loop；generic layout 保持原逻辑。Meson build/install/restart 通过；canonical Q1 w=8 连跑返回 4 groups，约 1655 ms / 1600 ms。真正多候选 vector group compare 仍待做。
 - 2026-05-07: 完成 P3.3 Q1 grouped-delta batch update：`UpdateAggregatesBatch()` 在 canonical Q1 layout 下按 canonical row pointer 合并 chunk 内 `sum_qty/sum_base/sum_disc/sum_charge/sum_discount/count` delta，再对每个 group row 一次性写回 SUM/AVG pair/COUNT state；generic layout 仍 fallback。Meson build/install/restart 通过；canonical Q1 w=8 连跑返回 4 groups，约 1810 ms / 1621 ms。真正 row-id gather + NEON/AVX SIMD 仍待做。
 - 2026-05-07: 完成 Phase 3 generic 化收尾：AHT batch probe 改为 unresolved-input iteration-major mini-vector，批量分类 empty/salt-hit/miss；salt-hit 通过 `MatchGroupBatch()` 做 layout-driven 多候选比较；移除 `IsCanonicalQ1HashAggLayout()` 及所有 Q1 offset/src-col 特判，`UpdateAggregatesBatch()`/`UpdateAggregatesGather()` 统一按 `TdcAggregateDesc` 合并 canonical row delta；hash finalizer 切到 SplitMix/xxhash 风格 finalizer。Meson build/install/restart 通过；canonical TPCH Q1 w=8 offload 返回 4 groups，`sum_*`/`charge`/`count_order` 与 native byte-exact（AVG 仍为既有 scale-2 简化）。
+- 2026-05-08: 启动 Phase 4 v1：translator 基于 `ColumnSchema` 为所有 group columns 都是单字节 `CHAR/BPCHAR` 且编码空间 ≤1024 的聚合生成 `perfect_hash_capacity` descriptor spec；`PhysicalHashAggregate` 消费该 spec 进入 generic perfect local sink mode，用 `row_ids[encode(key)]` 直接定位 canonical row，避免 local AHT probe。Meson build/install/restart 通过；canonical TPCH Q1 w=8 offload 返回 4 groups，EXPLAIN ANALYZE 约 1708 ms。独立 `PhysicalPerfectHashAggregate` 与 global perfect combine 仍待做。
