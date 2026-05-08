@@ -22,8 +22,8 @@
  *   - layout->columns[i] (i = 0..N-1) sources from chunk col `i`.
  *   - layout->aggregates[j] (j = 0..M-1) sources its update value from
  *     chunk col `aggregates[j].src_col_idx` (typically N+j, but the
- *     translator may share one input col across multiple aggs, e.g. Q1
- *     uses extendedprice for two SUMs).
+	 *     translator may share one input col across multiple aggs, e.g. when
+	 *     separate SUM/AVG aggregates read the same projected value).
  *
  * All functions are header-stable across operators. v1 dispatch is on
  * TdcColumnKind / TdcAggKind (no fn-ptrs, DSA-portable).
@@ -131,6 +131,13 @@ bool MatchGroup(const TupleDataLayout *layout,
                 const PipelineChunk &chunk,
                 uint16_t row_idx);
 
+void MatchGroupBatch(const TupleDataLayout *layout,
+                     const uint8_t *const *row_ptrs,
+                     const PipelineChunk &chunk,
+                     const uint16_t *row_indices,
+                     uint16_t count,
+                     bool *matches);
+
 /*
  * MatchGroupRow:
  *   Row-vs-row variant of MatchGroup. Returns true iff the group columns
@@ -144,8 +151,6 @@ bool MatchGroupRow(const TupleDataLayout *layout,
                    const uint8_t *row_a,
                    const uint8_t *row_b);
 
-bool IsCanonicalQ1HashAggLayout(const TupleDataLayout *layout);
-
 /*
  * UpdateAggregates:
  *   For each aggregate a in layout->aggregates[0..aggregate_count-1]:
@@ -155,8 +160,8 @@ bool IsCanonicalQ1HashAggLayout(const TupleDataLayout *layout);
  *     - COUNT_STAR   : *(int64*)&row[a.offset] += 1.
  *
  * Aggregate state is plain int64 in v1 (no Wide128 in DSA — out of scope
- * per design §3.1). Overflow is undefined for v1 (Q1 fits comfortably);
- * Wide128 widening lands at Q3+.
+	 * per design §3.1). Overflow is undefined for v1; supported queries are
+	 * expected to fit int64 accumulators until Wide128 widening lands at Q3+.
  *
  * Preconditions: chunk.count > row_idx; src_col_idx < 16.
  */
@@ -170,6 +175,14 @@ void UpdateAggregatesBatch(const TupleDataLayout *layout,
                            const PipelineChunk &chunk,
                            const uint16_t *row_indices,
                            uint16_t count);
+
+void UpdateAggregatesGather(const TupleDataLayout *layout,
+                            uint8_t *tdc_base,
+                            uint32_t row_width,
+                            const uint32_t *canonical_row_indices,
+                            const PipelineChunk &chunk,
+                            const uint16_t *row_indices,
+                            uint16_t count);
 
 /*
  * CombineAggregates:

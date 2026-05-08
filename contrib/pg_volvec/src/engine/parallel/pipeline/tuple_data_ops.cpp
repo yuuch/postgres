@@ -37,11 +37,11 @@ namespace {
 static inline uint64_t
 Mix64(uint64_t v)
 {
-	v ^= v >> 33;
-	v *= UINT64CONST(0xff51afd7ed558ccd);
-	v ^= v >> 33;
-	v *= UINT64CONST(0xc4ceb9fe1a85ec53);
-	v ^= v >> 33;
+	v ^= v >> 30;
+	v *= UINT64CONST(0xbf58476d1ce4e5b9);
+	v ^= v >> 27;
+	v *= UINT64CONST(0x94d049bb133111eb);
+	v ^= v >> 31;
 	return v;
 }
 
@@ -59,21 +59,6 @@ HashCombine(uint64_t hash, uint64_t value, uint16_t column_index)
 	return Mix64(hash ^ Mix64(lane));
 }
 
-static inline bool
-IsQ1Agg(const TdcAggregateDesc &agg,
-        TdcAggKind kind,
-        uint16_t src_col_idx,
-        uint16_t offset,
-        uint16_t width,
-        int16_t numeric_scale)
-{
-	return agg.kind == kind &&
-		agg.src_col_idx == src_col_idx &&
-		agg.offset == offset &&
-		agg.width == width &&
-		agg.numeric_scale == numeric_scale;
-}
-
 static inline void
 AddInt64At(uint8_t *row_ptr, uint16_t offset, int64_t add)
 {
@@ -83,89 +68,61 @@ AddInt64At(uint8_t *row_ptr, uint16_t offset, int64_t add)
 	std::memcpy(row_ptr + offset, &acc, sizeof(acc));
 }
 
-static inline void
-UpdateAvgNumericAt(uint8_t *row_ptr, uint16_t offset, int64_t add)
-{
-	int64_t acc_sum;
-	int64_t acc_cnt;
-	std::memcpy(&acc_sum, row_ptr + offset, sizeof(acc_sum));
-	std::memcpy(&acc_cnt, row_ptr + offset + 8, sizeof(acc_cnt));
-	acc_sum += add;
-	acc_cnt += 1;
-	std::memcpy(row_ptr + offset, &acc_sum, sizeof(acc_sum));
-	std::memcpy(row_ptr + offset + 8, &acc_cnt, sizeof(acc_cnt));
-}
-
-static inline void
-UpdateCanonicalQ1Aggregates(uint8_t *row_ptr,
-                            const PipelineChunk &chunk,
-                            uint16_t row_idx)
-{
-	const int64_t qty = chunk.int64_columns[0][row_idx];
-	const int64_t base_price = chunk.int64_columns[1][row_idx];
-	const int64_t discount = chunk.int64_columns[2][row_idx];
-	const int64_t disc_price = chunk.int64_columns[5][row_idx];
-	const int64_t charge = chunk.int64_columns[7][row_idx];
-
-	AddInt64At(row_ptr, 16, qty);
-	AddInt64At(row_ptr, 24, base_price);
-	AddInt64At(row_ptr, 32, disc_price);
-	AddInt64At(row_ptr, 40, charge);
-	UpdateAvgNumericAt(row_ptr, 48, qty);
-	UpdateAvgNumericAt(row_ptr, 64, base_price);
-	UpdateAvgNumericAt(row_ptr, 80, discount);
-	AddInt64At(row_ptr, 96, 1);
-}
-
-struct Q1AggDelta
+struct AggDelta
 {
 	uint8_t *row_ptr = nullptr;
-	int64_t sum_qty = 0;
-	int64_t sum_base_price = 0;
-	int64_t sum_disc_price = 0;
-	int64_t sum_charge = 0;
-	int64_t sum_discount = 0;
-	int64_t count = 0;
+	int64_t values[TUPLE_DATA_MAX_COLUMNS] = {0};
+	int64_t counts[TUPLE_DATA_MAX_COLUMNS] = {0};
 };
 
 static inline void
-AccumulateQ1Delta(Q1AggDelta &delta,
-                  const PipelineChunk &chunk,
-                  uint16_t row_idx)
+AccumulateAggDelta(const TupleDataLayout *layout,
+                   AggDelta &delta,
+                   const PipelineChunk &chunk,
+                   uint16_t row_idx)
 {
-	const int64_t qty = chunk.int64_columns[0][row_idx];
-	const int64_t base_price = chunk.int64_columns[1][row_idx];
-	delta.sum_qty += qty;
-	delta.sum_base_price += base_price;
-	delta.sum_disc_price += chunk.int64_columns[5][row_idx];
-	delta.sum_charge += chunk.int64_columns[7][row_idx];
-	delta.sum_discount += chunk.int64_columns[2][row_idx];
-	delta.count += 1;
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		switch (agg.kind)
+		{
+			case TdcAggKind::SUM_INT64:
+			case TdcAggKind::SUM_NUMERIC:
+				Assert(agg.src_col_idx < 16);
+				delta.values[a] += chunk.int64_columns[agg.src_col_idx][row_idx];
+				break;
+			case TdcAggKind::COUNT_STAR:
+				delta.values[a] += 1;
+				break;
+			case TdcAggKind::AVG_NUMERIC:
+				Assert(agg.src_col_idx < 16);
+				delta.values[a] += chunk.int64_columns[agg.src_col_idx][row_idx];
+				delta.counts[a] += 1;
+				break;
+		}
+	}
 }
 
 static inline void
-ApplyQ1Delta(const Q1AggDelta &delta)
+ApplyAggDelta(const TupleDataLayout *layout, const AggDelta &delta)
 {
-	AddInt64At(delta.row_ptr, 16, delta.sum_qty);
-	AddInt64At(delta.row_ptr, 24, delta.sum_base_price);
-	AddInt64At(delta.row_ptr, 32, delta.sum_disc_price);
-	AddInt64At(delta.row_ptr, 40, delta.sum_charge);
-	AddInt64At(delta.row_ptr, 48, delta.sum_qty);
-	AddInt64At(delta.row_ptr, 56, delta.count);
-	AddInt64At(delta.row_ptr, 64, delta.sum_base_price);
-	AddInt64At(delta.row_ptr, 72, delta.count);
-	AddInt64At(delta.row_ptr, 80, delta.sum_discount);
-	AddInt64At(delta.row_ptr, 88, delta.count);
-	AddInt64At(delta.row_ptr, 96, delta.count);
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		AddInt64At(delta.row_ptr, agg.offset, delta.values[a]);
+		if (agg.kind == TdcAggKind::AVG_NUMERIC)
+			AddInt64At(delta.row_ptr, agg.offset + 8, delta.counts[a]);
+	}
 }
 
 static void
-UpdateCanonicalQ1AggregatesBatch(uint8_t **row_ptrs,
-                                 const PipelineChunk &chunk,
-                                 const uint16_t *row_indices,
-                                 uint16_t count)
+UpdateAggregatesBatchGroupedGeneric(const TupleDataLayout *layout,
+                                    uint8_t **row_ptrs,
+                                    const PipelineChunk &chunk,
+                                    const uint16_t *row_indices,
+                                    uint16_t count)
 {
-	Q1AggDelta deltas[PIPELINE_DEFAULT_CHUNK_SIZE];
+	AggDelta deltas[PIPELINE_DEFAULT_CHUNK_SIZE];
 	uint16_t delta_count = 0;
 
 	for (uint16_t i = 0; i < count; ++i)
@@ -183,65 +140,50 @@ UpdateCanonicalQ1AggregatesBatch(uint8_t **row_ptrs,
 			deltas[delta_idx].row_ptr = row_ptrs[i];
 			++delta_count;
 		}
-		AccumulateQ1Delta(deltas[delta_idx], chunk, row_indices[i]);
+		AccumulateAggDelta(layout, deltas[delta_idx], chunk, row_indices[i]);
 	}
 
 	for (uint16_t i = 0; i < delta_count; ++i)
-		ApplyQ1Delta(deltas[i]);
+		ApplyAggDelta(layout, deltas[i]);
 }
 
-static inline bool
-MatchCanonicalQ1GroupRow(const uint8_t *row_a, const uint8_t *row_b)
+static void
+UpdateAggregatesGatherGroupedGeneric(const TupleDataLayout *layout,
+                                     uint8_t *tdc_base,
+                                     uint32_t row_width,
+                                     const uint32_t *canonical_row_indices,
+                                     const PipelineChunk &chunk,
+                                     const uint16_t *row_indices,
+                                     uint16_t count)
 {
-	uint32_t a0, a1, b0, b1;
-	std::memcpy(&a0, row_a, sizeof(a0));
-	std::memcpy(&a1, row_a + 8, sizeof(a1));
-	std::memcpy(&b0, row_b, sizeof(b0));
-	std::memcpy(&b1, row_b + 8, sizeof(b1));
-	return a0 == b0 && a1 == b1;
-}
+	AggDelta deltas[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint32_t delta_row_indices[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint16_t delta_count = 0;
 
-static inline bool
-MatchCanonicalQ1Group(const uint8_t *row_ptr,
-                      const PipelineChunk &chunk,
-                      uint16_t row_idx)
-{
-	uint32_t row0, row1;
-	std::memcpy(&row0, row_ptr, sizeof(row0));
-	std::memcpy(&row1, row_ptr + 8, sizeof(row1));
-	return row0 == static_cast<uint32_t>(chunk.int32_columns[0][row_idx]) &&
-		row1 == static_cast<uint32_t>(chunk.int32_columns[1][row_idx]);
+	for (uint16_t i = 0; i < count; ++i)
+	{
+		Assert(row_indices[i] < chunk.count);
+		const uint32_t canonical_idx = canonical_row_indices[i];
+		uint16_t delta_idx = 0;
+		for (; delta_idx < delta_count; ++delta_idx)
+		{
+			if (delta_row_indices[delta_idx] == canonical_idx)
+				break;
+		}
+		if (delta_idx == delta_count)
+		{
+			delta_row_indices[delta_idx] = canonical_idx;
+			deltas[delta_idx].row_ptr = tdc_base + static_cast<size_t>(canonical_idx) * row_width;
+			++delta_count;
+		}
+		AccumulateAggDelta(layout, deltas[delta_idx], chunk, row_indices[i]);
+	}
+
+	for (uint16_t i = 0; i < delta_count; ++i)
+		ApplyAggDelta(layout, deltas[i]);
 }
 
 }  /* namespace */
-
-bool
-IsCanonicalQ1HashAggLayout(const TupleDataLayout *layout)
-{
-	if (layout == nullptr || layout->validity_width != 0 ||
-		layout->column_count != 2 || layout->aggregate_count != 8 ||
-		layout->row_width != 104)
-		return false;
-
-	const TdcColumnDesc &col0 = layout->columns[0];
-	const TdcColumnDesc &col1 = layout->columns[1];
-	if (col0.kind != TdcColumnKind::INT32 || col0.offset != 0 ||
-		col0.width != 4 || col0.numeric_scale != 0)
-		return false;
-	if (col1.kind != TdcColumnKind::INT32 || col1.offset != 8 ||
-		col1.width != 4 || col1.numeric_scale != 0)
-		return false;
-
-	const TdcAggregateDesc *aggs = layout->aggregates;
-	return IsQ1Agg(aggs[0], TdcAggKind::SUM_NUMERIC, 0, 16, 8, 2) &&
-		IsQ1Agg(aggs[1], TdcAggKind::SUM_NUMERIC, 1, 24, 8, 2) &&
-		IsQ1Agg(aggs[2], TdcAggKind::SUM_NUMERIC, 5, 32, 8, 4) &&
-		IsQ1Agg(aggs[3], TdcAggKind::SUM_NUMERIC, 7, 40, 8, 6) &&
-		IsQ1Agg(aggs[4], TdcAggKind::AVG_NUMERIC, 0, 48, 16, 2) &&
-		IsQ1Agg(aggs[5], TdcAggKind::AVG_NUMERIC, 1, 64, 16, 2) &&
-		IsQ1Agg(aggs[6], TdcAggKind::AVG_NUMERIC, 2, 80, 16, 2) &&
-		IsQ1Agg(aggs[7], TdcAggKind::COUNT_STAR, 0, 96, 8, 0);
-}
 
 static inline void
 ScatterGroupColumns(const TupleDataLayout *layout,
@@ -471,8 +413,6 @@ MatchGroup(const TupleDataLayout *layout,
 {
 	Assert(layout != nullptr && row_ptr != nullptr);
 	Assert(row_idx < chunk.count);
-	if (IsCanonicalQ1HashAggLayout(layout))
-		return MatchCanonicalQ1Group(row_ptr, chunk, row_idx);
 
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
@@ -499,13 +439,11 @@ MatchGroup(const TupleDataLayout *layout,
 			}
 			case TdcColumnKind::DOUBLE:
 			{
-				double row_v;
+				uint64_t row_v;
+				uint64_t chunk_v;
 				std::memcpy(&row_v, row_ptr + col.offset, sizeof(row_v));
-				/* Bitwise equality (memcmp) on doubles — caller must ensure
-				 * both sides came through Scatter with no canonicalization
-				 * (Q1 group keys are int, so this branch is unused there). */
-				double chunk_v = chunk.double_columns[i][row_idx];
-				if (std::memcmp(&row_v, &chunk_v, sizeof(double)) != 0)
+				std::memcpy(&chunk_v, &chunk.double_columns[i][row_idx], sizeof(chunk_v));
+				if (row_v != chunk_v)
 					return false;
 				break;
 			}
@@ -514,14 +452,27 @@ MatchGroup(const TupleDataLayout *layout,
 	return true;
 }
 
+void
+MatchGroupBatch(const TupleDataLayout *layout,
+                const uint8_t *const *row_ptrs,
+                const PipelineChunk &chunk,
+                const uint16_t *row_indices,
+                uint16_t count,
+                bool *matches)
+{
+	Assert(layout != nullptr && row_ptrs != nullptr && row_indices != nullptr && matches != nullptr);
+	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
+
+	for (uint16_t i = 0; i < count; ++i)
+		matches[i] = row_ptrs[i] != nullptr && MatchGroup(layout, row_ptrs[i], chunk, row_indices[i]);
+}
+
 bool
 MatchGroupRow(const TupleDataLayout *layout,
               const uint8_t *row_a,
               const uint8_t *row_b)
 {
 	Assert(layout != nullptr && row_a != nullptr && row_b != nullptr);
-	if (IsCanonicalQ1HashAggLayout(layout))
-		return MatchCanonicalQ1GroupRow(row_a, row_b);
 
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
@@ -545,11 +496,6 @@ UpdateAggregates(const TupleDataLayout *layout,
 {
 	Assert(layout != nullptr && row_ptr != nullptr);
 	Assert(row_idx < chunk.count);
-	if (IsCanonicalQ1HashAggLayout(layout))
-	{
-		UpdateCanonicalQ1Aggregates(row_ptr, chunk, row_idx);
-		return;
-	}
 
 	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
 	{
@@ -614,18 +560,29 @@ UpdateAggregatesBatch(const TupleDataLayout *layout,
 	Assert(row_indices != nullptr);
 	Assert(count <= chunk.count);
 
-	if (IsCanonicalQ1HashAggLayout(layout))
-	{
-		UpdateCanonicalQ1AggregatesBatch(row_ptrs, chunk, row_indices, count);
-		return;
-	}
+	UpdateAggregatesBatchGroupedGeneric(layout, row_ptrs, chunk, row_indices, count);
+}
 
-	for (uint16_t i = 0; i < count; ++i)
-	{
-		Assert(row_ptrs[i] != nullptr);
-		Assert(row_indices[i] < chunk.count);
-		UpdateAggregates(layout, row_ptrs[i], chunk, row_indices[i]);
-	}
+void
+UpdateAggregatesGather(const TupleDataLayout *layout,
+                       uint8_t *tdc_base,
+                       uint32_t row_width,
+                       const uint32_t *canonical_row_indices,
+                       const PipelineChunk &chunk,
+                       const uint16_t *row_indices,
+                       uint16_t count)
+{
+	Assert(layout != nullptr && tdc_base != nullptr);
+	Assert(canonical_row_indices != nullptr && row_indices != nullptr);
+	Assert(row_width == layout->row_width);
+	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
+	UpdateAggregatesGatherGroupedGeneric(layout,
+		tdc_base,
+		row_width,
+		canonical_row_indices,
+		chunk,
+		row_indices,
+		count);
 }
 
 void

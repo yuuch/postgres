@@ -316,8 +316,9 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> probe_rows;
 	std::array<AggregateHashTableBatchProbeInput, PIPELINE_DEFAULT_CHUNK_SIZE> probe_inputs;
 	std::array<AggregateHashTableBatchProbeResult, PIPELINE_DEFAULT_CHUNK_SIZE> probe_results;
-	std::array<uint8_t *, PIPELINE_DEFAULT_CHUNK_SIZE> update_rows;
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_canonical_rows;
 	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_row_indices;
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_partitions;
 	uint16_t update_count = 0;
 
 	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
@@ -379,16 +380,32 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		for (uint16_t i = 0; i < probe_count; ++i)
 		{
 			update_row_indices[update_count] = probe_results[i].row_idx;
-			update_rows[update_count] = TupleDataCollectionGetRow(tdc,
-				probe_results[i].canonical_row_idx);
+			update_canonical_rows[update_count] = probe_results[i].canonical_row_idx;
+			update_partitions[update_count] = static_cast<uint16_t>(part_idx);
 			++update_count;
 		}
 	}
-	UpdateAggregatesBatch(local.layout,
-		update_rows.data(),
-		in,
-		update_row_indices.data(),
-		update_count);
+	uint16_t update_pos = 0;
+	while (update_pos < update_count)
+	{
+		const uint16_t part_idx = update_partitions[update_pos];
+		uint16_t run_count = 1;
+		while (update_pos + run_count < update_count &&
+			update_partitions[update_pos + run_count] == part_idx)
+			run_count++;
+
+		TupleDataCollection *tdc = ResolveTdc(ctx.dsa, local.local_partitions[part_idx].tdc_dp);
+		if (tdc == nullptr)
+			elog(ERROR, "pg_volvec: local hash aggregate partition TDC missing");
+		UpdateAggregatesGather(local.layout,
+			tdc->rows,
+			tdc->row_width,
+			update_canonical_rows.data() + update_pos,
+			in,
+			update_row_indices.data() + update_pos,
+			run_count);
+		update_pos += run_count;
+	}
 
 	return SinkResultType::NEED_MORE_INPUT;
 }
