@@ -3,7 +3,7 @@
 `pg_volvec` is a PostgreSQL extension prototype that keeps PostgreSQL planning
 unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
 
-> **⚠️ Phase notice — M-FRAME-MIN step 3g.2-final (runtime plumbed end-to-end, two open bugs).**
+> **⚠️ Phase notice — M-Q1-PERF / M-Q6-RESTORE in progress.**
 > The previous broad TPC-H prototype (Q1–Q22, HashJoin, MergeJoin,
 > SubqueryScan, the legacy serial vector executor under `src/engine/exec/`,
 > and the legacy morsel parallel runtime) was **intentionally deleted** in
@@ -12,12 +12,10 @@ unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
 > `6c344eb036d` plus this cycle's uncommitted work, the new runtime is
 > plumbed end-to-end: **SeqScan → HashAgg → Order → OutputSink** runs in
 > leader+workers, cross-process descriptor publish/load works, and the
-> leader drains the global TDC after FINALIZE. Two open bugs still cause
-> Q1 to emit 0 rows to `psql` (Bug G: HashAgg dedupe; Bug I: OutputSink →
-> `DestReceiver` emission), so the bridge currently still falls through to
-> `standard_ExecutorRun` for correct results. The current narrowed scope
-> is **Q1 only** (target: `M-Q1-PERF`); Q6 will be restored in a later
-> milestone (`M-Q6-RESTORE`). Anything in `docs/` dated `2026-04-17`
+> leader drains the global TDC after FINALIZE. Q1 remains the primary
+> performance target (`M-Q1-PERF`), and the Q6 `SeqScan -> HashAgg` shape
+> has been restored for the canonical TPC-H filter/`SUM(extprice*discount)`
+> path. Anything in `docs/` dated `2026-04-17`
 > describes the pre-greenfield codebase and should not be trusted; see
 > `docs/ARCHITECTURE_DEVIATIONS.md` for the diff vs the reference
 > architecture in `pg_duckdb_architecture.md`.
@@ -45,19 +43,20 @@ unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
 
 ## Current Status
 
-Status refreshed: `2026-04-30` (HEAD `6c344eb036d` + uncommitted M-FRAME-MIN step-3g.2-final runtime work; ~36 modified TUs, +4537/-1523, plus 5 new source pairs `aggregate_hash_table`, `tuple_data_collection`, `tuple_data_layout`, `tuple_data_ops`, `physical_projection`)
+Status refreshed: `2026-05-08` (HEAD `6c344eb036d` + uncommitted M-Q1-PERF/M-Q6-RESTORE runtime work; includes `aggregate_hash_table`, `tuple_data_collection`, `tuple_data_layout`, `tuple_data_ops`, `physical_projection`)
 
 ### What runs through `pg_volvec` today
 
-**End-to-end plumbing works; client emit blocked.** For Q1, `Translator::Translate`
-now produces a real `PhysicalOperator` tree, the bundle slices into 3
+For Q1, `Translator::Translate` now produces a real `PhysicalOperator` tree,
+the bundle slices into 3
 `MetaPipeline` chains (`P0=[Order→Output]`, `P1=[HashAgg→Order]`,
 `P2=[SeqScan→HashAgg]`), workers attach DSA, drain `DsmTaskQueue`, write
 `DataChunk` into the global TDC, and the leader runs FINALIZE → drains the
-TDC into the `DestReceiver`. **However**, two open bugs (Bug G — HashAgg
-dedupe wrong; Bug I — `OutputSink → DestReceiver` emit 0) still cause `psql`
-to see 0 rows, so the bridge currently falls back to `standard_ExecutorRun`
-for correct results. See `AGENTS.md` for the full bug ledger.
+TDC into the `DestReceiver`. Q6's canonical `SeqScan -> plain Agg` shape also
+runs through this path when `pg_volvec.parallel=on`; its multi-clause date and
+numeric filters are represented by `QualDescriptor` and evaluated in
+`PhysicalSeqScan` before projecting `l_extendedprice * l_discount` into
+`SUM_NUMERIC`. See `AGENTS.md` for the detailed bug ledger.
 
 ### Active milestone: `M-FRAME-MIN`
 
@@ -74,8 +73,9 @@ Sequential rebuild on top of the greenfield deletion:
 
 - **`M-Q1-PERF`** — drive Q1 to extreme single-shape performance through the
   new pipeline runtime; perf tracked in `perf/q1_p3x_progression.md`.
-- **`M-Q6-RESTORE`** — re-introduce the Q6 plan shape. Q6 is currently parked
-  at "fallback to standard PG executor with WARNING" (verified correct).
+- **`M-Q6-RESTORE`** — canonical Q6 is restored for `SeqScan -> plain Agg`
+  with date/numeric filter conjunctions. Broader non-Q1 TPC-H shapes remain
+  out of scope for the current phase.
 
 ### Out of scope (intentionally deleted, do not reintroduce)
 
@@ -124,19 +124,31 @@ meson test -C build --suite pg_volvec
 # and the harness's echo-mode change); test failures are intentional until
 # M-Q1-PERF.
 
-# Manual on the 10G TPC-H instance
+# Manual on the 10G TPC-H instance (set pg_volvec.parallel=on for runtime path)
 ./installed/bin/psql -h /tmp -p 5432 -d tpch -f contrib/pg_volvec/sql/q1.sql
 ./installed/bin/psql -h /tmp -p 5432 -d tpch -f contrib/pg_volvec/sql/q6.sql
+```
+
+For Q6 and other TPC-H repros, enable pg_volvec's runtime explicitly and
+disable PostgreSQL's own parallel executor unless the test is explicitly about
+PG parallel plan shapes. This keeps `Gather`/parallel scan out of the
+PostgreSQL plan and isolates the `pg_volvec` runtime behavior:
+
+```sql
+SET pg_volvec.enabled = on;
+SET pg_volvec.parallel = on;
+SET max_parallel_workers_per_gather = 0;
+SET max_parallel_workers = 0;
+SET min_parallel_table_scan_size = '1000GB';
+SET parallel_setup_cost = 1000000000;
+SET parallel_tuple_cost = 1000000000;
 ```
 
 Expected results today:
 
 - Q1 on the small fixture: 2 rows (`A/F`, `B/O`).
-- Q6 on 10G TPC-H: `1230113636.0101`.
-
-Both are produced by **standard PG execution** (not `pg_volvec`) until
-Bug G (HashAgg dedupe) and Bug I (`OutputSink → DestReceiver` emit) are
-closed. The runtime itself is wired and exercised — see `AGENTS.md`.
+- Q6 on 10G TPC-H: `1230113636.0101` through the pg_volvec runtime when
+  `pg_volvec.parallel=on` and PostgreSQL parallelism is disabled as above.
 
 ## Project Layout
 
