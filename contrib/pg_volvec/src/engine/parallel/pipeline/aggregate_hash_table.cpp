@@ -83,6 +83,16 @@ struct ProbeMeta
 	uint32_t step;
 };
 
+struct ProbeVector
+{
+	static constexpr uint16_t kWidth = 8;
+	uint16_t lane_input[kWidth];
+	uint64_t entry_value[kWidth];
+	uint16_t count;
+	uint16_t empty_mask;
+	uint16_t salt_match_mask;
+};
+
 static inline ProbeMeta
 BuildProbeMeta(const AggregateHashTable *aht, uint64_t hash)
 {
@@ -102,6 +112,48 @@ PrefetchEntry(const AggregateHashTable *aht, uint32_t slot)
 	(void) aht;
 	(void) slot;
 #endif
+}
+
+static inline bool
+EntryValueIsEmpty(uint64_t value)
+{
+	return value == AHT_EMPTY_ENTRY_VALUE;
+}
+
+static inline uint16_t
+EntryValueSalt(uint64_t value)
+{
+	return static_cast<uint16_t>(value >> 48);
+}
+
+static inline uint32_t
+EntryValueRowIndex(uint64_t value)
+{
+	return static_cast<uint32_t>(value & AHT_ROW_INDEX_MASK);
+}
+
+static inline void
+ProbeVectorInit(ProbeVector &vec)
+{
+	vec.count = 0;
+	vec.empty_mask = 0;
+	vec.salt_match_mask = 0;
+}
+
+static inline void
+ProbeVectorAppend(ProbeVector &vec,
+                  uint16_t input_idx,
+                  uint64_t entry_value,
+                  uint16_t wanted_salt)
+{
+	Assert(vec.count < ProbeVector::kWidth);
+	const uint16_t lane = vec.count++;
+	vec.lane_input[lane] = input_idx;
+	vec.entry_value[lane] = entry_value;
+	if (EntryValueIsEmpty(entry_value))
+		vec.empty_mask |= static_cast<uint16_t>(1u << lane);
+	else if (EntryValueSalt(entry_value) == wanted_salt)
+		vec.salt_match_mask |= static_cast<uint16_t>(1u << lane);
 }
 
 static bool FindOrInsertLocked(AggregateHashTable *aht,
@@ -375,66 +427,136 @@ AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
 	Assert(aht != nullptr && tdc != nullptr && layout != nullptr);
 	Assert(inputs != nullptr && results != nullptr);
 	ProbeMeta probe_meta[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint32_t current_slot[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint32_t probe_tries[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint16_t active[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint16_t deferred[PIPELINE_DEFAULT_CHUNK_SIZE];
+	const uint8_t *match_rows[ProbeVector::kWidth];
+	uint16_t match_input_indices[ProbeVector::kWidth];
+	uint16_t match_row_indices[ProbeVector::kWidth];
+	uint32_t match_existing_indices[ProbeVector::kWidth];
+	bool match_results[ProbeVector::kWidth];
+	bool resolved[PIPELINE_DEFAULT_CHUNK_SIZE];
 	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
 
 	for (uint16_t i = 0; i < count; ++i)
 	{
 		probe_meta[i] = BuildProbeMeta(aht, inputs[i].hash);
+		current_slot[i] = probe_meta[i].slot;
+		probe_tries[i] = 0;
+		active[i] = i;
+		resolved[i] = false;
 		PrefetchEntry(aht, probe_meta[i].slot);
 	}
 
 	SpinLockAcquire(&aht->mutex);
 	{
-		for (uint16_t i = 0; i < count; ++i)
+		uint16_t active_count = count;
+		while (active_count > 0)
 		{
-			uint32_t canonical_idx = AHT_INVALID_ROW_INDEX;
-			bool inserted = false;
-			uint32_t slot = probe_meta[i].slot;
+			uint16_t deferred_count = 0;
+			uint16_t pos = 0;
 
-			for (uint32_t tries = 0; tries < aht->capacity; ++tries)
+			while (pos < active_count)
 			{
-				AggHtEntry &entry = aht->entries[slot];
-				if (EntryIsEmpty(entry))
+				ProbeVector vec;
+				ProbeVectorInit(vec);
+				while (pos < active_count && vec.count < ProbeVector::kWidth)
 				{
+					const uint16_t input_idx = active[pos++];
+					if (probe_tries[input_idx] >= aht->capacity)
+						ereport(ERROR,
+						        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						         errmsg("pg_volvec: AggregateHashTable full (capacity=%u)",
+						                aht->capacity)));
+					const uint32_t slot = current_slot[input_idx];
+					ProbeVectorAppend(vec,
+						input_idx,
+						aht->entries[slot].value,
+						probe_meta[input_idx].salt);
+				}
+
+				uint16_t match_count = 0;
+				for (uint16_t lane = 0; lane < vec.count; ++lane)
+				{
+					const uint16_t input_idx = vec.lane_input[lane];
+					const uint16_t lane_bit = static_cast<uint16_t>(1u << lane);
+					const uint32_t slot = current_slot[input_idx];
+					AggHtEntry &entry = aht->entries[slot];
+
+					if ((vec.empty_mask & lane_bit) != 0 && EntryIsEmpty(entry))
+					{
 					uint8_t *candidate_row = nullptr;
 					const uint32_t candidate_idx = TupleDataCollectionAppendRow(tdc, &candidate_row);
 					if (candidate_idx == TDC_INVALID_ROW_INDEX)
 						elog(ERROR, "pg_volvec: local hash aggregate row capacity exceeded");
 
-					ScatterGroupOnly(layout, candidate_row, chunk, inputs[i].row_idx);
-					entry.value = PackEntry(probe_meta[i].salt, candidate_idx);
-					canonical_idx = candidate_idx;
-					inserted = true;
-					break;
+						ScatterGroupOnly(layout, candidate_row, chunk, inputs[input_idx].row_idx);
+						entry.value = PackEntry(probe_meta[input_idx].salt, candidate_idx);
+						results[input_idx].row_idx = inputs[input_idx].row_idx;
+						results[input_idx].canonical_row_idx = candidate_idx;
+						results[input_idx].inserted = true;
+						resolved[input_idx] = true;
+						continue;
+					}
+
+					const uint64_t value = entry.value;
+					if (!EntryValueIsEmpty(value) &&
+						EntryValueSalt(value) == probe_meta[input_idx].salt)
+					{
+						const uint32_t existing_idx = EntryValueRowIndex(value);
+						match_rows[match_count] = TupleDataCollectionGetRowConst(tdc, existing_idx);
+						match_input_indices[match_count] = input_idx;
+						match_row_indices[match_count] = inputs[input_idx].row_idx;
+						match_existing_indices[match_count] = existing_idx;
+						++match_count;
+						continue;
+					}
+
+					current_slot[input_idx] = (slot + probe_meta[input_idx].step) & aht->capacity_mask;
+					++probe_tries[input_idx];
+					PrefetchEntry(aht, current_slot[input_idx]);
+					deferred[deferred_count++] = input_idx;
 				}
 
-				if (EntrySalt(entry) == probe_meta[i].salt)
+				if (match_count > 0)
 				{
-					const uint32_t existing_idx = EntryRowIndex(entry);
-					const uint8_t *existing_ptr = TupleDataCollectionGetRowConst(tdc, existing_idx);
-					if (MatchGroup(layout, existing_ptr, chunk, inputs[i].row_idx))
+					MatchGroupBatch(layout,
+						match_rows,
+						chunk,
+						match_row_indices,
+						match_count,
+						match_results);
+					for (uint16_t m = 0; m < match_count; ++m)
 					{
-						canonical_idx = existing_idx;
-						inserted = false;
-						break;
+						const uint16_t input_idx = match_input_indices[m];
+						if (match_results[m])
+						{
+							results[input_idx].row_idx = inputs[input_idx].row_idx;
+							results[input_idx].canonical_row_idx = match_existing_indices[m];
+							results[input_idx].inserted = false;
+							resolved[input_idx] = true;
+							continue;
+						}
+
+						const uint32_t slot = current_slot[input_idx];
+						current_slot[input_idx] = (slot + probe_meta[input_idx].step) & aht->capacity_mask;
+						++probe_tries[input_idx];
+						PrefetchEntry(aht, current_slot[input_idx]);
+						deferred[deferred_count++] = input_idx;
 					}
 				}
-
-				slot = (slot + probe_meta[i].step) & aht->capacity_mask;
 			}
 
-			if (canonical_idx == AHT_INVALID_ROW_INDEX)
-				ereport(ERROR,
-				        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				         errmsg("pg_volvec: AggregateHashTable full (capacity=%u)",
-				                aht->capacity)));
-
-			results[i].row_idx = inputs[i].row_idx;
-			results[i].canonical_row_idx = canonical_idx;
-			results[i].inserted = inserted;
+			for (uint16_t i = 0; i < deferred_count; ++i)
+				active[i] = deferred[i];
+			active_count = deferred_count;
 		}
 	}
 	SpinLockRelease(&aht->mutex);
+
+	for (uint16_t i = 0; i < count; ++i)
+		Assert(resolved[i]);
 }
 
 void
