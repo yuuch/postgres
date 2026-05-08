@@ -31,6 +31,7 @@ extern "C" {
 
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
+#include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/pipeline_combine_event.hpp"
 #include "parallel/pipeline/pipeline_finalize_event.hpp"
 #include "parallel/pipeline/pipeline_run_event.hpp"
@@ -290,10 +291,21 @@ TaskScheduler::EnqueueTasks(Event &event)
 			break;
 		case TaskKind::COMBINE:
 			event_id   = base_id + 1;
-			/* One combine task per worker that participated in Run; matches
-			 * the Run fan-out. Step 11b reconstructs each concrete Task with
-			 * its WorkerTaskRuntime from this descriptor. */
-			task_count = DeriveRunTaskCount(*pipeline);
+			if (pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
+			{
+				auto *hash_agg = static_cast<PhysicalHashAggregate *>(pipeline->sink);
+				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(hash_agg);
+				if (!DsaPointerIsValid(payload_dp))
+					elog(ERROR, "pg_volvec: hash aggregate payload missing during COMBINE scheduling");
+				auto *payload = static_cast<HashAggSharedPayload *>(dsa_get_address(dsa_, payload_dp));
+				task_count = payload->partition_count;
+			}
+			else
+			{
+				/* One combine task per worker that participated in Run; matches
+				 * the Run fan-out for non-partition-owner sinks. */
+				task_count = DeriveRunTaskCount(*pipeline);
+			}
 			break;
 		case TaskKind::FINALIZE:
 			event_id   = base_id + 2;
@@ -327,8 +339,14 @@ TaskScheduler::EnqueueTasks(Event &event)
 		TaskDescriptor desc{};
 		desc.pipeline_id  = static_cast<uint32_t>(pid);
 		desc.event_id     = event_id;
+		desc.partition_id = UINT32_MAX;
 		desc.worker_index = static_cast<int32_t>(i);
 		desc.kind         = static_cast<uint8_t>(kind);
+		if (kind == TaskKind::COMBINE && pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
+		{
+			desc.partition_id = i;
+			desc.worker_index = static_cast<int32_t>(i % DeriveRunTaskCount(*pipeline));
+		}
 
 		/* TryPush wakes every registered worker latch on success
 		 * (DsmTaskQueue C2). Capacity sized in EstimateDsmSize is

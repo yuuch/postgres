@@ -190,7 +190,8 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 				task = std::make_unique<PipelineCombineTask>(desc.event_id,
 				                                            pipeline,
 				                                            &rt,
-				                                            desc.worker_index);
+				                                            desc.worker_index,
+				                                            desc.partition_id);
 				break;
 			case TaskKind::FINALIZE:
 			{
@@ -245,6 +246,8 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 	}
 
 exit_loop:
+	rt.per_pipeline.clear();
+	owned_pipelines.clear();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 }

@@ -254,7 +254,8 @@ ExecuteLeaderTask(TaskDescriptor desc,
 			task = std::make_unique<PipelineCombineTask>(desc.event_id,
 								pipeline,
 								leader_rt,
-								desc.worker_index);
+								desc.worker_index,
+								desc.partition_id);
 			break;
 		case TaskKind::FINALIZE:
 			task = std::make_unique<PipelineFinalizeTask>(desc.event_id,
@@ -615,6 +616,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 					TaskDescriptor desc{};
 					desc.pipeline_id = static_cast<uint32_t>(pipeline->id);
 					desc.event_id = event_id;
+					desc.partition_id = UINT32_MAX;
 					desc.worker_index = LEADER_WORKER_INDEX;
 					desc.kind = static_cast<uint8_t>(TaskKind::FINALIZE);
 
