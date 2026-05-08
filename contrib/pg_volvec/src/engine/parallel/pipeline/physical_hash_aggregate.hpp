@@ -62,6 +62,9 @@ public:
 	uint32_t             partition_mask = 0;
 	uint32_t             partition_shift = 64;
 	uint32_t             max_groups = 256;
+	bool                 use_perfect_hash = false;
+	uint32_t             perfect_capacity = 0;
+	PgVector<uint32_t>   perfect_row_indices;
 
 };
 
@@ -75,7 +78,7 @@ public:
 	bool initialized = false;
 };
 
-class PhysicalHashAggregate final : public PhysicalOperator {
+class PhysicalHashAggregate : public PhysicalOperator {
 public:
 	/*
 	 * Step 6 contract delta: HashAggregate no longer splits PARTIAL/FINAL into
@@ -88,6 +91,7 @@ public:
 	                      PgVector<AggFuncDesc> agg_funcs,
 	                      dsa_pointer shared_payload_dp,
 	                      uint32_t max_groups = 256,
+	                      uint32_t perfect_hash_capacity = 0,
 	                      OpDescriptor *desc = nullptr)
 		: PhysicalOperator(PhysicalOperatorType::HASH_AGGREGATE)
 		, layout_dp_(layout_dp)
@@ -95,6 +99,7 @@ public:
 		, agg_funcs_(std::move(agg_funcs))
 		, shared_payload_dp_(shared_payload_dp)
 		, max_groups_(max_groups)
+		, perfect_hash_capacity_(perfect_hash_capacity)
 		, desc_(desc)
 	{}
 
@@ -121,6 +126,7 @@ public:
 	const PgVector<AggFuncDesc>       &agg_funcs() const { return agg_funcs_; }
 	dsa_pointer                        shared_payload_dp() const { return shared_payload_dp_; }
 	uint32_t                           max_groups() const { return max_groups_; }
+	uint32_t                           perfect_hash_capacity() const { return perfect_hash_capacity_; }
 	OpDescriptor                      *desc() const { return desc_; }
 	const PgVector<OpDescriptor *>    &descs() const { return desc_list_; }
 
@@ -151,12 +157,19 @@ public:
 		desc_list_.push_back(desc);
 	}
 
+protected:
+	dsa_pointer LayoutDpFromDescriptor() const;
+	dsa_pointer SharedPayloadDpFromDescriptor() const;
+	uint32_t MaxGroupsFromDescriptor() const;
+	uint32_t PerfectHashCapacityFromDescriptor() const;
+
 private:
 	dsa_pointer              layout_dp_;
 	PgVector<uint16_t>       group_keys_;
 	PgVector<AggFuncDesc>    agg_funcs_;
 	dsa_pointer              shared_payload_dp_;
 	uint32_t                 max_groups_;
+	uint32_t                 perfect_hash_capacity_;
 	OpDescriptor            *desc_;
 	PgVector<OpDescriptor *> desc_list_;
 };

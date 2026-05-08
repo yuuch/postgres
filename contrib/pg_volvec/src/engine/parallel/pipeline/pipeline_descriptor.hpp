@@ -60,9 +60,10 @@ struct PipelineSharedControl;        /* defined in dsm_control.hpp */
 enum class OpKind : uint8_t {
 	SEQ_SCAN       = 0,
 	HASH_AGGREGATE = 1,
-	ORDER          = 2,
-	OUTPUT         = 3,
-	PROJECTION     = 4,
+	PERFECT_HASH_AGGREGATE = 2,
+	ORDER          = 3,
+	OUTPUT         = 4,
+	PROJECTION     = 5,
 };
 
 /* -------------------------------------------------------------------------
@@ -278,6 +279,7 @@ struct HashAggOpBody {
 	uint16_t    n_group_keys;
 	uint16_t    n_agg_funcs;
 	uint32_t    max_groups;
+	uint32_t    perfect_hash_capacity;
 };
 
 struct OrderOpBody {
@@ -320,6 +322,7 @@ struct OpDescriptor {
 	union OpBodyUnion {
 		SeqScanOpBody seq_scan;
 		HashAggOpBody hash_agg;
+		HashAggOpBody perfect_hash_agg;
 		OrderOpBody   order;
 		OutputOpBody  output;
 		ProjectOpBody project;

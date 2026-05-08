@@ -25,6 +25,7 @@ pg_volvec_sources = files(
   'src/engine/parallel/pipeline/columnar_filter.cpp',
   'src/engine/parallel/pipeline/physical_projection.cpp',
   'src/engine/parallel/pipeline/physical_hash_aggregate.cpp',
+  'src/engine/parallel/pipeline/physical_perfect_hash_aggregate.cpp',
   'src/engine/parallel/pipeline/physical_order.cpp',
   'src/engine/parallel/pipeline/output_sink.cpp',
   'src/engine/parallel/pipeline/translator.cpp',

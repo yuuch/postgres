@@ -28,6 +28,7 @@ namespace pipeline {
 enum class PhysicalOperatorType : uint8_t {
 	SEQ_SCAN,
 	HASH_AGGREGATE,
+	PERFECT_HASH_AGGREGATE,
 	ORDER,
 	OUTPUT,
 	PROJECTION,
@@ -129,8 +130,10 @@ public:
 	 */
 	virtual void BuildPipelines(Pipeline &current, MetaPipeline &meta);
 
-private:
+protected:
 	PhysicalOperatorType                                  type_;
+
+private:
 	PgVector<std::unique_ptr<PhysicalOperator>>           children_;
 };
 

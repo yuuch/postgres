@@ -1,7 +1,9 @@
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
+#include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 
 extern "C" {
 #include "postgres.h"
+#include "catalog/pg_type_d.h"
 #include "utils/elog.h"
 
 extern int pg_volvec_parallel_max_workers;
@@ -68,6 +70,10 @@ ResolveTdc(dsa_area *dsa, dsa_pointer tdc_dp)
 	return static_cast<TupleDataCollection *>(dsa_get_address(dsa, tdc_dp));
 }
 
+static void GrowLocalTdc(ExecCtx &ctx,
+                         HashAggLocalSinkState &local,
+                         HashAggPartition &part);
+
 static uint32_t
 PartitionRowCapacity(uint32_t max_groups, uint32_t partition_count)
 {
@@ -76,6 +82,100 @@ PartitionRowCapacity(uint32_t max_groups, uint32_t partition_count)
 	if (per < 16u)
 		per = 16u;
 	return per;
+}
+
+static bool
+CanEncodePerfectHashLayout(const TupleDataLayout *layout)
+{
+	if (layout == nullptr || layout->column_count == 0 || layout->validity_width != 0)
+		return false;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		const TdcColumnDesc &col = layout->columns[i];
+		if (col.kind != TdcColumnKind::INT32 || col.width != 4 ||
+			(col.pg_type_oid != BPCHAROID && col.pg_type_oid != CHAROID))
+			return false;
+	}
+	return true;
+}
+
+static inline bool
+EncodePerfectHashKey(const TupleDataLayout *layout,
+                     const PipelineChunk &chunk,
+                     uint16_t row_idx,
+                     uint32_t *out_key)
+{
+	uint32_t key = 0;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		const int32_t v = chunk.int32_columns[i][row_idx];
+		if (v < 0 || v > 255)
+			return false;
+		key = (key << 8) | static_cast<uint32_t>(v);
+	}
+	*out_key = key;
+	return true;
+}
+
+static void
+SinkChunkPerfectHash(ExecCtx &ctx,
+                     HashAggLocalSinkState &local,
+                     PipelineChunk &in)
+{
+	HashAggPartition &part = local.local_partitions[0];
+	TupleDataCollection *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+	if (tdc == nullptr)
+		elog(ERROR, "pg_volvec: perfect hash aggregate TDC missing");
+
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> canonical_rows;
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_rows;
+	uint16_t update_count = 0;
+
+	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+	{
+		uint32_t key = 0;
+		if (!EncodePerfectHashKey(local.layout, in, row_idx, &key) ||
+			key >= local.perfect_capacity)
+			ereport(ERROR,
+			        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			         errmsg("pg_volvec: perfect hash key out of domain")));
+
+		uint32_t canonical_idx = local.perfect_row_indices[key];
+		if (canonical_idx == TDC_INVALID_ROW_INDEX)
+		{
+			while (pg_atomic_read_u32(&tdc->row_count) >= tdc->row_capacity)
+			{
+				GrowLocalTdc(ctx, local, part);
+				tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+				if (tdc == nullptr)
+					elog(ERROR, "pg_volvec: perfect hash aggregate TDC missing after grow");
+			}
+			uint8_t *candidate_row = nullptr;
+			canonical_idx = TupleDataCollectionAppendRow(tdc, &candidate_row);
+			if (canonical_idx == TDC_INVALID_ROW_INDEX)
+				elog(ERROR, "pg_volvec: perfect hash aggregate row capacity exceeded");
+			ScatterGroupOnly(local.layout, candidate_row, in, row_idx);
+			local.perfect_row_indices[key] = canonical_idx;
+		}
+
+		update_rows[update_count] = row_idx;
+		canonical_rows[update_count] = canonical_idx;
+		++update_count;
+	}
+
+	if (update_count > 0)
+	{
+		tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+		if (tdc == nullptr)
+			elog(ERROR, "pg_volvec: perfect hash aggregate TDC missing before update");
+		UpdateAggregatesGather(local.layout,
+			tdc->rows,
+			tdc->row_width,
+			canonical_rows.data(),
+			in,
+			update_rows.data(),
+			update_count);
+	}
 }
 
 static void
@@ -192,27 +292,69 @@ PhysicalHashAggregate::MaxThreads(ExecCtx &ctx) const
 	return std::max(1, pg_volvec_parallel_max_workers);
 }
 
+dsa_pointer
+PhysicalHashAggregate::LayoutDpFromDescriptor() const
+{
+	if (desc_ == nullptr)
+		return InvalidDsaPointer;
+	return desc_->kind == OpKind::PERFECT_HASH_AGGREGATE
+		? desc_->body.perfect_hash_agg.layout
+		: desc_->body.hash_agg.layout;
+}
+
+dsa_pointer
+PhysicalHashAggregate::SharedPayloadDpFromDescriptor() const
+{
+	if (desc_ == nullptr)
+		return InvalidDsaPointer;
+	return desc_->kind == OpKind::PERFECT_HASH_AGGREGATE
+		? desc_->body.perfect_hash_agg.shared_payload
+		: desc_->body.hash_agg.shared_payload;
+}
+
+uint32_t
+PhysicalHashAggregate::MaxGroupsFromDescriptor() const
+{
+	if (desc_ == nullptr)
+		return 256;
+	const uint32_t max_groups = desc_->kind == OpKind::PERFECT_HASH_AGGREGATE
+		? desc_->body.perfect_hash_agg.max_groups
+		: desc_->body.hash_agg.max_groups;
+	return max_groups > 0 ? max_groups : 256;
+}
+
+uint32_t
+PhysicalHashAggregate::PerfectHashCapacityFromDescriptor() const
+{
+	if (desc_ == nullptr)
+		return 0;
+	return desc_->kind == OpKind::PERFECT_HASH_AGGREGATE
+		? desc_->body.perfect_hash_agg.perfect_hash_capacity
+		: desc_->body.hash_agg.perfect_hash_capacity;
+}
+
 std::unique_ptr<GlobalSinkState>
 PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 {
 	auto state = std::make_unique<HashAggGlobalSinkState>();
 	state->dsa = ctx.dsa;
 	state->desc = desc_;
-	state->layout_dp = DsaPointerIsValid(layout_dp_) ? layout_dp_ :
-		(desc_ != nullptr ? desc_->body.hash_agg.layout : InvalidDsaPointer);
+	state->layout_dp = DsaPointerIsValid(layout_dp_) ? layout_dp_ : LayoutDpFromDescriptor();
 	state->layout = ResolveLayout(ctx.dsa, state->layout_dp);
-	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp_) ? shared_payload_dp_ :
-		(desc_ != nullptr ? desc_->body.hash_agg.shared_payload : InvalidDsaPointer);
-	state->max_groups = desc_ != nullptr && desc_->body.hash_agg.max_groups > 0 ?
-		desc_->body.hash_agg.max_groups : 256;
+	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp_) ? shared_payload_dp_ : SharedPayloadDpFromDescriptor();
+	state->max_groups = MaxGroupsFromDescriptor();
 
 	if (state->layout == nullptr)
 		elog(ERROR, "pg_volvec: hash aggregate missing TupleDataLayout");
 
 	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
 	{
+		const uint32_t perfect_capacity = PerfectHashCapacityFromDescriptor();
+		const bool use_perfect_hash = perfect_capacity > 0 &&
+			CanEncodePerfectHashLayout(state->layout);
 		const uint32_t workers = static_cast<uint32_t>(std::max(1, pg_volvec_parallel_max_workers));
-		state->partition_count = HashAggChoosePartitionCount(workers, state->layout->row_width);
+		state->partition_count = use_perfect_hash ? 1u :
+			HashAggChoosePartitionCount(workers, state->layout->row_width);
 		const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
 
 		state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(HashAggSharedPayload));
@@ -221,6 +363,7 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		state->payload->partition_mask = state->partition_count - 1u;
 		state->payload->max_groups = state->max_groups;
 		state->payload->local_state_slot_count = static_cast<uint32_t>(std::max(1, pg_volvec_parallel_max_workers));
+		state->payload->perfect_hash_capacity = use_perfect_hash ? perfect_capacity : 0;
 		state->payload->finalized = false;
 		state->payload->partitions_dp = dsa_allocate0(ctx.dsa,
 			static_cast<size_t>(state->partition_count) * sizeof(HashAggPartition));
@@ -273,6 +416,15 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	state->partition_count = global.partition_count;
 	state->partition_mask = global.payload->partition_mask;
 	state->partition_shift = HashAggPartitionShift(state->partition_mask);
+	state->perfect_capacity = global.payload->perfect_hash_capacity;
+	state->use_perfect_hash = state->perfect_capacity > 0;
+	if (state->use_perfect_hash)
+	{
+		state->partition_count = 1;
+		state->partition_mask = 0;
+		state->partition_shift = 64;
+		state->perfect_row_indices.assign(state->perfect_capacity, TDC_INVALID_ROW_INDEX);
+	}
 	const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
 
 	state->local_partitions_dp = dsa_allocate0(ctx.dsa,
@@ -311,6 +463,12 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 {
 	auto &local = static_cast<HashAggLocalSinkState &>(input.local_state);
 	(void) ctx;
+	if (local.use_perfect_hash)
+	{
+		SinkChunkPerfectHash(ctx, local, in);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
 	std::array<uint64_t, PIPELINE_DEFAULT_CHUNK_SIZE> hashes;
 	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> partitions;
 	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> probe_rows;

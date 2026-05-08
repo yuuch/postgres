@@ -94,9 +94,22 @@ struct HashAggSharedPayload
 	uint32_t    partition_mask;
 	uint32_t    max_groups;
 	uint32_t    local_state_slot_count;
+	uint32_t    perfect_hash_capacity;
 	bool        finalized;
 	uint8_t     _pad[3];
 	dsa_pointer partitions_dp;  /* HashAggPartition[partition_count] */
+	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
+};
+
+struct PerfectHashAggSharedPayload
+{
+	uint32_t    max_groups;
+	uint32_t    local_state_slot_count;
+	uint32_t    perfect_hash_capacity;
+	bool        finalized;
+	uint8_t     _pad[3];
+	dsa_pointer global_tdc_dp;                /* TupleDataCollection */
+	dsa_pointer global_index_dp;              /* uint32_t[perfect_hash_capacity] */
 	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
 };
 
