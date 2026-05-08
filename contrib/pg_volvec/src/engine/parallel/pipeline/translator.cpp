@@ -52,6 +52,7 @@ struct Q1ExtractedShape {
 	SeqScan                    *scan;
 	Agg                        *agg;
 	Sort                       *sort;
+	uint32_t                    estimated_groups = 256;
 	Oid                         relid;
 	std::vector<AttrNumber>     group_attnos;
 	std::vector<Aggref *>       aggrefs;
@@ -114,6 +115,26 @@ RescaleInt64Constant(int64_t value, int8_t from_scale, int8_t to_scale, int64_t 
 		return false;
 	out = value * factor;
 	return true;
+}
+
+static uint32_t
+EstimateHashAggGroups(Agg *agg)
+{
+	constexpr double kMinGroups = 16.0;
+	constexpr double kMaxGroups = static_cast<double>(1u << 20);
+	double estimate = 256.0;
+
+	if (agg != nullptr)
+	{
+		if (agg->numGroups > 0.0)
+			estimate = agg->numGroups;
+		else if (agg->plan.plan_rows > 0.0)
+			estimate = agg->plan.plan_rows;
+	}
+
+	estimate *= 1.5;
+	estimate = std::max(kMinGroups, std::min(kMaxGroups, estimate));
+	return static_cast<uint32_t>(estimate);
 }
 
 static bool
@@ -1166,6 +1187,7 @@ ExtractQ1Shape(Sort *sort, Agg *agg, SeqScan *scan, QueryDesc *qd,
 	out.scan = scan;
 	out.agg = agg;
 	out.sort = sort;
+	out.estimated_groups = EstimateHashAggGroups(agg);
 
 	if (!ExtractRelid(scan, qd, out.relid))
 		return false;
@@ -1360,7 +1382,8 @@ Translator::TranslatePlan(Plan *plan, QueryDesc *qd, PgVolVecQueryState *state)
 		shape.hash_layout_dp,
 		std::move(group_keys),
 		std::move(agg_funcs),
-		InvalidDsaPointer);
+		InvalidDsaPointer,
+		shape.estimated_groups);
 	hash_op->AddChild(std::move(hash_child));
 
 	auto order_op = std::make_unique<PhysicalOrder>(

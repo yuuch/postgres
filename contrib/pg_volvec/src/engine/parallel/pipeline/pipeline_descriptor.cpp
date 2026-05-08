@@ -144,7 +144,7 @@ EmitHashAgg(const PhysicalHashAggregate &op, OpDescriptor &out, dsa_area *dsa)
 	out.body.hash_agg.output_schema = InvalidDsaPointer;
 	out.body.hash_agg.layout = op.layout_dp();
 	out.body.hash_agg.shared_payload = op.shared_payload_dp();
-	out.body.hash_agg.max_groups = 256;
+	out.body.hash_agg.max_groups = op.max_groups();
 	SerializeUInt16Vector(op.group_keys(), dsa, &out.body.hash_agg.group_keys, &out.body.hash_agg.n_group_keys);
 	SerializeAggFuncVector(op.agg_funcs(), dsa, &out.body.hash_agg.agg_funcs, &out.body.hash_agg.n_agg_funcs);
 }
@@ -226,6 +226,7 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				std::move(group_keys),
 				std::move(agg_funcs),
 				op.body.hash_agg.shared_payload,
+				op.body.hash_agg.max_groups,
 				const_cast<OpDescriptor *>(&op));
 		}
 
