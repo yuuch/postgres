@@ -40,13 +40,17 @@ StageName(PipelineProfileStage stage)
 		case PipelineProfileStage::TASK_FINALIZE_TOTAL: return "task_finalize_total";
 		case PipelineProfileStage::SOURCE_SEQ_SCAN: return "source_seq_scan";
 		case PipelineProfileStage::SOURCE_HASH_AGG: return "source_hashagg_readback";
+		case PipelineProfileStage::SOURCE_PERFECT_HASH_AGG: return "source_perfect_hashagg_readback";
 		case PipelineProfileStage::SOURCE_ORDER: return "source_order_readback";
 		case PipelineProfileStage::OP_PROJECTION: return "project_expr";
 		case PipelineProfileStage::SINK_HASH_AGG_UPDATE: return "agg_update_local";
+		case PipelineProfileStage::SINK_PERFECT_HASH_AGG_UPDATE: return "perfect_agg_update_local";
 		case PipelineProfileStage::SINK_ORDER_APPEND: return "order_sink_append";
 		case PipelineProfileStage::SINK_OUTPUT_APPEND: return "output_sink_append";
 		case PipelineProfileStage::COMBINE_HASH_AGG: return "agg_combine_global";
+		case PipelineProfileStage::COMBINE_PERFECT_HASH_AGG: return "perfect_agg_combine_global";
 		case PipelineProfileStage::FINALIZE_HASH_AGG: return "agg_finalize_global";
+		case PipelineProfileStage::FINALIZE_PERFECT_HASH_AGG: return "perfect_agg_finalize_global";
 		case PipelineProfileStage::FINALIZE_ORDER: return "order_finalize_sort";
 		case PipelineProfileStage::FINALIZE_OUTPUT: return "output_finalize";
 		case PipelineProfileStage::OUTPUT_EMIT: return "output_emit_to_dest";
@@ -228,12 +232,13 @@ PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 
 PipelineProfileStage
 PipelineProfileSourceStage(PhysicalOperatorType type)
-{
-	switch (type)
 	{
-		case PhysicalOperatorType::SEQ_SCAN: return PipelineProfileStage::SOURCE_SEQ_SCAN;
-		case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SOURCE_HASH_AGG;
-		case PhysicalOperatorType::ORDER: return PipelineProfileStage::SOURCE_ORDER;
+		switch (type)
+		{
+			case PhysicalOperatorType::SEQ_SCAN: return PipelineProfileStage::SOURCE_SEQ_SCAN;
+			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SOURCE_HASH_AGG;
+			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::SOURCE_PERFECT_HASH_AGG;
+			case PhysicalOperatorType::ORDER: return PipelineProfileStage::SOURCE_ORDER;
 		default: return PipelineProfileStage::TASK_RUN_TOTAL;
 	}
 }
@@ -248,11 +253,12 @@ PipelineProfileOperatorStage(PhysicalOperatorType type)
 
 PipelineProfileStage
 PipelineProfileSinkStage(PhysicalOperatorType type)
-{
-	switch (type)
 	{
-		case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SINK_HASH_AGG_UPDATE;
-		case PhysicalOperatorType::ORDER: return PipelineProfileStage::SINK_ORDER_APPEND;
+		switch (type)
+		{
+			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SINK_HASH_AGG_UPDATE;
+			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::SINK_PERFECT_HASH_AGG_UPDATE;
+			case PhysicalOperatorType::ORDER: return PipelineProfileStage::SINK_ORDER_APPEND;
 		case PhysicalOperatorType::OUTPUT: return PipelineProfileStage::SINK_OUTPUT_APPEND;
 		default: return PipelineProfileStage::TASK_RUN_TOTAL;
 	}
@@ -261,18 +267,22 @@ PipelineProfileSinkStage(PhysicalOperatorType type)
 PipelineProfileStage
 PipelineProfileCombineStage(PhysicalOperatorType type)
 {
-	return type == PhysicalOperatorType::HASH_AGGREGATE
-		? PipelineProfileStage::COMBINE_HASH_AGG
+	return (type == PhysicalOperatorType::HASH_AGGREGATE ||
+		type == PhysicalOperatorType::PERFECT_HASH_AGGREGATE)
+		? (type == PhysicalOperatorType::PERFECT_HASH_AGGREGATE
+			? PipelineProfileStage::COMBINE_PERFECT_HASH_AGG
+			: PipelineProfileStage::COMBINE_HASH_AGG)
 		: PipelineProfileStage::TASK_COMBINE_TOTAL;
 }
 
 PipelineProfileStage
 PipelineProfileFinalizeStage(PhysicalOperatorType type)
-{
-	switch (type)
 	{
-		case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_HASH_AGG;
-		case PhysicalOperatorType::ORDER: return PipelineProfileStage::FINALIZE_ORDER;
+		switch (type)
+		{
+			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_HASH_AGG;
+			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_PERFECT_HASH_AGG;
+			case PhysicalOperatorType::ORDER: return PipelineProfileStage::FINALIZE_ORDER;
 		case PhysicalOperatorType::OUTPUT: return PipelineProfileStage::FINALIZE_OUTPUT;
 		default: return PipelineProfileStage::TASK_FINALIZE_TOTAL;
 	}

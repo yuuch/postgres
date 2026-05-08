@@ -32,6 +32,7 @@ extern "C" {
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
+#include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 #include "parallel/pipeline/pipeline_combine_event.hpp"
 #include "parallel/pipeline/pipeline_finalize_event.hpp"
 #include "parallel/pipeline/pipeline_run_event.hpp"
@@ -300,6 +301,14 @@ TaskScheduler::EnqueueTasks(Event &event)
 				auto *payload = static_cast<HashAggSharedPayload *>(dsa_get_address(dsa_, payload_dp));
 				task_count = payload->partition_count;
 			}
+			else if (pipeline->sink->type() == PhysicalOperatorType::PERFECT_HASH_AGGREGATE)
+			{
+				auto *perfect_hash_agg = static_cast<PhysicalPerfectHashAggregate *>(pipeline->sink);
+				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(perfect_hash_agg);
+				if (!DsaPointerIsValid(payload_dp))
+					elog(ERROR, "pg_volvec: perfect hash aggregate payload missing during COMBINE scheduling");
+				task_count = 1;
+			}
 			else
 			{
 				/* One combine task per worker that participated in Run; matches
@@ -342,7 +351,8 @@ TaskScheduler::EnqueueTasks(Event &event)
 		desc.partition_id = UINT32_MAX;
 		desc.worker_index = static_cast<int32_t>(i);
 		desc.kind         = static_cast<uint8_t>(kind);
-		if (kind == TaskKind::COMBINE && pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
+		if (kind == TaskKind::COMBINE &&
+			pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
 		{
 			desc.partition_id = i;
 			desc.worker_index = static_cast<int32_t>(i % DeriveRunTaskCount(*pipeline));

@@ -33,6 +33,7 @@ extern "C" {
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/physical_order.hpp"
+#include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_projection.hpp"
 #include "parallel/pipeline/physical_seq_scan.hpp"
 #include "parallel/pipeline/pipeline.hpp"
@@ -138,15 +139,21 @@ EmitSeqScan(const PhysicalSeqScan &op, OpDescriptor &out)
 static void
 EmitHashAgg(const PhysicalHashAggregate &op, OpDescriptor &out, dsa_area *dsa)
 {
-	out.kind = OpKind::HASH_AGGREGATE;
+	out.kind = op.type() == PhysicalOperatorType::PERFECT_HASH_AGGREGATE
+		? OpKind::PERFECT_HASH_AGGREGATE
+		: OpKind::HASH_AGGREGATE;
 	out.n_children = 0;
-	out.body.hash_agg.input_schema = InvalidDsaPointer;
-	out.body.hash_agg.output_schema = InvalidDsaPointer;
-	out.body.hash_agg.layout = op.layout_dp();
-	out.body.hash_agg.shared_payload = op.shared_payload_dp();
-	out.body.hash_agg.max_groups = op.max_groups();
-	SerializeUInt16Vector(op.group_keys(), dsa, &out.body.hash_agg.group_keys, &out.body.hash_agg.n_group_keys);
-	SerializeAggFuncVector(op.agg_funcs(), dsa, &out.body.hash_agg.agg_funcs, &out.body.hash_agg.n_agg_funcs);
+	HashAggOpBody &body = out.kind == OpKind::PERFECT_HASH_AGGREGATE
+		? out.body.perfect_hash_agg
+		: out.body.hash_agg;
+	body.input_schema = InvalidDsaPointer;
+	body.output_schema = InvalidDsaPointer;
+	body.layout = op.layout_dp();
+	body.shared_payload = op.shared_payload_dp();
+	body.max_groups = op.max_groups();
+	body.perfect_hash_capacity = op.perfect_hash_capacity();
+	SerializeUInt16Vector(op.group_keys(), dsa, &body.group_keys, &body.n_group_keys);
+	SerializeAggFuncVector(op.agg_funcs(), dsa, &body.agg_funcs, &body.n_agg_funcs);
 }
 
 static void
@@ -206,27 +213,42 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				const_cast<OpDescriptor *>(&op));
 
 		case OpKind::HASH_AGGREGATE:
+		case OpKind::PERFECT_HASH_AGGREGATE:
 		{
+			const HashAggOpBody &body = op.kind == OpKind::PERFECT_HASH_AGGREGATE
+				? op.body.perfect_hash_agg
+				: op.body.hash_agg;
 			PgVector<uint16_t> group_keys;
-			if (op.body.hash_agg.n_group_keys > 0 && DsaPointerIsValid(op.body.hash_agg.group_keys))
+			if (body.n_group_keys > 0 && DsaPointerIsValid(body.group_keys))
 			{
-				auto *keys = static_cast<uint16_t *>(dsa_get_address(ctx.dsa, op.body.hash_agg.group_keys));
-				group_keys.assign(keys, keys + op.body.hash_agg.n_group_keys);
+				auto *keys = static_cast<uint16_t *>(dsa_get_address(ctx.dsa, body.group_keys));
+				group_keys.assign(keys, keys + body.n_group_keys);
 			}
 
 			PgVector<AggFuncDesc> agg_funcs;
-			if (op.body.hash_agg.n_agg_funcs > 0 && DsaPointerIsValid(op.body.hash_agg.agg_funcs))
+			if (body.n_agg_funcs > 0 && DsaPointerIsValid(body.agg_funcs))
 			{
-				auto *aggs = static_cast<AggFuncDesc *>(dsa_get_address(ctx.dsa, op.body.hash_agg.agg_funcs));
-				agg_funcs.assign(aggs, aggs + op.body.hash_agg.n_agg_funcs);
+				auto *aggs = static_cast<AggFuncDesc *>(dsa_get_address(ctx.dsa, body.agg_funcs));
+				agg_funcs.assign(aggs, aggs + body.n_agg_funcs);
 			}
 
+			if (op.kind == OpKind::PERFECT_HASH_AGGREGATE)
+				return std::make_unique<PhysicalPerfectHashAggregate>(
+					body.layout,
+					std::move(group_keys),
+					std::move(agg_funcs),
+					body.shared_payload,
+					body.max_groups,
+					body.perfect_hash_capacity,
+					const_cast<OpDescriptor *>(&op));
+
 			return std::make_unique<PhysicalHashAggregate>(
-				op.body.hash_agg.layout,
+				body.layout,
 				std::move(group_keys),
 				std::move(agg_funcs),
-				op.body.hash_agg.shared_payload,
-				op.body.hash_agg.max_groups,
+				body.shared_payload,
+				body.max_groups,
+				body.perfect_hash_capacity,
 				const_cast<OpDescriptor *>(&op));
 		}
 
@@ -319,6 +341,7 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 				idx++;
 				break;
 			case PhysicalOperatorType::HASH_AGGREGATE:
+			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
 				EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*pipeline.source), ops[idx], dsa);
 				static_cast<PhysicalHashAggregate &>(*pipeline.source).AttachDescriptor(&ops[idx]);
 				idx++;
@@ -337,24 +360,26 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 
 		for (PhysicalOperator *mid : pipeline.ops)
 		{
-				switch (mid->type())
-				{
-					case PhysicalOperatorType::HASH_AGGREGATE:
-						EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*mid), ops[idx], dsa);
-						static_cast<PhysicalHashAggregate *>(mid)->AttachDescriptor(&ops[idx]);
-						idx++;
-						break;
-					case PhysicalOperatorType::PROJECTION:
-						EmitProjection(static_cast<const PhysicalProjection &>(*mid), ops[idx++], dsa);
-						break;
-					default:
-						elog(ERROR, "pg_volvec: unsupported mid-pipeline operator type %u", (unsigned) mid->type());
-				}
+			switch (mid->type())
+			{
+				case PhysicalOperatorType::HASH_AGGREGATE:
+				case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
+					EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*mid), ops[idx], dsa);
+					static_cast<PhysicalHashAggregate *>(mid)->AttachDescriptor(&ops[idx]);
+					idx++;
+					break;
+				case PhysicalOperatorType::PROJECTION:
+					EmitProjection(static_cast<const PhysicalProjection &>(*mid), ops[idx++], dsa);
+					break;
+				default:
+					elog(ERROR, "pg_volvec: unsupported mid-pipeline operator type %u", (unsigned) mid->type());
+			}
 		}
 
 		switch (pipeline.sink->type())
 		{
 			case PhysicalOperatorType::HASH_AGGREGATE:
+			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
 				EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*pipeline.sink), ops[idx], dsa);
 				static_cast<PhysicalHashAggregate &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
 				break;
@@ -427,14 +452,20 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 					desc->body.seq_scan.shared_payload = payload_dp;
 			break;
 		}
-	case PhysicalOperatorType::HASH_AGGREGATE:
-	{
-		const auto &dl = static_cast<const PhysicalHashAggregate *>(op)->descs();
-		for (OpDescriptor *desc : dl)
+		case PhysicalOperatorType::HASH_AGGREGATE:
+		case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
 		{
-			if (desc != nullptr)
-				desc->body.hash_agg.shared_payload = payload_dp;
-		}
+			const auto &dl = static_cast<const PhysicalHashAggregate *>(op)->descs();
+			for (OpDescriptor *desc : dl)
+			{
+				if (desc != nullptr)
+				{
+					if (desc->kind == OpKind::PERFECT_HASH_AGGREGATE)
+						desc->body.perfect_hash_agg.shared_payload = payload_dp;
+					else
+						desc->body.hash_agg.shared_payload = payload_dp;
+				}
+			}
 			break;
 		}
 		case PhysicalOperatorType::ORDER:
@@ -469,12 +500,17 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 			OpDescriptor *desc = static_cast<const PhysicalSeqScan *>(op)->desc();
 			return desc != nullptr ? desc->body.seq_scan.shared_payload : InvalidDsaPointer;
 		}
-	case PhysicalOperatorType::HASH_AGGREGATE:
-	{
-		OpDescriptor *desc = static_cast<const PhysicalHashAggregate *>(op)->desc();
-		dsa_pointer ret = desc != nullptr ? desc->body.hash_agg.shared_payload : InvalidDsaPointer;
-		return ret;
-	}
+		case PhysicalOperatorType::HASH_AGGREGATE:
+		case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalHashAggregate *>(op)->desc();
+			dsa_pointer ret = InvalidDsaPointer;
+			if (desc != nullptr)
+				ret = desc->kind == OpKind::PERFECT_HASH_AGGREGATE
+					? desc->body.perfect_hash_agg.shared_payload
+					: desc->body.hash_agg.shared_payload;
+			return ret;
+		}
 		case PhysicalOperatorType::ORDER:
 		{
 			OpDescriptor *desc = static_cast<const PhysicalOrder *>(op)->desc();

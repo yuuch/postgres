@@ -31,6 +31,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 
 #include "parallel/pipeline/output_sink.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
+#include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_order.hpp"
 #include "parallel/pipeline/physical_projection.hpp"
 #include "parallel/pipeline/physical_seq_scan.hpp"
@@ -53,6 +54,7 @@ struct Q1ExtractedShape {
 	Agg                        *agg;
 	Sort                       *sort;
 	uint32_t                    estimated_groups = 256;
+	uint32_t                    perfect_hash_capacity = 0;
 	Oid                         relid;
 	std::vector<AttrNumber>     group_attnos;
 	std::vector<Aggref *>       aggrefs;
@@ -135,6 +137,38 @@ EstimateHashAggGroups(Agg *agg)
 	estimate *= 1.5;
 	estimate = std::max(kMinGroups, std::min(kMaxGroups, estimate));
 	return static_cast<uint32_t>(estimate);
+}
+
+static bool LookupRawColumn(AttrNumber attno,
+				const std::vector<AttrNumber> &raw_attnos,
+				const std::vector<ColumnSchema> &raw_cols,
+				const ColumnSchema *&out_col);
+
+static bool
+TryBuildPerfectHashSpec(const std::vector<AttrNumber> &group_attnos,
+                        const std::vector<AttrNumber> &seq_scan_attnos,
+                        const std::vector<ColumnSchema> &seq_scan_columns,
+                        uint32_t &out_capacity)
+{
+	if (group_attnos.empty())
+		return false;
+
+	uint32_t capacity = 1;
+	for (AttrNumber group_attno : group_attnos)
+	{
+		const ColumnSchema *col = nullptr;
+		if (!LookupRawColumn(group_attno, seq_scan_attnos, seq_scan_columns, col))
+			return false;
+		if (col->decode_kind != ColumnDecodeKind::INT32_CHAR ||
+			(col->type_oid != BPCHAROID && col->type_oid != CHAROID))
+			return false;
+		if (capacity > 1024u / 256u)
+			return false;
+		capacity *= 256u;
+	}
+
+	out_capacity = capacity;
+	return capacity > 0 && capacity <= 1024u;
 }
 
 static bool
@@ -1225,6 +1259,10 @@ ExtractQ1Shape(Sort *sort, Agg *agg, SeqScan *scan, QueryDesc *qd,
 			out.next_int64_slot,
 			out.next_double_slot))
 		return false;
+	(void) TryBuildPerfectHashSpec(out.group_attnos,
+		out.seq_scan_attnos,
+		out.seq_scan_columns,
+		out.perfect_hash_capacity);
 
 	std::vector<MaterializedProjectExpr> materialized_exprs;
 	for (Aggref *aggref : out.aggrefs)
@@ -1378,12 +1416,27 @@ Translator::TranslatePlan(Plan *plan, QueryDesc *qd, PgVolVecQueryState *state)
 	if (agg_funcs.size() != shape.aggrefs.size())
 		return nullptr;
 
-	auto hash_op = std::make_unique<PhysicalHashAggregate>(
-		shape.hash_layout_dp,
-		std::move(group_keys),
-		std::move(agg_funcs),
-		InvalidDsaPointer,
-		shape.estimated_groups);
+	std::unique_ptr<PhysicalHashAggregate> hash_op;
+	if (shape.perfect_hash_capacity > 0)
+	{
+		hash_op = std::make_unique<PhysicalPerfectHashAggregate>(
+			shape.hash_layout_dp,
+			std::move(group_keys),
+			std::move(agg_funcs),
+			InvalidDsaPointer,
+			shape.estimated_groups,
+			shape.perfect_hash_capacity);
+	}
+	else
+	{
+		hash_op = std::make_unique<PhysicalHashAggregate>(
+			shape.hash_layout_dp,
+			std::move(group_keys),
+			std::move(agg_funcs),
+			InvalidDsaPointer,
+			shape.estimated_groups,
+			0);
+	}
 	hash_op->AddChild(std::move(hash_child));
 
 	auto order_op = std::make_unique<PhysicalOrder>(
