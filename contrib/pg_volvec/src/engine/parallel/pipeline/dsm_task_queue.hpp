@@ -54,12 +54,13 @@ struct TaskDescriptor
 {
 	uint32_t pipeline_id;
 	uint32_t event_id;
+	uint32_t partition_id;
 	int32_t  worker_index;
 	uint8_t  kind;             /* TaskKind */
 	uint8_t  pad_[3];
 };
 
-static_assert(sizeof(TaskDescriptor) == 16, "TaskDescriptor must stay POD/16B");
+static_assert(sizeof(TaskDescriptor) == 20, "TaskDescriptor must stay POD/20B");
 
 /*
  * Per-slot cell. sequence is a Vyukov ticket: producer waits for sequence ==
@@ -73,7 +74,7 @@ struct DsmTaskQueueCell
 	TaskDescriptor   desc;
 };
 
-static_assert(sizeof(DsmTaskQueueCell) == 24, "DsmTaskQueueCell layout");
+static_assert(sizeof(DsmTaskQueueCell) == 28, "DsmTaskQueueCell layout");
 
 /*
  * Inline header in DSM. Followed by `capacity` cells. Worker latch table is

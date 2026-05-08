@@ -99,7 +99,8 @@ enum class TaskExecutionResult : uint8_t {
 class Task : public PgMemoryContextObject {
 public:
 	Task(EventId event_id, TaskKind kind, Pipeline *pipeline,
-	     WorkerTaskRuntime *runtime, int32_t worker_index);
+	     WorkerTaskRuntime *runtime, int32_t worker_index,
+	     uint32_t partition_id = UINT32_MAX);
 	virtual ~Task() = default;
 
 	Task(const Task &)            = delete;
@@ -112,6 +113,7 @@ public:
 	Pipeline *pipeline() const { return pipeline_; }
 	WorkerTaskRuntime *runtime() const { return runtime_; }
 	int32_t worker_index() const { return worker_index_; }
+	uint32_t partition_id() const { return partition_id_; }
 
 protected:
 	EventId event_id_;
@@ -119,6 +121,7 @@ protected:
 	Pipeline *pipeline_;
 	WorkerTaskRuntime *runtime_;
 	int32_t worker_index_;
+	uint32_t partition_id_;
 };
 
 class PipelineRunTask final : public Task {
@@ -132,7 +135,8 @@ public:
 class PipelineCombineTask final : public Task {
 public:
 	PipelineCombineTask(EventId event_id, Pipeline *pipeline,
-	                    WorkerTaskRuntime *runtime, int32_t worker_index);
+	                    WorkerTaskRuntime *runtime, int32_t worker_index,
+	                    uint32_t partition_id);
 
 	TaskExecutionResult Execute() override;
 };

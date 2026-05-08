@@ -76,12 +76,14 @@ private:
 }  /* namespace */
 
 Task::Task(EventId event_id, TaskKind kind, Pipeline *pipeline,
-           WorkerTaskRuntime *runtime, int32_t worker_index)
+           WorkerTaskRuntime *runtime, int32_t worker_index,
+           uint32_t partition_id)
     : event_id_(event_id)
     , kind_(kind)
     , pipeline_(pipeline)
     , runtime_(runtime)
-    , worker_index_(worker_index) {}
+    , worker_index_(worker_index)
+    , partition_id_(partition_id) {}
 
 PipelineRunTask::PipelineRunTask(EventId event_id, Pipeline *pipeline,
                                  WorkerTaskRuntime *runtime,
@@ -178,10 +180,11 @@ next_source_chunk:
 }
 
 PipelineCombineTask::PipelineCombineTask(EventId event_id,
-                                         Pipeline *pipeline,
-                                         WorkerTaskRuntime *runtime,
-                                         int32_t worker_index)
-    : Task(event_id, TaskKind::COMBINE, pipeline, runtime, worker_index) {}
+                                          Pipeline *pipeline,
+                                          WorkerTaskRuntime *runtime,
+                                          int32_t worker_index,
+                                          uint32_t partition_id)
+    : Task(event_id, TaskKind::COMBINE, pipeline, runtime, worker_index, partition_id) {}
 
 TaskExecutionResult
 PipelineCombineTask::Execute()
@@ -191,10 +194,11 @@ PipelineCombineTask::Execute()
 	TaskProfileEventGuard event_guard(ctx, event_id_);
 	PipelineProfileScope task_scope(ctx, PipelineProfileStage::TASK_COMBINE_TOTAL);
 	auto &ps = rt.GetPipelineState(pipeline_->id);
-	Assert(ps.local_sink != nullptr);
 	Assert(ps.global_sink != nullptr);
-	Assert(!ps.combine_done);
-	OperatorSinkCombineInput in{*ps.local_sink, *ps.global_sink};
+	if (partition_id_ == UINT32_MAX)
+		Assert(ps.local_sink != nullptr);
+	Assert(partition_id_ != UINT32_MAX || !ps.combine_done);
+	OperatorSinkCombineInput in{ps.local_sink.get(), *ps.global_sink, partition_id_};
 	SinkCombineResultType cres;
 	{
 		PipelineProfileScope combine_scope(ctx,
@@ -203,10 +207,13 @@ PipelineCombineTask::Execute()
 	}
 	if (cres == SinkCombineResultType::BLOCKED)
 		RaiseBlockedForbidden();
-	ps.combine_done = true;
-	ps.local_source.reset();
-	ps.local_sink.reset();
-	ps.local_ops.clear();
+	if (partition_id_ == UINT32_MAX)
+	{
+		ps.combine_done = true;
+		ps.local_source.reset();
+		ps.local_sink.reset();
+		ps.local_ops.clear();
+	}
 	return TaskExecutionResult::TASK_FINISHED;
 }
 
@@ -246,7 +253,7 @@ PipelineFinalizeTask::Execute()
 
 	if (ps.leader_partial_pending && ps.local_sink)
 	{
-		OperatorSinkCombineInput cin{*ps.local_sink, *ps.global_sink};
+		OperatorSinkCombineInput cin{ps.local_sink.get(), *ps.global_sink, UINT32_MAX};
 		auto cres = pipeline_->sink->Combine(ctx, cin);
 		if (cres == SinkCombineResultType::BLOCKED)
 			RaiseBlockedForbidden();

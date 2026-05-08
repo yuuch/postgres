@@ -36,8 +36,9 @@ struct OperatorSinkInput {
 };
 
 struct OperatorSinkCombineInput {
-	LocalSinkState  &local_state;
+	LocalSinkState  *local_state;
 	GlobalSinkState &global_state;
+	uint32_t         partition_id = UINT32_MAX;
 };
 
 class Sink {
