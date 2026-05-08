@@ -416,6 +416,10 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 						 dsa,
 						 scheduler.event_count(),
 						 static_cast<uint32>(bgworker_count));
+		PipelineProfileRegisterProcess(control,
+							  dsa,
+							  LEADER_WORKER_INDEX,
+							  MyProcPid);
 		instr_time profile_query_start;
 		if (pg_atomic_read_u32(&control->profile_enabled) != 0)
 			INSTR_TIME_SET_CURRENT(profile_query_start);
@@ -534,6 +538,10 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			}
 
 			registered_pids.push_back(worker_pid);
+			PipelineProfileRegisterProcess(control,
+							  dsa,
+							  static_cast<int>(worker_idx),
+							  worker_pid);
 		}
 
 		if (leader_participate)

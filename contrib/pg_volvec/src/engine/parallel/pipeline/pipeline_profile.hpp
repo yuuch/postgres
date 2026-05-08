@@ -13,6 +13,11 @@ namespace pipeline {
 struct PipelineSharedControl;
 enum class PhysicalOperatorType : uint8_t;
 
+struct PipelineProfileSlotInfo {
+	int32 pid;
+	int32 worker_index;
+};
+
 enum class PipelineProfileStage : uint8_t {
 	TOTAL = 0,
 	TASK_RUN_TOTAL,
@@ -58,9 +63,13 @@ bool PipelineProfileAllocate(PipelineSharedControl *control,
 							 uint32 event_count,
 							 uint32 num_workers);
 bool PipelineProfileEnabled(const ExecCtx &ctx);
+void PipelineProfileRegisterProcess(PipelineSharedControl *control,
+						 dsa_area *dsa,
+						 int worker_index,
+						 int pid);
 void PipelineProfileAddElapsed(PipelineSharedControl *control,
-						   dsa_area *dsa,
-						   int worker_index,
+					   dsa_area *dsa,
+					   int worker_index,
 						   EventId event_id,
 						   PipelineProfileStage stage,
 						   instr_time elapsed,

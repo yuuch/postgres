@@ -115,6 +115,7 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 	rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index, ctl, INVALID_EVENT_ID};
 	rt.control = ctl;
 	rt.event_shm = static_cast<EventShmState *>(dsa_get_address(dsa, ctl->event_states_root));
+	PipelineProfileRegisterProcess(ctl, dsa, worker_index, MyProcPid);
 	PipelineDsmLookup<Pipeline> lookup(worker_mcxt);
 	rt.pipelines = &lookup;
 	rt.leader_qd = nullptr;

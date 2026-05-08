@@ -23,6 +23,12 @@ namespace {
 
 static constexpr uint32 kStageCount = static_cast<uint32>(PipelineProfileStage::COUNT);
 
+struct StageTotals {
+	uint64 elapsed_ns = 0;
+	uint64 calls = 0;
+	uint64 rows = 0;
+};
+
 uint32
 ProfileWorkerSlot(int worker_index)
 {
@@ -103,6 +109,32 @@ ProfileRecord(PipelineSharedControl *control,
 	return &records[idx];
 }
 
+PipelineProfileSlotInfo *
+ProfileSlotInfos(PipelineSharedControl *control, dsa_area *dsa)
+{
+	if (control == nullptr || dsa == nullptr ||
+		!DsaPointerIsValid(control->profile_slot_pids_root))
+		return nullptr;
+	return static_cast<PipelineProfileSlotInfo *>(
+		dsa_get_address(dsa, control->profile_slot_pids_root));
+}
+
+const char *
+SlotRoleName(int worker_index)
+{
+	return worker_index == LEADER_WORKER_INDEX ? "leader" : "worker";
+}
+
+void
+AccumulateStageTotals(StageTotals *totals,
+				  uint32 stage_idx,
+				  const PipelineProfileRecord &record)
+{
+	totals[stage_idx].elapsed_ns += record.elapsed_ns;
+	totals[stage_idx].calls += record.calls;
+	totals[stage_idx].rows += record.rows;
+}
+
 }  /* namespace */
 
 bool
@@ -115,6 +147,7 @@ PipelineProfileAllocate(PipelineSharedControl *control,
 		return false;
 
 	control->profile_records_root = InvalidDsaPointer;
+	control->profile_slot_pids_root = InvalidDsaPointer;
 	control->profile_event_count = event_count;
 	control->profile_worker_slots = num_workers + 1u;
 	pg_atomic_write_u32(&control->profile_enabled, 0u);
@@ -125,7 +158,20 @@ PipelineProfileAllocate(PipelineSharedControl *control,
 	const Size nrecords = static_cast<Size>(control->profile_worker_slots) *
 		static_cast<Size>(event_count) * static_cast<Size>(kStageCount);
 	const Size bytes = nrecords * sizeof(PipelineProfileRecord);
+	const Size slot_info_bytes = static_cast<Size>(control->profile_worker_slots) *
+		sizeof(PipelineProfileSlotInfo);
 	control->profile_records_root = dsa_allocate0(dsa, bytes);
+	control->profile_slot_pids_root = dsa_allocate0(dsa, slot_info_bytes);
+	PipelineProfileSlotInfo *slot_infos = ProfileSlotInfos(control, dsa);
+	if (slot_infos != nullptr)
+	{
+		for (uint32 slot = 0; slot < control->profile_worker_slots; ++slot)
+		{
+			slot_infos[slot].pid = 0;
+			slot_infos[slot].worker_index =
+				(slot == 0) ? LEADER_WORKER_INDEX : static_cast<int32>(slot - 1);
+		}
+	}
 	pg_atomic_write_u32(&control->profile_enabled, 1u);
 	return true;
 }
@@ -135,6 +181,28 @@ PipelineProfileEnabled(const ExecCtx &ctx)
 {
 	return ctx.control != nullptr &&
 		pg_atomic_read_u32(&ctx.control->profile_enabled) != 0;
+}
+
+void
+PipelineProfileRegisterProcess(PipelineSharedControl *control,
+						 dsa_area *dsa,
+						 int worker_index,
+						 int pid)
+{
+	if (control == nullptr || dsa == nullptr ||
+		pg_atomic_read_u32(&control->profile_enabled) == 0)
+		return;
+
+	const uint32 slot = ProfileWorkerSlot(worker_index);
+	if (slot >= control->profile_worker_slots)
+		return;
+
+	PipelineProfileSlotInfo *slot_infos = ProfileSlotInfos(control, dsa);
+	if (slot_infos == nullptr)
+		return;
+
+	slot_infos[slot].pid = pid;
+	slot_infos[slot].worker_index = worker_index;
 }
 
 void
@@ -194,6 +262,26 @@ PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 		 control->profile_event_count,
 		 kStageCount);
 
+	PipelineProfileSlotInfo *slot_infos = ProfileSlotInfos(control, dsa);
+	for (uint32 slot = 0; slot < control->profile_worker_slots; ++slot)
+	{
+		int worker_index = (slot == 0) ? LEADER_WORKER_INDEX : static_cast<int>(slot - 1);
+		int pid = 0;
+		if (slot_infos != nullptr)
+		{
+			worker_index = slot_infos[slot].worker_index;
+			pid = slot_infos[slot].pid;
+		}
+		elog(NOTICE,
+			 "pg_volvec[timing] slot=%u role=%s worker_index=%d pid=%d",
+			 slot,
+			 SlotRoleName(worker_index),
+			 worker_index,
+			 pid);
+	}
+
+	StageTotals grand_totals[kStageCount] = {};
+
 	for (uint32 stage_idx = 0; stage_idx < kStageCount; ++stage_idx)
 	{
 		uint64 sum_ns = 0;
@@ -204,17 +292,43 @@ PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 		for (uint32 slot = 0; slot < control->profile_worker_slots; ++slot)
 		{
 			uint64 slot_ns = 0;
+			uint64 slot_calls = 0;
+			uint64 slot_rows = 0;
 			for (uint32 event_id = 0; event_id < control->profile_event_count; ++event_id)
 			{
 				const uint64 idx =
 					((uint64) slot * control->profile_event_count + event_id) * kStageCount + stage_idx;
 				const PipelineProfileRecord &record = records[idx];
 				slot_ns += record.elapsed_ns;
+				slot_calls += record.calls;
+				slot_rows += record.rows;
 				sum_ns += record.elapsed_ns;
 				calls += record.calls;
 				rows += record.rows;
+				AccumulateStageTotals(grand_totals, stage_idx, record);
 			}
 			max_slot_ns = std::max(max_slot_ns, slot_ns);
+
+			if (slot_calls == 0 && slot_ns == 0)
+				continue;
+
+			int worker_index = (slot == 0) ? LEADER_WORKER_INDEX : static_cast<int>(slot - 1);
+			int pid = 0;
+			if (slot_infos != nullptr)
+			{
+				worker_index = slot_infos[slot].worker_index;
+				pid = slot_infos[slot].pid;
+			}
+
+			elog(NOTICE,
+				 "pg_volvec[timing] role=%s worker_index=%d pid=%d stage=%s total_ms=%.3f calls=" UINT64_FORMAT " rows=" UINT64_FORMAT,
+				 SlotRoleName(worker_index),
+				 worker_index,
+				 pid,
+				 StageName(static_cast<PipelineProfileStage>(stage_idx)),
+				 (double) slot_ns / 1000000.0,
+				 slot_calls,
+				 slot_rows);
 		}
 
 		if (calls == 0 && sum_ns == 0)
@@ -227,6 +341,20 @@ PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 			 (double) max_slot_ns / 1000000.0,
 			 calls,
 			 rows);
+	}
+
+	for (uint32 stage_idx = 0; stage_idx < kStageCount; ++stage_idx)
+	{
+		const StageTotals &total = grand_totals[stage_idx];
+		if (total.calls == 0 && total.elapsed_ns == 0)
+			continue;
+
+		elog(NOTICE,
+			 "pg_volvec[timing] overall stage=%s total_ms=%.3f calls=" UINT64_FORMAT " rows=" UINT64_FORMAT,
+			 StageName(static_cast<PipelineProfileStage>(stage_idx)),
+			 (double) total.elapsed_ns / 1000000.0,
+			 total.calls,
+			 total.rows);
 	}
 }
 

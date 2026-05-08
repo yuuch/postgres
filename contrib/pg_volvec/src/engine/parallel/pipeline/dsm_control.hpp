@@ -111,6 +111,7 @@ struct PipelineSharedControl
 	 */
 	pg_atomic_uint32 profile_enabled;
 	dsa_pointer      profile_records_root;
+	dsa_pointer      profile_slot_pids_root;
 	uint32           profile_event_count;
 	uint32           profile_worker_slots;
 };
