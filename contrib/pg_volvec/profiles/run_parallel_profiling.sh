@@ -91,6 +91,7 @@ profile_query() {
   # Extract exec time
   local exec_time=""
   exec_time=$(sed -n 's/^Execution Time: //p' "$qdir/psql.out" | tail -n 1 | sed 's/ ms$//') || true
+  mkdir -p "$qdir/per_pid"
 
   # Export TOC
   xctrace export --input "$qdir/q${qnum}.trace" --toc > "$qdir/toc.xml" 2>/dev/null || true
@@ -101,7 +102,7 @@ profile_query() {
   # Generate folded stacks
   python3 <<'PYEOF'
 import xml.etree.ElementTree as ET
-import os, glob
+import os, re
 
 qnum = os.environ.get("QNUM", "1")
 qdir = os.environ.get("QDIR", "")
@@ -109,15 +110,21 @@ toc_path = os.path.join(qdir, "toc.xml")
 tp_path = os.path.join(qdir, "time-profile.xml")
 folded_path = os.path.join(qdir, f"q{qnum}.xctrace.postgres.folded.txt")
 top_stacks_path = os.path.join(qdir, "top_stacks.txt")
+stage_summary_path = os.path.join(qdir, "stage_summary.tsv")
+per_pid_dir = os.path.join(qdir, "per_pid")
 
 # Get postgres PIDs
 postgres_pids = set()
+process_names = {}
 try:
     tree = ET.parse(toc_path)
     for p in tree.iter("process"):
         name = p.get("name", "")
+        pid = p.get("pid", "")
+        if pid:
+            process_names[pid] = name
         if "postgres" in name.lower() or "postmaster" in name.lower():
-            postgres_pids.add(p.get("pid", ""))
+            postgres_pids.add(pid)
 except:
     pass
 
@@ -125,6 +132,19 @@ except:
 stack_counts = {}
 category_counts = {"expr": 0, "deform": 0, "io": 0, "hash_join": 0, "sort": 0, "agg": 0, "sync_wait": 0, "other": 0}
 pid_category_counts = {}
+pid_stack_counts = {}
+pid_roles = {}
+
+def process_role(symbols):
+    joined = " ".join(s.lower() for s in symbols)
+    if "parallelworkermain" in joined or "backgroundworkermain" in joined:
+        return "worker"
+    if "postgresmain" in joined:
+        return "leader"
+    return "unknown"
+
+def safe_name(text):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_") or "unknown"
 
 try:
     tree = ET.parse(tp_path)
@@ -151,6 +171,8 @@ try:
 
         stack = ";".join(reversed(frames))
         stack_counts[stack] = stack_counts.get(stack, 0) + count
+        pid_stack_counts.setdefault(pid, {})
+        pid_stack_counts[pid][stack] = pid_stack_counts[pid].get(stack, 0) + count
 
         # Categorize by leaf symbol
         leaf = frames[0]
@@ -179,6 +201,7 @@ try:
         if pid not in pid_category_counts:
             pid_category_counts[pid] = {}
         pid_category_counts[pid][cat] = pid_category_counts[pid].get(cat, 0) + count
+        pid_roles.setdefault(pid, process_role(frames))
 except Exception as e:
     print(f"Error parsing: {e}")
 
@@ -193,6 +216,29 @@ with open(folded_path, "w") as f:
 with open(top_stacks_path, "w") as f:
     for stack, cnt in sorted(stack_counts.items(), key=lambda x: -x[1])[:50]:
         f.write(f"{cnt}\t{stack}\n")
+
+os.makedirs(per_pid_dir, exist_ok=True)
+for pid, stacks in pid_stack_counts.items():
+    name = safe_name(process_names.get(pid, pid))
+    per_pid_path = os.path.join(per_pid_dir, f"pid_{pid}_{name}.folded.txt")
+    with open(per_pid_path, "w") as f:
+        for stack, cnt in sorted(stacks.items(), key=lambda x: -x[1]):
+            f.write(f"{cnt} {stack}\n")
+
+with open(stage_summary_path, "w") as f:
+    f.write("scope\tid_or_name\trole\tcategory\tsamples\tpct\n")
+    for cat in sorted(category_counts.keys(), key=lambda x: -category_counts[x]):
+        if category_counts[cat] > 0:
+            pct = (category_counts[cat] / total_samples * 100) if total_samples > 0 else 0
+            f.write(f"all\tpostgres\tall\t{cat}\t{category_counts[cat]}\t{pct:.2f}\n")
+    for pid in sorted(pid_category_counts.keys(), key=lambda x: -sum(pid_category_counts[x].values())):
+        pc = pid_category_counts[pid]
+        pid_total = sum(pc.values())
+        role = pid_roles.get(pid, "unknown")
+        name = process_names.get(pid, pid).replace("\t", " ")
+        for cat in sorted(pc.keys(), key=lambda x: -pc[x]):
+            pct = (pc[cat] / pid_total * 100) if pid_total > 0 else 0
+            f.write(f"pid\t{pid}:{name}\t{role}\t{cat}\t{pc[cat]}\t{pct:.2f}\n")
 
 # Print summary
 print(f"total_samples\t{total_samples}")
@@ -234,6 +280,18 @@ for q in "${QUERIES[@]}"; do
       > "$OUT_DIR/q${q}/q${q}.xctrace.postgres.flame.svg" 2>/dev/null
     echo "Flame graph generated for Q${q}"
   fi
+
+  for folded in "$OUT_DIR/q${q}/per_pid"/*.folded.txt; do
+    if [[ ! -f "$folded" ]]; then
+      continue
+    fi
+    base="${folded%.folded.txt}"
+    perl "$FG_DIR/flamegraph.pl" \
+      --title "pg_volvec q${q} per-pid" \
+      --subtitle "$(basename "$base")" \
+      "$folded" \
+      > "${base}.flame.svg" 2>/dev/null
+  done
 
   echo ""
 done
