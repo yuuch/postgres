@@ -463,6 +463,12 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 {
 	auto &local = static_cast<HashAggLocalSinkState &>(input.local_state);
 	(void) ctx;
+	if (local.layout->column_count == 0 && local.layout->aggregate_count > 0)
+		elog(LOG,
+		     "pg_volvec: HashAgg.SinkChunk in_count=%u partitions=%u perfect=%d",
+		     in.count,
+		     local.partition_count,
+		     local.use_perfect_hash ? 1 : 0);
 	if (local.use_perfect_hash)
 	{
 		SinkChunkPerfectHash(ctx, local, in);
@@ -733,6 +739,14 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 			return SourceResultType::FINISHED;
 
 		const uint32_t row_count = pg_atomic_read_u32(&tdc->row_count);
+		if (global.layout->column_count == 0 && global.layout->aggregate_count > 0)
+			elog(LOG,
+			     "pg_volvec: HashAgg.GetData part=%u row_count=%u cursor=%u out_count=%u finalized=%d",
+			     global.source_partition,
+			     row_count,
+			     global.source_cursor,
+			     out.count,
+			     tdc->finalized ? 1 : 0);
 		if (global.source_cursor >= row_count)
 		{
 			global.source_partition++;
