@@ -26,6 +26,7 @@
 
 extern "C" {
 #include "postgres.h"
+#include "access/relscan.h"
 #include "storage/block.h"
 #include "port/atomics.h"
 #include "utils/dsa.h"
@@ -218,8 +219,8 @@ struct ProjectOpBody {
  * holds a *view* via dsa_get_address() on every method call.
  * ------------------------------------------------------------------------- */
 struct SeqScanSharedPayload {
-	pg_atomic_uint64 next_block;
-	BlockNumber      total_blocks;
+	ParallelBlockTableScanDescData pbscan;
+	BlockNumber                    total_blocks;
 };
 
 /*
@@ -273,7 +274,7 @@ struct HashAggOpBody {
 	dsa_pointer group_keys;          /* uint16_t[n_group_keys] */
 	dsa_pointer agg_funcs;           /* AggFuncDesc[n_agg_funcs] */
 	dsa_pointer layout;              /* TupleDataLayout serialized from PG Agg plan */
-	dsa_pointer shared_payload;      /* AggregateHashTable (lazy: see §8.5.4.5) */
+	dsa_pointer shared_payload;      /* HashAggSharedPayload wrapper */
 	uint16_t    n_group_keys;
 	uint16_t    n_agg_funcs;
 	uint32_t    max_groups;

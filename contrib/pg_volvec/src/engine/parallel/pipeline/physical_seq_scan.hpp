@@ -47,6 +47,7 @@ public:
 	Relation        rel = nullptr;
 	HeapScanDesc    scan_desc = nullptr;
 	ReadStream     *read_stream = nullptr;
+	ParallelBlockTableScanWorkerData parallel_scan_worker{};
 	TupleDesc       scan_tupdesc = nullptr;
 	VecExprProgram *qual_program = nullptr;   /* interpreter-only; built from POD qual desc */
 	uint32          page_visible_index = 0;

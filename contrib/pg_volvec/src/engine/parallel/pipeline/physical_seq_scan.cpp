@@ -73,7 +73,10 @@ ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared)
 }
 
 struct SeqScanBlockStreamState {
+	Relation rel = nullptr;
 	SeqScanSharedPayload *shared = nullptr;
+	ParallelBlockTableScanWorker worker = nullptr;
+	BlockNumber startblock = InvalidBlockNumber;
 };
 
 static BlockNumber
@@ -84,13 +87,20 @@ SeqScanReadStreamNextBlock(ReadStream *stream,
 	(void) stream;
 	(void) per_buffer_data;
 	auto *state = static_cast<SeqScanBlockStreamState *>(callback_private_data);
-	if (state == nullptr || state->shared == nullptr)
+	if (state == nullptr || state->rel == nullptr || state->shared == nullptr ||
+		state->worker == nullptr)
 		return InvalidBlockNumber;
 
-	uint64 block = pg_atomic_fetch_add_u64(&state->shared->next_block, 1);
-	if (block >= state->shared->total_blocks)
-		return InvalidBlockNumber;
-	return (BlockNumber) block;
+	if (unlikely(state->worker->phsw_chunk_size == 0))
+		table_block_parallelscan_startblock_init(state->rel,
+			state->worker,
+			&state->shared->pbscan,
+			state->startblock,
+			InvalidBlockNumber);
+
+	return table_block_parallelscan_nextpage(state->rel,
+		state->worker,
+		&state->shared->pbscan);
 }
 
 /*
@@ -488,7 +498,7 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 		state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(SeqScanSharedPayload));
 		auto *payload = static_cast<SeqScanSharedPayload *>(
 			dsa_get_address(ctx.dsa, state->shared_payload_dp));
-		pg_atomic_init_u64(&payload->next_block, 0);
+		table_block_parallelscan_initialize(rel, (ParallelTableScanDesc) &payload->pbscan);
 		payload->total_blocks = total;
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
 	}
@@ -520,7 +530,10 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 		local->scan_desc->rs_read_stream = nullptr;
 	}
 	auto *stream_state = static_cast<SeqScanBlockStreamState *>(palloc0(sizeof(SeqScanBlockStreamState)));
+	stream_state->rel = local->rel;
 	stream_state->shared = global.shared;
+	stream_state->worker = &local->parallel_scan_worker;
+	stream_state->startblock = local->scan_desc->rs_startblock;
 	local->read_stream = read_stream_begin_relation(READ_STREAM_SEQUENTIAL |
 	                                                READ_STREAM_USE_BATCHING,
 	                                                local->scan_desc->rs_strategy,
