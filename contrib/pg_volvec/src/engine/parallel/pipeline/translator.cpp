@@ -49,7 +49,7 @@ struct MaterializedProjectExpr {
 	uint8_t slot;
 };
 
-struct Q1ExtractedShape {
+struct SupportedPlanShape {
 	SeqScan                    *scan;
 	Agg                        *agg;
 	Sort                       *sort;
@@ -77,6 +77,8 @@ struct Q1ExtractedShape {
 	uint8_t                     next_int64_slot = 0;
 	uint8_t                     next_double_slot = 0;
 };
+
+static bool AnalyzeSupportedPlanTree(Plan *plan, SupportedPlanShape &out);
 
 static Expr *
 StripRelabels(Expr *expr)
@@ -218,6 +220,27 @@ ScaleNumericConstDatumToInt64(Const *c, int8_t &out_scale, int64_t &out_value)
 	out_scale = static_cast<int8_t>(ExtractNumericTypmodScale(c->consttypmod));
 	int64_t factor = 1;
 	if (!Pow10Int64(out_scale, factor))
+		return false;
+
+	Datum factor_numeric = NumericGetDatum(int64_to_numeric(factor));
+	Datum scaled = DirectFunctionCall2(numeric_mul, c->constvalue, factor_numeric);
+	out_value = DatumGetInt64(DirectFunctionCall1(numeric_int8, scaled));
+	return true;
+}
+
+static bool
+ScaleNumericConstDatumToTargetScale(Const *c, int8_t target_scale, int64_t &out_value)
+{
+	if (c == nullptr || c->constisnull || c->consttype != NUMERICOID)
+		return false;
+	if (target_scale < 0)
+		return false;
+
+	if (TryFastNumericToScaledInt64(c->constvalue, target_scale, &out_value))
+		return true;
+
+	int64_t factor = 1;
+	if (!Pow10Int64(target_scale, factor))
 		return false;
 
 	Datum factor_numeric = NumericGetDatum(int64_to_numeric(factor));
@@ -763,7 +786,7 @@ BuildSeqScanColumns(Oid relid,
  * int64_columns. So chunk_slot here is the LAYOUT column index, not the
  * per-storage-bucket slot. src_attno=0 (not from SeqScan). */
 static dsa_pointer
-BuildOutputSchemaDescriptor(const Q1ExtractedShape &shape, dsa_area *dsa)
+BuildOutputSchemaDescriptor(const SupportedPlanShape &shape, dsa_area *dsa)
 {
 	const uint16_t n_groups = static_cast<uint16_t>(shape.group_attnos.size());
 	const uint16_t n_aggs   = static_cast<uint16_t>(shape.agg_kinds.size());
@@ -850,38 +873,69 @@ BuildOutputSchemaDescriptor(const Q1ExtractedShape &shape, dsa_area *dsa)
 }
 
 static bool
-MatchQ1Shape(Plan *root, Sort **out_sort, Agg **out_agg, SeqScan **out_scan)
+AnalyzeSeqScanNode(SeqScan *scan, SupportedPlanShape &out)
 {
-	if (root == nullptr || nodeTag(root) != T_Sort)
+	if (scan == nullptr || out.scan != nullptr)
 		return false;
-	Sort *sort = (Sort *) root;
-	if (sort->numCols < 1 || sort->plan.lefttree == nullptr)
+	if (scan->scan.plan.lefttree != nullptr || scan->scan.plan.righttree != nullptr)
 		return false;
+	out.scan = scan;
+	return true;
+}
 
-	Plan *agg_plan = sort->plan.lefttree;
-	if (nodeTag(agg_plan) != T_Agg)
+static bool
+AnalyzeAggNode(Agg *agg, SupportedPlanShape &out)
+{
+	if (agg == nullptr || out.agg != nullptr)
 		return false;
-	Agg *agg = (Agg *) agg_plan;
-	if (agg->aggstrategy != AGG_HASHED)
+	if (agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_PLAIN)
 		return false;
 	if (agg->aggsplit != AGGSPLIT_SIMPLE)
 		return false;
 	if (agg->groupingSets != NIL || agg->chain != NIL)
 		return false;
-	if (agg->numCols < 1 || agg->plan.lefttree == nullptr)
+	if (agg->numCols > 0 && agg->aggstrategy != AGG_HASHED)
+		return false;
+	if (agg->plan.lefttree == nullptr || agg->plan.righttree != nullptr)
 		return false;
 
-	Plan *scan_plan = agg->plan.lefttree;
-	if (nodeTag(scan_plan) != T_SeqScan)
+	out.agg = agg;
+	if (!AnalyzeSupportedPlanTree(agg->plan.lefttree, out))
 		return false;
-	SeqScan *scan = (SeqScan *) scan_plan;
-	if (scan->scan.plan.lefttree != nullptr || scan->scan.plan.righttree != nullptr)
+	return nodeTag(agg->plan.lefttree) == T_SeqScan;
+}
+
+static bool
+AnalyzeSortNode(Sort *sort, SupportedPlanShape &out)
+{
+	if (sort == nullptr || out.sort != nullptr)
+		return false;
+	if (sort->numCols < 1 || sort->plan.lefttree == nullptr || sort->plan.righttree != nullptr)
 		return false;
 
-	*out_sort = sort;
-	*out_agg = agg;
-	*out_scan = scan;
-	return true;
+	out.sort = sort;
+	if (!AnalyzeSupportedPlanTree(sort->plan.lefttree, out))
+		return false;
+	return nodeTag(sort->plan.lefttree) == T_Agg;
+}
+
+static bool
+AnalyzeSupportedPlanTree(Plan *plan, SupportedPlanShape &out)
+{
+	if (plan == nullptr)
+		return false;
+
+	switch (nodeTag(plan))
+	{
+		case T_SeqScan:
+			return AnalyzeSeqScanNode((SeqScan *) plan, out);
+		case T_Agg:
+			return AnalyzeAggNode((Agg *) plan, out);
+		case T_Sort:
+			return AnalyzeSortNode((Sort *) plan, out);
+		default:
+			return false;
+	}
 }
 
 static bool
@@ -890,6 +944,11 @@ ExtractGroupAttnos(Agg *agg, SeqScan *scan, std::vector<AttrNumber> &out)
 	List *scan_tlist = scan->scan.plan.targetlist;
 	if (scan_tlist == NIL)
 		return false;
+	if (agg->numCols == 0)
+	{
+		out.clear();
+		return true;
+	}
 
 	out.clear();
 	out.reserve(agg->numCols);
@@ -972,52 +1031,8 @@ MapOpnoToQualOp(Oid opno, QualOp &out)
 }
 
 static bool
-ExtractQual(SeqScan *scan, QualDescriptor &out)
+ExtractDateQualConst(Const *c, QualOp &qop, uint64_t &out_value)
 {
-	List *qual = scan->scan.plan.qual;
-	if (qual == NIL)
-	{
-		out.kind = QualKind::NONE;
-		out.op = QualOp::EQ;
-		out.col_attno = 0;
-		out._pad0 = 0;
-		out.const_typoid = InvalidOid;
-		out.const_value = 0;
-		return true;
-	}
-	if (list_length(qual) != 1)
-		return false;
-
-	Node *clause = (Node *) linitial(qual);
-	if (clause == nullptr || nodeTag(clause) != T_OpExpr)
-		return false;
-	OpExpr *op = (OpExpr *) clause;
-	if (list_length(op->args) != 2)
-		return false;
-
-	Node *left = (Node *) linitial(op->args);
-	Node *right = (Node *) lsecond(op->args);
-	if (left == nullptr || right == nullptr)
-		return false;
-	if (nodeTag(left) != T_Var || nodeTag(right) != T_Const)
-		return false;
-
-	Var *v = (Var *) left;
-	Const *c = (Const *) right;
-	if (v->varattno <= 0)
-		return false;
-	if (c->constisnull || !c->constbyval)
-		return false;
-	if (v->vartype != DATEOID)
-		return false;
-
-	QualOp qop;
-	if (!MapOpnoToQualOp(op->opno, qop))
-		return false;
-
-	/* Bug Q — accept TIMESTAMPOID const against DATEOID column.
-	 * Planner folds `date - interval` to TIMESTAMP (interval may carry sub-day
-	 * units). Runtime EvalTypedCompare only knows DATEOID; normalize here. */
 	DateADT date_const;
 	if (c->consttype == DATEOID)
 	{
@@ -1033,7 +1048,7 @@ ExtractQual(SeqScan *scan, QualDescriptor &out)
 		if (rem != 0)
 		{
 			/* Op-aware floor/ceil preserves date-vs-timestamp semantics; EQ/NE
-			 * on non-zero TOD has no date answer (single-bool runtime). */
+			 * on non-zero TOD has no date answer in this compact clause form. */
 			switch (qop)
 			{
 				case QualOp::LT: qop = QualOp::LE; date_const = (DateADT) days; break;
@@ -1056,12 +1071,131 @@ ExtractQual(SeqScan *scan, QualDescriptor &out)
 		return false;
 	}
 
-	out.kind = QualKind::COL_OP_CONST;
+	out_value = (uint64_t) DateADTGetDatum(date_const);
+	return true;
+}
+
+static bool
+LookupRelationAttr( Oid relid, AttrNumber attno, Oid &out_type_oid, int32 &out_typmod)
+{
+	if (relid == InvalidOid || attno <= 0)
+		return false;
+
+	Relation rel = relation_open(relid, AccessShareLock);
+	TupleDesc td = RelationGetDescr(rel);
+	if (attno > td->natts)
+	{
+		relation_close(rel, AccessShareLock);
+		return false;
+	}
+
+	Form_pg_attribute attr = TupleDescAttr(td, attno - 1);
+	out_type_oid = attr->atttypid;
+	out_typmod = attr->atttypmod;
+	relation_close(rel, AccessShareLock);
+	return true;
+}
+
+static bool
+ExtractQualClause(OpExpr *op, Oid relid, QualDescriptor::Clause &out)
+{
+	if (op == nullptr || list_length(op->args) != 2)
+		return false;
+
+	Expr *left = StripRelabels((Expr *) linitial(op->args));
+	Expr *right = StripRelabels((Expr *) lsecond(op->args));
+	if (left == nullptr || right == nullptr)
+		return false;
+	if (nodeTag(left) != T_Var || nodeTag(right) != T_Const)
+		return false;
+
+	Var *v = (Var *) left;
+	Const *c = (Const *) right;
+	if (v->varattno <= 0 || c->constisnull)
+		return false;
+
+	QualOp qop;
+	if (!MapOpnoToQualOp(op->opno, qop))
+		return false;
+
+	Oid rel_type_oid = InvalidOid;
+	int32 rel_typmod = -1;
+	if (!LookupRelationAttr(relid, v->varattno, rel_type_oid, rel_typmod))
+		return false;
+	if (rel_type_oid != v->vartype)
+		return false;
+
+	out = QualDescriptor::Clause{};
 	out.op = qop;
 	out.col_attno = (uint16_t) v->varattno;
-	out._pad0 = 0;
-	out.const_typoid = DATEOID;
-	out.const_value = (uint64_t) DateADTGetDatum(date_const);
+
+	switch (v->vartype)
+	{
+		case DATEOID:
+		{
+			out.decode_kind = ColumnDecodeKind::INT32_DATE;
+			out.const_typoid = DATEOID;
+			return ExtractDateQualConst(c, out.op, out.const_value);
+		}
+		case INT4OID:
+			if (c->consttype != INT4OID || !c->constbyval)
+				return false;
+			out.decode_kind = ColumnDecodeKind::INT32_INT4;
+			out.const_typoid = INT4OID;
+			out.const_value = (uint64_t) DatumGetInt32(c->constvalue);
+			return true;
+		case INT8OID:
+			if (c->consttype != INT8OID || !c->constbyval)
+				return false;
+			out.decode_kind = ColumnDecodeKind::INT64_INT8;
+			out.const_typoid = INT8OID;
+			out.const_value = (uint64_t) DatumGetInt64(c->constvalue);
+			return true;
+		case NUMERICOID:
+		{
+			if (c->consttype != NUMERICOID)
+				return false;
+			int64_t const_value = 0;
+			const int8_t target_scale = static_cast<int8_t>(ExtractNumericTypmodScale(rel_typmod));
+			if (!ScaleNumericConstDatumToTargetScale(c, target_scale, const_value))
+				return false;
+			out.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+			out.const_typoid = INT8OID;
+			out.const_value = (uint64_t) const_value;
+			return true;
+		}
+		default:
+			return false;
+	}
+}
+
+static bool
+ExtractQual(SeqScan *scan, Oid relid, QualDescriptor &out)
+{
+	out = QualDescriptor{};
+	List *qual = scan->scan.plan.qual;
+	if (qual == NIL)
+	{
+		out.kind = QualKind::NONE;
+		return true;
+	}
+	if (list_length(qual) > QualDescriptor::MAX_CLAUSES)
+		return false;
+
+	uint8_t clause_idx = 0;
+	ListCell *lc;
+	foreach(lc, qual)
+	{
+		Node *clause = (Node *) lfirst(lc);
+		if (clause == nullptr || nodeTag(clause) != T_OpExpr)
+			return false;
+		if (!ExtractQualClause((OpExpr *) clause, relid, out.clauses[clause_idx]))
+			return false;
+		++clause_idx;
+	}
+
+	out.kind = QualKind::COL_OP_CONST;
+	out.n_clauses = clause_idx;
 	return true;
 }
 
@@ -1215,23 +1349,35 @@ ClassifyAggref(Aggref *ag,
 }
 
 static bool
-ExtractQ1Shape(Sort *sort, Agg *agg, SeqScan *scan, QueryDesc *qd,
-		   Q1ExtractedShape &out)
+ExtractSupportedPlanShape(Plan *plan, QueryDesc *qd, SupportedPlanShape &out)
 {
-	out.scan = scan;
-	out.agg = agg;
-	out.sort = sort;
-	out.estimated_groups = EstimateHashAggGroups(agg);
+	if (!AnalyzeSupportedPlanTree(plan, out))
+		return false;
+	if (out.scan == nullptr || out.agg == nullptr)
+		return false;
+	if (out.sort != nullptr)
+	{
+		if (plan != &out.sort->plan)
+			return false;
+	}
+	else if (plan != &out.agg->plan)
+	{
+		return false;
+	}
 
-	if (!ExtractRelid(scan, qd, out.relid))
+	out.estimated_groups = EstimateHashAggGroups(out.agg);
+	if (out.agg->numCols == 0)
+		out.estimated_groups = 1;
+
+	if (!ExtractRelid(out.scan, qd, out.relid))
 		return false;
-	if (!ExtractGroupAttnos(agg, scan, out.group_attnos))
+	if (!ExtractGroupAttnos(out.agg, out.scan, out.group_attnos))
 		return false;
-	if (!ExtractAggrefs(agg, out.group_attnos, out.aggrefs))
+	if (!ExtractAggrefs(out.agg, out.group_attnos, out.aggrefs))
 		return false;
-	if (!ExtractQual(scan, out.qual))
+	if (!ExtractQual(out.scan, out.relid, out.qual))
 		return false;
-	if (!ExtractSortKeys(sort, agg, out.sort_keys))
+	if (out.sort != nullptr && !ExtractSortKeys(out.sort, out.agg, out.sort_keys))
 		return false;
 
 	out.seq_scan_attnos = out.group_attnos;
@@ -1259,10 +1405,13 @@ ExtractQ1Shape(Sort *sort, Agg *agg, SeqScan *scan, QueryDesc *qd,
 			out.next_int64_slot,
 			out.next_double_slot))
 		return false;
-	(void) TryBuildPerfectHashSpec(out.group_attnos,
-		out.seq_scan_attnos,
-		out.seq_scan_columns,
-		out.perfect_hash_capacity);
+	if (!out.group_attnos.empty())
+	{
+		(void) TryBuildPerfectHashSpec(out.group_attnos,
+			out.seq_scan_attnos,
+			out.seq_scan_columns,
+			out.perfect_hash_capacity);
+	}
 
 	std::vector<MaterializedProjectExpr> materialized_exprs;
 	for (Aggref *aggref : out.aggrefs)
@@ -1295,16 +1444,19 @@ ExtractQ1Shape(Sort *sort, Agg *agg, SeqScan *scan, QueryDesc *qd,
 			out.hash_layout))
 		return false;
 
-	if (!BuildSortLayouts(out.group_attnos,
-			out.seq_scan_attnos,
-			out.seq_scan_columns,
-			out.agg_funcs,
-			out.agg_kinds,
-			out.agg_numeric_scales,
-			out.sort_keys,
-			out.sort_key_layout,
-			out.sort_payload_layout))
-		return false;
+	if (out.sort != nullptr)
+	{
+		if (!BuildSortLayouts(out.group_attnos,
+				out.seq_scan_attnos,
+				out.seq_scan_columns,
+				out.agg_funcs,
+				out.agg_kinds,
+				out.agg_numeric_scales,
+				out.sort_keys,
+				out.sort_key_layout,
+				out.sort_payload_layout))
+			return false;
+	}
 
 	return true;
 }
@@ -1317,25 +1469,23 @@ Translator::TranslatePlan(Plan *plan, QueryDesc *qd, PgVolVecQueryState *state)
 	if (plan == nullptr || qd == nullptr || state == nullptr)
 		return nullptr;
 
-	Sort *sort = nullptr;
-	Agg *agg = nullptr;
-	SeqScan *scan = nullptr;
-	if (!MatchQ1Shape(plan, &sort, &agg, &scan))
-		return nullptr;
-
-	Q1ExtractedShape shape{};
-	if (!ExtractQ1Shape(sort, agg, scan, qd, shape))
+	SupportedPlanShape shape{};
+	if (!ExtractSupportedPlanShape(plan, qd, shape))
 		return nullptr;
 	if (state->runtime_dsa == nullptr)
 		return nullptr;
 
 	shape.hash_layout_dp = SerializeTupleDataLayout(shape.hash_layout, state->runtime_dsa);
-	shape.sort_key_layout_dp = SerializeTupleDataLayout(shape.sort_key_layout, state->runtime_dsa);
-	shape.sort_payload_layout_dp = SerializeTupleDataLayout(shape.sort_payload_layout, state->runtime_dsa);
-	if (shape.hash_layout_dp == InvalidDsaPointer ||
-		shape.sort_key_layout_dp == InvalidDsaPointer ||
-		shape.sort_payload_layout_dp == InvalidDsaPointer)
+	if (shape.hash_layout_dp == InvalidDsaPointer)
 		return nullptr;
+	if (shape.sort != nullptr)
+	{
+		shape.sort_key_layout_dp = SerializeTupleDataLayout(shape.sort_key_layout, state->runtime_dsa);
+		shape.sort_payload_layout_dp = SerializeTupleDataLayout(shape.sort_payload_layout, state->runtime_dsa);
+		if (shape.sort_key_layout_dp == InvalidDsaPointer ||
+			shape.sort_payload_layout_dp == InvalidDsaPointer)
+			return nullptr;
+	}
 
 	/*
 	 * Bug D fix — publish PhysicalSeqScan's output_schema and qual into DSA.
@@ -1439,16 +1589,26 @@ Translator::TranslatePlan(Plan *plan, QueryDesc *qd, PgVolVecQueryState *state)
 	}
 	hash_op->AddChild(std::move(hash_child));
 
-	auto order_op = std::make_unique<PhysicalOrder>(
-		shape.sort_key_layout_dp,
-		shape.sort_payload_layout_dp,
-		InvalidDsaPointer);
-	order_op->AddChild(std::move(hash_op));
+	std::unique_ptr<PhysicalOperator> result_root = std::move(hash_op);
+	if (shape.sort != nullptr)
+	{
+		auto order_op = std::make_unique<PhysicalOrder>(
+			shape.sort_key_layout_dp,
+			shape.sort_payload_layout_dp,
+			InvalidDsaPointer);
+		order_op->AddChild(std::move(result_root));
+		result_root = std::move(order_op);
+	}
 
 	dsa_pointer output_input_schema_dp =
 		BuildOutputSchemaDescriptor(shape, state->runtime_dsa);
 	if (!DsaPointerIsValid(output_input_schema_dp))
 		return nullptr;
+
+	const TupleDataLayout &output_layout =
+		(shape.sort != nullptr) ? shape.sort_payload_layout : shape.hash_layout;
+	const dsa_pointer output_layout_dp =
+		(shape.sort != nullptr) ? shape.sort_payload_layout_dp : shape.hash_layout_dp;
 
 	double plan_rows = 1024.0;
 	if (qd->plannedstmt != nullptr && qd->plannedstmt->planTree != nullptr)
@@ -1468,26 +1628,26 @@ Translator::TranslatePlan(Plan *plan, QueryDesc *qd, PgVolVecQueryState *state)
 	 * loads an InvalidDsaPointer from the descriptor and ResolveTdc returns
 	 * nullptr -> "output sink global TDC not initialized" ERROR. */
 	dsa_pointer output_payload_dp = dsa_allocate0(state->runtime_dsa,
-		TupleDataCollectionAllocSize(row_capacity, shape.sort_payload_layout.row_width));
+		TupleDataCollectionAllocSize(row_capacity, output_layout.row_width));
 	if (!DsaPointerIsValid(output_payload_dp))
 		return nullptr;
 	auto *output_tdc = static_cast<TupleDataCollection *>(
 		dsa_get_address(state->runtime_dsa, output_payload_dp));
 	TupleDataCollectionInit(output_tdc,
 		row_capacity,
-		shape.sort_payload_layout.row_width,
-		shape.sort_payload_layout_dp);
+		output_layout.row_width,
+		output_layout_dp);
 
 	auto output_op = std::make_unique<OutputSink>(
 		qd->dest,
 		qd->tupDesc,
 		static_cast<int>(qd->operation),
 		output_input_schema_dp,
-		shape.sort_payload_layout_dp,
+		output_layout_dp,
 		output_payload_dp,
 		row_capacity,
 		nullptr);
-	output_op->AddChild(std::move(order_op));
+	output_op->AddChild(std::move(result_root));
 
 	return output_op;
 }

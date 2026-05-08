@@ -15,6 +15,7 @@ extern "C" {
 #include <memory>
 
 #include "parallel/pipeline/physical_operator.hpp"
+#include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "core/data_chunk.hpp"
 #include "core/data_chunk_deform.hpp"
 #include "expr/expr.hpp"  /* pg_volvec_release_llvm_jit_context */
@@ -68,11 +69,12 @@ public:
 	/* qual_chunk: heap-allocated 1024-row scratch (uses DataChunk's
 	 * MemoryContext-backed operator new, ~600KB). Always written at row 0;
 	 * size matches PIPELINE_DEFAULT_CHUNK_SIZE so it shares the existing
-	 * deformer/JIT instantiation (no new template). qual_dst_col records the
-	 * single column the qual program writes (resolved at build time so the
-	 * inline predicate evaluator skips a search). */
+	 * deformer/JIT instantiation (no new template). The widened descriptor keeps
+	 * clauses in a tiny fixed array, so we cache the per-clause dst columns once
+	 * during build and then reuse them for every tuple. */
 	std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>> qual_chunk;
-	uint16_t                               qual_dst_col = 0;
+	uint16_t                               qual_dst_cols[QualDescriptor::MAX_CLAUSES]{};
+	uint8_t                                qual_nclauses = 0;
 	JitContext                            *proj_jit_context = nullptr;
 	JitDeformFunc                          proj_jit_func = nullptr;
 	JitContext                            *qual_jit_context = nullptr;

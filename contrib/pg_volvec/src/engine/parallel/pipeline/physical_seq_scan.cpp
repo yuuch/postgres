@@ -113,20 +113,20 @@ SeqScanReadStreamNextBlock(ReadStream *stream,
  * values from the chunk so no Datum unpacking is needed here.
  */
 static inline bool
-EvalSinglePredicate(const QualDescriptor *qual,
+EvalSinglePredicate(const QualDescriptor::Clause &clause,
                     const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
                     uint16_t dst_col)
 {
 	if (qchunk.nulls[dst_col][0])
 		return false;
 
-	switch (qual->const_typoid)
+	switch (clause.const_typoid)
 	{
 		case DATEOID:
 		{
 			DateADT l = (DateADT) qchunk.int32_columns[dst_col][0];
-			DateADT r = DatumGetDateADT((Datum) qual->const_value);
-			switch (qual->op)
+			DateADT r = DatumGetDateADT((Datum) clause.const_value);
+			switch (clause.op)
 			{
 				case QualOp::LE: return l <= r;
 				case QualOp::LT: return l <  r;
@@ -140,8 +140,8 @@ EvalSinglePredicate(const QualDescriptor *qual,
 		case INT4OID:
 		{
 			int32 l = qchunk.int32_columns[dst_col][0];
-			int32 r = DatumGetInt32((Datum) qual->const_value);
-			switch (qual->op)
+			int32 r = DatumGetInt32((Datum) clause.const_value);
+			switch (clause.op)
 			{
 				case QualOp::LE: return l <= r;
 				case QualOp::LT: return l <  r;
@@ -155,8 +155,8 @@ EvalSinglePredicate(const QualDescriptor *qual,
 		case INT8OID:
 		{
 			int64 l = qchunk.int64_columns[dst_col][0];
-			int64 r = DatumGetInt64((Datum) qual->const_value);
-			switch (qual->op)
+			int64 r = DatumGetInt64((Datum) clause.const_value);
+			switch (clause.op)
 			{
 				case QualOp::LE: return l <= r;
 				case QualOp::LT: return l <  r;
@@ -169,7 +169,7 @@ EvalSinglePredicate(const QualDescriptor *qual,
 		}
 		default:
 			elog(ERROR, "pg_volvec: QualDescriptor const_typoid=%u not supported in v1 (by-value only)",
-			     qual->const_typoid);
+			     clause.const_typoid);
 	}
 	return false;
 }
@@ -312,41 +312,63 @@ BuildProjDeformProgramFromSchema(const SchemaDescriptor *out_schema,
 	return true;
 }
 
-/*
- * Build DeformProgram for the qual column (qual side). v1 supports a
- * single col_op_const predicate so the program has exactly 1 target.
- * out_dst_col=0 is hard-coded (the qual chunk has only this one column
- * we care about) and stored in local.qual_dst_col so EvalSinglePredicate
- * skips a search per tuple. Decode kind chosen from const_typoid (the
- * column's type matches by construction — translator gates the extract).
- *
- * Routes the qual_chunk's int32_columns[0] / int64_columns[0] storage
- * via dst_col=0 so the binding builder's chunk_slot=0 default works
- * without a SchemaDescriptor.
- */
+/* Build a qual-side DeformProgram for an AND-of-simple-clauses descriptor.
+ * Clauses keep their original index as the destination slot so bindings can
+ * choose int32 vs int64 storage directly from clauses[i].decode_kind. Repeated
+ * predicates on the same column (Q6 date/discount ranges) reuse the first
+ * decoded slot; the later clause reads local.qual_dst_cols[i]. */
 static bool
 BuildQualDeformProgramFromQual(const QualDescriptor *qual,
                                 DeformProgram &program,
-                                uint16_t &out_dst_col)
+                                uint16_t *out_dst_cols,
+                                uint8_t &out_nclauses)
 {
 	program.reset();
 	if (qual == nullptr || qual->kind == QualKind::NONE)
 		return false;
-	if (qual->col_attno <= 0)
+	if (qual->n_clauses == 0 || qual->n_clauses > QualDescriptor::MAX_CLAUSES)
 		return false;
 
-	DeformDecodeKind kind;
-	switch (qual->const_typoid)
+	for (uint8_t i = 0; i < qual->n_clauses; ++i)
 	{
-		case DATEOID: kind = DeformDecodeKind::kDate32; break;
-		case INT4OID: kind = DeformDecodeKind::kInt32;  break;
-		case INT8OID: kind = DeformDecodeKind::kInt64;  break;
-		default:
+		const QualDescriptor::Clause &clause = qual->clauses[i];
+		if (clause.col_attno <= 0)
 			return false;
+		bool reused = false;
+		for (uint8_t existing = 0; existing < i; ++existing)
+		{
+			if (qual->clauses[existing].col_attno == clause.col_attno)
+			{
+				if (qual->clauses[existing].decode_kind != clause.decode_kind)
+					return false;
+				out_dst_cols[i] = out_dst_cols[existing];
+				reused = true;
+				break;
+			}
+		}
+		if (reused)
+			continue;
+
+		DeformDecodeKind kind;
+		switch (clause.decode_kind)
+		{
+			case ColumnDecodeKind::INT32_DATE: kind = DeformDecodeKind::kDate32; break;
+			case ColumnDecodeKind::INT32_INT4: kind = DeformDecodeKind::kInt32; break;
+			case ColumnDecodeKind::INT64_INT8:
+				kind = DeformDecodeKind::kInt64;
+				break;
+			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+				kind = DeformDecodeKind::kNumeric;
+				break;
+			default:
+				return false;
+		}
+		const uint16_t dst_col = i;
+		program.add_target((int) clause.col_attno - 1, (int) dst_col, kind);
+		out_dst_cols[i] = dst_col;
 	}
-	program.add_target((int) qual->col_attno - 1, 0, kind);
 	program.finalize();
-	out_dst_col = 0;
+	out_nclauses = qual->n_clauses;
 	return true;
 }
 
@@ -434,35 +456,36 @@ EnsureSeqScanPageLoaded(SeqScanLocalState &local, ExecCtx &ctx)
 	}
 }
 
-/*
- * Build qual-side DeformBindings against qual_chunk slot 0. The qual
- * deformer writes one column per tuple at row 0; the chunk type used
- * is the same PIPELINE_DEFAULT_CHUNK_SIZE template so the existing
- * deformer/JIT instantiation works without widening.
- */
+/* Build qual-side DeformBindings against per-clause scratch slots. The qual
+ * deformer writes one row at index 0; duplicate-column clauses may have an
+ * unused binding slot, which is harmless because no DeformTarget writes it. */
 static inline void
-BuildQualDeformBindings(DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
-                         DeformDecodeKind kind,
+BuildQualDeformBindings(const QualDescriptor *qual,
+                         DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
                          DeformBindings &bindings)
 {
-	bindings.ncolumns = 1;
+	bindings.ncolumns = qual != nullptr ? qual->n_clauses : 0;
 	bindings.owner_chunk = &qchunk;
-	void *data_head;
-	switch (kind)
+	for (uint8_t i = 0; i < bindings.ncolumns; ++i)
 	{
-		case DeformDecodeKind::kInt32:
-		case DeformDecodeKind::kDate32:
-			data_head = static_cast<void *>(qchunk.int32_columns[0]);
-			break;
-		case DeformDecodeKind::kInt64:
-			data_head = static_cast<void *>(qchunk.int64_columns[0]);
-			break;
-		default:
-			elog(ERROR, "pg_volvec: qual deform kind=%u unsupported (v1 by-value only)",
-			     (unsigned) kind);
+		void *data_head = nullptr;
+		switch (qual->clauses[i].decode_kind)
+		{
+			case ColumnDecodeKind::INT32_DATE:
+			case ColumnDecodeKind::INT32_INT4:
+				data_head = static_cast<void *>(qchunk.int32_columns[i]);
+				break;
+			case ColumnDecodeKind::INT64_INT8:
+			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+				data_head = static_cast<void *>(qchunk.int64_columns[i]);
+				break;
+			default:
+				elog(ERROR, "pg_volvec: qual decode kind=%u unsupported",
+				     (unsigned) qual->clauses[i].decode_kind);
+		}
+		bindings.columns_data[i]  = data_head;
+		bindings.columns_nulls[i] = qchunk.nulls[i];
 	}
-	bindings.columns_data[0]  = data_head;
-	bindings.columns_nulls[0] = qchunk.nulls[0];
 }
 
 } // namespace
@@ -512,7 +535,7 @@ std::unique_ptr<LocalSourceState>
 PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 {
 	auto &global = static_cast<SeqScanGlobalState &>(gstate);
-	auto local = std::make_unique<SeqScanLocalState>();
+	std::unique_ptr<SeqScanLocalState> local = std::make_unique<SeqScanLocalState>();
 
 	(void) ctx;
 
@@ -545,7 +568,7 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 	local->exhausted = (global.shared == nullptr || global.shared->total_blocks == 0);
 	local->qual_program = nullptr;
 
-	return local;
+	return std::unique_ptr<LocalSourceState>(std::move(local));
 }
 
 SourceResultType
@@ -553,11 +576,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 {
 	auto &global = static_cast<SeqScanGlobalState &>(input.global_state);
 	auto &local = static_cast<SeqScanLocalState &>(input.local_state);
+	const bool first_call = !local.diag_first_call_logged;
 
-	if (!local.diag_first_call_logged)
-	{
+	if (first_call)
 		local.diag_first_call_logged = true;
-	}
 
 	out.reset();
 
@@ -615,35 +637,36 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		 * skips this entire block; inner loop calls projection directly. */
 		if (qual != nullptr && qual->kind != QualKind::NONE)
 		{
-			if (BuildQualDeformProgramFromQual(qual, local.qual_deform_program,
-			                                    local.qual_dst_col))
-			{
-				local.qual_chunk = std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>(
-					new DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>());
-				local.qual_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
-				                                                            &local.qual_deform_program);
+			if (!BuildQualDeformProgramFromQual(qual, local.qual_deform_program,
+			                                    local.qual_dst_cols,
+			                                    local.qual_nclauses))
+				ereport(ERROR,
+				        (errmsg("pg_volvec: failed to build SeqScan qual deformer")));
+			local.qual_chunk = std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>(
+				new DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>());
+			local.qual_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
+			                                                            &local.qual_deform_program);
 #ifdef USE_LLVM
-				if (pg_volvec_jit_deform &&
-				    !(ctx.worker_index != LEADER_WORKER_INDEX &&
-				      pg_volvec_disable_jit_for_parallel_worker))
+			if (pg_volvec_jit_deform &&
+			    !(ctx.worker_index != LEADER_WORKER_INDEX &&
+			      pg_volvec_disable_jit_for_parallel_worker))
+			{
+				JitDeformFunc fn = nullptr;
+				JitContext   *jc = nullptr;
+				const char   *err = nullptr;
+				if (pg_volvec_try_compile_jit_deform_to_datachunk(local.scan_tupdesc,
+				                                                    &local.qual_deform_program,
+				                                                    &fn, &jc, &err) &&
+				    fn != nullptr)
 				{
-					JitDeformFunc fn = nullptr;
-					JitContext   *jc = nullptr;
-					const char   *err = nullptr;
-					if (pg_volvec_try_compile_jit_deform_to_datachunk(local.scan_tupdesc,
-					                                                    &local.qual_deform_program,
-					                                                    &fn, &jc, &err) &&
-					    fn != nullptr)
-					{
-						local.qual_jit_func    = fn;
-						local.qual_jit_context = jc;
-						local.qual_deformer->set_jit_func(fn);
-						if (jc != nullptr)
-							pg_volvec_register_llvm_jit_context(jc);
-					}
+					local.qual_jit_func    = fn;
+					local.qual_jit_context = jc;
+					local.qual_deformer->set_jit_func(fn);
+					if (jc != nullptr)
+						pg_volvec_register_llvm_jit_context(jc);
 				}
-#endif
 			}
+#endif
 		}
 		local.deform_programs_built = true;
 	}
@@ -654,17 +677,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	const bool has_qual = (qual != nullptr && qual->kind != QualKind::NONE
 	                       && local.qual_deformer != nullptr);
 	if (has_qual)
-	{
-		DeformDecodeKind kind;
-		switch (qual->const_typoid)
-		{
-			case DATEOID: kind = DeformDecodeKind::kDate32; break;
-			case INT4OID: kind = DeformDecodeKind::kInt32;  break;
-			case INT8OID: kind = DeformDecodeKind::kInt64;  break;
-			default:      kind = DeformDecodeKind::kInt64;  break;  /* unreachable: BuildQual… would have refused */
-		}
-		BuildQualDeformBindings(*local.qual_chunk, kind, qual_bindings);
-	}
+		BuildQualDeformBindings(qual, *local.qual_chunk, qual_bindings);
 
 	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
@@ -728,7 +741,15 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			instr_time filter_start;
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(filter_start);
-			const bool pass = EvalSinglePredicate(qual, *local.qual_chunk, local.qual_dst_col);
+			bool pass = true;
+			for (uint8_t i = 0; i < local.qual_nclauses; ++i)
+			{
+				if (!EvalSinglePredicate(qual->clauses[i], *local.qual_chunk, local.qual_dst_cols[i]))
+				{
+					pass = false;
+					break;
+				}
+			}
 			if (profile_on)
 			{
 				instr_time filter_end;
@@ -760,9 +781,25 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	}
 
 	if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+	{
+		if (first_call)
+			elog(LOG,
+			     "pg_volvec: SeqScan.GetData first_call full_chunk=%u exhausted=%d has_qual=%d total_blocks=%u",
+			     out.count,
+			     local.exhausted ? 1 : 0,
+			     has_qual ? 1 : 0,
+			     global.shared != nullptr ? global.shared->total_blocks : 0);
 		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
 
 	ReleaseSeqScanPage(local);
+	if (first_call)
+		elog(LOG,
+		     "pg_volvec: SeqScan.GetData first_call out_count=%u exhausted=%d has_qual=%d total_blocks=%u",
+		     out.count,
+		     local.exhausted ? 1 : 0,
+		     has_qual ? 1 : 0,
+		     global.shared != nullptr ? global.shared->total_blocks : 0);
 	return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
 	                    : SourceResultType::FINISHED;
 }

@@ -9,7 +9,9 @@
  * OutputSink encode path. Returns nullptr on any unsupported plan shape;
  * the bridge then logs WARNING and falls back to standard_ExecutorRun.
  *
- * Q1 only (M-Q1-PERF). Q6 deferred (M-Q6-RESTORE).
+ * Current supported tree: SeqScan -> Agg with optional top Sort. Unsupported
+ * nodes return nullptr so the bridge falls back cleanly. Q6 lowering remains
+ * deferred until qual support widens beyond the current single-clause path.
  *
  * Spec: PIPELINE_PORT_PLAN.md §15.3.2, §15.4; 3g.2-final delta-map §10.
  */

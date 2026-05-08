@@ -115,18 +115,13 @@ struct SchemaDescriptor {
 };
 
 /* -------------------------------------------------------------------------
- * Generic single-clause qual descriptor for SeqScan.
+ * Generic conjunctive qual descriptor for SeqScan.
  *
- * v1 supports a single column-op-const clause with a by-value Datum
- * constant (matches §8.5.4.7 ExprBytecode constraint forbidding by-ref
- * consts). Conjunctive multi-clause quals and by-ref consts require
- * ExprBytecode lowering (post-M-Q1-PERF).
- *
- * `col_attno` is a 1-based heap attno read via heap_getattr against the
- * scan tupdesc; quals run BEFORE projection so this is NOT a chunk_slot.
- *
- * `const_value` holds by-value Datum bytes only. By-ref consts are
- * forbidden in v1.
+ * The translator publishes a compact AND-of-simple-clauses form so the scan
+ * runtime can stay detached from PostgreSQL's planner node tree. Each clause
+ * is still a single column-op-const comparison with a by-value payload; the
+ * descriptor now just holds several of them so Q6-style filters avoid a
+ * separate expression bytecode dependency.
  * ------------------------------------------------------------------------- */
 enum class QualKind : uint8_t {
 	NONE         = 0,   /* identically true */
@@ -143,12 +138,22 @@ enum class QualOp : uint8_t {
 };
 
 struct QualDescriptor {
+	static constexpr uint16_t MAX_CLAUSES = 8;
+
+	struct Clause {
+		QualOp           op;
+		ColumnDecodeKind decode_kind;     /* drives qual deform kind */
+		uint16_t         col_attno;       /* 1-based heap attno (not chunk_slot) */
+		uint16_t         _pad0;
+		Oid              const_typoid;    /* runtime compare dispatch type */
+		uint64_t         const_value;     /* by-value payload only */
+	};
+
 	QualKind kind;
-	QualOp   op;
-	uint16_t col_attno;       /* 1-based heap attno (not chunk_slot) */
-	uint32_t _pad0;
-	Oid      const_typoid;    /* dispatch on this for typed comparison */
-	uint64_t const_value;     /* by-value Datum bytes; by-ref forbidden in v1 */
+	uint8_t  n_clauses;
+	uint16_t _pad0;
+	uint32_t _pad1;
+	Clause   clauses[MAX_CLAUSES];
 };
 
 /* -------------------------------------------------------------------------

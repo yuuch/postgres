@@ -21,7 +21,7 @@ namespace pipeline {
 uint16_t EvalColumnarPredicate(
     const QualDescriptor                            *qual,
     const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>    &qual_chunk,
-    uint16_t                                         qual_dst_col,
+    const uint16_t                                  *qual_dst_cols,
     uint16_t                                         count,
     uint16_t                                        *selvec_out);
 

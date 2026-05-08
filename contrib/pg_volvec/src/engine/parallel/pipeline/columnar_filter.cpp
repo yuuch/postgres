@@ -14,10 +14,73 @@ extern "C" {
 namespace pg_volvec {
 namespace pipeline {
 
+static inline bool
+EvalClauseVector(const QualDescriptor::Clause &clause,
+                 const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qual_chunk,
+                 uint16_t dst_col,
+                 uint16_t row_idx)
+{
+	if (qual_chunk.nulls[dst_col][row_idx])
+		return false;
+
+	switch (clause.const_typoid)
+	{
+		case DATEOID:
+		{
+			const int32_t l = qual_chunk.int32_columns[dst_col][row_idx];
+			const int32_t r = (int32_t) DatumGetDateADT((Datum) clause.const_value);
+			switch (clause.op)
+			{
+				case QualOp::LE: return l <= r;
+				case QualOp::LT: return l <  r;
+				case QualOp::EQ: return l == r;
+				case QualOp::GE: return l >= r;
+				case QualOp::GT: return l >  r;
+				case QualOp::NE: return l != r;
+			}
+			break;
+		}
+		case INT4OID:
+		{
+			const int32_t l = qual_chunk.int32_columns[dst_col][row_idx];
+			const int32_t r = DatumGetInt32((Datum) clause.const_value);
+			switch (clause.op)
+			{
+				case QualOp::LE: return l <= r;
+				case QualOp::LT: return l <  r;
+				case QualOp::EQ: return l == r;
+				case QualOp::GE: return l >= r;
+				case QualOp::GT: return l >  r;
+				case QualOp::NE: return l != r;
+			}
+			break;
+		}
+		case INT8OID:
+		{
+			const int64_t l = qual_chunk.int64_columns[dst_col][row_idx];
+			const int64_t r = DatumGetInt64((Datum) clause.const_value);
+			switch (clause.op)
+			{
+				case QualOp::LE: return l <= r;
+				case QualOp::LT: return l <  r;
+				case QualOp::EQ: return l == r;
+				case QualOp::GE: return l >= r;
+				case QualOp::GT: return l >  r;
+				case QualOp::NE: return l != r;
+			}
+			break;
+		}
+		default:
+			elog(ERROR, "pg_volvec: EvalColumnarPredicate const_typoid=%u unsupported (by-value only)",
+			     clause.const_typoid);
+	}
+	return false;
+}
+
 uint16_t
 EvalColumnarPredicate(const QualDescriptor                            *qual,
                       const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>    &qual_chunk,
-                      uint16_t                                         qual_dst_col,
+                      const uint16_t                                  *qual_dst_cols,
                       uint16_t                                         count,
                       uint16_t                                        *selvec_out)
 {
@@ -28,115 +91,27 @@ EvalColumnarPredicate(const QualDescriptor                            *qual,
 		return count;
 	}
 
-	const uint8_t *nulls = qual_chunk.nulls[qual_dst_col];
-	uint16_t       s     = 0;
-
-	switch (qual->const_typoid)
+	uint16_t s = 0;
+	for (uint16_t row_idx = 0; row_idx < count; ++row_idx)
 	{
-		case DATEOID:
+		bool pass = true;
+		for (uint8_t clause_idx = 0; clause_idx < qual->n_clauses; ++clause_idx)
 		{
-			const int32_t  *col = qual_chunk.int32_columns[qual_dst_col];
-			const int32_t   r   = (int32_t) DatumGetDateADT((Datum) qual->const_value);
-			switch (qual->op)
+			if (!EvalClauseVector(qual->clauses[clause_idx],
+					qual_chunk,
+					qual_dst_cols[clause_idx],
+					row_idx))
 			{
-				case QualOp::LE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] <= r); }
-					break;
-				case QualOp::LT:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] <  r); }
-					break;
-				case QualOp::EQ:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] == r); }
-					break;
-				case QualOp::GE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] >= r); }
-					break;
-				case QualOp::GT:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] >  r); }
-					break;
-				case QualOp::NE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] != r); }
-					break;
+				pass = false;
+				break;
 			}
-			return s;
 		}
-		case INT4OID:
+		if (pass)
 		{
-			const int32_t  *col = qual_chunk.int32_columns[qual_dst_col];
-			const int32_t   r   = DatumGetInt32((Datum) qual->const_value);
-			switch (qual->op)
-			{
-				case QualOp::LE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] <= r); }
-					break;
-				case QualOp::LT:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] <  r); }
-					break;
-				case QualOp::EQ:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] == r); }
-					break;
-				case QualOp::GE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] >= r); }
-					break;
-				case QualOp::GT:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] >  r); }
-					break;
-				case QualOp::NE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] != r); }
-					break;
-			}
-			return s;
+			selvec_out[s++] = row_idx;
 		}
-		case INT8OID:
-		{
-			const int64_t  *col = qual_chunk.int64_columns[qual_dst_col];
-			const int64_t   r   = DatumGetInt64((Datum) qual->const_value);
-			switch (qual->op)
-			{
-				case QualOp::LE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] <= r); }
-					break;
-				case QualOp::LT:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] <  r); }
-					break;
-				case QualOp::EQ:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] == r); }
-					break;
-				case QualOp::GE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] >= r); }
-					break;
-				case QualOp::GT:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] >  r); }
-					break;
-				case QualOp::NE:
-					for (uint16_t i = 0; i < count; ++i)
-					{ selvec_out[s] = i; s += (uint16_t)(!nulls[i] && col[i] != r); }
-					break;
-			}
-			return s;
-		}
-		default:
-			elog(ERROR, "pg_volvec: EvalColumnarPredicate const_typoid=%u unsupported (by-value only)",
-			     qual->const_typoid);
 	}
-	return 0;
+	return s;
 }
 
 }
