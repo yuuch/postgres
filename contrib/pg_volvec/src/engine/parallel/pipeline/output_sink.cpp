@@ -70,16 +70,30 @@ EncodeColumn(const ColumnSchema &col,
 		}
 		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
 		{
-			/* AVG is handled by the caller (it needs row_ptr to read count
-			 * from the aggregate state's second 8 bytes). For SUM_NUMERIC the
-			 * scale lives on the matching aggregate descriptor; layout column
-			 * count is the boundary between group cols and agg state cols. */
+			/* Projection output columns may use sparse chunk slots. Resolve the
+			 * numeric scale through TupleDataLayout::src_col_idx instead of
+			 * assuming chunk_slot == logical output column index. */
 			const uint16_t slot = col.chunk_slot;
 			int16_t scale = 0;
-			if (slot < layout->column_count)
-				scale = layout->columns[slot].numeric_scale;
-			else
+			bool found = false;
+			for (uint16_t i = 0; i < layout->column_count; ++i)
+			{
+				if (layout->columns[i].src_col_idx == slot)
+				{
+					scale = layout->columns[i].numeric_scale;
+					found = true;
+					break;
+				}
+			}
+			if (!found && slot >= layout->column_count &&
+			    slot - layout->column_count < layout->aggregate_count)
+			{
 				scale = layout->aggregates[slot - layout->column_count].numeric_scale;
+				found = true;
+			}
+			if (!found)
+				elog(ERROR, "pg_volvec: numeric output slot %u not present in layout",
+				     static_cast<unsigned>(slot));
 			return NumericGetDatum(
 				int64_div_fast_to_numeric(in.int64_columns[slot][row], scale));
 		}

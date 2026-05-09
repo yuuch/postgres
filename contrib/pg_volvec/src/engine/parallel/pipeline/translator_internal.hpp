@@ -97,6 +97,11 @@ struct SupportedPlanShape {
 	std::vector<int16_t>         agg_numeric_scales;
 	std::vector<ProjectStep>     project_steps;
 	std::vector<ProjectExprDesc> project_exprs;
+	std::vector<ProjectStep>     final_project_steps;
+	std::vector<ProjectExprDesc> final_project_exprs;
+	std::vector<ColumnSchema>    final_project_schema;
+	TupleDataLayout              final_project_layout;
+	bool                         has_final_project = false;
 	uint16_t                     next_filter_bool_reg = 0;
 	uint16_t                     hash_join_left_next_filter_bool_reg = 0;
 	uint16_t                     hash_join_right_next_filter_bool_reg = 0;
@@ -116,6 +121,11 @@ bool ColumnNumericScale(const ColumnSchema &col, int8_t &out);
 int16_t ExtractNumericTypmodScale(int32 typmod);
 bool ScaleNumericConstDatumToInt64(Const *c, int8_t &out_scale, int64_t &out_value);
 bool ScaleNumericConstDatumToTargetScale(Const *c, int8_t target_scale, int64_t &out_value);
+bool ExtractStringLikePrefix(Const *c,
+				    std::vector<char> &pool,
+				    uint32_t &out_offset,
+				    uint32_t &out_len,
+				    uint64_t &out_value);
 bool ResolvePlanVarToColumnRef(Var *var, Plan *context_plan, ColumnRef &out_ref);
 bool ResolvePlanExprToColumnRef(Expr *expr, Plan *context_plan, ColumnRef &out_ref);
 bool IsBareVarArg(Expr *arg, Plan *context_plan, ColumnRef &out_ref);
@@ -133,6 +143,15 @@ bool ClassifyAggref(Aggref *ag,
 		    AggFuncDesc &out_desc,
 		    TdcAggKind &out_kind,
 		    int16_t &out_numeric_scale);
+bool LowerProjectionExpr(Expr *expr,
+				std::vector<ProjectStep> &steps,
+				uint8_t &next_int64_slot,
+				const std::vector<ColumnRef> &raw_cols_ref,
+				const std::vector<ColumnSchema> &raw_cols,
+				Plan *context_plan,
+				const std::vector<MaterializedProjectExpr> *cache,
+				int8_t &out_result_scale,
+				uint8_t &out_result_slot);
 
 bool TryBuildPerfectHashSpec(const std::vector<ColumnRef> &group_cols,
 			     const std::vector<ColumnRef> &input_cols,

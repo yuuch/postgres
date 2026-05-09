@@ -7,8 +7,8 @@ extern "C" {
 #include "utils/fmgroids.h"
 #include "utils/numeric.h"
 
-extern Datum numeric_mul(PG_FUNCTION_ARGS);
-extern Datum numeric_int8(PG_FUNCTION_ARGS);
+	extern Datum numeric_mul(PG_FUNCTION_ARGS);
+	extern Datum numeric_int8(PG_FUNCTION_ARGS);
 }
 
 #include <algorithm>
@@ -255,12 +255,35 @@ LowerNumericBinaryExpr(OpExpr *op,
 	const bool is_mul = std::strcmp(opname, "*") == 0;
 	const bool is_sub = std::strcmp(opname, "-") == 0;
 	const bool is_add = std::strcmp(opname, "+") == 0;
-	if (!is_mul && !is_sub && !is_add)
+	const bool is_div = std::strcmp(opname, "/") == 0;
+	if (!is_mul && !is_sub && !is_add && !is_div)
 		return false;
 	lhs = StripRelabels(lhs);
 	rhs = StripRelabels(rhs);
 	const bool lhs_const = lhs != nullptr && nodeTag(lhs) == T_Const;
 	const bool rhs_const = rhs != nullptr && nodeTag(rhs) == T_Const;
+
+	if (is_div)
+	{
+		if (lhs_const || rhs_const)
+			return false;
+		int8_t lhs_scale = 0;
+		int8_t rhs_scale = 0;
+		uint8_t lhs_slot = 0;
+		uint8_t rhs_slot = 0;
+		if (!LowerExprToStepsInternal(lhs, steps, next_int64_slot, raw_cols_ref, raw_cols, context_plan, cache, lhs_scale, lhs_slot) ||
+		    !LowerExprToStepsInternal(rhs, steps, next_int64_slot, raw_cols_ref, raw_cols, context_plan, cache, rhs_scale, rhs_slot) ||
+		    next_int64_slot >= 16)
+			return false;
+		int64_t factor = 0;
+		out_result_scale = 2;
+		if (!Pow10Int64(static_cast<int>(out_result_scale) + static_cast<int>(rhs_scale) - static_cast<int>(lhs_scale), factor))
+			return false;
+		out_result_slot = next_int64_slot++;
+		steps.push_back(ProjectStep{ProjectOp::NUMERIC_DIV_VAR_VAR,
+			lhs_slot, rhs_slot, out_result_slot, factor});
+		return true;
+	}
 
 	if (is_mul)
 	{
@@ -381,6 +404,93 @@ LowerNumericBinaryExpr(OpExpr *op,
 }
 
 static bool
+LowerStringPrefixLike(OpExpr *op,
+			     std::vector<ProjectStep> &steps,
+			     uint8_t &next_int64_slot,
+			     const std::vector<ColumnRef> &raw_cols_ref,
+			     const std::vector<ColumnSchema> &raw_cols,
+			     Plan *context_plan,
+			     uint8_t &out_slot)
+{
+	if (op == nullptr || list_length(op->args) != 2)
+		return false;
+	char *opname = get_opname(op->opno);
+	if (opname == nullptr)
+		return false;
+	const bool is_like = std::strcmp(opname, "~~") == 0;
+	pfree(opname);
+	if (!is_like)
+		return false;
+	Expr *lhs = StripRelabels((Expr *) linitial(op->args));
+	Expr *rhs = StripRelabels((Expr *) lsecond(op->args));
+	if (lhs == nullptr || rhs == nullptr || nodeTag(rhs) != T_Const)
+		return false;
+	ColumnRef ref{};
+	if (!IsBareVarArg(lhs, context_plan, ref))
+		return false;
+	const ColumnSchema *col = nullptr;
+	if (!LookupRawColumn(ref, raw_cols_ref, raw_cols, col) || col->decode_kind != ColumnDecodeKind::STRING_REF)
+		return false;
+	std::vector<char> pool;
+	uint32_t offset = 0;
+	uint32_t len = 0;
+	uint64_t value = 0;
+	if (!ExtractStringLikePrefix((Const *) rhs, pool, offset, len, value) || offset != UINT32_MAX || len > 8 || next_int64_slot >= 16)
+		return false;
+	out_slot = next_int64_slot++;
+	steps.push_back(ProjectStep{ProjectOp::STRING_PREFIX_LIKE,
+		col->chunk_slot,
+		static_cast<uint8_t>(len),
+		out_slot,
+		static_cast<int64_t>(value)});
+	return true;
+}
+
+static bool
+LowerCaseExpr(CaseExpr *case_expr,
+		      std::vector<ProjectStep> &steps,
+		      uint8_t &next_int64_slot,
+		      const std::vector<ColumnRef> &raw_cols_ref,
+		      const std::vector<ColumnSchema> &raw_cols,
+		      Plan *context_plan,
+		      const std::vector<MaterializedProjectExpr> *cache,
+		      int8_t &out_result_scale,
+		      uint8_t &out_result_slot)
+{
+	if (case_expr == nullptr || case_expr->arg != nullptr || list_length(case_expr->args) != 1 ||
+	    case_expr->defresult == nullptr)
+		return false;
+	CaseWhen *when = (CaseWhen *) linitial(case_expr->args);
+	if (when == nullptr || nodeTag(when) != T_CaseWhen || when->expr == nullptr || when->result == nullptr)
+		return false;
+	Expr *cond = StripRelabels((Expr *) when->expr);
+	if (cond == nullptr || nodeTag(cond) != T_OpExpr)
+		return false;
+	uint8_t cond_slot = 0;
+	if (!LowerStringPrefixLike((OpExpr *) cond, steps, next_int64_slot, raw_cols_ref, raw_cols, context_plan, cond_slot))
+		return false;
+	int8_t then_scale = 0;
+	uint8_t then_slot = 0;
+	if (!LowerExprToStepsInternal((Expr *) when->result, steps, next_int64_slot,
+			raw_cols_ref, raw_cols, context_plan, cache, then_scale, then_slot))
+		return false;
+	Const *else_const = (Const *) StripRelabels((Expr *) case_expr->defresult);
+	if (else_const == nullptr || nodeTag(else_const) != T_Const)
+		return false;
+	int64_t else_value = 0;
+	if (!ScaleNumericConstDatumToTargetScale(else_const, then_scale, else_value) || next_int64_slot >= 16)
+		return false;
+	out_result_slot = next_int64_slot++;
+	out_result_scale = then_scale;
+	steps.push_back(ProjectStep{ProjectOp::NUMERIC_CASE_VAR_CONST,
+		cond_slot,
+		then_slot,
+		out_result_slot,
+		else_value});
+	return true;
+}
+
+static bool
 LowerExprToStepsInternal(Expr *e,
 				     std::vector<ProjectStep> &steps,
 				     uint8_t &next_int64_slot,
@@ -396,6 +506,10 @@ LowerExprToStepsInternal(Expr *e,
 		return false;
 	if (LookupCachedExpr(e, cache, out_result_scale, out_result_slot))
 		return true;
+	if (nodeTag(e) == T_CaseExpr)
+		return LowerCaseExpr((CaseExpr *) e, steps, next_int64_slot,
+			raw_cols_ref, raw_cols, context_plan, cache,
+			out_result_scale, out_result_slot);
 	ColumnRef ref{};
 	if (IsBareVarArg(e, context_plan, ref))
 	{
@@ -420,6 +534,28 @@ LowerExprToStepsInternal(Expr *e,
 		out_result_scale, out_result_slot);
 	pfree(opname);
 	return ok;
+}
+
+bool
+LowerProjectionExpr(Expr *expr,
+			     std::vector<ProjectStep> &steps,
+			     uint8_t &next_int64_slot,
+			     const std::vector<ColumnRef> &raw_cols_ref,
+			     const std::vector<ColumnSchema> &raw_cols,
+			     Plan *context_plan,
+			     const std::vector<MaterializedProjectExpr> *cache,
+			     int8_t &out_result_scale,
+			     uint8_t &out_result_slot)
+{
+	return LowerExprToStepsInternal(expr,
+		steps,
+		next_int64_slot,
+		raw_cols_ref,
+		raw_cols,
+		context_plan,
+		cache,
+		out_result_scale,
+		out_result_slot);
 }
 
 static bool
@@ -463,6 +599,23 @@ CollectVarLeavesFromExpr(Expr *expr, Plan *context_plan, std::vector<ColumnRef> 
 					return false;
 			}
 			return true;
+		}
+		case T_CaseExpr:
+		{
+			CaseExpr *case_expr = (CaseExpr *) expr;
+			if (case_expr->arg != nullptr && !CollectVarLeavesFromExpr((Expr *) case_expr->arg, context_plan, out))
+				return false;
+			ListCell *lc;
+			foreach(lc, case_expr->args)
+			{
+				CaseWhen *when = (CaseWhen *) lfirst(lc);
+				if (when == nullptr || nodeTag(when) != T_CaseWhen ||
+				    !CollectVarLeavesFromExpr((Expr *) when->expr, context_plan, out) ||
+				    !CollectVarLeavesFromExpr((Expr *) when->result, context_plan, out))
+					return false;
+			}
+			return case_expr->defresult == nullptr ||
+				CollectVarLeavesFromExpr((Expr *) case_expr->defresult, context_plan, out);
 		}
 		default:
 			return false;

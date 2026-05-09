@@ -173,7 +173,7 @@ ExtractStringFilterConst(Const *c,
 	return ok;
 }
 
-static bool
+bool
 ExtractStringLikePrefix(Const *c,
 			 std::vector<char> &pool,
 			 uint32_t &out_offset,

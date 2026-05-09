@@ -3,6 +3,8 @@
 extern "C" {
 #include "postgres.h"
 #include "executor/execdesc.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/plannodes.h"
 }
@@ -120,6 +122,8 @@ struct DerivedAggBuildState {
 	TupleDataLayout sort_payload_layout;
 	TupleDataLayout final_output_layout;
 	std::vector<ColumnSchema> final_output_schema;
+	TupleDataLayout final_project_layout;
+	std::vector<ColumnSchema> final_project_schema;
 	uint32_t perfect_hash_capacity = 0;
 };
 
@@ -315,6 +319,175 @@ BuildAggOperator(Agg *agg,
 
 	hash_op->AddChild(std::move(child));
 	return hash_op;
+}
+
+static bool
+BuildPlainAggOutputColumns(const DerivedAggBuildState &agg_state,
+				   std::vector<ColumnRef> &out_refs,
+				   std::vector<ColumnSchema> &out_schema)
+{
+	out_refs.clear();
+	out_schema.clear();
+	if (agg_state.agg_kinds.size() != agg_state.agg_numeric_scales.size() ||
+	    agg_state.agg_kinds.size() > 16)
+		return false;
+	for (uint16_t a = 0; a < agg_state.agg_kinds.size(); ++a)
+	{
+		ColumnSchema cs{};
+		cs.chunk_slot = static_cast<uint8_t>(a);
+		cs.src_attno = 0;
+		cs._pad0 = 0;
+		switch (agg_state.agg_kinds[a])
+		{
+			case TdcAggKind::COUNT_STAR:
+			case TdcAggKind::SUM_INT64:
+				cs.type_oid = INT8OID;
+				cs.typmod = -1;
+				cs.typlen = 8;
+				cs.typbyval = true;
+				cs.decode_kind = ColumnDecodeKind::INT64_INT8;
+				break;
+			case TdcAggKind::SUM_NUMERIC:
+			case TdcAggKind::AVG_NUMERIC:
+				cs.type_oid = NUMERICOID;
+				cs.typmod = -1;
+				cs.typlen = -1;
+				cs.typbyval = false;
+				cs.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+				break;
+			default:
+				return false;
+		}
+		out_refs.push_back(ColumnRef{1, static_cast<AttrNumber>(a + 1)});
+		out_schema.push_back(cs);
+	}
+	return !out_schema.empty();
+}
+
+static Expr *
+ReplaceAggrefsWithVarsMutator(Node *node, const std::vector<Aggref *> *aggrefs)
+{
+	if (node == nullptr)
+		return nullptr;
+	if (nodeTag(node) == T_Aggref && aggrefs != nullptr)
+	{
+		for (uint16_t a = 0; a < aggrefs->size(); ++a)
+		{
+			if ((*aggrefs)[a] == (Aggref *) node)
+				return (Expr *) makeVar(1,
+					static_cast<AttrNumber>(a + 1),
+					((Aggref *) node)->aggtype,
+					-1,
+					InvalidOid,
+					0);
+		}
+	}
+	return (Expr *) expression_tree_mutator(node,
+		(Node *(*)(Node *, void *)) ReplaceAggrefsWithVarsMutator,
+		(void *) aggrefs);
+}
+
+static bool
+TryBuildPostAggProjection(Agg *agg,
+				 const DerivedAggBuildState &agg_state,
+				 const std::vector<Aggref *> &aggrefs,
+				 std::unique_ptr<PhysicalOperator> &op,
+				 PgVolVecQueryState *state,
+				 std::vector<ColumnSchema> &out_schema,
+				 TupleDataLayout &out_layout)
+{
+	if (agg == nullptr || agg->numCols != 0 || agg->plan.targetlist == NIL || op == nullptr ||
+	    state == nullptr || state->runtime_dsa == nullptr)
+		return false;
+	std::vector<ColumnRef> agg_cols;
+	std::vector<ColumnSchema> agg_schema;
+	if (!BuildPlainAggOutputColumns(agg_state, agg_cols, agg_schema))
+		return false;
+	Plan agg_output_context{};
+	agg_output_context.targetlist = NIL;
+	for (uint16_t a = 0; a < agg_state.agg_kinds.size(); ++a)
+	{
+		Var *var = makeVar(1,
+			static_cast<AttrNumber>(a + 1),
+			agg_schema[a].type_oid,
+			agg_schema[a].typmod,
+			InvalidOid,
+			0);
+		agg_output_context.targetlist = lappend(agg_output_context.targetlist,
+			makeTargetEntry((Expr *) var,
+				static_cast<AttrNumber>(a + 1),
+				nullptr,
+				false));
+	}
+	uint8_t next_int64_slot = static_cast<uint8_t>(agg_schema.size());
+	std::vector<ProjectStep> steps;
+	std::vector<ProjectExprDesc> exprs;
+	std::vector<ColumnSchema> project_schema;
+	TupleDataLayout project_layout;
+	TupleDataLayoutInit(&project_layout);
+	ListCell *lc;
+	foreach(lc, agg->plan.targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		if (tle == nullptr || tle->expr == nullptr)
+			return false;
+		const uint16_t first_step_idx = static_cast<uint16_t>(steps.size());
+		Expr *rewritten = ReplaceAggrefsWithVarsMutator((Node *) tle->expr, &aggrefs);
+		int8_t scale = 0;
+		uint8_t slot = 0;
+		if (!LowerProjectionExpr(rewritten,
+				steps,
+				next_int64_slot,
+				agg_cols,
+				agg_schema,
+				&agg_output_context,
+				nullptr,
+				scale,
+				slot) ||
+		    steps.size() == first_step_idx)
+			return false;
+		exprs.push_back(ProjectExprDesc{first_step_idx,
+			static_cast<uint16_t>(steps.size() - first_step_idx),
+			slot,
+			scale,
+			0});
+		ColumnSchema cs{};
+		cs.type_oid = NUMERICOID;
+		cs.typmod = -1;
+		cs.typlen = -1;
+		cs.typbyval = false;
+		cs.chunk_slot = slot;
+		cs.src_attno = 0;
+		cs.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+		cs._pad0 = 0;
+		project_schema.push_back(cs);
+		(void) TupleDataLayoutAppendColumn(&project_layout,
+			TdcColumnKind::INT64,
+			slot,
+			NUMERICOID,
+			scale);
+	}
+	TupleDataLayoutSeal(&project_layout);
+	if (project_schema.empty() || project_schema.size() > 16)
+		return false;
+	dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(agg_schema, state->runtime_dsa);
+	dsa_pointer output_schema_dp = BuildSchemaDescriptorFromColumns(project_schema, state->runtime_dsa);
+	if (!DsaPointerIsValid(input_schema_dp) || !DsaPointerIsValid(output_schema_dp))
+		return false;
+	PgVector<ProjectExprDesc> pg_exprs;
+	pg_exprs.assign(exprs.begin(), exprs.end());
+	PgVector<ProjectStep> pg_steps;
+	pg_steps.assign(steps.begin(), steps.end());
+	auto project_op = std::make_unique<PhysicalProjection>(
+		input_schema_dp,
+		output_schema_dp,
+		std::move(pg_exprs),
+		std::move(pg_steps));
+	project_op->AddChild(std::move(op));
+	op = std::move(project_op);
+	out_schema = std::move(project_schema);
+	out_layout = project_layout;
+	return true;
 }
 
 static std::unique_ptr<PhysicalOperator>
@@ -597,6 +770,30 @@ TranslateNode(Plan *plan,
 				state);
 			if (agg_op == nullptr)
 				return false;
+			bool has_post_agg_expr = false;
+			ListCell *tle_lc;
+			foreach(tle_lc, agg->plan.targetlist)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(tle_lc);
+				if (tle == nullptr || tle->expr == nullptr)
+					return false;
+				Expr *expr = StripRelabels((Expr *) tle->expr);
+				if (expr == nullptr)
+					return false;
+				if (nodeTag(expr) != T_Aggref && nodeTag(expr) != T_Var)
+				{
+					has_post_agg_expr = true;
+					break;
+				}
+			}
+			if (has_post_agg_expr && !TryBuildPostAggProjection(agg,
+					agg_state,
+					aggrefs,
+					agg_op,
+					state,
+					agg_state.final_project_schema,
+					agg_state.final_project_layout))
+				return false;
 
 			out = NodeTranslation{};
 			out.op = std::move(agg_op);
@@ -607,8 +804,16 @@ TranslateNode(Plan *plan,
 			out.agg_input_cols = std::move(child.raw_cols);
 			out.agg_input_schema = std::move(child.raw_schema);
 			out.agg_state = std::move(agg_state);
-			out.final_output_schema = out.agg_state.final_output_schema;
-			out.final_output_layout = out.agg_state.final_output_layout;
+			if (has_post_agg_expr)
+			{
+				out.final_output_schema = out.agg_state.final_project_schema;
+				out.final_output_layout = out.agg_state.final_project_layout;
+			}
+			else
+			{
+				out.final_output_schema = out.agg_state.final_output_schema;
+				out.final_output_layout = out.agg_state.final_output_layout;
+			}
 			out.has_output_contract = true;
 			return true;
 		}

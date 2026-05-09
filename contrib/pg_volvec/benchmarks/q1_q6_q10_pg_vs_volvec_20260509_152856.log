@@ -1,0 +1,33 @@
+--- q1 pg_parallel ---
+q1 pg_parallel run1: 1039 ms (error)
+q1 pg_parallel run2: 1036 ms (error)
+q1 pg_parallel run3: 1033 ms (error)
+q1 pg_parallel median: 1036 ms (1.036 s) status=error
+--- q1 volvec_parallel ---
+q1 volvec_parallel run1: 1035 ms (error)
+q1 volvec_parallel run2: 1038 ms (error)
+q1 volvec_parallel run3: 1034 ms (error)
+q1 volvec_parallel median: 1035 ms (1.035 s) status=error
+--- q6 pg_parallel ---
+q6 pg_parallel run1: 1036 ms (error)
+q6 pg_parallel run2: 1035 ms (error)
+q6 pg_parallel run3: 1037 ms (error)
+q6 pg_parallel median: 1036 ms (1.036 s) status=error
+--- q6 volvec_parallel ---
+q6 volvec_parallel run1: 1037 ms (error)
+q6 volvec_parallel run2: 1033 ms (error)
+q6 volvec_parallel run3: 1037 ms (error)
+q6 volvec_parallel median: 1037 ms (1.037 s) status=error
+--- q10 pg_parallel ---
+q10 pg_parallel run1: 1037 ms (error)
+q10 pg_parallel run2: 1036 ms (error)
+q10 pg_parallel run3: 1035 ms (error)
+q10 pg_parallel median: 1036 ms (1.036 s) status=error
+--- q10 volvec_parallel ---
+q10 volvec_parallel run1: 1039 ms (error)
+q10 volvec_parallel run2: 1040 ms (error)
+q10 volvec_parallel run3: 1038 ms (error)
+q10 volvec_parallel median: 1039 ms (1.039 s) status=error
+
+Results TSV: /Users/chenyunwen/proj/postgres/contrib/pg_volvec/benchmarks/q1_q6_q10_pg_vs_volvec_20260509_152856.tsv
+Results LOG: /Users/chenyunwen/proj/postgres/contrib/pg_volvec/benchmarks/q1_q6_q10_pg_vs_volvec_20260509_152856.log

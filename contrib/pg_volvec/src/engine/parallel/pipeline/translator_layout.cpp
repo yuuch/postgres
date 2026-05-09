@@ -336,6 +336,10 @@ BuildAggFinalOutput(const Agg *agg,
 			out_schema.push_back(cs);
 			continue;
 		}
+		if (nodeTag(expr) != T_Var)
+		{
+			continue;
+		}
 
 		ColumnRef ref{};
 		if (!ResolvePlanExprToColumnRef(expr, const_cast<Plan *>(&agg->plan), ref))
@@ -359,7 +363,7 @@ BuildAggFinalOutput(const Agg *agg,
 			numeric_scale);
 	}
 	TupleDataLayoutSeal(&out_layout);
-	return !out_schema.empty() && out_schema.size() <= 16;
+	return out_schema.size() <= 16;
 }
 
 bool

@@ -181,9 +181,9 @@ CCACHE_DISABLE=1 PATH=/opt/homebrew/bin:$PATH meson install -C build --only-chan
 ./installed/bin/psql -h /tmp -p 5432 -d postgres -c "DROP TABLE IF EXISTS lineitem_q1;"
 ./installed/bin/psql -h /tmp -p 5432 -d postgres -f contrib/pg_volvec/sql/q1.sql
 
-# Benchmark (PG parallel vs pg_volvec parallel) for q1/q6/q10
+# Benchmark (PG parallel vs pg_volvec parallel) for q1/q6/q10/q14
 RUNS=3 TIMEOUT_SEC=600 PG_WORKERS=14 VOLVEC_WORKERS=14 TRACE_EXECUTION_PATH=off \
-  contrib/pg_volvec/scripts/bench_q1_q6_q10_pg_vs_volvec.sh
+  contrib/pg_volvec/scripts/bench_tpch_pg_vs_volvec.sh
 
 # Disable PG parallel for clean single-thread repros
 SET max_parallel_workers_per_gather = 0;

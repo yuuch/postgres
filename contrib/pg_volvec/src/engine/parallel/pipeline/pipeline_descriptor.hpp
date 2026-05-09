@@ -237,6 +237,9 @@ enum class ProjectOp : uint8_t {
 	NUMERIC_ADD_VAR_CONST = 7,
 	NUMERIC_SUB_VAR_CONST = 8,
 	COPY_VAR              = 9,
+	NUMERIC_DIV_VAR_VAR   = 10,
+	STRING_PREFIX_LIKE    = 11,
+	NUMERIC_CASE_VAR_CONST = 12,
 };
 
 struct ProjectStep {

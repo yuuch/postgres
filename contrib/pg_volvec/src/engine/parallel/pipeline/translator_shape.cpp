@@ -2,6 +2,7 @@
 
 extern "C" {
 #include "nodes/pg_list.h"
+#include "nodes/nodeFuncs.h"
 }
 
 namespace pg_volvec {
@@ -9,6 +10,24 @@ namespace pipeline {
 namespace translator_detail {
 
 namespace {
+
+struct AggrefCollectorContext {
+	std::vector<Aggref *> *out;
+};
+
+static bool
+CollectAggrefWalker(Node *node, void *ctx)
+{
+	auto *collector = static_cast<AggrefCollectorContext *>(ctx);
+	if (node == nullptr)
+		return false;
+	if (nodeTag(node) == T_Aggref)
+	{
+		collector->out->push_back((Aggref *) node);
+		return false;
+	}
+	return expression_tree_walker(node, CollectAggrefWalker, ctx);
+}
 
 } // namespace
 
@@ -160,6 +179,7 @@ ExtractAggrefs(Agg *agg,
 	if (agg_tlist == NIL)
 		return false;
 	out.clear();
+	AggrefCollectorContext ctx{&out};
 	ListCell *lc;
 	foreach(lc, agg_tlist)
 	{
@@ -187,7 +207,12 @@ ExtractAggrefs(Agg *agg,
 		else if (tag == T_Aggref)
 			out.push_back((Aggref *) tle->expr);
 		else
-			return false;
+		{
+			const size_t before = out.size();
+			(void) expression_tree_walker((Node *) tle->expr, CollectAggrefWalker, &ctx);
+			if (out.size() == before)
+				return false;
+		}
 	}
 	return true;
 }

@@ -1,0 +1,7 @@
+query	mode	run1_ms	run2_ms	run3_ms	median_ms	median_s	status
+q1	pg_parallel	1039	1037	1034	1037	1.037	error
+q1	volvec_parallel	1037	1038	1037	1037	1.037	error
+q6	pg_parallel	1037	1037	1032	1037	1.037	error
+q6	volvec_parallel	1039	1035	1032	1035	1.035	error
+q10	pg_parallel	1030	1036	1037	1036	1.036	error
+q10	volvec_parallel	1034	1037	1032	1034	1.034	error

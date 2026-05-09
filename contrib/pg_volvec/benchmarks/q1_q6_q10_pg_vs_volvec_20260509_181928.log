@@ -1,0 +1,11 @@
+--- q1 pg_parallel ---
+q1 pg_parallel run1: 4059 ms (ok)
+q1 pg_parallel run2: 4056 ms (ok)
+q1 pg_parallel run3: 4064 ms (ok)
+q1 pg_parallel median: 4059 ms (4.059 s) status=ok
+--- q1 volvec_parallel ---
+q1 volvec_parallel run1: 2053 ms (ok)
+q1 volvec_parallel run2: 2048 ms (ok)
+q1 volvec_parallel run3: 2063 ms (ok)
+q1 volvec_parallel median: 2053 ms (2.053 s) status=ok
+--- q1 pg_duckdb ---

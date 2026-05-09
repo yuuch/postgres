@@ -27,8 +27,13 @@ StepInputIsNull(const ProjectStep &step, const PipelineChunk &out, uint16_t row)
 		case ProjectOp::NUMERIC_MUL_VAR_VAR:
 		case ProjectOp::NUMERIC_ADD_VAR_VAR:
 		case ProjectOp::NUMERIC_SUB_VAR_VAR:
+		case ProjectOp::NUMERIC_DIV_VAR_VAR:
 			return out.nulls[step.in_a_chunk_slot][row] != 0 ||
 			       out.nulls[step.in_b_chunk_slot][row] != 0;
+		case ProjectOp::STRING_PREFIX_LIKE:
+			return out.nulls[step.in_a_chunk_slot][row] != 0;
+		case ProjectOp::NUMERIC_CASE_VAR_CONST:
+			return false;
 	}
 
 	return true;
@@ -123,6 +128,49 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 					case ProjectOp::COPY_VAR:
 						out.int64_columns[step.out_chunk_slot][row] =
 							out.int64_columns[step.in_a_chunk_slot][row];
+						break;
+					case ProjectOp::NUMERIC_DIV_VAR_VAR:
+					{
+						const int64_t denom = out.int64_columns[step.in_b_chunk_slot][row];
+						if (denom == 0)
+						{
+							out.nulls[step.out_chunk_slot][row] = 1;
+							continue;
+						}
+						const NumericWideInt numerator =
+							WideIntFromInt64(out.int64_columns[step.in_a_chunk_slot][row]) *
+							WideIntFromInt64(step.const_value);
+						out.int64_columns[step.out_chunk_slot][row] =
+							WideIntToInt64Checked(numerator / WideIntFromInt64(denom),
+								"projection numeric division");
+						break;
+					}
+					case ProjectOp::STRING_PREFIX_LIKE:
+					{
+						const VecStringRef &ref = out.string_columns[step.in_a_chunk_slot][row];
+						const char *lhs = out.get_string_ptr(ref);
+						const uint32_t prefix_len = step.in_b_chunk_slot;
+						const char *rhs = reinterpret_cast<const char *>(&step.const_value);
+						const bool match = (lhs != nullptr || ref.len == 0) &&
+							ref.len >= prefix_len &&
+							(prefix_len == 0 || std::memcmp(lhs, rhs, prefix_len) == 0);
+						out.int64_columns[step.out_chunk_slot][row] = match ? 1 : 0;
+						break;
+					}
+					case ProjectOp::NUMERIC_CASE_VAR_CONST:
+						if (out.nulls[step.in_a_chunk_slot][row] == 0 &&
+							out.int64_columns[step.in_a_chunk_slot][row] != 0)
+						{
+							if (out.nulls[step.in_b_chunk_slot][row] != 0)
+							{
+								out.nulls[step.out_chunk_slot][row] = 1;
+								continue;
+							}
+							out.int64_columns[step.out_chunk_slot][row] =
+								out.int64_columns[step.in_b_chunk_slot][row];
+						}
+						else
+							out.int64_columns[step.out_chunk_slot][row] = step.const_value;
 						break;
 				}
 				out.nulls[step.out_chunk_slot][row] = 0;

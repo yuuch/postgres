@@ -29,9 +29,12 @@
 extern "C" {
 #include "postgres.h"
 #include "executor/executor.h"
+#include "nodes/plannodes.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
 }
+
+#include <string>
 
 #include "execute.h"
 
@@ -53,6 +56,92 @@ extern bool pg_volvec_parallel;
  * pipeline_leader once M-FRAME-MIN lands its scheduler implementation.
  */
 static char pgvolvec_parallel_scheduler_sentinel;
+
+namespace {
+
+static const char *
+PgvolvecPlanNodeName(Plan *plan)
+{
+	if (plan == nullptr)
+		return "NULL";
+	if (IsA(plan, Gather))
+		return "Gather";
+	if (IsA(plan, GatherMerge))
+		return "GatherMerge";
+	if (IsA(plan, Agg))
+		return "Agg";
+	if (IsA(plan, Sort))
+		return "Sort";
+	if (IsA(plan, Limit))
+		return "Limit";
+	if (IsA(plan, SeqScan))
+		return "SeqScan";
+	if (IsA(plan, HashJoin))
+		return "HashJoin";
+	if (IsA(plan, MergeJoin))
+		return "MergeJoin";
+	if (IsA(plan, NestLoop))
+		return "NestLoop";
+	if (IsA(plan, SubqueryScan))
+		return "SubqueryScan";
+	if (IsA(plan, Material))
+		return "Material";
+	if (IsA(plan, Hash))
+		return "Hash";
+	if (IsA(plan, Append))
+		return "Append";
+	if (IsA(plan, MergeAppend))
+		return "MergeAppend";
+	return "Other";
+}
+
+static void
+AppendPlanTreeSummary(Plan *plan, std::string &out)
+{
+	if (plan == nullptr)
+		return;
+	if (!out.empty())
+		out += " -> ";
+	out += PgvolvecPlanNodeName(plan);
+	out += "(";
+	out += std::to_string((int) nodeTag(plan));
+	out += ")";
+
+	if (IsA(plan, Append))
+	{
+		ListCell *lc;
+		foreach(lc, ((Append *) plan)->appendplans)
+			AppendPlanTreeSummary((Plan *) lfirst(lc), out);
+		return;
+	}
+	if (IsA(plan, MergeAppend))
+	{
+		ListCell *lc;
+		foreach(lc, ((MergeAppend *) plan)->mergeplans)
+			AppendPlanTreeSummary((Plan *) lfirst(lc), out);
+		return;
+	}
+	if (IsA(plan, SubqueryScan))
+	{
+		AppendPlanTreeSummary(((SubqueryScan *) plan)->subplan, out);
+		return;
+	}
+
+	AppendPlanTreeSummary(plan->lefttree, out);
+	AppendPlanTreeSummary(plan->righttree, out);
+}
+
+static const char *
+PlanTreeSummaryCString(Plan *plan)
+{
+	std::string summary;
+	AppendPlanTreeSummary(plan, summary);
+	if (summary.empty())
+		summary = "<empty-plan-tree>";
+	return pstrdup(summary.c_str());
+}
+
+} // namespace
 
 extern "C" {
 
@@ -102,8 +191,11 @@ pg_volvec_initialize_plan(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *s
 	if (state_ptr->parallel_plan == nullptr)
 	{
 		pg_volvec::pipeline::DestroyRuntimeDsm(state_ptr);
+		const char *plan_summary = PlanTreeSummaryCString(queryDesc->plannedstmt->planTree);
 		elog(WARNING,
-			 "pg_volvec: unsupported plan shape, falling back to standard PostgreSQL executor");
+			 "pg_volvec: unsupported plan shape, falling back to standard PostgreSQL executor; root=%s plan_nodes=%s",
+			 PgvolvecPlanNodeName(queryDesc->plannedstmt->planTree),
+			 plan_summary);
 		return false;
 	}
 
@@ -158,10 +250,14 @@ pg_volvec_execute_query(QueryDesc *queryDesc, pg_volvec::PgVolVecQueryState *sta
 
 	if (!ok)
 	{
-		if (pg_volvec_trace_hooks || pg_volvec_trace_execution_path)
-			elog(LOG,
-				 "pg_volvec: pipeline run skipped (%s), falling back to standard PostgreSQL executor",
-				 failure_reason != nullptr ? failure_reason : "no reason recorded");
+		const char *plan_summary = PlanTreeSummaryCString(
+			queryDesc != nullptr && queryDesc->plannedstmt != nullptr ? queryDesc->plannedstmt->planTree : nullptr);
+		elog(WARNING,
+			 "pg_volvec: pipeline run skipped (%s), falling back to standard PostgreSQL executor; root=%s plan_nodes=%s",
+			 failure_reason != nullptr ? failure_reason : "no reason recorded",
+			 queryDesc != nullptr && queryDesc->plannedstmt != nullptr ?
+			 	PgvolvecPlanNodeName(queryDesc->plannedstmt->planTree) : "NULL",
+			 plan_summary);
 		return false;
 	}
 
