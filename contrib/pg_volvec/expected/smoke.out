@@ -25,6 +25,7 @@ GROUP BY
 ORDER BY 
     l_returnflag, 
     l_linestatus;
+WARNING:  pg_volvec: pg_volvec.parallel=off, running volvec serially
  l_returnflag | l_linestatus | sum_qty | sum_base_price | count_order 
 --------------+--------------+---------+----------------+-------------
  A            | F            |      30 |            300 |           2

@@ -1,14 +1,14 @@
 # pipeline/ — DuckDB-Style PhysicalOperator + MetaPipeline Runtime
 
-**Refreshed:** 2026-04-30 against HEAD `6c344eb036d` + uncommitted Bug A/B/B'/C-pre/C/E/F/H landed and 5 new source pairs.
+**Refreshed:** 2026-05-09.
 
-**~52 files, 22 active translation units.** The **only** parallel runtime in the codebase. Replaces the deleted legacy `parallel_runtime.cpp` + `runtime_*.cpp/.inc` family. Active scope: **Q1 only** (target `M-Q1-PERF`); Q6 parked at `M-Q6-RESTORE`.
+**~52 files, 22 active translation units.** The **only** parallel runtime in the codebase. Replaces the deleted legacy `parallel_runtime.cpp` + `runtime_*.cpp/.inc` family. Validated slice includes Q1/Q6 smoke plus the join-heavy Q10 path (see `contrib/pg_volvec/q10_milestone.md`).
 
 ## OVERVIEW
 
 DuckDB-faithful `PhysicalOperator` tree (unified `Source/Operator/Sink` base, `physical_operator.hpp`) is built by `Translator::TranslatePlan` from a PG `PlannedStmt`. The tree is sliced at blocking operators (`HashAggregate`, `Order`) into `MetaPipeline` chains via `PhysicalOperator::BuildPipelines`. Each pipeline becomes one or more `Task`s (`PipelineRunEvent`, `PipelineCombineEvent`, `PipelineFinalizeEvent`) and is dispatched onto a DSM-resident MPMC `DsmTaskQueue` (Vyukov bounded queue) by `TaskScheduler::EnqueueTasks`. PostgreSQL parallel bgworkers (and the leader) pop tasks and execute them. Cross-process state lives in DSA, published via `PipelineSharedControl.event_states_root` and `pipelines_root`, addressed by id through `pipeline_descriptor.cpp` Store/LoadSharedPayload + `pipeline_dsm_lookup.hpp`.
 
-**Status:** runtime end-to-end **plumbed**; SeqScan → HashAgg → Order → OutputSink runs in leader+workers; descriptor publish/load works cross-process; leader drains the global TDC after FINALIZE. **Open bugs**: G (HashAgg dedupe wrong, row_count=3 vs expected 2) and I (OutputSink → DestReceiver emits 0 rows to psql despite internal row_count=3).
+**Status:** runtime end-to-end **plumbed**; SeqScan → HashAgg → Order → OutputSink runs in leader+workers; descriptor publish/load works cross-process; leader drains the global TDC after FINALIZE.
 
 ## MODULE STATUS
 
@@ -31,17 +31,23 @@ DuckDB-faithful `PhysicalOperator` tree (unified `Source/Operator/Sink` base, `p
 | `pipeline_leader.cpp` | Leader: builds DSM/DSA + descriptor, allocates `EventShmState`, registers latches, launches bgworkers, leader-participates, drives event loop, finalizes, drains global TDC via `EmitGlobalTdcToDest`. Bug A/C landed; race fix at `6c344eb036d`. |
 | `pipeline_worker_main.cpp` | bgworker entry: DSM/DSA attach, descriptor reconstruct, `DsmTaskQueue` drain, `Task::Execute`, populate `worker_error{,_msg}` on ereport, atomic-dec + SetLatch. |
 | `task.cpp` | `PipelineRunEvent::Execute` drives source→operators→sink loop; `PipelineCombineEvent::Execute` runs sink combine; `PipelineFinalizeEvent::Execute` finalizes. Diagnostic `RUN.GetData ENTER` fprintf still in. |
-| `translator.cpp` | Q1 shape matcher (SeqScan → HashAggregate → Sort → output). Builds `SchemaDescriptor` + `QualDescriptor` + `TupleDataLayout`s, allocates payloads via DSA before operator ctors. |
+| `translator.cpp` (+ `translator_{expr,filter,layout,shape}.cpp`) | Plan-to-`PhysicalOperator` translation for the currently admitted shapes. Builds descriptors/layouts and allocates payloads via DSA before operator ctors. |
 
 ### Shipped — operators
 
 | Module | Notes |
 |--------|-------|
 | `physical_seq_scan.{cpp,hpp}` | Page-wise scan with leader self-alloc (Bug B); descriptor fallback in workers; `heap_prepare_pagescan` removed (Bug C-pre). `AppendProjectedTupleToChunk` real body. |
-| `physical_hash_aggregate.{cpp,hpp}` | Real `Sink/Combine/Finalize/GetGlobalSinkState/GetGlobalSourceState/GetData`. Bug E (DSA-authoritative `finalized` flag) and Bug F (Combine runs in every worker, not leader-only) landed. **Open Bug G**: dedupe not happening (row_count=3 should be 2). Diagnostic `HashAgg.GetData ENTER` / `HashAgg GetGlobalSinkState NON-leader branch` fprintfs still in. |
+| `physical_hash_aggregate.{cpp,hpp}` | Real `Sink/Combine/Finalize/GetGlobalSinkState/GetGlobalSourceState/GetData`. Uses DSA-authoritative `global_tdc->finalized` gating; Combine runs in every worker (not leader-only). |
 | `physical_order.{cpp,hpp}` | Sort `MaxThreads=1`, in-memory single-run. Bug H (Load-before-alloc invariant) landed. Diagnostic `Order.GetGlobalSinkState ENTER`, `Order LEADER ALLOC`, `Order LOAD`, `Order NEITHER-BRANCH`, `Order.Finalize ENTER/EXIT` fprintfs still in. |
 | `physical_projection.{cpp,hpp}` | NEW. Pure projection operator (no sink). |
-| `output_sink.{hpp,cpp}` | DSA TDC sink. `EncodeColumn(layout, ...)` resolves NUMERIC scale from `layout->columns[slot].numeric_scale` for group cols and `layout->aggregates[slot - column_count].numeric_scale` for agg cols. `INT64_NUMERIC_SCALED` via `int64_div_fast_to_numeric`. AVG_NUMERIC: `EmitGlobalTdcToDest` reads sum from chunk + count from `row_ptr + agg.offset + 8`, computes `sum/count` at scale=2. Leader-ctor `shared_payload_dp_` workaround pending removal. **Open Bug I**: `EmitGlobalTdcToDest → DestReceiver` emits 0 rows to client. |
+| `output_sink.{hpp,cpp}` | DSA TDC sink. `EmitGlobalTdcToDest` drains finalized global TDC into `DestReceiver`. |
+
+Additional operators used by Q10:
+
+| Module | Notes |
+|--------|-------|
+| `physical_hash_join.{cpp,hpp}` | Inner equi-hash join. Build side materializes into TDC + bucket/chain directory; probe side can resume mid-bucket and may emit multiple output chunks per input chunk (`HAVE_MORE_OUTPUT`). |
 
 ### Shipped — TupleData / hash table (NEW this cycle, ~1561 LoC)
 
@@ -112,7 +118,7 @@ Same invariant for `GetGlobalSourceState`. **Never** read `shared_payload_dp_` d
 
 ## CONVENTIONS
 
-- **Single shape (Q1 only):** SeqScan → HashAggregate → optional Sort → Output. Anything else fails admission in `Translator::TranslatePlan` (returns `nullptr`); bridge falls back to PG.
+ - **Supported shapes:** scan→agg→(optional sort)→output, and join-fed aggregate/sort/output for the validated Q10 slice. Anything else fails admission in `Translator::TranslatePlan` (returns `nullptr`); bridge falls back to PG.
 - **Worker indexing**: leader is `LEADER_WORKER_INDEX = -1`. Bgworkers are `0..N-1`. Leader participation gated by `pg_volvec.parallel_leader_participation`.
 - **Chunk size**: `PipelineChunk = DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>` (1024 rows).
 - **DSM keys**: `PIPELINE_DSM_KEY_*` in `0xD8…` range. Always go through `dsm_control.hpp` constants.
@@ -130,7 +136,7 @@ Same invariant for `GetGlobalSourceState`. **Never** read `shared_payload_dp_` d
 
 - **Do NOT change `PhysicalOperator` base virtual signatures.** Locked in `eb7901b022a`.
 - **Do NOT add `AttachGlobal*State` virtuals** or an `ExecutionAffinity` enum. Both unnecessary.
-- **Do NOT widen `Translator::TranslatePlan` to non-Q1 shapes.**
+ - **Do NOT add query-specific hacks.** Prefer reusable operator/type support; keep admission conservative and explicit.
 - **Do NOT extend Sort beyond MaxThreads=1, in-memory single-run.**
 - **Do NOT have workers call `FinishEvent`.** Atomic-dec + `SetLatch` only.
 - **Do NOT publish palloc'd pointers via `PipelineSharedControl` or DSA.**
@@ -147,7 +153,7 @@ Same invariant for `GetGlobalSourceState`. **Never** read `shared_payload_dp_` d
 
 ## NOTES
 
-- **Diagnostic fprintfs** (`PGVOLVEC_DIAG[…]`) remain in `physical_hash_aggregate.cpp`, `physical_order.cpp`, `task.cpp`. Pending removal once Bug G + Bug I close.
+ - **Resumable output contract:** `task.cpp` drains an operator suffix for each source chunk; operators that return `HAVE_MORE_OUTPUT` must be re-enterable on the same logical input until they return `NEED_MORE_INPUT`.
 - **Deviations from `pg_duckdb_architecture.md`** are recorded in `contrib/pg_volvec/docs/ARCHITECTURE_DEVIATIONS.md`. Read it before designing new sinks.
 - **bundle.pipelines order:** P0=[Order→Output], P1=[HashAgg→Order], P2=[SeqScan→HashAgg].
 - **`task_scheduler.cpp`** dispatches RUN/COMBINE/FINALIZE on `Event::kind()`.

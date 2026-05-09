@@ -1,8 +1,8 @@
 # bridge/ — PostgreSQL Hook Integration & Plan Dispatch
 
-**Refreshed:** 2026-04-30 against HEAD `6c344eb036d` + uncommitted M-FRAME-MIN step-3g.2-final runtime work.
+**Refreshed:** 2026-05-09.
 
-6 files (5 source + this AGENTS.md). The C/C++ boundary: PostgreSQL `ExecutorStart/Run/Finish/End` hooks → `pg_volvec` admission → `pipeline::Translator` → `PhysicalOperator` tree → `pipeline::PgvolvecPipelineRun`. The bridge layer itself is **unchanged** since `fd9a8aaf326`; all this cycle's work landed downstream in `parallel/pipeline/`. `PgvolvecPipelineRun` is now plumbed end-to-end (SeqScan → HashAgg → Order → OutputSink across leader+workers, cross-process descriptor publish/load, leader FINALIZE drains global TDC). Two open bugs (Bug G HashAgg dedupe, Bug I OutputSink → DestReceiver emit 0) still cause `psql` to see 0 rows for Q1, so the bridge currently still falls through to `standard_ExecutorRun` for correct results — but the dispatch path itself now exercises the full runtime.
+6 files (5 source + this AGENTS.md). The C/C++ boundary: PostgreSQL `ExecutorStart/Run/Finish/End` hooks → `pg_volvec` admission → `pipeline::Translator` → `PhysicalOperator` tree → `pipeline::PgvolvecPipelineRun`. Plan-shape support and correctness live downstream in `parallel/pipeline/`; the bridge mostly stays stable.
 
 ## OVERVIEW
 
@@ -31,7 +31,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 | Query state lifecycle | `state.c::pg_volvec_try_build_query_state`, `pg_volvec_close_query_state` | Allocates child `MemoryContext` named `"pg_volvec query context"`. |
 | Plan init / dispatch | `execute.cpp::pg_volvec_initialize_plan`, `pg_volvec_execute_query` | `Translator::Translate` returns `unique_ptr<PhysicalOperator>`. On non-null, ownership is `release()`d into `state->parallel_plan`. `parallel_scheduler` is set to a static char sentinel iff `pg_volvec.parallel=on`. |
 | Plan teardown | `execute.cpp::pg_volvec_delete_plan` | `static_cast<PhysicalOperator*>(state->parallel_plan)` → `delete`. Called from `pg_volvec_close_query_state` in `state.c`. |
-| Pipeline dispatch | `execute.cpp::pg_volvec_execute_query` | Calls `pg_volvec::pipeline::PgvolvecPipelineRun(queryDesc, state, &failure_reason)`. Runtime is now plumbed end-to-end; returns `false` today only because Bug G/I prevent emit. On `false` the hook falls through to `standard_ExecutorRun`. |
+| Pipeline dispatch | `execute.cpp::pg_volvec_execute_query` | Calls `pg_volvec::pipeline::PgvolvecPipelineRun(queryDesc, state, &failure_reason)`. On failure/unsupported shape it falls through to `standard_ExecutorRun`. |
 
 ## CONVENTIONS
 
@@ -106,7 +106,7 @@ callback, not a tunable block-range morsel scheduler.
      - Patch `estate->es_snapshot = GetActiveSnapshot()` if missing.
       - `pg_volvec_execute_query(qd, state, direction, count)`:
         - Gate on `state->parallel_plan && state->parallel_scheduler` (both non-null).
-        - `pg_volvec::pipeline::PgvolvecPipelineRun(qd, state, &failure_reason)`. Runtime is plumbed end-to-end; today still returns `false` because Bug G (HashAgg dedupe) and Bug I (OutputSink → DestReceiver emit 0) prevent successful client emission. See top-level `AGENTS.md` for bug ledger.
+        - `pg_volvec::pipeline::PgvolvecPipelineRun(qd, state, &failure_reason)`.
        - On `true` → log `pg_volvec_path: path=pipeline detail=duckdb_style_pipeline` (when traced) and return `true`.
        - On `false` → log skip reason (when traced) and return `false`.
      - On `true` from `pg_volvec_execute_query` → return (we own this query).
