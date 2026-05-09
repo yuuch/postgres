@@ -12,6 +12,7 @@ struct OpDescriptor;
 class ProjectionOperatorState final : public OperatorState {
 public:
 	bool initialized = false;
+	bool current_input_drained = false;
 };
 
 class PhysicalProjection final : public PhysicalOperator {

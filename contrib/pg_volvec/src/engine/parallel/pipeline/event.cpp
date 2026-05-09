@@ -37,12 +37,19 @@ Event::CompleteDependency(bool upstream_aborted)
 		return;
 	}
 
+	TrySchedule();
+}
+
+bool
+Event::TrySchedule()
+{
 	EventState expected = EventState::PENDING;
 	if (!state_.compare_exchange_strong(expected, EventState::SCHEDULED,
 	                                    std::memory_order_acq_rel))
-		return;
+		return false;
 
 	Schedule();
+	return true;
 }
 
 void

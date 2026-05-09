@@ -19,7 +19,8 @@
  *   Input chunk for HashAggregate sink =
  *     [ group_col_0, ..., group_col_{N-1}, agg_input_0, ..., agg_input_{M-1} ]
  *
- *   - layout->columns[i] (i = 0..N-1) sources from chunk col `i`.
+ *   - layout->columns[i] (i = 0..N-1) sources from chunk col
+ *     `columns[i].src_col_idx`.
  *   - layout->aggregates[j] (j = 0..M-1) sources its update value from
  *     chunk col `aggregates[j].src_col_idx` (typically N+j, but the
 	 *     translator may share one input col across multiple aggs, e.g. when
@@ -33,6 +34,7 @@
  */
 
 #include "parallel/pipeline/tuple_data_layout.hpp"
+#include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/types.hpp"
 
 #include <cstdint>
@@ -67,6 +69,7 @@ namespace pipeline {
  *   - column_count + aggregate_count <= 16.
  */
 void Scatter(const TupleDataLayout *layout,
+             TupleDataCollection *tdc,
              uint8_t *row_ptr,
              const PipelineChunk &chunk,
              uint16_t row_idx);
@@ -82,6 +85,7 @@ void Scatter(const TupleDataLayout *layout,
  *   aggregate accumulator with unrelated row data.
  */
 void ScatterGroupOnly(const TupleDataLayout *layout,
+                      TupleDataCollection *tdc,
                       uint8_t *row_ptr,
                       const PipelineChunk &chunk,
                       uint16_t row_idx);
@@ -99,6 +103,7 @@ void ScatterGroupOnly(const TupleDataLayout *layout,
  *   - Caller bumps chunk.count itself (Gather does NOT touch count).
  */
 void Gather(const TupleDataLayout *layout,
+            const TupleDataCollection *tdc,
             const uint8_t *row_ptr,
             PipelineChunk &chunk,
             uint16_t row_idx);
@@ -116,6 +121,7 @@ uint64_t HashGroup(const TupleDataLayout *layout,
 /* Row-buffer variant used by HashAgg combine and AHT rehash. Must stay
  * bit-identical to HashGroup for rows produced by ScatterGroupOnly. */
 uint64_t HashGroupRow(const TupleDataLayout *layout,
+                      const TupleDataCollection *tdc,
                       const uint8_t *row_ptr);
 
 /*
@@ -127,11 +133,27 @@ uint64_t HashGroupRow(const TupleDataLayout *layout,
  *   matches on Scatter.
  */
 bool MatchGroup(const TupleDataLayout *layout,
+                const TupleDataCollection *tdc,
                 const uint8_t *row_ptr,
                 const PipelineChunk &chunk,
                 uint16_t row_idx);
 
+/*
+ * MatchGroupLayouts:
+ *   Row-vs-chunk variant for operators whose build/probe sides may store the
+ *   same logical key in different chunk slots. row_layout describes row_ptr;
+ *   chunk_layout describes chunk[row_idx]. Column positions are paired by
+ *   ordinal, but each side uses its own src_col_idx/offset.
+ */
+bool MatchGroupLayouts(const TupleDataLayout *row_layout,
+                       const TupleDataCollection *tdc,
+                       const uint8_t *row_ptr,
+                       const TupleDataLayout *chunk_layout,
+                       const PipelineChunk &chunk,
+                       uint16_t row_idx);
+
 void MatchGroupBatch(const TupleDataLayout *layout,
+                     const TupleDataCollection *tdc,
                      const uint8_t *const *row_ptrs,
                      const PipelineChunk &chunk,
                      const uint16_t *row_indices,
@@ -148,7 +170,9 @@ void MatchGroupBatch(const TupleDataLayout *layout,
  *   against an existing canonical row.
  */
 bool MatchGroupRow(const TupleDataLayout *layout,
+                   const TupleDataCollection *tdc_a,
                    const uint8_t *row_a,
+                   const TupleDataCollection *tdc_b,
                    const uint8_t *row_b);
 
 /*

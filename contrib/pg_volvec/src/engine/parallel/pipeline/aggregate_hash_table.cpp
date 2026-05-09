@@ -242,7 +242,7 @@ FindOrInsertFromSlotLocked(AggregateHashTable *aht,
 		{
 			const uint32_t existing_idx = EntryRowIndex(e);
 			const uint8_t *existing_ptr = TupleDataCollectionGetRowConst(tdc, existing_idx);
-			if (MatchGroupRow(layout, group_row_ptr, existing_ptr))
+				if (MatchGroupRow(layout, tdc, group_row_ptr, tdc, existing_ptr))
 			{
 				*out_existing_row_idx = existing_idx;
 				return false;
@@ -353,7 +353,7 @@ AggregateHashTableRehash(AggregateHashTable *aht,
 	for (uint32_t row_idx = 0; row_idx < row_count; ++row_idx)
 	{
 		const uint8_t *row_ptr = TupleDataCollectionGetRowConst(tdc, row_idx);
-		const uint64_t hash = HashGroupRow(layout, row_ptr);
+		const uint64_t hash = HashGroupRow(layout, tdc, row_ptr);
 		const uint16_t salt = HashSalt(hash);
 		const uint32_t mask = aht->capacity_mask;
 		const uint32_t step = ProbeStep(hash);
@@ -486,12 +486,12 @@ AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
 
 					if ((vec.empty_mask & lane_bit) != 0 && EntryIsEmpty(entry))
 					{
-					uint8_t *candidate_row = nullptr;
-					const uint32_t candidate_idx = TupleDataCollectionAppendRow(tdc, &candidate_row);
-					if (candidate_idx == TDC_INVALID_ROW_INDEX)
-						elog(ERROR, "pg_volvec: local hash aggregate row capacity exceeded");
+						uint8_t *candidate_row = nullptr;
+						const uint32_t candidate_idx = TupleDataCollectionAppendRow(tdc, &candidate_row);
+						if (candidate_idx == TDC_INVALID_ROW_INDEX)
+							elog(ERROR, "pg_volvec: local hash aggregate row capacity exceeded");
 
-						ScatterGroupOnly(layout, candidate_row, chunk, inputs[input_idx].row_idx);
+						ScatterGroupOnly(layout, tdc, candidate_row, chunk, inputs[input_idx].row_idx);
 						entry.value = PackEntry(probe_meta[input_idx].salt, candidate_idx);
 						results[input_idx].row_idx = inputs[input_idx].row_idx;
 						results[input_idx].canonical_row_idx = candidate_idx;
@@ -522,6 +522,7 @@ AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
 				if (match_count > 0)
 				{
 					MatchGroupBatch(layout,
+						tdc,
 						match_rows,
 						chunk,
 						match_row_indices,
@@ -610,7 +611,7 @@ AggregateHashTableCombineRow(AggregateHashTable *aht,
 				const uint32_t existing_idx = EntryRowIndex(e);
 				const uint8_t *existing_ptr =
 					TupleDataCollectionGetRowConst(tdc, existing_idx);
-				if (MatchGroupRow(layout, src_row, existing_ptr))
+				if (MatchGroupRow(layout, tdc, src_row, tdc, existing_ptr))
 				{
 					canonical_row = TupleDataCollectionGetRow(tdc, existing_idx);
 					break;

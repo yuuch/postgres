@@ -14,6 +14,7 @@ extern int pg_volvec_parallel_max_workers;
 #include <cstring>
 
 #include "core/data_chunk.hpp"
+#include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 #include "parallel/pipeline/types.hpp"
 
@@ -21,6 +22,40 @@ namespace pg_volvec {
 namespace pipeline {
 
 namespace {
+
+static void
+CopyTdcRow(const TupleDataLayout *layout,
+	       const TupleDataCollection *src_tdc,
+	       const uint8_t *src_row,
+	       TupleDataCollection *dst_tdc,
+	       uint8_t *dst_row)
+{
+	for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
+	{
+		const TdcColumnDesc &col = layout->columns[col_idx];
+		if (col.kind != TdcColumnKind::STRING_REF)
+		{
+			std::memcpy(dst_row + col.offset, src_row + col.offset, col.width);
+			continue;
+		}
+
+		VecStringRef src_ref;
+		std::memcpy(&src_ref, src_row + col.offset, sizeof(src_ref));
+		const char *src_ptr = VecStringRefDataPtr(src_ref,
+			src_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(src_tdc)) : nullptr);
+		VecStringRef dst_ref;
+		if (!TupleDataCollectionStoreStringBytes(dst_tdc, src_ptr, src_ref.len, &dst_ref))
+			elog(ERROR, "pg_volvec: hash aggregate TDC copy ran out of heap");
+		std::memcpy(dst_row + col.offset, &dst_ref, sizeof(dst_ref));
+	}
+
+	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
+		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
+		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
+	}
+}
 
 static const TupleDataLayout *
 ResolveLayout(dsa_area *dsa, dsa_pointer layout_dp)
@@ -72,7 +107,8 @@ ResolveTdc(dsa_area *dsa, dsa_pointer tdc_dp)
 
 static void GrowLocalTdc(ExecCtx &ctx,
                          HashAggLocalSinkState &local,
-                         HashAggPartition &part);
+	                         HashAggPartition &part,
+	                         uint32_t required_heap_bytes);
 
 static uint32_t
 PartitionRowCapacity(uint32_t max_groups, uint32_t partition_count)
@@ -108,7 +144,8 @@ EncodePerfectHashKey(const TupleDataLayout *layout,
 	uint32_t key = 0;
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
-		const int32_t v = chunk.int32_columns[i][row_idx];
+		const TdcColumnDesc &col = layout->columns[i];
+		const int32_t v = chunk.int32_columns[col.src_col_idx][row_idx];
 		if (v < 0 || v > 255)
 			return false;
 		key = (key << 8) | static_cast<uint32_t>(v);
@@ -133,6 +170,8 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 
 	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
 	{
+		if (PipelineCancelRequestedEvery(ctx, row_idx))
+			return;
 		uint32_t key = 0;
 		if (!EncodePerfectHashKey(local.layout, in, row_idx, &key) ||
 			key >= local.perfect_capacity)
@@ -145,7 +184,7 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 		{
 			while (pg_atomic_read_u32(&tdc->row_count) >= tdc->row_capacity)
 			{
-				GrowLocalTdc(ctx, local, part);
+				GrowLocalTdc(ctx, local, part, 0);
 				tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 				if (tdc == nullptr)
 					elog(ERROR, "pg_volvec: perfect hash aggregate TDC missing after grow");
@@ -154,7 +193,7 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 			canonical_idx = TupleDataCollectionAppendRow(tdc, &candidate_row);
 			if (canonical_idx == TDC_INVALID_ROW_INDEX)
 				elog(ERROR, "pg_volvec: perfect hash aggregate row capacity exceeded");
-			ScatterGroupOnly(local.layout, candidate_row, in, row_idx);
+			ScatterGroupOnly(local.layout, tdc, candidate_row, in, row_idx);
 			local.perfect_row_indices[key] = canonical_idx;
 		}
 
@@ -198,6 +237,7 @@ ResizeAhtForTdc(ExecCtx &ctx,
                 const TupleDataLayout *layout,
                 dsa_pointer *aht_dp)
 {
+	dsa_pointer old_aht_dp = *aht_dp;
 	AggregateHashTable *old_aht = ResolveAht(ctx.dsa, *aht_dp);
 	if (old_aht == nullptr || !AggregateHashTableShouldResize(old_aht, tdc))
 		return;
@@ -208,24 +248,32 @@ ResizeAhtForTdc(ExecCtx &ctx,
 	AggregateHashTableInit(new_aht, new_capacity, tdc_dp);
 	AggregateHashTableRehash(new_aht, tdc, layout);
 	*aht_dp = new_aht_dp;
+	dsa_free(ctx.dsa, old_aht_dp);
 }
 
 static void
 GrowTdcForPartition(ExecCtx &ctx,
                     dsa_pointer layout_dp,
                     const TupleDataLayout *layout,
-                    HashAggPartition &part)
+	                    HashAggPartition &part,
+	                    uint32_t required_heap_bytes)
 {
+	dsa_pointer old_tdc_dp = part.tdc_dp;
+	dsa_pointer old_aht_dp = part.aht_dp;
 	TupleDataCollection *old_tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 	if (old_tdc == nullptr)
 		elog(ERROR, "pg_volvec: hash aggregate partition TDC missing");
 
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
 	const uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(layout,
+		old_tdc,
+		new_capacity,
+		required_heap_bytes);
 	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionAllocSize(new_capacity, layout->row_width));
+		TupleDataCollectionCheckedAllocSize(new_capacity, layout->row_width, heap_capacity));
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
-	TupleDataCollectionInit(new_tdc, new_capacity, layout->row_width, layout_dp);
+	TupleDataCollectionInit(new_tdc, new_capacity, layout->row_width, layout_dp, heap_capacity);
 
 	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
 	{
@@ -234,7 +282,7 @@ GrowTdcForPartition(ExecCtx &ctx,
 		if (copied_idx == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_volvec: hash aggregate TDC grow copy overflow");
 		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
-		std::memcpy(dst, src, layout->row_width);
+		CopyTdcRow(layout, old_tdc, src, new_tdc, dst);
 	}
 
 	const uint32_t capacity = AggregateHashTableChooseCapacity(new_capacity);
@@ -244,25 +292,35 @@ GrowTdcForPartition(ExecCtx &ctx,
 	AggregateHashTableRehash(new_aht, new_tdc, layout);
 	part.tdc_dp = new_tdc_dp;
 	part.aht_dp = new_aht_dp;
+	dsa_free(ctx.dsa, old_aht_dp);
+	dsa_free(ctx.dsa, old_tdc_dp);
 }
 
 static void
 GrowLocalTdc(ExecCtx &ctx,
              HashAggLocalSinkState &local,
-             HashAggPartition &part)
+	             HashAggPartition &part,
+	             uint32_t required_heap_bytes)
 {
+	dsa_pointer old_tdc_dp = part.tdc_dp;
+	dsa_pointer old_aht_dp = part.aht_dp;
 	TupleDataCollection *old_tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 	if (old_tdc == nullptr)
 		elog(ERROR, "pg_volvec: local hash aggregate partition TDC missing");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
 	const uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(local.layout,
+		old_tdc,
+		new_capacity,
+		required_heap_bytes);
 	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionAllocSize(new_capacity, local.layout->row_width));
+		TupleDataCollectionCheckedAllocSize(new_capacity, local.layout->row_width, heap_capacity));
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc,
 		new_capacity,
 		local.layout->row_width,
-		local.layout_dp);
+		local.layout_dp,
+		heap_capacity);
 
 	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
 	{
@@ -271,7 +329,7 @@ GrowLocalTdc(ExecCtx &ctx,
 		if (copied_idx == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_volvec: local hash aggregate TDC grow copy overflow");
 		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
-		std::memcpy(dst, src, local.layout->row_width);
+		CopyTdcRow(local.layout, old_tdc, src, new_tdc, dst);
 	}
 
 	const uint32_t capacity = AggregateHashTableChooseCapacity(new_capacity);
@@ -281,6 +339,47 @@ GrowLocalTdc(ExecCtx &ctx,
 	AggregateHashTableRehash(new_aht, new_tdc, local.layout);
 	part.tdc_dp = new_tdc_dp;
 	part.aht_dp = new_aht_dp;
+	dsa_free(ctx.dsa, old_aht_dp);
+	dsa_free(ctx.dsa, old_tdc_dp);
+}
+
+static uint32_t
+RequiredHeapBytesForChunkRows(const TupleDataLayout *layout,
+                              const PipelineChunk &chunk,
+                              const uint16_t *row_indices,
+                              uint16_t count)
+{
+	uint64_t required = 0;
+	for (uint16_t i = 0; i < count; ++i)
+		required += TupleDataCollectionRequiredHeapBytesForChunkRow(layout, chunk, row_indices[i]);
+	return required > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(required);
+}
+
+static bool
+PartitionNeedsGrowForChunkBatch(const TupleDataLayout *layout,
+                                const TupleDataCollection *tdc,
+                                const PipelineChunk &chunk,
+                                const uint16_t *row_indices,
+                                uint16_t count)
+{
+	if (tdc == nullptr)
+		return true;
+	const uint32_t row_count = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&tdc->row_count));
+	if (static_cast<uint64_t>(row_count) + count > tdc->row_capacity)
+		return true;
+	return !TupleDataCollectionHasSpaceForAppend(tdc,
+		RequiredHeapBytesForChunkRows(layout, chunk, row_indices, count));
+}
+
+static inline bool
+PartitionNeedsGrowForRow(const TupleDataLayout *layout,
+	                    const TupleDataCollection *tdc,
+	                    const uint8_t *row_ptr)
+{
+	return !TupleDataCollectionHasSpaceForAppend(
+		tdc,
+		TupleDataCollectionRequiredHeapBytesForRow(layout, tdc, row_ptr));
 }
 
 }  /* namespace */
@@ -378,13 +477,16 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		{
 			HashAggPartition &part = state->partitions[part_idx];
 			SpinLockInit(&part.mutex);
+			const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
+				per_partition_groups);
 			part.tdc_dp = dsa_allocate0(ctx.dsa,
-				TupleDataCollectionAllocSize(per_partition_groups, state->layout->row_width));
+				TupleDataCollectionCheckedAllocSize(per_partition_groups, state->layout->row_width, heap_capacity));
 			auto *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 			TupleDataCollectionInit(tdc,
 				per_partition_groups,
 				state->layout->row_width,
-				state->layout_dp);
+				state->layout_dp,
+				heap_capacity);
 			AggregateHashTable *aht = nullptr;
 			AllocAhtForTdc(ctx, part.tdc_dp, per_partition_groups, &part.aht_dp, &aht);
 		}
@@ -436,13 +538,16 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	{
 		HashAggPartition &part = state->local_partitions[part_idx];
 		SpinLockInit(&part.mutex);
+		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
+			per_partition_groups);
 		part.tdc_dp = dsa_allocate0(ctx.dsa,
-			TupleDataCollectionAllocSize(per_partition_groups, state->layout->row_width));
+			TupleDataCollectionCheckedAllocSize(per_partition_groups, state->layout->row_width, heap_capacity));
 		auto *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 		TupleDataCollectionInit(tdc,
 			per_partition_groups,
 			state->layout->row_width,
-			global.layout_dp);
+			global.layout_dp,
+			heap_capacity);
 		AggregateHashTable *aht = nullptr;
 		AllocAhtForTdc(ctx, part.tdc_dp, per_partition_groups, &part.aht_dp, &aht);
 	}
@@ -487,6 +592,8 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 
 	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
 	{
+		if (PipelineCancelRequestedEvery(ctx, row_idx))
+			return SinkResultType::FINISHED;
 		hashes[row_idx] = HashGroup(local.layout, in, row_idx);
 		partitions[row_idx] = static_cast<uint32_t>(hashes[row_idx] >> local.partition_shift) &
 			local.partition_mask;
@@ -494,6 +601,8 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 
 	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
 	{
+		if (PipelineCancelRequestedEvery(ctx, part_idx))
+			return SinkResultType::FINISHED;
 		uint16_t probe_count = 0;
 		for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
 		{
@@ -508,10 +617,15 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		TupleDataCollection *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 		if (tdc == nullptr)
 			elog(ERROR, "pg_volvec: local hash aggregate partition TDC missing");
-		while (pg_atomic_read_u32(&tdc->row_count) >= tdc->row_capacity)
+		while (PartitionNeedsGrowForChunkBatch(local.layout, tdc, in, probe_rows.data(), probe_count))
 		{
-			GrowLocalTdc(ctx, local, part);
+			GrowLocalTdc(ctx,
+				local,
+				part,
+				RequiredHeapBytesForChunkRows(local.layout, in, probe_rows.data(), probe_count));
 			tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+			if (tdc == nullptr)
+				elog(ERROR, "pg_volvec: local hash aggregate partition TDC missing after grow");
 		}
 		AggregateHashTable *aht = ResolveAht(ctx.dsa, part.aht_dp);
 		for (uint16_t i = 0; i < probe_count; ++i)
@@ -552,6 +666,8 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 	uint16_t update_pos = 0;
 	while (update_pos < update_count)
 	{
+		if (PipelineCancelRequestedEvery(ctx, update_pos))
+			return SinkResultType::FINISHED;
 		const uint16_t part_idx = update_partitions[update_pos];
 		uint16_t run_count = 1;
 		while (update_pos + run_count < update_count &&
@@ -578,7 +694,6 @@ SinkCombineResultType
 PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 {
 	auto &global = static_cast<HashAggGlobalSinkState &>(input.global_state);
-	(void) ctx;
 
 	if (input.partition_id == UINT32_MAX)
 	{
@@ -587,6 +702,8 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		auto &local = static_cast<HashAggLocalSinkState &>(*input.local_state);
 		for (uint32_t local_part_idx = 0; local_part_idx < local.partition_count; ++local_part_idx)
 		{
+			if (PipelineCancelRequestedEvery(ctx, local_part_idx))
+				return SinkCombineResultType::FINISHED;
 			HashAggPartition &local_part = local.local_partitions[local_part_idx];
 			TupleDataCollection *local_tdc = ResolveTdc(ctx.dsa, local_part.tdc_dp);
 			if (local_tdc == nullptr)
@@ -596,17 +713,33 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 				continue;
 
 			HashAggPartition &global_part = global.partitions[local_part_idx & global.payload->partition_mask];
-			SpinLockAcquire(&global_part.mutex);
+			uint32_t local_row_idx = 0;
+			while (local_row_idx < local_row_count)
 			{
-				for (uint32_t local_row_idx = 0; local_row_idx < local_row_count; ++local_row_idx)
+				if (PipelineCancelRequested(ctx))
+					return SinkCombineResultType::FINISHED;
+				const uint32_t batch_end = std::min(local_row_idx + 64u, local_row_count);
+				SpinLockAcquire(&global_part.mutex);
+				for (; local_row_idx < batch_end; ++local_row_idx)
 				{
 					const uint8_t *src_row = TupleDataCollectionGetRowConst(local_tdc, local_row_idx);
-					const uint64_t hash = HashGroupRow(global.layout, src_row);
+					const uint64_t hash = HashGroupRow(global.layout, local_tdc, src_row);
 					TupleDataCollection *global_tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
 					if (global_tdc == nullptr)
 						elog(ERROR, "pg_volvec: hash aggregate partition TDC missing");
-					if (pg_atomic_read_u32(&global_tdc->row_count) >= global_tdc->row_capacity)
-						GrowTdcForPartition(ctx, global.layout_dp, global.layout, global_part);
+					while (PartitionNeedsGrowForRow(global.layout, global_tdc, src_row))
+					{
+						GrowTdcForPartition(ctx,
+							global.layout_dp,
+							global.layout,
+							global_part,
+							TupleDataCollectionRequiredHeapBytesForRow(global.layout,
+								local_tdc,
+								src_row));
+						global_tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
+						if (global_tdc == nullptr)
+							elog(ERROR, "pg_volvec: hash aggregate partition TDC missing after grow");
+					}
 
 					AggregateHashTable *global_aht = ResolveAht(ctx.dsa, global_part.aht_dp);
 					global_tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
@@ -621,8 +754,8 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 						global.layout,
 						&global_part.aht_dp);
 				}
+				SpinLockRelease(&global_part.mutex);
 			}
-			SpinLockRelease(&global_part.mutex);
 		}
 		return SinkCombineResultType::FINISHED;
 	}
@@ -638,6 +771,8 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	HashAggPartition &global_part = global.partitions[input.partition_id];
 	for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
 	{
+		if (PipelineCancelRequestedEvery(ctx, slot))
+			return SinkCombineResultType::FINISHED;
 		if (!DsaPointerIsValid(registry[slot]))
 			continue;
 		auto *local_parts = static_cast<HashAggPartition *>(dsa_get_address(ctx.dsa, registry[slot]));
@@ -648,13 +783,26 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		const uint32_t local_row_count = pg_atomic_read_u32(&local_tdc->row_count);
 		for (uint32_t local_row_idx = 0; local_row_idx < local_row_count; ++local_row_idx)
 		{
+			if (PipelineCancelRequestedEvery(ctx, local_row_idx))
+				return SinkCombineResultType::FINISHED;
 			const uint8_t *src_row = TupleDataCollectionGetRowConst(local_tdc, local_row_idx);
-			const uint64_t hash = HashGroupRow(global.layout, src_row);
+			const uint64_t hash = HashGroupRow(global.layout, local_tdc, src_row);
 			TupleDataCollection *global_tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
 			if (global_tdc == nullptr)
 				elog(ERROR, "pg_volvec: hash aggregate partition TDC missing");
-			if (pg_atomic_read_u32(&global_tdc->row_count) >= global_tdc->row_capacity)
-				GrowTdcForPartition(ctx, global.layout_dp, global.layout, global_part);
+			while (PartitionNeedsGrowForRow(global.layout, global_tdc, src_row))
+			{
+				GrowTdcForPartition(ctx,
+					global.layout_dp,
+					global.layout,
+					global_part,
+					TupleDataCollectionRequiredHeapBytesForRow(global.layout,
+						local_tdc,
+						src_row));
+				global_tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
+				if (global_tdc == nullptr)
+					elog(ERROR, "pg_volvec: hash aggregate partition TDC missing after grow");
+			}
 
 			AggregateHashTable *global_aht = ResolveAht(ctx.dsa, global_part.aht_dp);
 			global_tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
@@ -678,9 +826,10 @@ SinkFinalizeType
 PhysicalHashAggregate::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 {
 	auto &global = static_cast<HashAggGlobalSinkState &>(gstate);
-	(void) ctx;
 	for (uint32_t part_idx = 0; part_idx < global.partition_count; ++part_idx)
 	{
+		if (PipelineCancelRequestedEvery(ctx, part_idx))
+			return SinkFinalizeType::READY;
 		TupleDataCollection *tdc = ResolveTdc(global.dsa, global.partitions[part_idx].tdc_dp);
 		if (tdc != nullptr)
 			tdc->finalized = true;
@@ -722,7 +871,6 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 {
 	auto &global = static_cast<HashAggGlobalSourceState &>(input.global_state);
 	(void) input.local_state;
-	(void) ctx;
 	out.reset();
 
 	/* global.finalized is a stale snapshot from GetGlobalSourceState() time;
@@ -733,6 +881,8 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 	while (global.source_partition < global.partition_count &&
 	       out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
+		if (PipelineCancelRequestedEvery(ctx, global.source_cursor))
+			break;
 		TupleDataCollection *tdc = ResolveTdc(ctx.dsa,
 			global.partitions[global.source_partition].tdc_dp);
 		if (tdc == nullptr || !tdc->finalized)
@@ -755,7 +905,7 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 		}
 
 		const uint8_t *row = TupleDataCollectionGetRowConst(tdc, global.source_cursor++);
-		Gather(global.layout, row, out, out.count);
+		Gather(global.layout, tdc, row, out, out.count);
 		++out.count;
 	}
 
@@ -773,8 +923,15 @@ OperatorResultType
 PhysicalHashAggregate::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
 {
 	(void) ctx;
-	(void) state;
+	auto &op_state = static_cast<HashAggOperatorState &>(state);
+	if (op_state.current_input_drained)
+	{
+		op_state.current_input_drained = false;
+		out.reset();
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
 	out = in;
+	op_state.current_input_drained = out.count > 0;
 	return out.count > 0 ? OperatorResultType::HAVE_MORE_OUTPUT
 	                      : OperatorResultType::NEED_MORE_INPUT;
 }

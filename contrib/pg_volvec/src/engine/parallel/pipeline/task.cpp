@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "core/data_chunk.hpp"
+#include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
@@ -73,6 +74,70 @@ private:
 	EventId previous_;
 };
 
+enum class DrainResult : uint8_t {
+	NEED_MORE_INPUT,
+	FINISHED,
+};
+
+DrainResult
+DrainOperatorSuffix(ExecCtx &ctx,
+                    Pipeline &pipeline,
+                    ProcessPipelineExecState &ps,
+                    size_t op_idx,
+                    PipelineChunk &input,
+                    PipelineChunk &scratch_a,
+                    PipelineChunk &scratch_b)
+{
+	if (op_idx >= pipeline.ops.size())
+	{
+		OperatorSinkInput sink_in{*ps.global_sink, *ps.local_sink};
+		SinkResultType kres;
+		{
+			PipelineProfileScope sink_scope(ctx,
+				PipelineProfileSinkStage(pipeline.sink->type()));
+			kres = pipeline.sink->SinkChunk(ctx, input, sink_in);
+			sink_scope.AddRows(input.count);
+		}
+		if (kres == SinkResultType::BLOCKED)
+			RaiseBlockedForbidden();
+		if (kres == SinkResultType::FINISHED)
+			return DrainResult::FINISHED;
+		return DrainResult::NEED_MORE_INPUT;
+	}
+
+	PhysicalOperator *op = pipeline.ops[op_idx];
+	OperatorState &op_state = *ps.local_ops[op_idx];
+	PipelineChunk *out = (&input == &scratch_a) ? &scratch_b : &scratch_a;
+	for (;;)
+	{
+		out->reset();
+		OperatorResultType ores;
+		{
+			PipelineProfileScope op_scope(ctx,
+				PipelineProfileOperatorStage(op->type()));
+			ores = op->Execute(ctx, input, *out, op_state);
+			if (ores == OperatorResultType::HAVE_MORE_OUTPUT)
+				op_scope.AddRows(out->count);
+		}
+		if (ores == OperatorResultType::BLOCKED)
+			RaiseBlockedForbidden();
+		if (ores == OperatorResultType::FINISHED)
+			return DrainResult::FINISHED;
+		if (ores == OperatorResultType::NEED_MORE_INPUT)
+			return DrainResult::NEED_MORE_INPUT;
+
+		DrainResult downstream = DrainOperatorSuffix(ctx,
+			pipeline,
+			ps,
+			op_idx + 1,
+			*out,
+			scratch_a,
+			scratch_b);
+		if (downstream == DrainResult::FINISHED)
+			return DrainResult::FINISHED;
+	}
+}
+
 }  /* namespace */
 
 Task::Task(EventId event_id, TaskKind kind, Pipeline *pipeline,
@@ -102,8 +167,7 @@ PipelineRunTask::Execute()
 	EnsureGlobalStates(ps, *pipeline_, ctx);
 	EnsureRunLocalStates(ps, *pipeline_, ctx);
 
-	const bool leader_slice = (worker_index_ == LEADER_WORKER_INDEX);
-	const uint32_t chunk_budget = leader_slice ? 32 : UINT32_MAX;
+	const uint32_t chunk_budget = 32;
 	uint32_t chunks_done = 0;
 
 	PipelineChunk src_chunk;
@@ -111,6 +175,11 @@ PipelineRunTask::Execute()
 
 	for (;;)
 	{
+		if (rt.control != nullptr &&
+			pg_atomic_read_u32(&rt.control->shutdown_requested) != 0)
+			return TaskExecutionResult::TASK_FINISHED;
+		CHECK_FOR_INTERRUPTS();
+
 		if (chunks_done >= chunk_budget)
 			return TaskExecutionResult::TASK_NOT_FINISHED;
 
@@ -129,52 +198,9 @@ PipelineRunTask::Execute()
 		if (sres == SourceResultType::FINISHED)
 			return TaskExecutionResult::TASK_FINISHED;
 
-		PipelineChunk *current_in = &src_chunk;
-		PipelineChunk *current_out = &scratch_a;
-
-		for (size_t i = 0; i < pipeline_->ops.size(); ++i)
-		{
-			PhysicalOperator *op = pipeline_->ops[i];
-			OperatorState &op_state = *ps.local_ops[i];
-			for (;;)
-			{
-				current_out->reset();
-				OperatorResultType ores;
-				{
-					PipelineProfileScope op_scope(ctx,
-						PipelineProfileOperatorStage(op->type()));
-					ores = op->Execute(ctx, *current_in, *current_out,
-											op_state);
-					if (ores == OperatorResultType::HAVE_MORE_OUTPUT)
-						op_scope.AddRows(current_out->count);
-				}
-				if (ores == OperatorResultType::BLOCKED)
-					RaiseBlockedForbidden();
-				if (ores == OperatorResultType::FINISHED)
-					return TaskExecutionResult::TASK_FINISHED;
-				if (ores == OperatorResultType::NEED_MORE_INPUT)
-					goto next_source_chunk;
-				current_in = current_out;
-				current_out = (current_out == &scratch_a) ? &scratch_b : &scratch_a;
-				break;
-			}
-		}
-		{
-			OperatorSinkInput sink_in{*ps.global_sink, *ps.local_sink};
-			SinkResultType kres;
-			{
-				PipelineProfileScope sink_scope(ctx,
-					PipelineProfileSinkStage(pipeline_->sink->type()));
-				kres = pipeline_->sink->SinkChunk(ctx, *current_in,
-											 sink_in);
-				sink_scope.AddRows(current_in->count);
-			}
-			if (kres == SinkResultType::BLOCKED)
-				RaiseBlockedForbidden();
-			if (kres == SinkResultType::FINISHED)
-				return TaskExecutionResult::TASK_FINISHED;
-		}
-next_source_chunk:
+		if (DrainOperatorSuffix(ctx, *pipeline_, ps, 0, src_chunk, scratch_a, scratch_b) ==
+			DrainResult::FINISHED)
+			return TaskExecutionResult::TASK_FINISHED;
 		++chunks_done;
 	}
 }

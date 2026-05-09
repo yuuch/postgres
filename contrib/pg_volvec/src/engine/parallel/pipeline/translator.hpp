@@ -9,9 +9,14 @@
  * OutputSink encode path. Returns nullptr on any unsupported plan shape;
  * the bridge then logs WARNING and falls back to standard_ExecutorRun.
  *
- * Current supported tree: SeqScan -> Agg with optional top Sort. Unsupported
- * nodes return nullptr so the bridge falls back cleanly. Q6 lowering remains
- * deferred until qual support widens beyond the current single-clause path.
+ * Current supported trees:
+ *   - SeqScan -> Agg with optional top Sort
+ *   - one inner HashJoin whose left/right children are scan-backed leaves
+ *     (optionally with PostgreSQL's build-side Hash wrapper)
+ *
+ * The HashJoin slice is intentionally not recursive yet: nested join children
+ * and Agg-over-Join shapes still return nullptr so the bridge falls back
+ * cleanly instead of pretending broader join support exists.
  *
  * Spec: PIPELINE_PORT_PLAN.md §15.3.2, §15.4; 3g.2-final delta-map §10.
  */

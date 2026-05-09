@@ -45,6 +45,16 @@ pg_volvec_pipeline_worker_main(Datum main_arg);
 extern "C" void
 pg_volvec_proc_exit_release_jit_contexts(int code, Datum arg);
 
+static inline bool
+WorkerShutdownRequested(PipelineSharedControl *ctl)
+{
+	if (pg_atomic_read_u32(&ctl->shutdown_requested) != 0)
+		return true;
+	if (pg_atomic_read_u32(&ctl->worker_error) != 0)
+		return true;
+	return ctl->leader_pid != 0 && BackendPidGetProc(ctl->leader_pid) == nullptr;
+}
+
 extern "C" PGDLLEXPORT void
 pg_volvec_pipeline_worker_main(Datum main_arg)
 {
@@ -129,9 +139,7 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 
 	for (;;)
 	{
-		if (pg_atomic_read_u32(&ctl->shutdown_requested) != 0)
-			break;
-		if (pg_atomic_read_u32(&ctl->worker_error) != 0)
+		if (WorkerShutdownRequested(ctl))
 			break;
 
 		TaskDescriptor desc;
@@ -160,8 +168,12 @@ pg_volvec_pipeline_worker_main(Datum main_arg)
 			ResetLatch(MyLatch);
 			if (rc & WL_POSTMASTER_DEATH)
 				break;
+			if (WorkerShutdownRequested(ctl))
+				break;
 			continue;
 		}
+		if (WorkerShutdownRequested(ctl))
+			break;
 
 		Pipeline *pipeline = lookup.Resolve(desc.pipeline_id);
 		if (pipeline == nullptr)

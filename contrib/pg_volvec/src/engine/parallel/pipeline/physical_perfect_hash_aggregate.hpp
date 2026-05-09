@@ -48,6 +48,7 @@ public:
 class PerfectHashAggOperatorState final : public OperatorState {
 public:
 	bool initialized = false;
+	bool current_input_drained = false;
 };
 
 class PhysicalPerfectHashAggregate final : public PhysicalHashAggregate {

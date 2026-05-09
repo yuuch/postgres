@@ -5,16 +5,13 @@
  * the design contract. Spec: §3.1, §10 step 1 of
  * .sisyphus/plans/3g2-tuple-data-collection-design.md.
  *
- * Width policy (v1): all columns and aggregates pad up to 8 bytes in the
- * row layout. We carry the actual byte-width on TdcColumnDesc::width for
- * the scatter/gather code, but row offsets always advance by 8. This keeps
- * the row 8-byte aligned without per-row pad bookkeeping and matches what
- * duckdb::TupleDataLayout does for its column section before the validity
- * mask is added. When variable-width support lands (TODO(Q3+)) the row
- * builder will switch to per-column actual-width plus an explicit pad.
+ * Width policy: each column advances by its 8-byte-aligned physical width.
+ * This matters for STRING_REF, whose in-row descriptor is wider than 8 bytes;
+ * advancing by a fixed 8 bytes silently overlaps following columns.
  */
 
 #include "tuple_data_layout.hpp"
+#include "core/data_chunk.hpp"
 
 extern "C" {
 #include "postgres.h"
@@ -29,9 +26,10 @@ TupleDataLayoutColumnWidth(TdcColumnKind kind)
 {
 	switch (kind)
 	{
-		case TdcColumnKind::INT32:  return 4;
-		case TdcColumnKind::INT64:  return 8;
-		case TdcColumnKind::DOUBLE: return 8;
+	case TdcColumnKind::INT32:  return 4;
+	case TdcColumnKind::INT64:  return 8;
+	case TdcColumnKind::DOUBLE: return 8;
+	case TdcColumnKind::STRING_REF: return sizeof(VecStringRef);
 	}
 	elog(ERROR, "pg_volvec: TupleDataLayoutColumnWidth: unknown TdcColumnKind %u",
 		 static_cast<unsigned>(kind));
@@ -72,6 +70,7 @@ TupleDataLayoutInit(TupleDataLayout *layout)
 uint16_t
 TupleDataLayoutAppendColumn(TupleDataLayout *layout,
 							TdcColumnKind kind,
+							uint16_t src_col_idx,
 							Oid pg_type_oid,
 							int16_t numeric_scale)
 {
@@ -86,11 +85,12 @@ TupleDataLayoutAppendColumn(TupleDataLayout *layout,
 	col.kind          = kind;
 	col.offset        = layout->row_width;
 	col.width         = width;
+	col.src_col_idx   = src_col_idx;
 	col.numeric_scale = numeric_scale;
 	col.pg_type_oid   = pg_type_oid;
 
-	/* v1: advance row_width by 8 regardless of width (see file header). */
-	layout->row_width   = static_cast<uint16_t>(layout->row_width + 8);
+	const uint16_t advance = static_cast<uint16_t>((width + 7u) & ~7u);
+	layout->row_width   = static_cast<uint16_t>(layout->row_width + advance);
 	layout->column_count = static_cast<uint16_t>(idx + 1);
 	return idx;
 }

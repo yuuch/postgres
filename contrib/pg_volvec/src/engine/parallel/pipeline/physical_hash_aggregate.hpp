@@ -76,6 +76,7 @@ public:
 class HashAggOperatorState final : public OperatorState {
 public:
 	bool initialized = false;
+	bool current_input_drained = false;
 };
 
 class PhysicalHashAggregate : public PhysicalOperator {

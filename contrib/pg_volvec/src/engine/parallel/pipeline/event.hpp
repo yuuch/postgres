@@ -75,6 +75,9 @@ public:
 	/* Called by upstream events on transition to FINISHED or ABORTED. */
 	void CompleteDependency(bool upstream_aborted);
 
+	/* Transition PENDING -> SCHEDULED and enqueue this event's tasks. */
+	bool TrySchedule();
+
 	/* Mark this event aborted and cascade CompleteDependency to dependents. */
 	void Abort();
 

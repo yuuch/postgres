@@ -23,6 +23,7 @@ extern "C" {
 #include "parallel/pipeline/dsm_task_queue.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/output_sink.hpp"
+#include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
@@ -98,8 +99,33 @@ WakeStartedWorkers(const PgVector<BackgroundWorkerHandle *> &handles)
 	}
 }
 
+static bool
+WaitForBackgroundWorkerShutdownTimed(BackgroundWorkerHandle *handle, long timeout_ms)
+{
+	long waited_ms = 0;
+	while (waited_ms < timeout_ms)
+	{
+		pid_t pid = 0;
+		BgwHandleStatus status = GetBackgroundWorkerPid(handle, &pid);
+		if (status == BGWH_STOPPED || status == BGWH_POSTMASTER_DIED)
+			return true;
+
+		const long step_ms = 10;
+		int rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_TIMEOUT,
+					   step_ms,
+					   WAIT_EVENT_BGWORKER_SHUTDOWN);
+		ResetLatch(MyLatch);
+		if (rc & WL_POSTMASTER_DEATH)
+			return true;
+		waited_ms += step_ms;
+	}
+	return false;
+}
+
 static void
-SignalShutdownAndWait(const LeaderCleanupState &cleanup)
+SignalShutdownAndWait(const LeaderCleanupState &cleanup,
+					  bool terminate_workers = false)
 {
 	if (cleanup.control != nullptr)
 		pg_atomic_write_u32(&cleanup.control->shutdown_requested, 1u);
@@ -107,10 +133,29 @@ SignalShutdownAndWait(const LeaderCleanupState &cleanup)
 	if (cleanup.handles != nullptr)
 	{
 		WakeStartedWorkers(*cleanup.handles);
+		if (terminate_workers)
+		{
+			for (BackgroundWorkerHandle *handle : *cleanup.handles)
+			{
+				if (handle != nullptr)
+					(void) WaitForBackgroundWorkerShutdownTimed(handle, 250);
+			}
+			for (BackgroundWorkerHandle *handle : *cleanup.handles)
+			{
+				if (handle != nullptr)
+				{
+					pid_t pid = 0;
+					BgwHandleStatus status = GetBackgroundWorkerPid(handle, &pid);
+					if (status == BGWH_STARTED)
+						TerminateBackgroundWorker(handle);
+				}
+			}
+		}
 		for (BackgroundWorkerHandle *handle : *cleanup.handles)
 		{
-			if (handle != nullptr)
-				WaitForBackgroundWorkerShutdown(handle);
+			if (handle == nullptr)
+				continue;
+			WaitForBackgroundWorkerShutdown(handle);
 		}
 	}
 
@@ -121,9 +166,10 @@ SignalShutdownAndWait(const LeaderCleanupState &cleanup)
 }
 
 static void
-ShutdownAndDestroy(const LeaderCleanupState &cleanup)
+ShutdownAndDestroy(const LeaderCleanupState &cleanup,
+				   bool terminate_workers = false)
 {
-	SignalShutdownAndWait(cleanup);
+	SignalShutdownAndWait(cleanup, terminate_workers);
 	if (cleanup.state != nullptr)
 		DestroyRuntimeDsm(cleanup.state);
 }
@@ -200,6 +246,40 @@ AllEventsFinished(TaskScheduler &scheduler)
 			return false;
 	}
 	return true;
+}
+
+enum class PipelineRunCleanupRole {
+	SOURCE,
+	OPERATOR,
+	SINK,
+};
+
+static void
+DispatchConsumerResourceCleanup(ExecCtx &ctx,
+						 PhysicalOperator *op,
+						 PipelineRunCleanupRole role)
+{
+	if (op == nullptr)
+		return;
+
+	switch (op->type())
+	{
+		case PhysicalOperatorType::HASH_JOIN:
+			if (role == PipelineRunCleanupRole::OPERATOR)
+				static_cast<PhysicalHashJoin *>(op)->ReleaseBuildPayloadAfterConsumerRun(ctx);
+			return;
+		default:
+			return;
+	}
+}
+
+static void
+PipelinePostConsumerRunCleanup(ExecCtx &ctx, Pipeline &consumer)
+{
+	DispatchConsumerResourceCleanup(ctx, consumer.source, PipelineRunCleanupRole::SOURCE);
+	for (PhysicalOperator *op : consumer.ops)
+		DispatchConsumerResourceCleanup(ctx, op, PipelineRunCleanupRole::OPERATOR);
+	DispatchConsumerResourceCleanup(ctx, consumer.sink, PipelineRunCleanupRole::SINK);
 }
 
 static void
@@ -330,6 +410,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		PgMemoryContextAllocator<pid_t>(leader_mcxt)};
 	PgVector<char> event_scheduled{PgMemoryContextAllocator<char>(leader_mcxt)};
 	PgVector<char> event_finished{PgMemoryContextAllocator<char>(leader_mcxt)};
+	PgVector<char> run_cleanup_done{PgMemoryContextAllocator<char>(leader_mcxt)};
 
 	cleanup.handles = &handles;
 
@@ -573,6 +654,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 
 		event_scheduled.assign(scheduler.event_count(), 0);
 		event_finished.assign(scheduler.event_count(), 0);
+		run_cleanup_done.assign(scheduler.event_count(), 0);
 
 		for (auto &pipeline_uptr : scheduler.bundle().pipelines)
 		{
@@ -582,8 +664,8 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 			EventId event_id = static_cast<EventId>(pipeline_uptr->id) * 3u;
 			Event *event = scheduler.event_lookup().Resolve(event_id);
 			Assert(event != nullptr);
-			event->Schedule();
-			event_scheduled[event_id] = 1;
+			if (event->TrySchedule())
+				event_scheduled[event_id] = 1;
 		}
 
 		phase.mark("T6_first_enqueue");
@@ -649,6 +731,13 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 					!event_finished[event_id] &&
 					pg_atomic_read_u32(&leader_rt.event_shm[event_id].tasks_remaining) == 0)
 				{
+					if ((event_id % 3u) == 0u && !run_cleanup_done[event_id])
+					{
+						Pipeline *pipeline = leader_lookup.Resolve(event->pipeline_id());
+						Assert(pipeline != nullptr);
+						PipelinePostConsumerRunCleanup(leader_rt.exec_ctx, *pipeline);
+						run_cleanup_done[event_id] = 1;
+					}
 					event->FinishEvent();
 					event_finished[event_id] = 1;
 					progress = true;
@@ -750,7 +839,7 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 	{
 		state->parallel_plan = nullptr;
 		state->parallel_scheduler = nullptr;
-		ShutdownAndDestroy(cleanup);
+		ShutdownAndDestroy(cleanup, true);
 		/*
 		 * Bug L: do NOT DestroyLeaderMemoryContext here. PG_RE_THROW
 		 * longjmps over C++ destructors, so PgVector containers above

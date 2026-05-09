@@ -18,6 +18,40 @@ namespace pipeline {
 
 namespace {
 
+static void
+CopyTdcRow(const TupleDataLayout *layout,
+	       const TupleDataCollection *src_tdc,
+	       const uint8_t *src_row,
+	       TupleDataCollection *dst_tdc,
+	       uint8_t *dst_row)
+{
+	for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
+	{
+		const TdcColumnDesc &col = layout->columns[col_idx];
+		if (col.kind != TdcColumnKind::STRING_REF)
+		{
+			std::memcpy(dst_row + col.offset, src_row + col.offset, col.width);
+			continue;
+		}
+
+		VecStringRef src_ref;
+		std::memcpy(&src_ref, src_row + col.offset, sizeof(src_ref));
+		const char *src_ptr = VecStringRefDataPtr(src_ref,
+			src_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(src_tdc)) : nullptr);
+		VecStringRef dst_ref;
+		if (!TupleDataCollectionStoreStringBytes(dst_tdc, src_ptr, src_ref.len, &dst_ref))
+			elog(ERROR, "pg_volvec: perfect hash TDC copy ran out of heap");
+		std::memcpy(dst_row + col.offset, &dst_ref, sizeof(dst_ref));
+	}
+
+	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
+		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
+		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
+	}
+}
+
 static const TupleDataLayout *
 ResolveLayout(dsa_area *dsa, dsa_pointer layout_dp)
 {
@@ -67,7 +101,8 @@ EncodePerfectHashKey(const TupleDataLayout *layout,
 	uint32_t key = 0;
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
-		const int32_t v = chunk.int32_columns[i][row_idx];
+		const TdcColumnDesc &col = layout->columns[i];
+		const int32_t v = chunk.int32_columns[col.src_col_idx][row_idx];
 		if (v < 0 || v > 255)
 			return false;
 		key = (key << 8) | static_cast<uint32_t>(v);
@@ -104,10 +139,12 @@ GrowLocalTdc(ExecCtx &ctx, PerfectHashAggLocalSinkState &local)
 		elog(ERROR, "pg_volvec: perfect hash local TDC missing");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
 	const uint32_t new_capacity = Max(old_tdc->row_capacity * 2u, old_count + 1u);
+	const uint32_t heap_capacity = old_tdc->heap_capacity > 0 ? old_tdc->heap_capacity * 2u :
+		TupleDataCollectionDefaultHeapCapacity(local.layout, new_capacity);
 	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionAllocSize(new_capacity, local.layout->row_width));
+		TupleDataCollectionCheckedAllocSize(new_capacity, local.layout->row_width, heap_capacity));
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
-	TupleDataCollectionInit(new_tdc, new_capacity, local.layout->row_width, local.layout_dp);
+	TupleDataCollectionInit(new_tdc, new_capacity, local.layout->row_width, local.layout_dp, heap_capacity);
 	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
 	{
 		uint8_t *dst = nullptr;
@@ -115,7 +152,7 @@ GrowLocalTdc(ExecCtx &ctx, PerfectHashAggLocalSinkState &local)
 		if (copied_idx == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_volvec: perfect hash local TDC grow overflow");
 		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
-		std::memcpy(dst, src, local.layout->row_width);
+		CopyTdcRow(local.layout, old_tdc, src, new_tdc, dst);
 	}
 	local.local_tdc_dp = new_tdc_dp;
 	local.local_tdc = new_tdc;
@@ -129,10 +166,12 @@ GrowGlobalTdc(ExecCtx &ctx, PerfectHashAggGlobalSinkState &global)
 		elog(ERROR, "pg_volvec: perfect hash global TDC missing");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
 	const uint32_t new_capacity = Max(old_tdc->row_capacity * 2u, old_count + 1u);
+	const uint32_t heap_capacity = old_tdc->heap_capacity > 0 ? old_tdc->heap_capacity * 2u :
+		TupleDataCollectionDefaultHeapCapacity(global.layout, new_capacity);
 	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionAllocSize(new_capacity, global.layout->row_width));
+		TupleDataCollectionCheckedAllocSize(new_capacity, global.layout->row_width, heap_capacity));
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
-	TupleDataCollectionInit(new_tdc, new_capacity, global.layout->row_width, global.layout_dp);
+	TupleDataCollectionInit(new_tdc, new_capacity, global.layout->row_width, global.layout_dp, heap_capacity);
 	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
 	{
 		uint8_t *dst = nullptr;
@@ -140,7 +179,7 @@ GrowGlobalTdc(ExecCtx &ctx, PerfectHashAggGlobalSinkState &global)
 		if (copied_idx == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_volvec: perfect hash global TDC grow overflow");
 		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
-		std::memcpy(dst, src, global.layout->row_width);
+		CopyTdcRow(global.layout, old_tdc, src, new_tdc, dst);
 	}
 	global.payload->global_tdc_dp = new_tdc_dp;
 	global.global_tdc = new_tdc;
@@ -182,7 +221,7 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 			canonical_idx = TupleDataCollectionAppendRow(tdc, &candidate_row);
 			if (canonical_idx == TDC_INVALID_ROW_INDEX)
 				elog(ERROR, "pg_volvec: perfect hash local row capacity exceeded");
-			ScatterGroupOnly(local.layout, candidate_row, in, row_idx);
+			ScatterGroupOnly(local.layout, tdc, candidate_row, in, row_idx);
 			local.perfect_row_indices[key] = canonical_idx;
 		}
 
@@ -236,13 +275,16 @@ PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			static_cast<size_t>(perfect_capacity) * sizeof(uint32_t));
 		state->payload->local_partitions_registry_dp = dsa_allocate0(ctx.dsa,
 			static_cast<size_t>(state->local_state_slot_count) * sizeof(dsa_pointer));
+		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
+			state->max_groups);
 		state->payload->global_tdc_dp = dsa_allocate0(ctx.dsa,
-			TupleDataCollectionAllocSize(state->max_groups, state->layout->row_width));
+			TupleDataCollectionCheckedAllocSize(state->max_groups, state->layout->row_width, heap_capacity));
 		state->global_tdc = ResolveTdc(ctx.dsa, state->payload->global_tdc_dp);
 		TupleDataCollectionInit(state->global_tdc,
 			state->max_groups,
 			state->layout->row_width,
-			state->layout_dp);
+			state->layout_dp,
+			heap_capacity);
 		state->global_index = ResolveGlobalIndex(ctx.dsa, state->payload);
 		for (uint32_t i = 0; i < perfect_capacity; ++i)
 			state->global_index[i] = TDC_INVALID_ROW_INDEX;
@@ -278,13 +320,16 @@ PhysicalPerfectHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &g
 	state->max_groups = global.max_groups;
 	state->perfect_capacity = global.payload->perfect_hash_capacity;
 	state->perfect_row_indices.assign(state->perfect_capacity, TDC_INVALID_ROW_INDEX);
+	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
+		state->max_groups);
 	state->local_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionAllocSize(state->max_groups, state->layout->row_width));
+		TupleDataCollectionCheckedAllocSize(state->max_groups, state->layout->row_width, heap_capacity));
 	state->local_tdc = ResolveTdc(ctx.dsa, state->local_tdc_dp);
 	TupleDataCollectionInit(state->local_tdc,
 		state->max_groups,
 		state->layout->row_width,
-		state->layout_dp);
+		state->layout_dp,
+		heap_capacity);
 
 	if (ctx.worker_index >= 0)
 	{
@@ -446,7 +491,7 @@ PhysicalPerfectHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, Operator
 	while (global.source_cursor < row_count && out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
 		const uint8_t *row = TupleDataCollectionGetRowConst(global.global_tdc, global.source_cursor++);
-		Gather(global.layout, row, out, out.count);
+		Gather(global.layout, global.global_tdc, row, out, out.count);
 		++out.count;
 	}
 
@@ -464,8 +509,15 @@ OperatorResultType
 PhysicalPerfectHashAggregate::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
 {
 	(void) ctx;
-	(void) state;
+	auto &op_state = static_cast<PerfectHashAggOperatorState &>(state);
+	if (op_state.current_input_drained)
+	{
+		op_state.current_input_drained = false;
+		out.reset();
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
 	out = in;
+	op_state.current_input_drained = out.count > 0;
 	return out.count > 0 ? OperatorResultType::HAVE_MORE_OUTPUT
 	                      : OperatorResultType::NEED_MORE_INPUT;
 }

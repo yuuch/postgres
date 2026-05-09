@@ -61,9 +61,10 @@ enum class OpKind : uint8_t {
 	SEQ_SCAN       = 0,
 	HASH_AGGREGATE = 1,
 	PERFECT_HASH_AGGREGATE = 2,
-	ORDER          = 3,
-	OUTPUT         = 4,
-	PROJECTION     = 5,
+	HASH_JOIN      = 3,
+	ORDER          = 4,
+	OUTPUT         = 5,
+	PROJECTION     = 6,
 };
 
 /* -------------------------------------------------------------------------
@@ -95,10 +96,12 @@ enum class ColumnDecodeKind : uint8_t {
 	INT64_INT8           = 4,   /* DatumGetInt64 -> int64_columns */
 	INT64_NUMERIC_SCALED = 5,   /* numeric * 100 -> int64_columns */
 	DOUBLE_FLOAT8        = 6,   /* DatumGetFloat8 -> double_columns */
+	STRING_REF           = 7,   /* varlena/text-like -> string_columns */
 };
 
 struct ColumnSchema {
 	Oid              type_oid;
+	int32            typmod;
 	int16_t          typlen;
 	bool             typbyval;
 	uint8_t          chunk_slot;     /* per-storage-type DataChunk slot [0, 16) */
@@ -156,6 +159,47 @@ struct QualDescriptor {
 	Clause   clauses[MAX_CLAUSES];
 };
 
+static constexpr uint16_t FILTER_MAX_INPUTS = 16;
+static constexpr uint16_t FILTER_MAX_STEPS = 64;
+static constexpr uint16_t FILTER_MAX_BOOL_REGS = 64;
+
+enum class FilterStepOp : uint8_t {
+	INT32_CMP_CONST    = 0,
+	INT64_CMP_CONST    = 1,
+	STRING_EQ_CONST    = 2,
+	STRING_NE_CONST    = 3,
+	STRING_PREFIX_LIKE = 4,
+	BOOL_AND           = 5,
+	BOOL_OR            = 6,
+	BOOL_NOT           = 7,
+};
+
+struct FilterInputDesc {
+	uint16_t         attno;
+	uint8_t          dst_col;
+	ColumnDecodeKind decode_kind;
+	uint16_t         _pad0;
+};
+
+struct FilterExprDesc {
+	uint16_t first_step_idx;
+	uint16_t n_steps;
+	uint16_t output_bool_reg;
+	uint16_t _pad0;
+};
+
+struct FilterStep {
+	FilterStepOp op;
+	QualOp       cmp_op;
+	uint16_t     left_idx;
+	uint16_t     right_idx;
+	uint16_t     out_bool_reg;
+	uint16_t     _pad0;
+	uint32_t     const_offset;
+	uint32_t     const_len;
+	uint64_t     const_value;
+};
+
 /* -------------------------------------------------------------------------
  * §8.5.4.7 Expression bytecode (POD; integer-index operands; by-value or
  * by-bytes-copied constants; Oid function dispatch via fmgr_info_cxt;
@@ -183,11 +227,16 @@ struct ExprBytecode {
  * stays interpreter-only for now.
  * ------------------------------------------------------------------------- */
 enum class ProjectOp : uint8_t {
-	NUMERIC_MUL_VAR_VAR   = 0,
-	NUMERIC_MUL_VAR_CONST = 1,
-	NUMERIC_SUB_CONST_VAR = 2,
-	NUMERIC_ADD_CONST_VAR = 3,
-	COPY_VAR              = 4,
+	NUMERIC_SCALE_VAR_CONST = 0,
+	NUMERIC_MUL_VAR_VAR   = 1,
+	NUMERIC_MUL_VAR_CONST = 2,
+	NUMERIC_SUB_CONST_VAR = 3,
+	NUMERIC_ADD_CONST_VAR = 4,
+	NUMERIC_ADD_VAR_VAR   = 5,
+	NUMERIC_SUB_VAR_VAR   = 6,
+	NUMERIC_ADD_VAR_CONST = 7,
+	NUMERIC_SUB_VAR_CONST = 8,
+	COPY_VAR              = 9,
 };
 
 struct ProjectStep {
@@ -216,6 +265,35 @@ struct ProjectOpBody {
 	uint32_t    _pad0;
 };
 
+enum class HashJoinOutputSide : uint8_t {
+	LEFT = 0,
+	RIGHT = 1,
+};
+
+struct HashJoinOutputColumnDesc {
+	HashJoinOutputSide side;
+	uint8_t            input_chunk_slot;
+	ColumnDecodeKind   decode_kind;
+	uint8_t            output_chunk_slot;
+};
+
+struct HashJoinOpBody {
+	dsa_pointer left_input_schema;
+	dsa_pointer right_input_schema;
+	dsa_pointer output_schema;
+	dsa_pointer left_key_layout;
+	dsa_pointer right_key_layout;
+	dsa_pointer left_payload_layout;
+	dsa_pointer right_payload_layout;
+	dsa_pointer output_columns; /* HashJoinOutputColumnDesc[output_column_count] */
+	dsa_pointer shared_payload;
+	uint16_t    n_left_keys;
+	uint16_t    n_right_keys;
+	uint16_t    output_column_count;
+	uint16_t    _pad0;
+	uint32_t    max_rows;
+};
+
 /* -------------------------------------------------------------------------
  * §6.3 + §8.5.4.5 Per-operator shared payload PODs.
  *
@@ -227,6 +305,28 @@ struct ProjectOpBody {
 struct SeqScanSharedPayload {
 	ParallelBlockTableScanDescData pbscan;
 	BlockNumber                    total_blocks;
+};
+
+struct HashJoinLocalBuildRegistryEntry {
+	dsa_pointer build_keys_dp;
+	dsa_pointer build_rows_dp;
+};
+
+struct HashJoinSharedPayload {
+	slock_t     mutex;
+	uint32_t    local_state_slot_count;
+	uint32_t    build_partition_count;
+	uint32_t    hash_table_capacity;
+	uint8_t     radix_bits;
+	bool        combined;
+	bool        finalized;
+	uint8_t     _pad0;
+	pg_atomic_uint32 release_state;       /* 0=live, 1=releasing, 2=released */
+	dsa_pointer local_build_registry_dp; /* HashJoinLocalBuildRegistryEntry[local_state_slot_count] */
+	dsa_pointer build_keys_dp;           /* global build-side key row store */
+	dsa_pointer build_rows_dp;           /* future global build-side row store */
+	dsa_pointer hash_table_dp;           /* uint32_t[hash_table_capacity] bucket heads */
+	dsa_pointer hash_links_dp;           /* uint32_t[build_rows.row_count] next indices */
 };
 
 /*
@@ -270,8 +370,16 @@ struct SeqScanOpBody {
 	Oid         relid;
 	dsa_pointer input_schema;        /* SchemaDescriptor */
 	dsa_pointer output_schema;       /* SchemaDescriptor (may equal input_schema) */
-	dsa_pointer qual_bytecode;       /* ExprBytecode, or InvalidDsaPointer */
+	dsa_pointer filter_inputs;       /* FilterInputDesc[n_filter_inputs] */
+	dsa_pointer filter_exprs;        /* FilterExprDesc[n_filter_exprs] */
+	dsa_pointer filter_steps;        /* FilterStep[n_filter_steps] */
+	dsa_pointer filter_string_consts; /* char[filter_string_const_bytes] */
 	dsa_pointer shared_payload;      /* SeqScanSharedPayload */
+	uint16_t    n_filter_inputs;
+	uint16_t    n_filter_exprs;
+	uint16_t    n_filter_steps;
+	uint16_t    filter_bool_regs;
+	uint32_t    filter_string_const_bytes;
 };
 
 struct HashAggOpBody {
@@ -328,6 +436,7 @@ struct OpDescriptor {
 		SeqScanOpBody seq_scan;
 		HashAggOpBody hash_agg;
 		HashAggOpBody perfect_hash_agg;
+		HashJoinOpBody hash_join;
 		OrderOpBody   order;
 		OutputOpBody  output;
 		ProjectOpBody project;
@@ -372,6 +481,7 @@ struct PipelineDescriptor {
  * ------------------------------------------------------------------------- */
 void        StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer dp);
 dsa_pointer LoadSharedPayloadFromDescriptor(const PhysicalOperator *op);
+void        ClearSharedPayloadOnDescriptor(const PhysicalOperator *op);
 
 /*
  * Step 5 contract delta: HashAggregate / Order descriptor bodies now publish

@@ -48,8 +48,8 @@ PhysicalOperator::BuildPipelines(Pipeline &current, MetaPipeline &meta)
 	}
 
 	Assert(children_.size() == 1);
-	meta.AddOperator(current, *this);
 	children_[0]->BuildPipelines(current, meta);
+	meta.AddOperator(current, *this);
 }
 
 }  /* namespace pipeline */

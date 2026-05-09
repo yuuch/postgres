@@ -39,8 +39,13 @@ extern "C" {
 
 #include <cstdint>
 
+#include "core/data_chunk.hpp"
+#include "parallel/pipeline/types.hpp"
+
 namespace pg_volvec {
 namespace pipeline {
+
+struct TupleDataLayout;
 
 /*
  * Sentinel returned by AppendRow when the caller-side allocation policy
@@ -59,6 +64,8 @@ struct TupleDataCollection
 	/* append-side state: spinlock + count */
 	slock_t          mutex;           /* guards the bump allocator */
 	pg_atomic_uint32 row_count;       /* current row count; readers use atomic load */
+	uint32_t         heap_capacity;    /* trailing heap bytes for STRING_REF payloads */
+	pg_atomic_uint32 heap_used;        /* bytes consumed in trailing heap */
 
 	/* scan-side state: cooperative parallel scan cursor */
 	pg_atomic_uint32 scan_cursor;     /* next row index to hand out to a scanner */
@@ -80,14 +87,43 @@ struct TupleDataCollection
  * zero init for SUM=0 / COUNT=0.
  */
 inline size_t
-TupleDataCollectionAllocSize(uint32_t row_capacity, uint32_t row_width)
+TupleDataCollectionRowBytes(uint32_t row_capacity, uint32_t row_width)
+{
+	return static_cast<size_t>(row_capacity) * row_width;
+}
+
+inline size_t
+TupleDataCollectionAllocSize(uint32_t row_capacity,
+	                         uint32_t row_width,
+	                         uint32_t heap_capacity = 0)
 {
 	/* offsetof-style: header up to (but not including) the rows[1] stub +
 	 * the actual row buffer. Equivalent to:
 	 *   sizeof(TupleDataCollection) - 1 + row_capacity * row_width
 	 * but we use offsetof to be explicit. */
 	return offsetof(TupleDataCollection, rows) +
-	       static_cast<size_t>(row_capacity) * row_width;
+	       TupleDataCollectionRowBytes(row_capacity, row_width) +
+	       heap_capacity;
+}
+
+void TupleDataCollectionCheckFlatAllocSize(uint32_t row_capacity,
+	                                         uint32_t row_width,
+	                                         uint32_t heap_capacity = 0);
+
+size_t TupleDataCollectionCheckedAllocSize(uint32_t row_capacity,
+	                                         uint32_t row_width,
+	                                         uint32_t heap_capacity = 0);
+
+inline uint8_t *
+TupleDataCollectionHeap(TupleDataCollection *tdc)
+{
+	return &tdc->rows[0] + TupleDataCollectionRowBytes(tdc->row_capacity, tdc->row_width);
+}
+
+inline const uint8_t *
+TupleDataCollectionHeapConst(const TupleDataCollection *tdc)
+{
+	return &tdc->rows[0] + TupleDataCollectionRowBytes(tdc->row_capacity, tdc->row_width);
 }
 
 /*
@@ -103,7 +139,32 @@ TupleDataCollectionAllocSize(uint32_t row_capacity, uint32_t row_width)
 void TupleDataCollectionInit(TupleDataCollection *tdc,
                              uint32_t row_capacity,
 							 uint32_t row_width,
-							 dsa_pointer layout_dp);
+							 dsa_pointer layout_dp,
+							 uint32_t heap_capacity = 0);
+
+uint32_t TupleDataCollectionDefaultHeapCapacity(const TupleDataLayout *layout,
+	                                            uint32_t row_capacity);
+
+uint32_t TupleDataCollectionGrowHeapCapacity(const TupleDataLayout *layout,
+	                                          const TupleDataCollection *old_tdc,
+	                                          uint32_t new_row_capacity,
+	                                          uint32_t required_heap_bytes);
+
+bool TupleDataCollectionStoreStringBytes(TupleDataCollection *tdc,
+	                                     const char *data,
+	                                     uint32_t len,
+	                                     VecStringRef *out_ref);
+
+uint32_t TupleDataCollectionRequiredHeapBytesForChunkRow(const TupleDataLayout *layout,
+	                                                      const PipelineChunk &chunk,
+	                                                      uint16_t row_idx);
+
+uint32_t TupleDataCollectionRequiredHeapBytesForRow(const TupleDataLayout *layout,
+	                                                 const TupleDataCollection *tdc,
+	                                                 const uint8_t *row_ptr);
+
+bool TupleDataCollectionHasSpaceForAppend(const TupleDataCollection *tdc,
+	                                      uint32_t required_heap_bytes);
 
 /*
  * Append a row. Returns the row index (0-based) and writes the row pointer

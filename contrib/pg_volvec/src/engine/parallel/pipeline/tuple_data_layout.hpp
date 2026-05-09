@@ -50,12 +50,17 @@ static constexpr uint16_t TUPLE_DATA_MAX_COLUMNS = 32;
  * INT64  is also used for NUMERIC carried as scaled int64
  *        (see TdcColumnDesc::numeric_scale).
  *
- * TODO(Q3+): VARCHAR_INLINE (≤12B), VARCHAR_HEAP, INT128.
+ * STRING_REF stores a VecStringRef inline in the row. The pointed-to bytes
+ * must remain owned by the surrounding pipeline object; current Milestone A
+ * usage is limited to descriptor/output plumbing, not HashAgg/Order row-store
+ * ownership.
+ * TODO(Q3+): dedicated row-store string heap/ownership, INT128.
  */
 enum class TdcColumnKind : uint8_t {
 	INT32  = 0,
 	INT64  = 1,
 	DOUBLE = 2,
+	STRING_REF = 3,
 };
 
 /*
@@ -81,6 +86,7 @@ enum class TdcAggKind : uint8_t {
  *   kind          - drives scatter/gather byte width and read/write ops.
  *   offset        - byte offset within the row.
  *   width         - bytes occupied by the column (4 or 8 in v1).
+ *   src_col_idx   - source/output chunk column index used by Scatter/Gather.
  *   pg_type_oid   - PG type Oid (kept for diagnostics; v1 dispatch is on
  *                   TdcColumnKind, not pg_type_oid).
  *   numeric_scale - non-zero only for NUMERIC carried as scaled int64.
@@ -93,6 +99,7 @@ struct TdcColumnDesc {
 	uint8_t       _pad0;
 	uint16_t      offset;
 	uint16_t      width;
+	uint16_t      src_col_idx;
 	int16_t       numeric_scale;
 	Oid           pg_type_oid;
 };
@@ -165,6 +172,7 @@ struct TupleDataLayout {
 void   TupleDataLayoutInit(TupleDataLayout *layout);
 uint16_t TupleDataLayoutAppendColumn(TupleDataLayout *layout,
                                       TdcColumnKind kind,
+                                      uint16_t src_col_idx,
                                       Oid pg_type_oid,
                                       int16_t numeric_scale);
 uint16_t TupleDataLayoutAppendAggregate(TupleDataLayout *layout,
@@ -177,7 +185,7 @@ void   TupleDataLayoutSeal(TupleDataLayout *layout);
 
 /*
  * Width helper — returns the in-row byte width for a column kind.
- * v1: INT32=4, INT64=8, DOUBLE=8.
+ * v1: INT32=4, INT64=8, DOUBLE=8, STRING_REF=sizeof(VecStringRef).
  */
 uint16_t TupleDataLayoutColumnWidth(TdcColumnKind kind);
 

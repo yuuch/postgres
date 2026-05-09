@@ -28,6 +28,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 #include <algorithm>
 #include <cmath>
 
+#include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #ifdef USE_LLVM
 #include "llvmjit_deform_datachunk.h"
@@ -54,12 +55,28 @@ ResolveSchemaDescriptor(dsa_area *dsa, dsa_pointer dp)
 	return static_cast<SchemaDescriptor *>(dsa_get_address(dsa, dp));
 }
 
-static QualDescriptor *
-ResolveQualDescriptor(dsa_area *dsa, dsa_pointer dp)
+static FilterInputDesc *
+ResolveFilterInputs(dsa_area *dsa, dsa_pointer dp)
 {
 	if (!DsaPointerIsValid(dp))
 		return nullptr;
-	return static_cast<QualDescriptor *>(dsa_get_address(dsa, dp));
+	return static_cast<FilterInputDesc *>(dsa_get_address(dsa, dp));
+}
+
+static FilterExprDesc *
+ResolveFilterExprs(dsa_area *dsa, dsa_pointer dp)
+{
+	if (!DsaPointerIsValid(dp))
+		return nullptr;
+	return static_cast<FilterExprDesc *>(dsa_get_address(dsa, dp));
+}
+
+static FilterStep *
+ResolveFilterSteps(dsa_area *dsa, dsa_pointer dp)
+{
+	if (!DsaPointerIsValid(dp))
+		return nullptr;
+	return static_cast<FilterStep *>(dsa_get_address(dsa, dp));
 }
 
 static uint32
@@ -112,66 +129,107 @@ SeqScanReadStreamNextBlock(ReadStream *stream,
  * Datum path (DATEOID/INT4/INT8 × 6 ops); we read pre-decoded typed
  * values from the chunk so no Datum unpacking is needed here.
  */
-static inline bool
-EvalSinglePredicate(const QualDescriptor::Clause &clause,
-                    const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
-                    uint16_t dst_col)
+static inline const char *
+ResolveFilterConstPtr(const FilterStep &step, const char *string_consts)
 {
-	if (qchunk.nulls[dst_col][0])
-		return false;
+	if (step.const_len == 0)
+		return "";
+	if (step.const_offset == UINT32_MAX)
+		return reinterpret_cast<const char *>(&step.const_value);
+	if (string_consts == nullptr)
+		return nullptr;
+	return string_consts + step.const_offset;
+}
 
-	switch (clause.const_typoid)
+static inline bool
+EvalFilterStep(const FilterStep &step,
+	       const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk,
+	       const char *string_consts,
+	       uint8_t *bool_values)
+
+
+{
+	bool result = false;
+	switch (step.op)
 	{
-		case DATEOID:
+		case FilterStepOp::INT32_CMP_CONST:
 		{
-			DateADT l = (DateADT) qchunk.int32_columns[dst_col][0];
-			DateADT r = DatumGetDateADT((Datum) clause.const_value);
-			switch (clause.op)
+			if (!filter_chunk.nulls[step.left_idx][0])
 			{
-				case QualOp::LE: return l <= r;
-				case QualOp::LT: return l <  r;
-				case QualOp::EQ: return l == r;
-				case QualOp::GE: return l >= r;
-				case QualOp::GT: return l >  r;
-				case QualOp::NE: return l != r;
+				const int32_t l = filter_chunk.int32_columns[step.left_idx][0];
+				const int32_t r = static_cast<int32_t>(step.const_value);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: result = l <= r; break;
+					case QualOp::LT: result = l <  r; break;
+					case QualOp::EQ: result = l == r; break;
+					case QualOp::GE: result = l >= r; break;
+					case QualOp::GT: result = l >  r; break;
+					case QualOp::NE: result = l != r; break;
+				}
 			}
 			break;
 		}
-		case INT4OID:
+		case FilterStepOp::INT64_CMP_CONST:
 		{
-			int32 l = qchunk.int32_columns[dst_col][0];
-			int32 r = DatumGetInt32((Datum) clause.const_value);
-			switch (clause.op)
+			if (!filter_chunk.nulls[step.left_idx][0])
 			{
-				case QualOp::LE: return l <= r;
-				case QualOp::LT: return l <  r;
-				case QualOp::EQ: return l == r;
-				case QualOp::GE: return l >= r;
-				case QualOp::GT: return l >  r;
-				case QualOp::NE: return l != r;
+				const int64_t l = filter_chunk.int64_columns[step.left_idx][0];
+				const int64_t r = static_cast<int64_t>(step.const_value);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: result = l <= r; break;
+					case QualOp::LT: result = l <  r; break;
+					case QualOp::EQ: result = l == r; break;
+					case QualOp::GE: result = l >= r; break;
+					case QualOp::GT: result = l >  r; break;
+					case QualOp::NE: result = l != r; break;
+				}
 			}
 			break;
 		}
-		case INT8OID:
+		case FilterStepOp::STRING_EQ_CONST:
+		case FilterStepOp::STRING_NE_CONST:
 		{
-			int64 l = qchunk.int64_columns[dst_col][0];
-			int64 r = DatumGetInt64((Datum) clause.const_value);
-			switch (clause.op)
+			if (!filter_chunk.nulls[step.left_idx][0])
 			{
-				case QualOp::LE: return l <= r;
-				case QualOp::LT: return l <  r;
-				case QualOp::EQ: return l == r;
-				case QualOp::GE: return l >= r;
-				case QualOp::GT: return l >  r;
-				case QualOp::NE: return l != r;
+				const VecStringRef &ref = filter_chunk.string_columns[step.left_idx][0];
+				const char *lhs = filter_chunk.get_string_ptr(ref);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				const bool eq = (lhs != nullptr || ref.len == 0) && rhs != nullptr &&
+					ref.len == step.const_len &&
+					(step.const_len == 0 || std::memcmp(lhs, rhs, step.const_len) == 0);
+				result = (step.op == FilterStepOp::STRING_EQ_CONST) ? eq : !eq;
 			}
 			break;
 		}
+		case FilterStepOp::STRING_PREFIX_LIKE:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef &ref = filter_chunk.string_columns[step.left_idx][0];
+				const char *lhs = filter_chunk.get_string_ptr(ref);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				result = (lhs != nullptr || ref.len == 0) && rhs != nullptr &&
+					ref.len >= step.const_len &&
+					(step.const_len == 0 || std::memcmp(lhs, rhs, step.const_len) == 0);
+			}
+			break;
+		}
+		case FilterStepOp::BOOL_AND:
+			result = bool_values[step.left_idx] && bool_values[step.right_idx];
+			break;
+		case FilterStepOp::BOOL_OR:
+			result = bool_values[step.left_idx] || bool_values[step.right_idx];
+			break;
+		case FilterStepOp::BOOL_NOT:
+			result = !bool_values[step.left_idx];
+			break;
 		default:
-			elog(ERROR, "pg_volvec: QualDescriptor const_typoid=%u not supported in v1 (by-value only)",
-			     clause.const_typoid);
+			elog(ERROR, "pg_volvec: unsupported filter step op %u", static_cast<unsigned>(step.op));
 	}
-	return false;
+	bool_values[step.out_bool_reg] = result ? 1 : 0;
+	return result;
 }
 
 /*
@@ -207,6 +265,9 @@ MapColumnToDeformKind(const ColumnSchema &col, DeformDecodeKind &out_kind)
 			return true;
 		case ColumnDecodeKind::DOUBLE_FLOAT8:
 			out_kind = DeformDecodeKind::kFloat8;
+			return true;
+		case ColumnDecodeKind::STRING_REF:
+			out_kind = DeformDecodeKind::kStringRef;
 			return true;
 		case ColumnDecodeKind::NONE:
 		default:
@@ -250,6 +311,9 @@ BuildDeformBindings(const SchemaDescriptor *out_schema,
 				break;
 			case ColumnDecodeKind::DOUBLE_FLOAT8:
 				data_head = static_cast<void *>(out.double_columns[slot_idx]);
+				break;
+			case ColumnDecodeKind::STRING_REF:
+				data_head = static_cast<void *>(out.string_columns[slot_idx]);
 				break;
 			default:
 				elog(ERROR, "pg_volvec: unsupported ColumnDecodeKind=%u in SeqScan deform binding",
@@ -312,46 +376,30 @@ BuildProjDeformProgramFromSchema(const SchemaDescriptor *out_schema,
 	return true;
 }
 
-/* Build a qual-side DeformProgram for an AND-of-simple-clauses descriptor.
- * Clauses keep their original index as the destination slot so bindings can
- * choose int32 vs int64 storage directly from clauses[i].decode_kind. Repeated
- * predicates on the same column (Q6 date/discount ranges) reuse the first
- * decoded slot; the later clause reads local.qual_dst_cols[i]. */
+/* Build a filter-side DeformProgram from the published input vector.
+ * Repeated predicates on the same column are deduplicated by the translator,
+ * so each dst_col here corresponds to one decoded scratch slot. */
 static bool
-BuildQualDeformProgramFromQual(const QualDescriptor *qual,
-                                DeformProgram &program,
-                                uint16_t *out_dst_cols,
-                                uint8_t &out_nclauses)
+BuildFilterDeformProgram(const FilterInputDesc *inputs,
+			        uint16_t n_inputs,
+			        DeformProgram &program)
 {
 	program.reset();
-	if (qual == nullptr || qual->kind == QualKind::NONE)
+	if (inputs == nullptr || n_inputs == 0)
 		return false;
-	if (qual->n_clauses == 0 || qual->n_clauses > QualDescriptor::MAX_CLAUSES)
+	if (n_inputs > FILTER_MAX_INPUTS)
 		return false;
 
-	for (uint8_t i = 0; i < qual->n_clauses; ++i)
+	for (uint16_t i = 0; i < n_inputs; ++i)
 	{
-		const QualDescriptor::Clause &clause = qual->clauses[i];
-		if (clause.col_attno <= 0)
+		const FilterInputDesc &input = inputs[i];
+		if (input.attno <= 0)
 			return false;
-		bool reused = false;
-		for (uint8_t existing = 0; existing < i; ++existing)
-		{
-			if (qual->clauses[existing].col_attno == clause.col_attno)
-			{
-				if (qual->clauses[existing].decode_kind != clause.decode_kind)
-					return false;
-				out_dst_cols[i] = out_dst_cols[existing];
-				reused = true;
-				break;
-			}
-		}
-		if (reused)
-			continue;
 
 		DeformDecodeKind kind;
-		switch (clause.decode_kind)
+		switch (input.decode_kind)
 		{
+			case ColumnDecodeKind::INT32_CHAR: kind = DeformDecodeKind::kBpchar1; break;
 			case ColumnDecodeKind::INT32_DATE: kind = DeformDecodeKind::kDate32; break;
 			case ColumnDecodeKind::INT32_INT4: kind = DeformDecodeKind::kInt32; break;
 			case ColumnDecodeKind::INT64_INT8:
@@ -360,15 +408,15 @@ BuildQualDeformProgramFromQual(const QualDescriptor *qual,
 			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
 				kind = DeformDecodeKind::kNumeric;
 				break;
+			case ColumnDecodeKind::STRING_REF:
+				kind = DeformDecodeKind::kStringRef;
+				break;
 			default:
 				return false;
 		}
-		const uint16_t dst_col = i;
-		program.add_target((int) clause.col_attno - 1, (int) dst_col, kind);
-		out_dst_cols[i] = dst_col;
+		program.add_target((int) input.attno - 1, (int) input.dst_col, kind);
 	}
 	program.finalize();
-	out_nclauses = qual->n_clauses;
 	return true;
 }
 
@@ -395,7 +443,8 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 	Assert(local.read_stream != nullptr);
 
 	ReleaseSeqScanPage(local);
-	CHECK_FOR_INTERRUPTS();
+	if (PipelineCancelRequested(ctx))
+		return false;
 	local.scan_desc->rs_dir = ForwardScanDirection;
 
 	const bool profile_on = PipelineProfileEnabled(ctx);
@@ -456,21 +505,23 @@ EnsureSeqScanPageLoaded(SeqScanLocalState &local, ExecCtx &ctx)
 	}
 }
 
-/* Build qual-side DeformBindings against per-clause scratch slots. The qual
- * deformer writes one row at index 0; duplicate-column clauses may have an
- * unused binding slot, which is harmless because no DeformTarget writes it. */
+/* Build filter-side DeformBindings against per-input scratch slots. The
+ * filter deformer writes one row at index 0; duplicate-column predicates share
+ * the same dst_col so each published input maps to one binding slot. */
 static inline void
-BuildQualDeformBindings(const QualDescriptor *qual,
-                         DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
-                         DeformBindings &bindings)
+BuildFilterDeformBindings(const FilterInputDesc *inputs,
+			         uint16_t n_inputs,
+			         DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &qchunk,
+			         DeformBindings &bindings)
 {
-	bindings.ncolumns = qual != nullptr ? qual->n_clauses : 0;
+	bindings.ncolumns = n_inputs;
 	bindings.owner_chunk = &qchunk;
 	for (uint8_t i = 0; i < bindings.ncolumns; ++i)
 	{
 		void *data_head = nullptr;
-		switch (qual->clauses[i].decode_kind)
+		switch (inputs[i].decode_kind)
 		{
+			case ColumnDecodeKind::INT32_CHAR:
 			case ColumnDecodeKind::INT32_DATE:
 			case ColumnDecodeKind::INT32_INT4:
 				data_head = static_cast<void *>(qchunk.int32_columns[i]);
@@ -479,9 +530,12 @@ BuildQualDeformBindings(const QualDescriptor *qual,
 			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
 				data_head = static_cast<void *>(qchunk.int64_columns[i]);
 				break;
+			case ColumnDecodeKind::STRING_REF:
+				data_head = static_cast<void *>(qchunk.string_columns[i]);
+				break;
 			default:
 				elog(ERROR, "pg_volvec: qual decode kind=%u unsupported",
-				     (unsigned) qual->clauses[i].decode_kind);
+				     (unsigned) inputs[i].decode_kind);
 		}
 		bindings.columns_data[i]  = data_head;
 		bindings.columns_nulls[i] = qchunk.nulls[i];
@@ -566,7 +620,6 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 	                                                stream_state,
 	                                                0);
 	local->exhausted = (global.shared == nullptr || global.shared->total_blocks == 0);
-	local->qual_program = nullptr;
 
 	return std::unique_ptr<LocalSourceState>(std::move(local));
 }
@@ -589,8 +642,21 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	SchemaDescriptor *out_schema = ResolveSchemaDescriptor(global.dsa, output_schema_dp_);
 	if (out_schema == nullptr)
 		elog(ERROR, "pg_volvec: PhysicalSeqScan output_schema_dp not published");
-
-	QualDescriptor *qual = ResolveQualDescriptor(global.dsa, qual_desc_dp_);
+	FilterInputDesc *filter_inputs = ResolveFilterInputs(global.dsa, filter_inputs_dp_);
+	FilterExprDesc *filter_exprs = ResolveFilterExprs(global.dsa, filter_exprs_dp_);
+	FilterStep *filter_steps = ResolveFilterSteps(global.dsa, filter_steps_dp_);
+	const char *filter_string_consts = DsaPointerIsValid(filter_string_consts_dp_)
+		? static_cast<const char *>(dsa_get_address(global.dsa, filter_string_consts_dp_))
+		: nullptr;
+	if (n_filter_inputs_ > 0 && filter_inputs == nullptr)
+		elog(ERROR, "pg_volvec: PhysicalSeqScan filter_inputs_dp not published");
+	if (n_filter_exprs_ > 0 && filter_exprs == nullptr)
+		elog(ERROR, "pg_volvec: PhysicalSeqScan filter_exprs_dp not published");
+	if (n_filter_steps_ > 0 && filter_steps == nullptr)
+		elog(ERROR, "pg_volvec: PhysicalSeqScan filter_steps_dp not published");
+	if (filter_bool_regs_ > FILTER_MAX_BOOL_REGS)
+		elog(ERROR, "pg_volvec: PhysicalSeqScan filter bool register overflow (%u)",
+		     static_cast<unsigned>(filter_bool_regs_));
 
 	(void) ctx;
 
@@ -598,11 +664,11 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	 * First-call deformer build. Why here (not in GetLocalSourceState):
 	 * out_schema is resolved from a DSA pointer that is only valid after
 	 * descriptor publish; the local-state ctor runs before that for
-	 * leader-self-allocate paths. Builds BOTH proj and qual programs
-	 * (qual only when present), allocates qual_chunk lazily, and JITs
-	 * each independently. JIT compile is opportunistic and silently
-	 * falls back to native interpreter on failure. JIT for the qual
-	 * deformer is identical to proj — same factory, same dispatch.
+	 * leader-self-allocate paths. Builds BOTH projection and filter programs
+	 * (filter only when published), allocates the filter scratch chunk lazily,
+	 * and JITs each independently. JIT compile is opportunistic and silently
+	 * falls back to native interpreter on failure. The filter deformer uses the
+	 * same factory/dispatch path as projection; only the target list differs.
 	 */
 	if (!local.deform_programs_built)
 	{
@@ -633,19 +699,19 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 #endif
 		}
 
-		/* Qual side: only built if a real predicate exists. NONE qual
-		 * skips this entire block; inner loop calls projection directly. */
-		if (qual != nullptr && qual->kind != QualKind::NONE)
+		/* Filter side: only built if a real predicate exists. Empty filter tapes
+		 * skip this entire block; the inner loop calls projection directly. */
+		if (n_filter_inputs_ > 0 && n_filter_exprs_ > 0 && n_filter_steps_ > 0)
 		{
-			if (!BuildQualDeformProgramFromQual(qual, local.qual_deform_program,
-			                                    local.qual_dst_cols,
-			                                    local.qual_nclauses))
+			if (!BuildFilterDeformProgram(filter_inputs,
+					n_filter_inputs_,
+					local.filter_deform_program))
 				ereport(ERROR,
-				        (errmsg("pg_volvec: failed to build SeqScan qual deformer")));
-			local.qual_chunk = std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>(
+				        (errmsg("pg_volvec: failed to build SeqScan filter deformer")));
+			local.filter_chunk = std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>(
 				new DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>());
-			local.qual_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
-			                                                            &local.qual_deform_program);
+			local.filter_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
+								    &local.filter_deform_program);
 #ifdef USE_LLVM
 			if (pg_volvec_jit_deform &&
 			    !(ctx.worker_index != LEADER_WORKER_INDEX &&
@@ -655,13 +721,13 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				JitContext   *jc = nullptr;
 				const char   *err = nullptr;
 				if (pg_volvec_try_compile_jit_deform_to_datachunk(local.scan_tupdesc,
-				                                                    &local.qual_deform_program,
+				                                                    &local.filter_deform_program,
 				                                                    &fn, &jc, &err) &&
 				    fn != nullptr)
 				{
-					local.qual_jit_func    = fn;
-					local.qual_jit_context = jc;
-					local.qual_deformer->set_jit_func(fn);
+					local.filter_jit_func    = fn;
+					local.filter_jit_context = jc;
+					local.filter_deformer->set_jit_func(fn);
 					if (jc != nullptr)
 						pg_volvec_register_llvm_jit_context(jc);
 				}
@@ -671,16 +737,23 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		local.deform_programs_built = true;
 	}
 
-	/* Pre-build qual bindings once per GetData call (heads point at row 0
-	 * of the persistent qual_chunk; deformer always writes there). */
-	DeformBindings qual_bindings;
-	const bool has_qual = (qual != nullptr && qual->kind != QualKind::NONE
-	                       && local.qual_deformer != nullptr);
-	if (has_qual)
-		BuildQualDeformBindings(qual, *local.qual_chunk, qual_bindings);
+	/* Pre-build filter bindings once per GetData call (heads point at row 0 of
+	 * the persistent filter_chunk; the deformer always writes there). */
+	DeformBindings filter_bindings;
+	const bool has_filter = (n_filter_inputs_ > 0 && n_filter_exprs_ > 0 &&
+				      n_filter_steps_ > 0 && local.filter_deformer != nullptr &&
+				      local.filter_chunk != nullptr);
+	if (has_filter)
+		BuildFilterDeformBindings(filter_inputs, n_filter_inputs_, *local.filter_chunk, filter_bindings);
 
+	uint32_t tuple_checks = 0;
 	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
+		if (PipelineCancelRequestedEvery(ctx, tuple_checks++))
+		{
+			ReleaseSeqScanPage(local);
+			break;
+		}
 		if (!EnsureSeqScanPageLoaded(local, ctx))
 		{
 			local.exhausted = true;
@@ -715,18 +788,18 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		if (tuple.t_data == nullptr)
 			continue;
 
-		/* B.1 Option C: deform qual cols first (1-row scratch at row 0),
+		/* B.1 Option C: deform filter cols first (1-row scratch at row 0),
 		 * evaluate predicate inline; only on survival do we deform the
 		 * full projection at out.count and increment. Q1 rejects ~96.6%
 		 * of rows so the projection deform is short-circuited for the
 		 * vast majority of tuples. */
-		if (has_qual)
+		if (has_filter)
 		{
 			instr_time qual_deform_start;
 			const bool profile_on = PipelineProfileEnabled(ctx);
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(qual_deform_start);
-			local.qual_deformer->deform_tuple_header(tuple.t_data, 0, qual_bindings);
+			local.filter_deformer->deform_tuple_header(tuple.t_data, 0, filter_bindings);
 			if (profile_on)
 			{
 				instr_time qual_deform_end;
@@ -742,9 +815,22 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(filter_start);
 			bool pass = true;
-			for (uint8_t i = 0; i < local.qual_nclauses; ++i)
+			std::fill(local.filter_bool_values,
+				  local.filter_bool_values + filter_bool_regs_,
+				  static_cast<uint8_t>(0));
+			for (uint16_t expr_idx = 0; expr_idx < n_filter_exprs_; ++expr_idx)
 			{
-				if (!EvalSinglePredicate(qual->clauses[i], *local.qual_chunk, local.qual_dst_cols[i]))
+				const FilterExprDesc &expr = filter_exprs[expr_idx];
+				const uint16_t expr_end = expr.first_step_idx + expr.n_steps;
+				if (expr_end > n_filter_steps_)
+					elog(ERROR, "pg_volvec: filter expression step range overflow");
+				for (uint16_t step_idx = expr.first_step_idx; step_idx < expr_end; ++step_idx)
+					EvalFilterStep(filter_steps[step_idx],
+						*local.filter_chunk,
+						filter_string_consts,
+						local.filter_bool_values);
+				if (expr.output_bool_reg >= filter_bool_regs_ ||
+				    !local.filter_bool_values[expr.output_bool_reg])
 				{
 					pass = false;
 					break;
@@ -784,10 +870,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	{
 		if (first_call)
 			elog(LOG,
-			     "pg_volvec: SeqScan.GetData first_call full_chunk=%u exhausted=%d has_qual=%d total_blocks=%u",
+			     "pg_volvec: SeqScan.GetData first_call full_chunk=%u exhausted=%d has_filter=%d total_blocks=%u",
 			     out.count,
 			     local.exhausted ? 1 : 0,
-			     has_qual ? 1 : 0,
+			     has_filter ? 1 : 0,
 			     global.shared != nullptr ? global.shared->total_blocks : 0);
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
@@ -795,10 +881,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	ReleaseSeqScanPage(local);
 	if (first_call)
 		elog(LOG,
-		     "pg_volvec: SeqScan.GetData first_call out_count=%u exhausted=%d has_qual=%d total_blocks=%u",
+		     "pg_volvec: SeqScan.GetData first_call out_count=%u exhausted=%d has_filter=%d total_blocks=%u",
 		     out.count,
 		     local.exhausted ? 1 : 0,
-		     has_qual ? 1 : 0,
+		     has_filter ? 1 : 0,
 		     global.shared != nullptr ? global.shared->total_blocks : 0);
 	return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT
 	                    : SourceResultType::FINISHED;

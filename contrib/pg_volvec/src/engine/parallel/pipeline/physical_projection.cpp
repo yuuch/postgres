@@ -8,6 +8,34 @@ extern "C" {
 namespace pg_volvec {
 namespace pipeline {
 
+namespace {
+
+static inline bool
+StepInputIsNull(const ProjectStep &step, const PipelineChunk &out, uint16_t row)
+{
+	switch (step.op)
+	{
+		case ProjectOp::NUMERIC_SCALE_VAR_CONST:
+		case ProjectOp::NUMERIC_MUL_VAR_CONST:
+		case ProjectOp::NUMERIC_ADD_VAR_CONST:
+		case ProjectOp::NUMERIC_SUB_VAR_CONST:
+		case ProjectOp::COPY_VAR:
+			return out.nulls[step.in_a_chunk_slot][row] != 0;
+		case ProjectOp::NUMERIC_SUB_CONST_VAR:
+		case ProjectOp::NUMERIC_ADD_CONST_VAR:
+			return out.nulls[step.in_b_chunk_slot][row] != 0;
+		case ProjectOp::NUMERIC_MUL_VAR_VAR:
+		case ProjectOp::NUMERIC_ADD_VAR_VAR:
+		case ProjectOp::NUMERIC_SUB_VAR_VAR:
+			return out.nulls[step.in_a_chunk_slot][row] != 0 ||
+			       out.nulls[step.in_b_chunk_slot][row] != 0;
+	}
+
+	return true;
+}
+
+} // namespace
+
 std::unique_ptr<OperatorState>
 PhysicalProjection::GetOperatorState(ExecCtx &ctx)
 {
@@ -19,7 +47,13 @@ OperatorResultType
 PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
 {
 	(void) ctx;
-	(void) state;
+	auto &op_state = static_cast<ProjectionOperatorState &>(state);
+	if (op_state.current_input_drained)
+	{
+		op_state.current_input_drained = false;
+		out.reset();
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
 	out = in;
 
 	for (const ProjectExprDesc &expr : expr_descs_)
@@ -34,8 +68,22 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 			const ProjectStep &step = steps_[step_idx];
 			for (uint16_t row = 0; row < out.count; ++row)
 			{
+				if (StepInputIsNull(step, out, row))
+				{
+					out.nulls[step.out_chunk_slot][row] = 1;
+					continue;
+				}
+
 				switch (step.op)
 				{
+					case ProjectOp::NUMERIC_SCALE_VAR_CONST:
+						if (step.const_value >= 0)
+							out.int64_columns[step.out_chunk_slot][row] =
+								out.int64_columns[step.in_a_chunk_slot][row] * step.const_value;
+						else
+							out.int64_columns[step.out_chunk_slot][row] =
+								out.int64_columns[step.in_a_chunk_slot][row] / (-step.const_value);
+						break;
 					case ProjectOp::NUMERIC_MUL_VAR_VAR:
 						out.int64_columns[step.out_chunk_slot][row] =
 							out.int64_columns[step.in_a_chunk_slot][row] *
@@ -54,6 +102,24 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 						out.int64_columns[step.out_chunk_slot][row] =
 							step.const_value + out.int64_columns[step.in_b_chunk_slot][row];
 						break;
+					case ProjectOp::NUMERIC_ADD_VAR_VAR:
+						out.int64_columns[step.out_chunk_slot][row] =
+							out.int64_columns[step.in_a_chunk_slot][row] +
+							out.int64_columns[step.in_b_chunk_slot][row];
+						break;
+					case ProjectOp::NUMERIC_SUB_VAR_VAR:
+						out.int64_columns[step.out_chunk_slot][row] =
+							out.int64_columns[step.in_a_chunk_slot][row] -
+							out.int64_columns[step.in_b_chunk_slot][row];
+						break;
+					case ProjectOp::NUMERIC_ADD_VAR_CONST:
+						out.int64_columns[step.out_chunk_slot][row] =
+							out.int64_columns[step.in_a_chunk_slot][row] + step.const_value;
+						break;
+					case ProjectOp::NUMERIC_SUB_VAR_CONST:
+						out.int64_columns[step.out_chunk_slot][row] =
+							out.int64_columns[step.in_a_chunk_slot][row] - step.const_value;
+						break;
 					case ProjectOp::COPY_VAR:
 						out.int64_columns[step.out_chunk_slot][row] =
 							out.int64_columns[step.in_a_chunk_slot][row];
@@ -67,6 +133,7 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 			elog(ERROR, "pg_volvec: projection output slot descriptor mismatch");
 	}
 
+	op_state.current_input_drained = out.count > 0;
 	return out.count > 0 ? OperatorResultType::HAVE_MORE_OUTPUT
 	                     : OperatorResultType::NEED_MORE_INPUT;
 }

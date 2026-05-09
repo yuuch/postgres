@@ -24,21 +24,37 @@
 
 #include "tuple_data_collection.hpp"
 
+#include "tuple_data_layout.hpp"
+
 extern "C" {
 #include "postgres.h"
 #include "utils/elog.h"
 }
 
+#include <algorithm>
 #include <cstring>
 
 namespace pg_volvec {
 namespace pipeline {
 
+namespace {
+
+static constexpr uint64_t kTupleDataCollectionMaxFlatAllocBytes = 900ull * 1024ull * 1024ull;
+
+static inline uint32_t
+HeapBytesNeededForStringLength(uint32_t len)
+{
+	return len > 8 ? len : 0;
+}
+
+}  /* namespace */
+
 void
 TupleDataCollectionInit(TupleDataCollection *tdc,
                         uint32_t row_capacity,
 						uint32_t row_width,
-						dsa_pointer layout_dp)
+						dsa_pointer layout_dp,
+						uint32_t heap_capacity)
 {
 	Assert(tdc != nullptr);
 	Assert(row_capacity > 0);
@@ -51,12 +67,212 @@ TupleDataCollectionInit(TupleDataCollection *tdc,
 	SpinLockInit(&tdc->mutex);
 	pg_atomic_init_u32(&tdc->row_count, 0);
 	pg_atomic_init_u32(&tdc->scan_cursor, 0);
+	tdc->heap_capacity = heap_capacity;
+	pg_atomic_init_u32(&tdc->heap_used, 0);
 	tdc->finalized = false;
 	tdc->_pad[0] = 0;
 	tdc->_pad[1] = 0;
 	tdc->_pad[2] = 0;
 	/* tdc->rows is already zero from dsa_allocate0; do not memset
 	 * row_capacity*row_width bytes here (could be many MB). */
+}
+
+uint32_t
+TupleDataCollectionDefaultHeapCapacity(const TupleDataLayout *layout,
+	                                   uint32_t row_capacity)
+{
+	if (layout == nullptr)
+		return 0;
+
+	uint32_t string_columns = 0;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
+			string_columns++;
+	}
+	if (string_columns == 0)
+		return 0;
+
+	const uint64_t bytes = static_cast<uint64_t>(row_capacity) *
+		static_cast<uint64_t>(string_columns) * 96u;
+	return bytes > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(bytes);
+}
+
+void
+TupleDataCollectionCheckFlatAllocSize(uint32_t row_capacity,
+	                                    uint32_t row_width,
+	                                    uint32_t heap_capacity)
+{
+	const uint64_t alloc_size = static_cast<uint64_t>(offsetof(TupleDataCollection, rows)) +
+		static_cast<uint64_t>(row_capacity) * static_cast<uint64_t>(row_width) +
+		static_cast<uint64_t>(heap_capacity);
+	if (alloc_size >= kTupleDataCollectionMaxFlatAllocBytes)
+		elog(ERROR,
+			 "pg_volvec: TDC flat allocation exceeds limit (rows=%u row_width=%u heap=%u size=%llu limit=%llu)",
+			 row_capacity,
+			 row_width,
+			 heap_capacity,
+			 static_cast<unsigned long long>(alloc_size),
+			 static_cast<unsigned long long>(kTupleDataCollectionMaxFlatAllocBytes));
+}
+
+size_t
+TupleDataCollectionCheckedAllocSize(uint32_t row_capacity,
+	                                  uint32_t row_width,
+	                                  uint32_t heap_capacity)
+{
+	TupleDataCollectionCheckFlatAllocSize(row_capacity, row_width, heap_capacity);
+	return TupleDataCollectionAllocSize(row_capacity, row_width, heap_capacity);
+}
+
+uint32_t
+TupleDataCollectionGrowHeapCapacity(const TupleDataLayout *layout,
+	                                  const TupleDataCollection *old_tdc,
+	                                  uint32_t new_row_capacity,
+	                                  uint32_t required_heap_bytes)
+{
+	Assert(old_tdc != nullptr);
+
+	if (layout == nullptr || old_tdc->heap_capacity == 0)
+	{
+		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, new_row_capacity);
+		TupleDataCollectionCheckFlatAllocSize(new_row_capacity, old_tdc->row_width, heap_capacity);
+		return heap_capacity;
+	}
+
+	const uint32_t heap_used = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&old_tdc->heap_used));
+	const uint64_t min_required = static_cast<uint64_t>(heap_used) +
+		static_cast<uint64_t>(required_heap_bytes);
+	uint64_t next_capacity = static_cast<uint64_t>(old_tdc->heap_capacity) +
+		std::max<uint64_t>(static_cast<uint64_t>(old_tdc->heap_capacity) / 2u, 1024u * 1024u);
+	if (next_capacity < min_required)
+		next_capacity = min_required;
+
+	const uint64_t row_bytes = TupleDataCollectionRowBytes(new_row_capacity,
+		old_tdc->row_width);
+	if (row_bytes + offsetof(TupleDataCollection, rows) >= kTupleDataCollectionMaxFlatAllocBytes)
+		elog(ERROR, "pg_volvec: TDC row buffer exceeds flat allocation limit");
+	const uint64_t max_heap_capacity = kTupleDataCollectionMaxFlatAllocBytes -
+		row_bytes - offsetof(TupleDataCollection, rows);
+	if (min_required > max_heap_capacity)
+		elog(ERROR, "pg_volvec: TDC string heap exceeds flat allocation limit");
+	if (next_capacity > max_heap_capacity)
+		next_capacity = max_heap_capacity;
+	return next_capacity > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(next_capacity);
+}
+
+bool
+TupleDataCollectionStoreStringBytes(TupleDataCollection *tdc,
+	                                const char *data,
+	                                uint32_t len,
+	                                VecStringRef *out_ref)
+{
+	Assert(tdc != nullptr && out_ref != nullptr);
+
+	VecStringRef ref{len, 0, 0};
+	if (len == 0 || data == nullptr)
+	{
+		*out_ref = ref;
+		return true;
+	}
+
+	std::memcpy(&ref.prefix, data, len > 8 ? 8 : len);
+	if (len <= 8)
+	{
+		ref.offset = kVecStringInlineOffset;
+		*out_ref = ref;
+		return true;
+	}
+
+	uint32_t heap_offset = 0;
+	SpinLockAcquire(&tdc->mutex);
+	{
+		const uint32_t heap_used = pg_atomic_read_u32(&tdc->heap_used);
+		if (heap_used > tdc->heap_capacity || len > tdc->heap_capacity - heap_used)
+		{
+			SpinLockRelease(&tdc->mutex);
+			return false;
+		}
+		heap_offset = heap_used;
+		pg_atomic_write_u32(&tdc->heap_used, heap_used + len);
+	}
+	SpinLockRelease(&tdc->mutex);
+
+	uint8_t *heap = TupleDataCollectionHeap(tdc);
+	std::memcpy(heap + heap_offset, data, len);
+	ref.offset = heap_offset;
+	*out_ref = ref;
+	return true;
+}
+
+uint32_t
+TupleDataCollectionRequiredHeapBytesForChunkRow(const TupleDataLayout *layout,
+	                                           const PipelineChunk &chunk,
+	                                           uint16_t row_idx)
+{
+	Assert(layout != nullptr);
+	Assert(row_idx < chunk.count);
+
+	uint64_t required = 0;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		const TdcColumnDesc &col = layout->columns[i];
+		if (col.kind != TdcColumnKind::STRING_REF)
+			continue;
+		Assert(col.src_col_idx < 16);
+		required += HeapBytesNeededForStringLength(
+			chunk.string_columns[col.src_col_idx][row_idx].len);
+	}
+
+	return required > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(required);
+}
+
+uint32_t
+TupleDataCollectionRequiredHeapBytesForRow(const TupleDataLayout *layout,
+	                                      const TupleDataCollection *tdc,
+	                                      const uint8_t *row_ptr)
+{
+	Assert(layout != nullptr);
+	Assert(row_ptr != nullptr);
+
+	uint64_t required = 0;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		const TdcColumnDesc &col = layout->columns[i];
+		if (col.kind != TdcColumnKind::STRING_REF)
+			continue;
+
+		VecStringRef ref;
+		std::memcpy(&ref, row_ptr + col.offset, sizeof(ref));
+		const char *ptr = VecStringRefDataPtr(ref,
+			tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
+		if (ref.len != 0 && ptr == nullptr)
+			elog(ERROR, "pg_volvec: STRING_REF row-store copy missing heap backing");
+		required += HeapBytesNeededForStringLength(ref.len);
+	}
+
+	return required > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(required);
+}
+
+bool
+TupleDataCollectionHasSpaceForAppend(const TupleDataCollection *tdc,
+	                                uint32_t required_heap_bytes)
+{
+	Assert(tdc != nullptr);
+
+	const uint32_t row_count = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&tdc->row_count));
+	if (row_count >= tdc->row_capacity)
+		return false;
+
+	if (required_heap_bytes == 0)
+		return true;
+
+	const uint32_t heap_used = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&tdc->heap_used));
+	return heap_used <= tdc->heap_capacity &&
+		required_heap_bytes <= tdc->heap_capacity - heap_used;
 }
 
 uint32_t
