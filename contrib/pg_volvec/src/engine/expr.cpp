@@ -2142,7 +2142,7 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					registers_nulls[res + i] = chunk.nulls[att][i];
 					if (step.d.var.storage_kind == VecOutputStorageKind::NumericAvgPair)
 					{
-						double count = chunk.double_columns[att][i];
+						double count = chunk.get_double(att, i);
 						int scale_delta = Max(res_scale - step.d.var.storage_scale, 0);
 						long double scaled_avg = 0.0L;
 
@@ -2150,33 +2150,36 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 							registers_nulls[res + i] = 1;
 						if (!registers_nulls[res + i])
 						{
-							scaled_avg = ((long double) chunk.int64_columns[att][i] *
+							const int64_t sum = chunk.get_int64(att, i);
+							scaled_avg = ((long double) sum *
 										  (long double) Pow10Int64(scale_delta)) /
 								(long double) count;
 							registers_i64[res + i] = (int64_t) std::llround(scaled_avg);
 							registers_i64_hi[res + i] =
 								(registers_i64[res + i] < 0) ? -1 : 0;
 							registers_f8[res + i] =
-								((double) chunk.int64_columns[att][i] /
+								((double) sum /
 								 (double) Pow10Int64(step.d.var.storage_scale)) / count;
 						}
 					}
 					else if (typ == FLOAT8OID)
-						registers_f8[res + i] = chunk.double_columns[att][i];
+						registers_f8[res + i] = chunk.get_double(att, i);
 					else if (typ == NUMERICOID || typ == INT8OID)
 					{
-						registers_i64[res + i] = chunk.int64_columns[att][i];
+						const int64_t value = chunk.get_int64(att, i);
+						registers_i64[res + i] = value;
 						registers_i64_hi[res + i] =
-							(chunk.int64_columns[att][i] < 0) ? -1 : 0;
+							(value < 0) ? -1 : 0;
 					}
 					else
 					{
-						registers_i32[res + i] = chunk.int32_columns[att][i];
+						const int32_t value = chunk.get_int32(att, i);
+						registers_i32[res + i] = value;
 						if (IsIntegerType(typ))
 						{
-							registers_i64[res + i] = (int64_t) chunk.int32_columns[att][i];
+							registers_i64[res + i] = (int64_t) value;
 							registers_i64_hi[res + i] =
-								(chunk.int32_columns[att][i] < 0) ? -1 : 0;
+								(value < 0) ? -1 : 0;
 						}
 					}
 				}
@@ -2544,7 +2547,7 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 					mask = (prefix_len >= 8) ? UINT64_MAX : ((UINT64CONST(1) << (prefix_len * 8)) - 1);
 				for (int i = 0; i < chunk.count; i++)
 				{
-					VecStringRef ref = chunk.string_columns[att][i];
+					VecStringRef ref = chunk.get_string_ref(att, i);
 
 					registers_nulls[res + i] = chunk.nulls[att][i];
 					registers_i32[res + i] =
@@ -2560,7 +2563,7 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 
 					for (int i = 0; i < chunk.count; i++)
 					{
-						VecStringRef ref = chunk.string_columns[att][i];
+						VecStringRef ref = chunk.get_string_ref(att, i);
 
 						registers_nulls[res + i] = chunk.nulls[att][i];
 						registers_i32[res + i] = !registers_nulls[res + i] &&
@@ -2574,7 +2577,7 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 
 					for (int i = 0; i < chunk.count; i++)
 					{
-						VecStringRef ref = chunk.string_columns[att][i];
+						VecStringRef ref = chunk.get_string_ref(att, i);
 
 						registers_nulls[res + i] = chunk.nulls[att][i];
 						registers_i32[res + i] = !registers_nulls[res + i] &&
@@ -2588,7 +2591,7 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 
 					for (int i = 0; i < chunk.count; i++)
 					{
-						VecStringRef ref = chunk.string_columns[att][i];
+						VecStringRef ref = chunk.get_string_ref(att, i);
 
 						registers_nulls[res + i] = chunk.nulls[att][i];
 						registers_i32[res + i] = !registers_nulls[res + i] &&
@@ -2602,7 +2605,7 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 
 					for (int i = 0; i < chunk.count; i++)
 					{
-						VecStringRef ref = chunk.string_columns[att][i];
+						VecStringRef ref = chunk.get_string_ref(att, i);
 
 						registers_nulls[res + i] = chunk.nulls[att][i];
 						registers_i32[res + i] = registers_nulls[res + i] ? 0 :

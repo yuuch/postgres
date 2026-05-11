@@ -159,14 +159,14 @@ EvalFilterStep(const FilterStep &step,
 
 {
 	bool result = false;
-	switch (step.op)
-	{
-		case FilterStepOp::INT32_CMP_CONST:
+		switch (step.op)
 		{
-			if (!filter_chunk.nulls[step.left_idx][0])
+			case FilterStepOp::INT32_CMP_CONST:
 			{
-				const int32_t l = filter_chunk.int32_columns[step.left_idx][0];
-				const int32_t r = static_cast<int32_t>(step.const_value);
+				if (!filter_chunk.nulls[step.left_idx][0])
+				{
+					const int32_t l = filter_chunk.get_int32(step.left_idx, 0);
+					const int32_t r = static_cast<int32_t>(step.const_value);
 				switch (step.cmp_op)
 				{
 					case QualOp::LE: result = l <= r; break;
@@ -179,12 +179,12 @@ EvalFilterStep(const FilterStep &step,
 			}
 			break;
 		}
-		case FilterStepOp::INT64_CMP_CONST:
-		{
-			if (!filter_chunk.nulls[step.left_idx][0])
+			case FilterStepOp::INT64_CMP_CONST:
 			{
-				const int64_t l = filter_chunk.int64_columns[step.left_idx][0];
-				const int64_t r = static_cast<int64_t>(step.const_value);
+				if (!filter_chunk.nulls[step.left_idx][0])
+				{
+					const int64_t l = filter_chunk.get_int64(step.left_idx, 0);
+					const int64_t r = static_cast<int64_t>(step.const_value);
 				switch (step.cmp_op)
 				{
 					case QualOp::LE: result = l <= r; break;
@@ -197,14 +197,14 @@ EvalFilterStep(const FilterStep &step,
 			}
 			break;
 		}
-		case FilterStepOp::STRING_EQ_CONST:
-		case FilterStepOp::STRING_NE_CONST:
-		{
-			if (!filter_chunk.nulls[step.left_idx][0])
+			case FilterStepOp::STRING_EQ_CONST:
+			case FilterStepOp::STRING_NE_CONST:
 			{
-				const VecStringRef &ref = filter_chunk.string_columns[step.left_idx][0];
-				const char *lhs = filter_chunk.get_string_ptr(ref);
-				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				if (!filter_chunk.nulls[step.left_idx][0])
+				{
+					const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+					const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+					const char *rhs = ResolveFilterConstPtr(step, string_consts);
 				const bool eq = (lhs != nullptr || ref.len == 0) && rhs != nullptr &&
 					ref.len == step.const_len &&
 					(step.const_len == 0 || std::memcmp(lhs, rhs, step.const_len) == 0);
@@ -212,22 +212,22 @@ EvalFilterStep(const FilterStep &step,
 			}
 			break;
 		}
-		case FilterStepOp::STRING_PREFIX_LIKE:
-		{
-			if (!filter_chunk.nulls[step.left_idx][0])
+			case FilterStepOp::STRING_PREFIX_LIKE:
 			{
-				const VecStringRef &ref = filter_chunk.string_columns[step.left_idx][0];
-				const char *rhs = ResolveFilterConstPtr(step, string_consts);
-				result = rhs != nullptr && ref.len >= step.const_len;
-				if (result && step.const_len != 0)
+				if (!filter_chunk.nulls[step.left_idx][0])
 				{
-					if (step.const_len <= sizeof(ref.prefix))
-						result = std::memcmp(&ref.prefix, rhs, step.const_len) == 0;
-					else
+					const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+					const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				result = rhs != nullptr && ref.len >= step.const_len;
+					if (result && step.const_len != 0)
 					{
-						const char *lhs = filter_chunk.get_string_ptr(ref);
-						result = lhs != nullptr && std::memcmp(lhs, rhs, step.const_len) == 0;
-					}
+						if (step.const_len <= sizeof(ref.prefix))
+							result = std::memcmp(&ref.prefix, rhs, step.const_len) == 0;
+						else
+						{
+							const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+							result = lhs != nullptr && std::memcmp(lhs, rhs, step.const_len) == 0;
+						}
 				}
 			}
 			break;

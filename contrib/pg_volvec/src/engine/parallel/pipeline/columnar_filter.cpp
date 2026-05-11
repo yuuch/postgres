@@ -24,11 +24,11 @@ EvalClauseVector(const QualDescriptor::Clause &clause,
 		return false;
 
 	switch (clause.const_typoid)
-	{
-		case DATEOID:
 		{
-			const int32_t l = qual_chunk.int32_columns[dst_col][row_idx];
-			const int32_t r = (int32_t) DatumGetDateADT((Datum) clause.const_value);
+			case DATEOID:
+			{
+				const int32_t l = qual_chunk.get_int32(dst_col, row_idx);
+				const int32_t r = (int32_t) DatumGetDateADT((Datum) clause.const_value);
 			switch (clause.op)
 			{
 				case QualOp::LE: return l <= r;
@@ -40,10 +40,10 @@ EvalClauseVector(const QualDescriptor::Clause &clause,
 			}
 			break;
 		}
-		case INT4OID:
-		{
-			const int32_t l = qual_chunk.int32_columns[dst_col][row_idx];
-			const int32_t r = DatumGetInt32((Datum) clause.const_value);
+			case INT4OID:
+			{
+				const int32_t l = qual_chunk.get_int32(dst_col, row_idx);
+				const int32_t r = DatumGetInt32((Datum) clause.const_value);
 			switch (clause.op)
 			{
 				case QualOp::LE: return l <= r;
@@ -55,10 +55,10 @@ EvalClauseVector(const QualDescriptor::Clause &clause,
 			}
 			break;
 		}
-		case INT8OID:
-		{
-			const int64_t l = qual_chunk.int64_columns[dst_col][row_idx];
-			const int64_t r = DatumGetInt64((Datum) clause.const_value);
+			case INT8OID:
+			{
+				const int64_t l = qual_chunk.get_int64(dst_col, row_idx);
+				const int64_t r = DatumGetInt64((Datum) clause.const_value);
 			switch (clause.op)
 			{
 				case QualOp::LE: return l <= r;
