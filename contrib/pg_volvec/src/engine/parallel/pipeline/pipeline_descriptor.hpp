@@ -330,6 +330,7 @@ struct HashJoinSharedPayload {
 	dsa_pointer build_rows_dp;           /* future global build-side row store */
 	dsa_pointer hash_table_dp;           /* uint32_t[hash_table_capacity] bucket heads */
 	dsa_pointer hash_links_dp;           /* uint32_t[build_rows.row_count] next indices */
+	dsa_pointer hash_salts_dp;           /* uint16_t[build_rows.row_count] high-hash salts */
 };
 
 /*

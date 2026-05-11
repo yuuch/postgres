@@ -26,6 +26,12 @@ namespace {
 static constexpr uint32_t HASH_JOIN_INVALID_ROW = UINT32_MAX;
 static constexpr uint32_t HASH_JOIN_MAX_INITIAL_ROWS = 1u << 20;
 
+static inline uint16_t
+HashJoinSalt(uint64_t hash)
+{
+	return static_cast<uint16_t>(hash >> 48);
+}
+
 static uint32_t
 HashJoinInitialRows(uint32_t estimated_rows)
 {
@@ -299,16 +305,17 @@ BuildRightColumnsBySlot(const TupleDataLayout *right_layout,
 }
 
 static void
-CopyRowByMapping(const PipelineChunk &left_chunk,
-	           uint16_t left_row_idx,
-	           const TupleDataLayout *right_layout,
-	           const TupleDataCollection *right_tdc,
-	           const uint8_t *right_row,
-	           const TdcColumnDesc *const *right_columns_by_slot,
-	           const HashJoinOutputColumnDesc *output_columns,
-	           uint16_t output_column_count,
-	           PipelineChunk &out,
-	           uint16_t out_row_idx)
+CopyRowsByMappingBatch(const PipelineChunk &left_chunk,
+	               const uint16_t *left_row_indices,
+	               const TupleDataLayout *right_layout,
+	               const TupleDataCollection *right_tdc,
+	               const uint8_t *const *right_rows,
+	               const TdcColumnDesc *const *right_columns_by_slot,
+	               const HashJoinOutputColumnDesc *output_columns,
+	               uint16_t output_column_count,
+	               PipelineChunk &out,
+	               uint16_t out_row_base,
+	               uint16_t batch_count)
 {
 	Assert(right_columns_by_slot != nullptr);
 
@@ -320,70 +327,86 @@ CopyRowByMapping(const PipelineChunk &left_chunk,
 			: nullptr;
 		if (desc.side == HashJoinOutputSide::RIGHT && right_col == nullptr)
 			elog(ERROR, "pg_volvec: hash join output column mapping missing right payload column");
-		switch (desc.decode_kind)
-		{
-			case ColumnDecodeKind::INT32_CHAR:
-			case ColumnDecodeKind::INT32_DATE:
-			case ColumnDecodeKind::INT32_INT4:
-				if (desc.side == HashJoinOutputSide::LEFT)
-					out.int32_columns[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.int32_columns[desc.input_chunk_slot][left_row_idx];
-				else
-				{
-					int32_t value;
-					std::memcpy(&value, right_row + right_col->offset, sizeof(value));
-					out.int32_columns[desc.output_chunk_slot][out_row_idx] = value;
+
+			switch (desc.decode_kind)
+			{
+				case ColumnDecodeKind::INT32_CHAR:
+				case ColumnDecodeKind::INT32_DATE:
+				case ColumnDecodeKind::INT32_INT4:
+					for (uint16_t batch_idx = 0; batch_idx < batch_count; ++batch_idx)
+					{
+						const uint16_t out_row_idx = out_row_base + batch_idx;
+						if (desc.side == HashJoinOutputSide::LEFT)
+							out.int32_columns[desc.output_chunk_slot][out_row_idx] =
+								left_chunk.get_int32(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						else
+						{
+							int32_t value;
+						std::memcpy(&value, right_rows[batch_idx] + right_col->offset, sizeof(value));
+						out.int32_columns[desc.output_chunk_slot][out_row_idx] = value;
+					}
 				}
 				break;
-			case ColumnDecodeKind::INT64_INT8:
-			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
-				if (desc.side == HashJoinOutputSide::LEFT)
-					out.int64_columns[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.int64_columns[desc.input_chunk_slot][left_row_idx];
-				else
-				{
-					int64_t value;
-					std::memcpy(&value, right_row + right_col->offset, sizeof(value));
-					out.int64_columns[desc.output_chunk_slot][out_row_idx] = value;
+				case ColumnDecodeKind::INT64_INT8:
+				case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+					for (uint16_t batch_idx = 0; batch_idx < batch_count; ++batch_idx)
+					{
+						const uint16_t out_row_idx = out_row_base + batch_idx;
+						if (desc.side == HashJoinOutputSide::LEFT)
+							out.int64_columns[desc.output_chunk_slot][out_row_idx] =
+								left_chunk.get_int64(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						else
+						{
+							int64_t value;
+						std::memcpy(&value, right_rows[batch_idx] + right_col->offset, sizeof(value));
+						out.int64_columns[desc.output_chunk_slot][out_row_idx] = value;
+					}
 				}
 				break;
-			case ColumnDecodeKind::DOUBLE_FLOAT8:
-				if (desc.side == HashJoinOutputSide::LEFT)
-					out.double_columns[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.double_columns[desc.input_chunk_slot][left_row_idx];
-				else
-				{
-					double value;
-					std::memcpy(&value, right_row + right_col->offset, sizeof(value));
-					out.double_columns[desc.output_chunk_slot][out_row_idx] = value;
+				case ColumnDecodeKind::DOUBLE_FLOAT8:
+					for (uint16_t batch_idx = 0; batch_idx < batch_count; ++batch_idx)
+					{
+						const uint16_t out_row_idx = out_row_base + batch_idx;
+						if (desc.side == HashJoinOutputSide::LEFT)
+							out.double_columns[desc.output_chunk_slot][out_row_idx] =
+								left_chunk.get_double(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						else
+						{
+							double value;
+						std::memcpy(&value, right_rows[batch_idx] + right_col->offset, sizeof(value));
+						out.double_columns[desc.output_chunk_slot][out_row_idx] = value;
+					}
 				}
 				break;
 			case ColumnDecodeKind::STRING_REF:
-			{
-				VecStringRef ref;
-				const char *ptr = nullptr;
-				if (desc.side == HashJoinOutputSide::LEFT)
+				for (uint16_t batch_idx = 0; batch_idx < batch_count; ++batch_idx)
 				{
-					const VecStringRef &src = left_chunk.string_columns[desc.input_chunk_slot][left_row_idx];
-					ptr = left_chunk.get_string_ptr(src);
-					ref = src;
+					const uint16_t out_row_idx = out_row_base + batch_idx;
+					VecStringRef ref;
+					const char *ptr = nullptr;
+					if (desc.side == HashJoinOutputSide::LEFT)
+					{
+						const VecStringRef src = left_chunk.get_string_ref(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						ptr = left_chunk.get_string_ptr(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						ref = src;
+					}
+					else
+					{
+						std::memcpy(&ref, right_rows[batch_idx] + right_col->offset, sizeof(ref));
+						ptr = VecStringRefDataPtr(ref,
+							right_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(right_tdc)) : nullptr);
+					}
+					if (ptr == nullptr && ref.len != 0)
+						elog(ERROR, "pg_volvec: hash join output string missing backing storage");
+					out.string_columns[desc.output_chunk_slot][out_row_idx] =
+						out.store_string_bytes(ptr, ref.len);
 				}
-				else
-				{
-					std::memcpy(&ref, right_row + right_col->offset, sizeof(ref));
-					ptr = VecStringRefDataPtr(ref,
-						right_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(right_tdc)) : nullptr);
-				}
-				if (ptr == nullptr && ref.len != 0)
-					elog(ERROR, "pg_volvec: hash join output string missing backing storage");
-				out.string_columns[desc.output_chunk_slot][out_row_idx] =
-					out.store_string_bytes(ptr, ref.len);
 				break;
-			}
 			case ColumnDecodeKind::NONE:
 				elog(ERROR, "pg_volvec: hash join output decode_kind NONE is invalid");
 		}
 	}
+	(void) right_layout;
 }
 
 static void
@@ -425,6 +448,7 @@ public:
 	uint16_t probe_row_idx = 0;
 	uint32_t build_row_idx = HASH_JOIN_INVALID_ROW;
 	bool have_build_cursor = false;
+	uint16_t probe_salt = 0;
 };
 
 } // namespace
@@ -726,9 +750,12 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 			static_cast<size_t>(hash_capacity) * sizeof(uint32_t));
 		global.payload->hash_links_dp = dsa_allocate0(ctx.dsa,
 			static_cast<size_t>(row_count) * sizeof(uint32_t));
+		global.payload->hash_salts_dp = dsa_allocate0(ctx.dsa,
+			static_cast<size_t>(row_count) * sizeof(uint16_t));
 
 		auto *bucket_heads = static_cast<uint32_t *>(dsa_get_address(ctx.dsa, global.payload->hash_table_dp));
 		auto *links = static_cast<uint32_t *>(dsa_get_address(ctx.dsa, global.payload->hash_links_dp));
+		auto *salts = static_cast<uint16_t *>(dsa_get_address(ctx.dsa, global.payload->hash_salts_dp));
 		for (uint32_t i = 0; i < hash_capacity; ++i)
 		{
 			if (PipelineCancelRequestedEvery(ctx, i, 1023u))
@@ -740,6 +767,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 			if (PipelineCancelRequestedEvery(ctx, row_idx, 1023u))
 				return SinkFinalizeType::READY;
 			links[row_idx] = HASH_JOIN_INVALID_ROW;
+			salts[row_idx] = 0;
 		}
 
 		for (uint32_t row_idx = 0; row_idx < row_count; ++row_idx)
@@ -748,6 +776,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 				return SinkFinalizeType::READY;
 			const uint8_t *row_ptr = TupleDataCollectionGetRowConst(global.build_keys, row_idx);
 			const uint64_t hash = HashGroupRow(global.build_key_layout, global.build_keys, row_ptr);
+			salts[row_idx] = HashJoinSalt(hash);
 			const uint32_t bucket = static_cast<uint32_t>(hash) & (hash_capacity - 1u);
 			links[row_idx] = bucket_heads[bucket];
 			bucket_heads[bucket] = row_idx;
@@ -758,6 +787,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 		global.payload->hash_table_capacity = 0;
 		global.payload->hash_table_dp = InvalidDsaPointer;
 		global.payload->hash_links_dp = InvalidDsaPointer;
+		global.payload->hash_salts_dp = InvalidDsaPointer;
 	}
 	TupleDataCollectionResetScan(global.build_keys);
 	TupleDataCollectionResetScan(global.build_rows);
@@ -809,9 +839,14 @@ PhysicalHashJoin::ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx)
 	const uint64_t link_bytes = DsaPointerIsValid(payload->hash_links_dp) && build_rows != nullptr
 		? static_cast<uint64_t>(pg_atomic_read_u32(&build_rows->row_count)) * sizeof(uint32_t)
 		: 0;
+	const uint64_t salt_bytes = DsaPointerIsValid(payload->hash_salts_dp) && build_rows != nullptr
+		? static_cast<uint64_t>(pg_atomic_read_u32(&build_rows->row_count)) * sizeof(uint16_t)
+		: 0;
+	(void) salt_bytes;
 
 	FreeDsaPointerIfValid(ctx.dsa, &payload->hash_table_dp);
 	FreeDsaPointerIfValid(ctx.dsa, &payload->hash_links_dp);
+	FreeDsaPointerIfValid(ctx.dsa, &payload->hash_salts_dp);
 	FreeDsaPointerIfValid(ctx.dsa, &payload->build_keys_dp);
 	FreeDsaPointerIfValid(ctx.dsa, &payload->build_rows_dp);
 	if (registry != nullptr)
@@ -901,11 +936,16 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	if (output_columns == nullptr || output_column_count == 0)
 		elog(ERROR, "pg_volvec: hash join probe missing output column mapping");
 	BuildRightColumnsBySlot(build_row_layout, right_columns_by_slot);
-	if (!DsaPointerIsValid(payload->hash_table_dp) || !DsaPointerIsValid(payload->hash_links_dp))
+	if (!DsaPointerIsValid(payload->hash_table_dp) ||
+		!DsaPointerIsValid(payload->hash_links_dp) ||
+		!DsaPointerIsValid(payload->hash_salts_dp))
 		return OperatorResultType::NEED_MORE_INPUT;
 
 	auto *bucket_heads = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa, payload->hash_table_dp));
 	auto *links = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa, payload->hash_links_dp));
+	auto *salts = static_cast<const uint16_t *>(dsa_get_address(ctx.dsa, payload->hash_salts_dp));
+	uint16_t matched_probe_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
+	const uint8_t *matched_build_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	out.reset();
 	uint32_t matched_rows = 0;
 
@@ -915,10 +955,12 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		op_state.probe_row_idx = 0;
 		op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
 		op_state.have_build_cursor = false;
+		op_state.probe_salt = 0;
 	}
 
 	while (op_state.probe_row_idx < in.count)
 	{
+		uint16_t batch_count = 0;
 		if (PipelineCancelRequestedEvery(ctx, op_state.probe_row_idx))
 			break;
 		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
@@ -926,33 +968,46 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		if (!op_state.have_build_cursor)
 		{
 			const uint64_t hash = HashGroup(probe_layout, in, op_state.probe_row_idx);
+			op_state.probe_salt = HashJoinSalt(hash);
 			const uint32_t bucket = static_cast<uint32_t>(hash) & (payload->hash_table_capacity - 1u);
 			op_state.build_row_idx = bucket_heads[bucket];
 			op_state.have_build_cursor = true;
+			while (op_state.build_row_idx != HASH_JOIN_INVALID_ROW &&
+				salts[op_state.build_row_idx] != op_state.probe_salt)
+				op_state.build_row_idx = links[op_state.build_row_idx];
 		}
 		while (op_state.build_row_idx != HASH_JOIN_INVALID_ROW)
 		{
 			const uint32_t build_row_idx = op_state.build_row_idx;
 			op_state.build_row_idx = links[build_row_idx];
+			while (op_state.build_row_idx != HASH_JOIN_INVALID_ROW &&
+				salts[op_state.build_row_idx] != op_state.probe_salt)
+				op_state.build_row_idx = links[op_state.build_row_idx];
 			const uint8_t *build_key_row = TupleDataCollectionGetRowConst(build_keys, build_row_idx);
 			if (MatchGroupLayouts(build_key_layout, build_keys, build_key_row, probe_layout, in, op_state.probe_row_idx))
 			{
 				++matched_rows;
-				const uint8_t *build_payload_row = TupleDataCollectionGetRowConst(build_rows, build_row_idx);
-				CopyRowByMapping(in,
-					op_state.probe_row_idx,
-					build_row_layout,
-					build_rows,
-					build_payload_row,
-					right_columns_by_slot,
-					output_columns,
-					output_column_count,
-					out,
-					out.count);
-				++out.count;
-				if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+				matched_probe_rows[batch_count] = op_state.probe_row_idx;
+				matched_build_rows[batch_count] = TupleDataCollectionGetRowConst(build_rows, build_row_idx);
+				++batch_count;
+				if (out.count + batch_count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 					break;
 			}
+		}
+		if (batch_count > 0)
+		{
+			CopyRowsByMappingBatch(in,
+				matched_probe_rows,
+				build_row_layout,
+				build_rows,
+				matched_build_rows,
+				right_columns_by_slot,
+				output_columns,
+				output_column_count,
+				out,
+				out.count,
+				batch_count);
+			out.count += batch_count;
 		}
 		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 			break;
@@ -965,6 +1020,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		op_state.current_input_drained = out.count > 0;
 		op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
 		op_state.have_build_cursor = false;
+		op_state.probe_salt = 0;
 	}
 	if (out.count > 0 && pg_volvec_trace_execution_path)
 		ereport(LOG,
