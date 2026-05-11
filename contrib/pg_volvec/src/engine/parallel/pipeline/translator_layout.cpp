@@ -12,6 +12,18 @@ namespace pg_volvec {
 namespace pipeline {
 namespace translator_detail {
 
+static bool
+UseInt32CharDecodeForColumn(Oid type_oid, int32 typmod)
+{
+	if (type_oid == CHAROID)
+		return true;
+	if (type_oid != BPCHAROID)
+		return false;
+	if (typmod < VARHDRSZ)
+		return false;
+	return (typmod - VARHDRSZ) == 1;
+}
+
 bool
 TryBuildPerfectHashSpec(const std::vector<ColumnRef> &group_cols,
 			     const std::vector<ColumnRef> &input_cols,
@@ -538,6 +550,11 @@ BuildSeqScanColumns(Oid relid,
 		switch (attr->atttypid)
 		{
 			case BPCHAROID:
+				cs.decode_kind = UseInt32CharDecodeForColumn(attr->atttypid, attr->atttypmod) ?
+					ColumnDecodeKind::INT32_CHAR :
+					ColumnDecodeKind::STRING_REF;
+				cs.chunk_slot = (cs.decode_kind == ColumnDecodeKind::INT32_CHAR) ? i32++ : i32++;
+				break;
 			case CHAROID:
 				cs.decode_kind = ColumnDecodeKind::INT32_CHAR;
 				cs.chunk_slot = i32++;
