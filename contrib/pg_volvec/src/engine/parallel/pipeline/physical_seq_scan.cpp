@@ -141,6 +141,15 @@ ResolveFilterConstPtr(const FilterStep &step, const char *string_consts)
 	return string_consts + step.const_offset;
 }
 
+static inline uint16_t
+RequiredFilterBoolRegs(const FilterExprDesc *exprs, uint16_t n_exprs)
+{
+	uint16_t max_reg = 0;
+	for (uint16_t expr_idx = 0; expr_idx < n_exprs; ++expr_idx)
+		max_reg = std::max<uint16_t>(max_reg, static_cast<uint16_t>(exprs[expr_idx].output_bool_reg + 1));
+	return max_reg;
+}
+
 static inline bool
 EvalFilterStep(const FilterStep &step,
 	       const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk,
@@ -208,11 +217,18 @@ EvalFilterStep(const FilterStep &step,
 			if (!filter_chunk.nulls[step.left_idx][0])
 			{
 				const VecStringRef &ref = filter_chunk.string_columns[step.left_idx][0];
-				const char *lhs = filter_chunk.get_string_ptr(ref);
 				const char *rhs = ResolveFilterConstPtr(step, string_consts);
-				result = (lhs != nullptr || ref.len == 0) && rhs != nullptr &&
-					ref.len >= step.const_len &&
-					(step.const_len == 0 || std::memcmp(lhs, rhs, step.const_len) == 0);
+				result = rhs != nullptr && ref.len >= step.const_len;
+				if (result && step.const_len != 0)
+				{
+					if (step.const_len <= sizeof(ref.prefix))
+						result = std::memcmp(&ref.prefix, rhs, step.const_len) == 0;
+					else
+					{
+						const char *lhs = filter_chunk.get_string_ptr(ref);
+						result = lhs != nullptr && std::memcmp(lhs, rhs, step.const_len) == 0;
+					}
+				}
 			}
 			break;
 		}
@@ -648,6 +664,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	const char *filter_string_consts = DsaPointerIsValid(filter_string_consts_dp_)
 		? static_cast<const char *>(dsa_get_address(global.dsa, filter_string_consts_dp_))
 		: nullptr;
+	const uint16_t required_bool_regs = filter_exprs != nullptr ?
+		RequiredFilterBoolRegs(filter_exprs, n_filter_exprs_) : 0;
 	if (n_filter_inputs_ > 0 && filter_inputs == nullptr)
 		elog(ERROR, "pg_volvec: PhysicalSeqScan filter_inputs_dp not published");
 	if (n_filter_exprs_ > 0 && filter_exprs == nullptr)
@@ -815,9 +833,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(filter_start);
 			bool pass = true;
-			std::fill(local.filter_bool_values,
-				  local.filter_bool_values + filter_bool_regs_,
-				  static_cast<uint8_t>(0));
+			if (required_bool_regs > 0)
+				std::memset(local.filter_bool_values, 0, required_bool_regs * sizeof(local.filter_bool_values[0]));
 			for (uint16_t expr_idx = 0; expr_idx < n_filter_exprs_; ++expr_idx)
 			{
 				const FilterExprDesc &expr = filter_exprs[expr_idx];

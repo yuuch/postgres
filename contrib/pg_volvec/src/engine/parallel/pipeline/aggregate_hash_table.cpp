@@ -31,6 +31,10 @@ extern "C" {
 
 #include <cstring>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "tuple_data_ops.hpp"
 
 namespace pg_volvec {
@@ -155,6 +159,50 @@ ProbeVectorAppend(ProbeVector &vec,
 	else if (EntryValueSalt(entry_value) == wanted_salt)
 		vec.salt_match_mask |= static_cast<uint16_t>(1u << lane);
 }
+
+#if defined(__aarch64__)
+static inline uint8_t
+NeonMaskEqU64x2(uint64x2_t cmp)
+{
+	uint8_t mask = 0;
+	if (vgetq_lane_u64(cmp, 0) == UINT64_MAX)
+		mask |= 1u << 0;
+	if (vgetq_lane_u64(cmp, 1) == UINT64_MAX)
+		mask |= 1u << 1;
+	return mask;
+}
+
+static inline void
+ProbeVectorFinalizeMasks(ProbeVector &vec, const uint16_t *wanted_salts)
+{
+	vec.empty_mask = 0;
+	vec.salt_match_mask = 0;
+	uint16_t lane = 0;
+	for (; lane + 2 <= vec.count; lane += 2)
+	{
+		const uint64_t values[2] = {vec.entry_value[lane], vec.entry_value[lane + 1]};
+		const uint64_t wanted[2] = {
+			static_cast<uint64_t>(wanted_salts[lane]) << 48,
+			static_cast<uint64_t>(wanted_salts[lane + 1]) << 48,
+		};
+		const uint64x2_t loaded = vld1q_u64(values);
+		const uint64x2_t empty_cmp = vceqq_u64(loaded, vdupq_n_u64(AHT_EMPTY_ENTRY_VALUE));
+		const uint64x2_t salt_cmp = vceqq_u64(
+			vandq_u64(loaded, vdupq_n_u64(UINT64CONST(0xFFFF000000000000))),
+			vld1q_u64(wanted));
+		vec.empty_mask |= static_cast<uint16_t>(NeonMaskEqU64x2(empty_cmp) << lane);
+		vec.salt_match_mask |= static_cast<uint16_t>(NeonMaskEqU64x2(salt_cmp) << lane);
+	}
+	for (; lane < vec.count; ++lane)
+	{
+		const uint64_t entry_value = vec.entry_value[lane];
+		if (EntryValueIsEmpty(entry_value))
+			vec.empty_mask |= static_cast<uint16_t>(1u << lane);
+		else if (EntryValueSalt(entry_value) == wanted_salts[lane])
+			vec.salt_match_mask |= static_cast<uint16_t>(1u << lane);
+	}
+}
+#endif
 
 static bool FindOrInsertLocked(AggregateHashTable *aht,
                                TupleDataCollection *tdc,
@@ -460,6 +508,7 @@ AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
 			while (pos < active_count)
 			{
 				ProbeVector vec;
+				uint16_t wanted_salts[ProbeVector::kWidth];
 				ProbeVectorInit(vec);
 				while (pos < active_count && vec.count < ProbeVector::kWidth)
 				{
@@ -470,11 +519,16 @@ AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
 						         errmsg("pg_volvec: AggregateHashTable full (capacity=%u)",
 						                aht->capacity)));
 					const uint32_t slot = current_slot[input_idx];
+					const uint16_t lane = vec.count;
 					ProbeVectorAppend(vec,
 						input_idx,
 						aht->entries[slot].value,
 						probe_meta[input_idx].salt);
+					wanted_salts[lane] = probe_meta[input_idx].salt;
 				}
+				#if defined(__aarch64__)
+				ProbeVectorFinalizeMasks(vec, wanted_salts);
+				#endif
 
 				uint16_t match_count = 0;
 				for (uint16_t lane = 0; lane < vec.count; ++lane)

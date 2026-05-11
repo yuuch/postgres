@@ -284,29 +284,42 @@ EnsureJoinGlobalCapacity(ExecCtx &ctx,
 }
 
 static void
+BuildRightColumnsBySlot(const TupleDataLayout *right_layout,
+	                const TdcColumnDesc **right_columns_by_slot)
+{
+	std::fill_n(right_columns_by_slot, 16, nullptr);
+	for (uint16_t col_idx = 0; col_idx < right_layout->column_count; ++col_idx)
+	{
+		const TdcColumnDesc &col = right_layout->columns[col_idx];
+		if (col.src_col_idx >= 16)
+			elog(ERROR, "pg_volvec: hash join right payload slot %u out of range",
+			     static_cast<unsigned>(col.src_col_idx));
+		right_columns_by_slot[col.src_col_idx] = &col;
+	}
+}
+
+static void
 CopyRowByMapping(const PipelineChunk &left_chunk,
 	           uint16_t left_row_idx,
 	           const TupleDataLayout *right_layout,
 	           const TupleDataCollection *right_tdc,
 	           const uint8_t *right_row,
+	           const TdcColumnDesc *const *right_columns_by_slot,
 	           const HashJoinOutputColumnDesc *output_columns,
 	           uint16_t output_column_count,
 	           PipelineChunk &out,
 	           uint16_t out_row_idx)
 {
-	auto find_right_col = [right_layout](uint16_t src_col_idx) -> const TdcColumnDesc & {
-		for (uint16_t col_idx = 0; col_idx < right_layout->column_count; ++col_idx)
-		{
-			const TdcColumnDesc &col = right_layout->columns[col_idx];
-			if (col.src_col_idx == src_col_idx)
-				return col;
-		}
-		elog(ERROR, "pg_volvec: hash join output column mapping missing right payload column");
-	};
+	Assert(right_columns_by_slot != nullptr);
 
 	for (uint16_t i = 0; i < output_column_count; ++i)
 	{
 		const HashJoinOutputColumnDesc &desc = output_columns[i];
+		const TdcColumnDesc *right_col = desc.side == HashJoinOutputSide::RIGHT
+			? right_columns_by_slot[desc.input_chunk_slot]
+			: nullptr;
+		if (desc.side == HashJoinOutputSide::RIGHT && right_col == nullptr)
+			elog(ERROR, "pg_volvec: hash join output column mapping missing right payload column");
 		switch (desc.decode_kind)
 		{
 			case ColumnDecodeKind::INT32_CHAR:
@@ -317,9 +330,8 @@ CopyRowByMapping(const PipelineChunk &left_chunk,
 						left_chunk.int32_columns[desc.input_chunk_slot][left_row_idx];
 				else
 				{
-					const TdcColumnDesc &col = find_right_col(desc.input_chunk_slot);
 					int32_t value;
-					std::memcpy(&value, right_row + col.offset, sizeof(value));
+					std::memcpy(&value, right_row + right_col->offset, sizeof(value));
 					out.int32_columns[desc.output_chunk_slot][out_row_idx] = value;
 				}
 				break;
@@ -330,9 +342,8 @@ CopyRowByMapping(const PipelineChunk &left_chunk,
 						left_chunk.int64_columns[desc.input_chunk_slot][left_row_idx];
 				else
 				{
-					const TdcColumnDesc &col = find_right_col(desc.input_chunk_slot);
 					int64_t value;
-					std::memcpy(&value, right_row + col.offset, sizeof(value));
+					std::memcpy(&value, right_row + right_col->offset, sizeof(value));
 					out.int64_columns[desc.output_chunk_slot][out_row_idx] = value;
 				}
 				break;
@@ -342,9 +353,8 @@ CopyRowByMapping(const PipelineChunk &left_chunk,
 						left_chunk.double_columns[desc.input_chunk_slot][left_row_idx];
 				else
 				{
-					const TdcColumnDesc &col = find_right_col(desc.input_chunk_slot);
 					double value;
-					std::memcpy(&value, right_row + col.offset, sizeof(value));
+					std::memcpy(&value, right_row + right_col->offset, sizeof(value));
 					out.double_columns[desc.output_chunk_slot][out_row_idx] = value;
 				}
 				break;
@@ -360,8 +370,7 @@ CopyRowByMapping(const PipelineChunk &left_chunk,
 				}
 				else
 				{
-					const TdcColumnDesc &col = find_right_col(desc.input_chunk_slot);
-					std::memcpy(&ref, right_row + col.offset, sizeof(ref));
+					std::memcpy(&ref, right_row + right_col->offset, sizeof(ref));
 					ptr = VecStringRefDataPtr(ref,
 						right_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(right_tdc)) : nullptr);
 				}
@@ -878,6 +887,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		: (desc_ != nullptr && DsaPointerIsValid(desc_->body.hash_join.output_columns)
 			? static_cast<const HashJoinOutputColumnDesc *>(dsa_get_address(ctx.dsa, desc_->body.hash_join.output_columns))
 			: nullptr);
+	const TdcColumnDesc *right_columns_by_slot[16];
 	uint16_t output_column_count = output_column_count_ > 0 ? output_column_count_ :
 		(desc_ != nullptr ? desc_->body.hash_join.output_column_count : 0);
 	PgVector<HashJoinOutputColumnDesc> fallback_output_columns;
@@ -890,6 +900,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	}
 	if (output_columns == nullptr || output_column_count == 0)
 		elog(ERROR, "pg_volvec: hash join probe missing output column mapping");
+	BuildRightColumnsBySlot(build_row_layout, right_columns_by_slot);
 	if (!DsaPointerIsValid(payload->hash_table_dp) || !DsaPointerIsValid(payload->hash_links_dp))
 		return OperatorResultType::NEED_MORE_INPUT;
 
@@ -933,6 +944,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 					build_row_layout,
 					build_rows,
 					build_payload_row,
+					right_columns_by_slot,
 					output_columns,
 					output_column_count,
 					out,

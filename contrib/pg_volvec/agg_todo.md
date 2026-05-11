@@ -92,9 +92,9 @@
 - [x] sink 改 batch lookup（partition-local mini-batch；AHT 内部 batch find-or-insert 复用同一 salt/step/match 逻辑）
 - [x] prefetch loop（batch metadata prepass）：算 slot/step/salt、touch 首探测 entry
 - [x] main lookup loop 首槽 fast path：empty/salt-hit 直接处理，collision 才进入完整 probe walk
-- [x] main lookup loop 多槽 vector salt compare → compare_vector / empty_vector
+- [~] main lookup loop 多槽 vector salt compare → compare_vector / empty_vector（当前仅 Apple Silicon/ARM64 上有 2-lane NEON compare/mask；不是完整 probe SIMD）
 - [x] batch group compare：layout-driven 多候选比较（无 Q1 layout 特判）
-- [x] batch group compare 多候选向量化
+- [~] batch group compare 多候选向量化（当前仅固定宽度、无字符串布局上的 ARM64 NEON fast path；通用路径仍为标量）
 - [x] batch update（gather-update on row_ids）
 
 ### P3.2 哈希函数升级
@@ -107,7 +107,7 @@
 - [x] `UpdateAggregatesBatch()` API：generic layout-driven grouped-delta，避免逐行重复写 accumulator
 - [x] generic grouped-delta batch update：chunk 内按 canonical row 合并 delta，减少重复 accumulator 写
 - [x] update 改 `(tdc_base, row_width, row_ids, src row_indices, n)` gather
-- [x] 编译器 SIMD 友好循环（固定数组 + unrolled/vectorizable gathers；不写 ISA-specific Q1 offsets）
+- [ ] 编译器 SIMD 友好循环（固定数组 + unrolled/vectorizable gathers；不写 ISA-specific Q1 offsets）
 
 预期：HashAgg 整体 1.5-2×
 

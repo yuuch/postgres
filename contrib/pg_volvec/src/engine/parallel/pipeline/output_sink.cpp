@@ -28,74 +28,130 @@ namespace pipeline {
 
 namespace {
 
-static Datum
-EncodeColumn(const ColumnSchema &col,
-             const TupleDataLayout *layout,
-             const PipelineChunk &in,
-             uint16_t row)
+static inline bool
+LayoutHasStringColumns(const TupleDataLayout *layout)
 {
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
+			return true;
+	}
+	return false;
+}
+
+static inline bool
+ResolveRowValueLocation(const TupleDataLayout *layout,
+	                    uint16_t chunk_slot,
+	                    const TdcColumnDesc *&column,
+	                    const TdcAggregateDesc *&aggregate)
+{
+	column = nullptr;
+	aggregate = nullptr;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		if (layout->columns[i].src_col_idx == chunk_slot)
+		{
+			column = &layout->columns[i];
+			return true;
+		}
+	}
+	if (chunk_slot >= layout->column_count)
+	{
+		const uint16_t agg_idx = chunk_slot - layout->column_count;
+		if (agg_idx < layout->aggregate_count)
+		{
+			aggregate = &layout->aggregates[agg_idx];
+			return true;
+		}
+	}
+	return false;
+}
+
+static inline Datum
+EncodeStringDatum(const ColumnSchema &col, const char *ptr, uint32_t len)
+{
+	if (ptr == nullptr)
+		elog(ERROR, "pg_volvec: string output missing arena backing");
+	if (col.type_oid == TEXTOID)
+		return PointerGetDatum(cstring_to_text_with_len(ptr, len));
+	if (col.type_oid == VARCHAROID)
+		return DirectFunctionCall3(varcharin,
+		                           CStringGetDatum(pnstrdup(ptr, len)),
+		                           ObjectIdGetDatum(InvalidOid),
+		                           Int32GetDatum(col.typmod));
+	if (col.type_oid == BPCHAROID)
+		return DirectFunctionCall3(bpcharin,
+		                           CStringGetDatum(pnstrdup(ptr, len)),
+		                           ObjectIdGetDatum(InvalidOid),
+		                           Int32GetDatum(col.typmod));
+	elog(ERROR, "pg_volvec: string decode_kind unsupported for output type %u",
+	     col.type_oid);
+	return (Datum) 0;
+}
+
+static Datum
+EncodeColumnFromRow(const ColumnSchema &col,
+	                const TupleDataLayout *layout,
+	                const TupleDataCollection *tdc,
+	                const uint8_t *row_ptr)
+{
+	const TdcColumnDesc *layout_col = nullptr;
+	const TdcAggregateDesc *layout_agg = nullptr;
+	if (!ResolveRowValueLocation(layout, col.chunk_slot, layout_col, layout_agg))
+		elog(ERROR, "pg_volvec: output chunk slot %u not present in row layout",
+		     static_cast<unsigned>(col.chunk_slot));
+
 	switch (col.decode_kind)
 	{
 		case ColumnDecodeKind::INT32_CHAR:
-			return CharGetDatum(static_cast<char>(in.int32_columns[col.chunk_slot][row]));
 		case ColumnDecodeKind::INT32_INT4:
-			return Int32GetDatum(in.int32_columns[col.chunk_slot][row]);
 		case ColumnDecodeKind::INT32_DATE:
-			return DateADTGetDatum(static_cast<DateADT>(in.int32_columns[col.chunk_slot][row]));
+		{
+			if (layout_col == nullptr)
+				elog(ERROR, "pg_volvec: int32 output slot %u missing row column",
+				     static_cast<unsigned>(col.chunk_slot));
+			int32_t value;
+			std::memcpy(&value, row_ptr + layout_col->offset, sizeof(value));
+			if (col.decode_kind == ColumnDecodeKind::INT32_CHAR)
+				return CharGetDatum(static_cast<char>(value));
+			if (col.decode_kind == ColumnDecodeKind::INT32_DATE)
+				return DateADTGetDatum(static_cast<DateADT>(value));
+			return Int32GetDatum(value);
+		}
 		case ColumnDecodeKind::INT64_INT8:
-			return Int64GetDatum(in.int64_columns[col.chunk_slot][row]);
+		{
+			const uint16_t offset = layout_col != nullptr ? layout_col->offset : layout_agg->offset;
+			int64_t value;
+			std::memcpy(&value, row_ptr + offset, sizeof(value));
+			return Int64GetDatum(value);
+		}
 		case ColumnDecodeKind::DOUBLE_FLOAT8:
-			return Float8GetDatum(in.double_columns[col.chunk_slot][row]);
+		{
+			if (layout_col == nullptr)
+				elog(ERROR, "pg_volvec: float8 output slot %u missing row column",
+				     static_cast<unsigned>(col.chunk_slot));
+			double value;
+			std::memcpy(&value, row_ptr + layout_col->offset, sizeof(value));
+			return Float8GetDatum(value);
+		}
 		case ColumnDecodeKind::STRING_REF:
 		{
-			const VecStringRef &ref = in.string_columns[col.chunk_slot][row];
-			const char *ptr = in.get_string_ptr(ref);
-			if (ptr == nullptr)
-				elog(ERROR, "pg_volvec: string output missing arena backing");
-			if (col.type_oid == TEXTOID)
-				return PointerGetDatum(cstring_to_text_with_len(ptr, ref.len));
-			if (col.type_oid == VARCHAROID)
-				return DirectFunctionCall3(varcharin,
-				                           CStringGetDatum(pnstrdup(ptr, ref.len)),
-				                           ObjectIdGetDatum(InvalidOid),
-				                           Int32GetDatum(col.typmod));
-			if (col.type_oid == BPCHAROID)
-				return DirectFunctionCall3(bpcharin,
-				                           CStringGetDatum(pnstrdup(ptr, ref.len)),
-				                           ObjectIdGetDatum(InvalidOid),
-				                           Int32GetDatum(col.typmod));
-			elog(ERROR, "pg_volvec: string decode_kind unsupported for output type %u",
-			     col.type_oid);
-			return (Datum) 0;
+			if (layout_col == nullptr)
+				elog(ERROR, "pg_volvec: string output slot %u missing row column",
+				     static_cast<unsigned>(col.chunk_slot));
+			VecStringRef ref;
+			std::memcpy(&ref, row_ptr + layout_col->offset, sizeof(ref));
+			const char *ptr = VecStringRefDataPtr(ref,
+				tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
+			return EncodeStringDatum(col, ptr, ref.len);
 		}
 		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
 		{
-			/* Projection output columns may use sparse chunk slots. Resolve the
-			 * numeric scale through TupleDataLayout::src_col_idx instead of
-			 * assuming chunk_slot == logical output column index. */
-			const uint16_t slot = col.chunk_slot;
-			int16_t scale = 0;
-			bool found = false;
-			for (uint16_t i = 0; i < layout->column_count; ++i)
-			{
-				if (layout->columns[i].src_col_idx == slot)
-				{
-					scale = layout->columns[i].numeric_scale;
-					found = true;
-					break;
-				}
-			}
-			if (!found && slot >= layout->column_count &&
-			    slot - layout->column_count < layout->aggregate_count)
-			{
-				scale = layout->aggregates[slot - layout->column_count].numeric_scale;
-				found = true;
-			}
-			if (!found)
-				elog(ERROR, "pg_volvec: numeric output slot %u not present in layout",
-				     static_cast<unsigned>(slot));
-			return NumericGetDatum(
-				int64_div_fast_to_numeric(in.int64_columns[slot][row], scale));
+			const uint16_t offset = layout_col != nullptr ? layout_col->offset : layout_agg->offset;
+			const int16_t scale = layout_col != nullptr ? layout_col->numeric_scale : layout_agg->numeric_scale;
+			int64_t value;
+			std::memcpy(&value, row_ptr + offset, sizeof(value));
+			return NumericGetDatum(int64_div_fast_to_numeric(value, scale));
 		}
 		case ColumnDecodeKind::NONE:
 			elog(ERROR, "pg_volvec: output column decode_kind=NONE invalid for sink");
@@ -128,6 +184,12 @@ CopyTdcRow(const TupleDataLayout *layout,
 	       TupleDataCollection *dst_tdc,
 	       uint8_t *dst_row)
 {
+	if (!LayoutHasStringColumns(layout))
+	{
+		std::memcpy(dst_row, src_row, layout->row_width);
+		return;
+	}
+
 	for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
 	{
 		const TdcColumnDesc &col = layout->columns[col_idx];
@@ -368,59 +430,17 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 	 * ('T') and libpq drops every data row. */
 	dest_->rStartup(dest_, operation_, tupdesc_);
 
-	/* Stage one TDC row at a time into a single-row PipelineChunk so we can
-	 * reuse Gather + EncodeColumn (both consume PipelineChunk-shaped input).
-	 * One-row staging is intentional for v1: avoids allocating a 1024-row
-	 * chunk just to encode-and-discard, and matches the row-at-a-time
-	 * DestReceiver contract. */
-	auto staging = std::make_unique<PipelineChunk>();
-	staging->reset();
-
 	const uint32_t row_count = pg_atomic_read_u32(&tdc->row_count);
 	for (uint32_t i = 0; i < row_count; ++i)
 	{
 		const uint8_t *row_ptr = TupleDataCollectionGetRowConst(tdc, i);
-
-		staging->reset();
-		Gather(layout, tdc, row_ptr, *staging, 0);
-		staging->count = 1;
 
 		ExecClearTuple(slot);
 		for (uint16_t c = 0; c < natts; ++c)
 		{
 			const ColumnSchema &col = schema->columns[c];
 
-			/* AVG_NUMERIC needs the count half (row_ptr+offset+8); Gather
-			 * only places the sum in the chunk slot, so we bypass Encode
-			 * and compute sum/count at scale=2 directly. */
-			if (col.decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
-			    col.chunk_slot >= layout->column_count)
-			{
-				const uint16_t a = col.chunk_slot - layout->column_count;
-				if (a < layout->aggregate_count &&
-				    layout->aggregates[a].kind == TdcAggKind::AVG_NUMERIC)
-				{
-					/* Scatter (tuple_data_ops.cpp) finalizes AVG_NUMERIC at
-					 * the HashAgg→Order boundary by dividing sum/count and
-					 * writing the scale=2 quotient into row_ptr+agg.offset;
-					 * the count tail at +8 is intentionally NOT propagated
-					 * past HashAgg's TDC. So here we read the finalized
-					 * scaled-int64 directly and emit at scale=2. NULL is
-					 * unrecoverable here (count discarded upstream) and Q1
-					 * group-by guarantees count >= 1, so we surface 0 rather
-					 * than NULL on the (impossible-for-Q1) zero case. */
-					int64 avg_scaled;
-					std::memcpy(&avg_scaled,
-					            row_ptr + layout->aggregates[a].offset,
-					            sizeof(int64));
-					slot->tts_values[c] = NumericGetDatum(
-						int64_div_fast_to_numeric(avg_scaled, 2));
-					slot->tts_isnull[c] = false;
-					continue;
-				}
-			}
-
-			slot->tts_values[c] = EncodeColumn(col, layout, *staging, 0);
+			slot->tts_values[c] = EncodeColumnFromRow(col, layout, tdc, row_ptr);
 			slot->tts_isnull[c] = false;
 
 			/* Q1 stores l_returnflag/l_linestatus as INT32_CHAR (single byte)

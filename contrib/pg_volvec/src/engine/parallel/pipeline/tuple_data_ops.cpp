@@ -27,11 +27,19 @@ extern "C" {
 
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace pg_volvec {
 namespace pipeline {
 
 namespace {
+
+static constexpr uint16_t AGG_DELTA_HASH_SLOTS = PIPELINE_DEFAULT_CHUNK_SIZE * 2;
+static constexpr uint16_t AGG_DELTA_EMPTY_SLOT = UINT16_MAX;
 
 static inline uint64_t
 Mix64(uint64_t v)
@@ -66,6 +74,65 @@ AddInt64At(uint8_t *row_ptr, uint16_t offset, int64_t add)
 	acc += add;
 	std::memcpy(row_ptr + offset, &acc, sizeof(acc));
 }
+
+static inline int64_t
+ReadInt64At(const uint8_t *row_ptr, uint16_t offset)
+{
+	int64_t value;
+	std::memcpy(&value, row_ptr + offset, sizeof(value));
+	return value;
+}
+
+static inline bool
+LayoutHasStringColumns(const TupleDataLayout *layout)
+{
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
+			return true;
+	}
+	return false;
+}
+
+static inline uint16_t
+LayoutGroupRegionWidth(const TupleDataLayout *layout)
+{
+	uint16_t width = 0;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		const TdcColumnDesc &col = layout->columns[i];
+		width = std::max<uint16_t>(width, col.offset + col.width);
+	}
+	return width;
+}
+
+#if defined(__aarch64__)
+static inline uint8_t
+NeonLaneMaskEqU32(uint32x4_t cmp)
+{
+	uint8_t mask = 0;
+	if (vgetq_lane_u32(cmp, 0) == UINT32_MAX)
+		mask |= 1u << 0;
+	if (vgetq_lane_u32(cmp, 1) == UINT32_MAX)
+		mask |= 1u << 1;
+	if (vgetq_lane_u32(cmp, 2) == UINT32_MAX)
+		mask |= 1u << 2;
+	if (vgetq_lane_u32(cmp, 3) == UINT32_MAX)
+		mask |= 1u << 3;
+	return mask;
+}
+
+static inline uint8_t
+NeonLaneMaskEqU64(uint64x2_t cmp)
+{
+	uint8_t mask = 0;
+	if (vgetq_lane_u64(cmp, 0) == UINT64_MAX)
+		mask |= 1u << 0;
+	if (vgetq_lane_u64(cmp, 1) == UINT64_MAX)
+		mask |= 1u << 1;
+	return mask;
+}
+#endif
 
 struct AggDelta
 {
@@ -122,22 +189,35 @@ UpdateAggregatesBatchGroupedGeneric(const TupleDataLayout *layout,
                                     uint16_t count)
 {
 	AggDelta deltas[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint16_t delta_slots[AGG_DELTA_HASH_SLOTS];
 	uint16_t delta_count = 0;
+	std::fill_n(delta_slots, AGG_DELTA_HASH_SLOTS, AGG_DELTA_EMPTY_SLOT);
 
 	for (uint16_t i = 0; i < count; ++i)
 	{
 		Assert(row_ptrs[i] != nullptr);
 		Assert(row_indices[i] < chunk.count);
-		uint16_t delta_idx = 0;
-		for (; delta_idx < delta_count; ++delta_idx)
+		const uintptr_t row_key = reinterpret_cast<uintptr_t>(row_ptrs[i]) >> 3;
+		uint16_t delta_idx = AGG_DELTA_EMPTY_SLOT;
+		uint16_t slot = static_cast<uint16_t>(row_key & (AGG_DELTA_HASH_SLOTS - 1));
+		for (;;)
 		{
-			if (deltas[delta_idx].row_ptr == row_ptrs[i])
+			const uint16_t existing = delta_slots[slot];
+			if (existing == AGG_DELTA_EMPTY_SLOT)
+			{
+				delta_idx = delta_count;
+				deltas[delta_idx] = AggDelta{};
+				deltas[delta_idx].row_ptr = row_ptrs[i];
+				delta_slots[slot] = delta_idx;
+				++delta_count;
 				break;
-		}
-		if (delta_idx == delta_count)
-		{
-			deltas[delta_idx].row_ptr = row_ptrs[i];
-			++delta_count;
+			}
+			if (deltas[existing].row_ptr == row_ptrs[i])
+			{
+				delta_idx = existing;
+				break;
+			}
+			slot = static_cast<uint16_t>((slot + 1) & (AGG_DELTA_HASH_SLOTS - 1));
 		}
 		AccumulateAggDelta(layout, deltas[delta_idx], chunk, row_indices[i]);
 	}
@@ -157,23 +237,35 @@ UpdateAggregatesGatherGroupedGeneric(const TupleDataLayout *layout,
 {
 	AggDelta deltas[PIPELINE_DEFAULT_CHUNK_SIZE];
 	uint32_t delta_row_indices[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint16_t delta_slots[AGG_DELTA_HASH_SLOTS];
 	uint16_t delta_count = 0;
+	std::fill_n(delta_slots, AGG_DELTA_HASH_SLOTS, AGG_DELTA_EMPTY_SLOT);
 
 	for (uint16_t i = 0; i < count; ++i)
 	{
 		Assert(row_indices[i] < chunk.count);
 		const uint32_t canonical_idx = canonical_row_indices[i];
-		uint16_t delta_idx = 0;
-		for (; delta_idx < delta_count; ++delta_idx)
+		uint16_t delta_idx = AGG_DELTA_EMPTY_SLOT;
+		uint16_t slot = static_cast<uint16_t>(canonical_idx & (AGG_DELTA_HASH_SLOTS - 1));
+		for (;;)
 		{
-			if (delta_row_indices[delta_idx] == canonical_idx)
+			const uint16_t existing = delta_slots[slot];
+			if (existing == AGG_DELTA_EMPTY_SLOT)
+			{
+				delta_idx = delta_count;
+				deltas[delta_idx] = AggDelta{};
+				delta_row_indices[delta_idx] = canonical_idx;
+				deltas[delta_idx].row_ptr = tdc_base + static_cast<size_t>(canonical_idx) * row_width;
+				delta_slots[slot] = delta_idx;
+				++delta_count;
 				break;
-		}
-		if (delta_idx == delta_count)
-		{
-			delta_row_indices[delta_idx] = canonical_idx;
-			deltas[delta_idx].row_ptr = tdc_base + static_cast<size_t>(canonical_idx) * row_width;
-			++delta_count;
+			}
+			if (delta_row_indices[existing] == canonical_idx)
+			{
+				delta_idx = existing;
+				break;
+			}
+			slot = static_cast<uint16_t>((slot + 1) & (AGG_DELTA_HASH_SLOTS - 1));
 		}
 		AccumulateAggDelta(layout, deltas[delta_idx], chunk, row_indices[i]);
 	}
@@ -543,6 +635,58 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 	if (row_layout->column_count != chunk_layout->column_count)
 		return false;
 
+	if (!LayoutHasStringColumns(row_layout) && row_layout->column_count == 1)
+	{
+		const TdcColumnDesc &row_col = row_layout->columns[0];
+		const TdcColumnDesc &chunk_col = chunk_layout->columns[0];
+		if (row_col.kind != chunk_col.kind || row_col.width != chunk_col.width)
+			return false;
+		Assert(chunk_col.src_col_idx < 16);
+		switch (row_col.kind)
+		{
+			case TdcColumnKind::INT32:
+			{
+				int32_t row_v;
+				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
+				return row_v == chunk.int32_columns[chunk_col.src_col_idx][row_idx];
+			}
+			case TdcColumnKind::INT64:
+			{
+				int64_t row_v;
+				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
+				return row_v == chunk.int64_columns[chunk_col.src_col_idx][row_idx];
+			}
+			case TdcColumnKind::DOUBLE:
+			{
+				uint64_t row_v;
+				uint64_t chunk_v;
+				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
+				std::memcpy(&chunk_v, &chunk.double_columns[chunk_col.src_col_idx][row_idx], sizeof(chunk_v));
+				return row_v == chunk_v;
+			}
+			case TdcColumnKind::STRING_REF:
+				break;
+		}
+	}
+
+	if (!LayoutHasStringColumns(row_layout) && row_layout->column_count == 2 &&
+		row_layout->columns[0].kind == TdcColumnKind::INT32 &&
+		row_layout->columns[1].kind == TdcColumnKind::INT32 &&
+		chunk_layout->columns[0].kind == TdcColumnKind::INT32 &&
+		chunk_layout->columns[1].kind == TdcColumnKind::INT32)
+	{
+		const TdcColumnDesc &row_col0 = row_layout->columns[0];
+		const TdcColumnDesc &row_col1 = row_layout->columns[1];
+		const TdcColumnDesc &chunk_col0 = chunk_layout->columns[0];
+		const TdcColumnDesc &chunk_col1 = chunk_layout->columns[1];
+		int32_t row_v0;
+		int32_t row_v1;
+		std::memcpy(&row_v0, row_ptr + row_col0.offset, sizeof(row_v0));
+		std::memcpy(&row_v1, row_ptr + row_col1.offset, sizeof(row_v1));
+		return row_v0 == chunk.int32_columns[chunk_col0.src_col_idx][row_idx] &&
+			row_v1 == chunk.int32_columns[chunk_col1.src_col_idx][row_idx];
+	}
+
 	for (uint16_t i = 0; i < row_layout->column_count; ++i)
 	{
 		const TdcColumnDesc &row_col = row_layout->columns[i];
@@ -612,6 +756,110 @@ MatchGroupBatch(const TupleDataLayout *layout,
 	Assert(layout != nullptr && row_ptrs != nullptr && row_indices != nullptr && matches != nullptr);
 	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
 
+#if defined(__aarch64__)
+	if (!LayoutHasStringColumns(layout) && layout->column_count == 1)
+	{
+		const TdcColumnDesc &col = layout->columns[0];
+		if (col.kind == TdcColumnKind::INT32)
+		{
+			uint16_t i = 0;
+			for (; i + 4 <= count; i += 4)
+			{
+				uint32_t row_vals[4] = {};
+				uint32_t chunk_vals[4] = {};
+				uint8_t valid_mask = 0;
+				for (uint16_t lane = 0; lane < 4; ++lane)
+				{
+					const uint16_t idx = i + lane;
+					if (row_ptrs[idx] == nullptr)
+						continue;
+					int32_t row_v;
+					std::memcpy(&row_v, row_ptrs[idx] + col.offset, sizeof(row_v));
+					row_vals[lane] = static_cast<uint32_t>(row_v);
+					chunk_vals[lane] = static_cast<uint32_t>(chunk.int32_columns[col.src_col_idx][row_indices[idx]]);
+					valid_mask |= static_cast<uint8_t>(1u << lane);
+				}
+				const uint8_t match_mask = NeonLaneMaskEqU32(
+					vceqq_u32(vld1q_u32(row_vals), vld1q_u32(chunk_vals))) & valid_mask;
+				for (uint16_t lane = 0; lane < 4; ++lane)
+					matches[i + lane] = (match_mask & (1u << lane)) != 0;
+			}
+			for (; i < count; ++i)
+				matches[i] = row_ptrs[i] != nullptr && MatchGroup(layout, tdc, row_ptrs[i], chunk, row_indices[i]);
+			return;
+		}
+		if (col.kind == TdcColumnKind::INT64 || col.kind == TdcColumnKind::DOUBLE)
+		{
+			uint16_t i = 0;
+			for (; i + 2 <= count; i += 2)
+			{
+				uint64_t row_vals[2] = {};
+				uint64_t chunk_vals[2] = {};
+				uint8_t valid_mask = 0;
+				for (uint16_t lane = 0; lane < 2; ++lane)
+				{
+					const uint16_t idx = i + lane;
+					if (row_ptrs[idx] == nullptr)
+						continue;
+					std::memcpy(&row_vals[lane], row_ptrs[idx] + col.offset, sizeof(uint64_t));
+					if (col.kind == TdcColumnKind::INT64)
+						chunk_vals[lane] = static_cast<uint64_t>(chunk.int64_columns[col.src_col_idx][row_indices[idx]]);
+					else
+						std::memcpy(&chunk_vals[lane], &chunk.double_columns[col.src_col_idx][row_indices[idx]], sizeof(uint64_t));
+					valid_mask |= static_cast<uint8_t>(1u << lane);
+				}
+				const uint8_t match_mask = NeonLaneMaskEqU64(
+					vceqq_u64(vld1q_u64(row_vals), vld1q_u64(chunk_vals))) & valid_mask;
+				for (uint16_t lane = 0; lane < 2; ++lane)
+					matches[i + lane] = (match_mask & (1u << lane)) != 0;
+			}
+			for (; i < count; ++i)
+				matches[i] = row_ptrs[i] != nullptr && MatchGroup(layout, tdc, row_ptrs[i], chunk, row_indices[i]);
+			return;
+		}
+	}
+
+	if (!LayoutHasStringColumns(layout) && layout->column_count == 2 &&
+		layout->columns[0].kind == TdcColumnKind::INT32 &&
+		layout->columns[1].kind == TdcColumnKind::INT32)
+	{
+		const TdcColumnDesc &col0 = layout->columns[0];
+		const TdcColumnDesc &col1 = layout->columns[1];
+		uint16_t i = 0;
+		for (; i + 4 <= count; i += 4)
+		{
+			uint32_t row0[4] = {};
+			uint32_t row1[4] = {};
+			uint32_t chunk0[4] = {};
+			uint32_t chunk1[4] = {};
+			uint8_t valid_mask = 0;
+			for (uint16_t lane = 0; lane < 4; ++lane)
+			{
+				const uint16_t idx = i + lane;
+				if (row_ptrs[idx] == nullptr)
+					continue;
+				int32_t row_v0;
+				int32_t row_v1;
+				std::memcpy(&row_v0, row_ptrs[idx] + col0.offset, sizeof(row_v0));
+				std::memcpy(&row_v1, row_ptrs[idx] + col1.offset, sizeof(row_v1));
+				row0[lane] = static_cast<uint32_t>(row_v0);
+				row1[lane] = static_cast<uint32_t>(row_v1);
+				chunk0[lane] = static_cast<uint32_t>(chunk.int32_columns[col0.src_col_idx][row_indices[idx]]);
+				chunk1[lane] = static_cast<uint32_t>(chunk.int32_columns[col1.src_col_idx][row_indices[idx]]);
+				valid_mask |= static_cast<uint8_t>(1u << lane);
+			}
+			const uint32x4_t cmp0 = vceqq_u32(vld1q_u32(row0), vld1q_u32(chunk0));
+			const uint32x4_t cmp1 = vceqq_u32(vld1q_u32(row1), vld1q_u32(chunk1));
+			const uint8_t match_mask = NeonLaneMaskEqU32(vandq_u32(cmp0, cmp1)) & valid_mask;
+			for (uint16_t lane = 0; lane < 4; ++lane)
+				matches[i + lane] = (match_mask & (1u << lane)) != 0;
+		}
+		for (; i < count; ++i)
+			matches[i] = row_ptrs[i] != nullptr && MatchGroup(layout, tdc, row_ptrs[i], chunk, row_indices[i]);
+		return;
+	}
+#endif
+
 	for (uint16_t i = 0; i < count; ++i)
 		matches[i] = row_ptrs[i] != nullptr && MatchGroup(layout, tdc, row_ptrs[i], chunk, row_indices[i]);
 }
@@ -624,6 +872,9 @@ MatchGroupRow(const TupleDataLayout *layout,
               const uint8_t *row_b)
 {
 	Assert(layout != nullptr && row_a != nullptr && row_b != nullptr);
+
+	if (!LayoutHasStringColumns(layout))
+		return std::memcmp(row_a, row_b, LayoutGroupRegionWidth(layout)) == 0;
 
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
@@ -677,47 +928,22 @@ UpdateAggregates(const TupleDataLayout *layout,
 		switch (agg.kind)
 		{
 			case TdcAggKind::SUM_INT64:
-			{
-				Assert(agg.src_col_idx < 16);
-				int64_t add = chunk.int64_columns[agg.src_col_idx][row_idx];
-				int64_t acc;
-				std::memcpy(&acc, row_ptr + agg.offset, sizeof(acc));
-				acc += add;
-				std::memcpy(row_ptr + agg.offset, &acc, sizeof(acc));
-				break;
-			}
-			case TdcAggKind::COUNT_STAR:
-			{
-				int64_t acc;
-				std::memcpy(&acc, row_ptr + agg.offset, sizeof(acc));
-				acc += 1;
-				std::memcpy(row_ptr + agg.offset, &acc, sizeof(acc));
-				break;
-			}
 			case TdcAggKind::SUM_NUMERIC:
-			{
 				Assert(agg.src_col_idx < 16);
-				int64_t add = chunk.int64_columns[agg.src_col_idx][row_idx];
-				int64_t acc;
-				std::memcpy(&acc, row_ptr + agg.offset, sizeof(acc));
-				acc += add;
-				std::memcpy(row_ptr + agg.offset, &acc, sizeof(acc));
+				AddInt64At(row_ptr,
+				           agg.offset,
+				           chunk.int64_columns[agg.src_col_idx][row_idx]);
 				break;
-			}
+			case TdcAggKind::COUNT_STAR:
+				AddInt64At(row_ptr, agg.offset, 1);
+				break;
 			case TdcAggKind::AVG_NUMERIC:
-			{
 				Assert(agg.src_col_idx < 16);
-				int64_t add = chunk.int64_columns[agg.src_col_idx][row_idx];
-				int64_t acc_sum;
-				int64_t acc_cnt;
-				std::memcpy(&acc_sum, row_ptr + agg.offset, sizeof(acc_sum));
-				std::memcpy(&acc_cnt, row_ptr + agg.offset + 8, sizeof(acc_cnt));
-				acc_sum += add;
-				acc_cnt += 1;
-				std::memcpy(row_ptr + agg.offset, &acc_sum, sizeof(acc_sum));
-				std::memcpy(row_ptr + agg.offset + 8, &acc_cnt, sizeof(acc_cnt));
+				AddInt64At(row_ptr,
+				           agg.offset,
+				           chunk.int64_columns[agg.src_col_idx][row_idx]);
+				AddInt64At(row_ptr, agg.offset + 8, 1);
 				break;
-			}
 		}
 	}
 }
@@ -772,38 +998,13 @@ CombineAggregates(const TupleDataLayout *layout,
 		{
 			case TdcAggKind::SUM_INT64:
 			case TdcAggKind::COUNT_STAR:
-			{
-				int64_t dst_v;
-				int64_t src_v;
-				std::memcpy(&dst_v, dst_row + agg.offset, sizeof(dst_v));
-				std::memcpy(&src_v, src_row + agg.offset, sizeof(src_v));
-				dst_v += src_v;
-				std::memcpy(dst_row + agg.offset, &dst_v, sizeof(dst_v));
-				break;
-			}
 			case TdcAggKind::SUM_NUMERIC:
-			{
-				int64_t dst_v;
-				int64_t src_v;
-				std::memcpy(&dst_v, dst_row + agg.offset, sizeof(dst_v));
-				std::memcpy(&src_v, src_row + agg.offset, sizeof(src_v));
-				dst_v += src_v;
-				std::memcpy(dst_row + agg.offset, &dst_v, sizeof(dst_v));
+				AddInt64At(dst_row, agg.offset, ReadInt64At(src_row, agg.offset));
 				break;
-			}
 			case TdcAggKind::AVG_NUMERIC:
-			{
-				int64_t dst_sum, dst_cnt, src_sum, src_cnt;
-				std::memcpy(&dst_sum, dst_row + agg.offset, sizeof(dst_sum));
-				std::memcpy(&dst_cnt, dst_row + agg.offset + 8, sizeof(dst_cnt));
-				std::memcpy(&src_sum, src_row + agg.offset, sizeof(src_sum));
-				std::memcpy(&src_cnt, src_row + agg.offset + 8, sizeof(src_cnt));
-				dst_sum += src_sum;
-				dst_cnt += src_cnt;
-				std::memcpy(dst_row + agg.offset, &dst_sum, sizeof(dst_sum));
-				std::memcpy(dst_row + agg.offset + 8, &dst_cnt, sizeof(dst_cnt));
+				AddInt64At(dst_row, agg.offset, ReadInt64At(src_row, agg.offset));
+				AddInt64At(dst_row, agg.offset + 8, ReadInt64At(src_row, agg.offset + 8));
 				break;
-			}
 		}
 	}
 

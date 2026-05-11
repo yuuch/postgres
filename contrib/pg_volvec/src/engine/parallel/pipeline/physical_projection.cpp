@@ -5,38 +5,319 @@ extern "C" {
 #include "utils/elog.h"
 }
 
+#include <cstring>
+
 namespace pg_volvec {
 namespace pipeline {
 
 namespace {
 
 static inline bool
-StepInputIsNull(const ProjectStep &step, const PipelineChunk &out, uint16_t row)
+ColumnHasNulls(const uint8_t *nulls, uint16_t count)
 {
+	return count != 0 && std::memchr(nulls, 1, count) != nullptr;
+}
+
+static void
+ExecuteStep(const ProjectStep &step, PipelineChunk &out)
+{
+	const uint16_t count = out.count;
+	uint8_t *const out_nulls = out.nulls[step.out_chunk_slot];
+
 	switch (step.op)
 	{
 		case ProjectOp::NUMERIC_SCALE_VAR_CONST:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			if (!ColumnHasNulls(in_nulls, count))
+			{
+				std::memset(out_nulls, 0, count);
+				if (step.const_value >= 0)
+				{
+					for (uint16_t row = 0; row < count; ++row)
+						output[row] = input[row] * step.const_value;
+				}
+				else
+				{
+					for (uint16_t row = 0; row < count; ++row)
+						output[row] = input[row] / (-step.const_value);
+				}
+				return;
+			}
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = (step.const_value >= 0) ?
+					input[row] * step.const_value :
+					input[row] / (-step.const_value);
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::NUMERIC_MUL_VAR_VAR:
+		case ProjectOp::NUMERIC_ADD_VAR_VAR:
+		case ProjectOp::NUMERIC_SUB_VAR_VAR:
+		{
+			const uint8_t *const left_nulls = out.nulls[step.in_a_chunk_slot];
+			const uint8_t *const right_nulls = out.nulls[step.in_b_chunk_slot];
+			const int64_t *const left = out.int64_columns[step.in_a_chunk_slot];
+			const int64_t *const right = out.int64_columns[step.in_b_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			if (!ColumnHasNulls(left_nulls, count) && !ColumnHasNulls(right_nulls, count))
+			{
+				std::memset(out_nulls, 0, count);
+				switch (step.op)
+				{
+					case ProjectOp::NUMERIC_MUL_VAR_VAR:
+						for (uint16_t row = 0; row < count; ++row)
+							output[row] = left[row] * right[row];
+						break;
+					case ProjectOp::NUMERIC_ADD_VAR_VAR:
+						for (uint16_t row = 0; row < count; ++row)
+							output[row] = left[row] + right[row];
+						break;
+					case ProjectOp::NUMERIC_SUB_VAR_VAR:
+						for (uint16_t row = 0; row < count; ++row)
+							output[row] = left[row] - right[row];
+						break;
+					default:
+						break;
+				}
+				return;
+			}
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (left_nulls[row] != 0 || right_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				switch (step.op)
+				{
+					case ProjectOp::NUMERIC_MUL_VAR_VAR:
+						output[row] = left[row] * right[row];
+						break;
+					case ProjectOp::NUMERIC_ADD_VAR_VAR:
+						output[row] = left[row] + right[row];
+						break;
+					case ProjectOp::NUMERIC_SUB_VAR_VAR:
+						output[row] = left[row] - right[row];
+						break;
+					default:
+						break;
+				}
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
 		case ProjectOp::NUMERIC_MUL_VAR_CONST:
 		case ProjectOp::NUMERIC_ADD_VAR_CONST:
 		case ProjectOp::NUMERIC_SUB_VAR_CONST:
 		case ProjectOp::COPY_VAR:
-			return out.nulls[step.in_a_chunk_slot][row] != 0;
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			if (!ColumnHasNulls(in_nulls, count))
+			{
+				std::memset(out_nulls, 0, count);
+				switch (step.op)
+				{
+					case ProjectOp::NUMERIC_MUL_VAR_CONST:
+						for (uint16_t row = 0; row < count; ++row)
+							output[row] = input[row] * step.const_value;
+						break;
+					case ProjectOp::NUMERIC_ADD_VAR_CONST:
+						for (uint16_t row = 0; row < count; ++row)
+							output[row] = input[row] + step.const_value;
+						break;
+					case ProjectOp::NUMERIC_SUB_VAR_CONST:
+						for (uint16_t row = 0; row < count; ++row)
+							output[row] = input[row] - step.const_value;
+						break;
+					case ProjectOp::COPY_VAR:
+						for (uint16_t row = 0; row < count; ++row)
+							output[row] = input[row];
+						break;
+					default:
+						break;
+				}
+				return;
+			}
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				switch (step.op)
+				{
+					case ProjectOp::NUMERIC_MUL_VAR_CONST:
+						output[row] = input[row] * step.const_value;
+						break;
+					case ProjectOp::NUMERIC_ADD_VAR_CONST:
+						output[row] = input[row] + step.const_value;
+						break;
+					case ProjectOp::NUMERIC_SUB_VAR_CONST:
+						output[row] = input[row] - step.const_value;
+						break;
+					case ProjectOp::COPY_VAR:
+						output[row] = input[row];
+						break;
+					default:
+						break;
+				}
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
 		case ProjectOp::NUMERIC_SUB_CONST_VAR:
 		case ProjectOp::NUMERIC_ADD_CONST_VAR:
-			return out.nulls[step.in_b_chunk_slot][row] != 0;
-		case ProjectOp::NUMERIC_MUL_VAR_VAR:
-		case ProjectOp::NUMERIC_ADD_VAR_VAR:
-		case ProjectOp::NUMERIC_SUB_VAR_VAR:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_b_chunk_slot];
+			const int64_t *const input = out.int64_columns[step.in_b_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			if (!ColumnHasNulls(in_nulls, count))
+			{
+				std::memset(out_nulls, 0, count);
+				if (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR)
+				{
+					for (uint16_t row = 0; row < count; ++row)
+						output[row] = step.const_value - input[row];
+				}
+				else
+				{
+					for (uint16_t row = 0; row < count; ++row)
+						output[row] = step.const_value + input[row];
+				}
+				return;
+			}
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR) ?
+					step.const_value - input[row] :
+					step.const_value + input[row];
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
 		case ProjectOp::NUMERIC_DIV_VAR_VAR:
-			return out.nulls[step.in_a_chunk_slot][row] != 0 ||
-			       out.nulls[step.in_b_chunk_slot][row] != 0;
+		{
+			const uint8_t *const left_nulls = out.nulls[step.in_a_chunk_slot];
+			const uint8_t *const right_nulls = out.nulls[step.in_b_chunk_slot];
+			const int64_t *const left = out.int64_columns[step.in_a_chunk_slot];
+			const int64_t *const right = out.int64_columns[step.in_b_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			if (!ColumnHasNulls(left_nulls, count) && !ColumnHasNulls(right_nulls, count))
+				std::memset(out_nulls, 0, count);
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if ((left_nulls[row] != 0) || (right_nulls[row] != 0))
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				const int64_t denom = right[row];
+				if (denom == 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				const NumericWideInt numerator =
+					WideIntFromInt64(left[row]) * WideIntFromInt64(step.const_value);
+				output[row] =
+					WideIntToInt64Checked(numerator / WideIntFromInt64(denom),
+						"projection numeric division");
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
 		case ProjectOp::STRING_PREFIX_LIKE:
-			return out.nulls[step.in_a_chunk_slot][row] != 0;
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const VecStringRef *const input = out.string_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			const uint32_t prefix_len = step.in_b_chunk_slot;
+			const char *const rhs = reinterpret_cast<const char *>(&step.const_value);
+			const bool use_prefix_only = prefix_len <= sizeof(step.const_value);
+			if (!ColumnHasNulls(in_nulls, count))
+				std::memset(out_nulls, 0, count);
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				const VecStringRef &ref = input[row];
+				bool match = ref.len >= prefix_len;
+				if (match && prefix_len != 0)
+				{
+					if (use_prefix_only)
+						match = std::memcmp(&ref.prefix, rhs, prefix_len) == 0;
+					else
+					{
+						const char *const lhs = out.get_string_ptr(ref);
+						match = lhs != nullptr && std::memcmp(lhs, rhs, prefix_len) == 0;
+					}
+				}
+				output[row] = match ? 1 : 0;
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
 		case ProjectOp::NUMERIC_CASE_VAR_CONST:
-			return false;
+		{
+			const uint8_t *const cond_nulls = out.nulls[step.in_a_chunk_slot];
+			const uint8_t *const value_nulls = out.nulls[step.in_b_chunk_slot];
+			const int64_t *const cond = out.int64_columns[step.in_a_chunk_slot];
+			const int64_t *const value = out.int64_columns[step.in_b_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			if (!ColumnHasNulls(cond_nulls, count) && !ColumnHasNulls(value_nulls, count))
+			{
+				std::memset(out_nulls, 0, count);
+				for (uint16_t row = 0; row < count; ++row)
+					output[row] = (cond[row] != 0) ? value[row] : step.const_value;
+				return;
+			}
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (cond_nulls[row] == 0 && cond[row] != 0)
+				{
+					if (value_nulls[row] != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					output[row] = value[row];
+				}
+				else
+					output[row] = step.const_value;
+				out_nulls[row] = 0;
+			}
+			return;
+		}
 	}
 
-	return true;
+	elog(ERROR, "pg_volvec: unsupported projection opcode %u", static_cast<unsigned>(step.op));
 }
 
 } // namespace
@@ -71,110 +352,7 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 		     ++step_idx)
 		{
 			const ProjectStep &step = steps_[step_idx];
-			for (uint16_t row = 0; row < out.count; ++row)
-			{
-				if (StepInputIsNull(step, out, row))
-				{
-					out.nulls[step.out_chunk_slot][row] = 1;
-					continue;
-				}
-
-				switch (step.op)
-				{
-					case ProjectOp::NUMERIC_SCALE_VAR_CONST:
-						if (step.const_value >= 0)
-							out.int64_columns[step.out_chunk_slot][row] =
-								out.int64_columns[step.in_a_chunk_slot][row] * step.const_value;
-						else
-							out.int64_columns[step.out_chunk_slot][row] =
-								out.int64_columns[step.in_a_chunk_slot][row] / (-step.const_value);
-						break;
-					case ProjectOp::NUMERIC_MUL_VAR_VAR:
-						out.int64_columns[step.out_chunk_slot][row] =
-							out.int64_columns[step.in_a_chunk_slot][row] *
-							out.int64_columns[step.in_b_chunk_slot][row];
-						break;
-					case ProjectOp::NUMERIC_MUL_VAR_CONST:
-						out.int64_columns[step.out_chunk_slot][row] =
-							out.int64_columns[step.in_a_chunk_slot][row] *
-							step.const_value;
-						break;
-					case ProjectOp::NUMERIC_SUB_CONST_VAR:
-						out.int64_columns[step.out_chunk_slot][row] =
-							step.const_value - out.int64_columns[step.in_b_chunk_slot][row];
-						break;
-					case ProjectOp::NUMERIC_ADD_CONST_VAR:
-						out.int64_columns[step.out_chunk_slot][row] =
-							step.const_value + out.int64_columns[step.in_b_chunk_slot][row];
-						break;
-					case ProjectOp::NUMERIC_ADD_VAR_VAR:
-						out.int64_columns[step.out_chunk_slot][row] =
-							out.int64_columns[step.in_a_chunk_slot][row] +
-							out.int64_columns[step.in_b_chunk_slot][row];
-						break;
-					case ProjectOp::NUMERIC_SUB_VAR_VAR:
-						out.int64_columns[step.out_chunk_slot][row] =
-							out.int64_columns[step.in_a_chunk_slot][row] -
-							out.int64_columns[step.in_b_chunk_slot][row];
-						break;
-					case ProjectOp::NUMERIC_ADD_VAR_CONST:
-						out.int64_columns[step.out_chunk_slot][row] =
-							out.int64_columns[step.in_a_chunk_slot][row] + step.const_value;
-						break;
-					case ProjectOp::NUMERIC_SUB_VAR_CONST:
-						out.int64_columns[step.out_chunk_slot][row] =
-							out.int64_columns[step.in_a_chunk_slot][row] - step.const_value;
-						break;
-					case ProjectOp::COPY_VAR:
-						out.int64_columns[step.out_chunk_slot][row] =
-							out.int64_columns[step.in_a_chunk_slot][row];
-						break;
-					case ProjectOp::NUMERIC_DIV_VAR_VAR:
-					{
-						const int64_t denom = out.int64_columns[step.in_b_chunk_slot][row];
-						if (denom == 0)
-						{
-							out.nulls[step.out_chunk_slot][row] = 1;
-							continue;
-						}
-						const NumericWideInt numerator =
-							WideIntFromInt64(out.int64_columns[step.in_a_chunk_slot][row]) *
-							WideIntFromInt64(step.const_value);
-						out.int64_columns[step.out_chunk_slot][row] =
-							WideIntToInt64Checked(numerator / WideIntFromInt64(denom),
-								"projection numeric division");
-						break;
-					}
-					case ProjectOp::STRING_PREFIX_LIKE:
-					{
-						const VecStringRef &ref = out.string_columns[step.in_a_chunk_slot][row];
-						const char *lhs = out.get_string_ptr(ref);
-						const uint32_t prefix_len = step.in_b_chunk_slot;
-						const char *rhs = reinterpret_cast<const char *>(&step.const_value);
-						const bool match = (lhs != nullptr || ref.len == 0) &&
-							ref.len >= prefix_len &&
-							(prefix_len == 0 || std::memcmp(lhs, rhs, prefix_len) == 0);
-						out.int64_columns[step.out_chunk_slot][row] = match ? 1 : 0;
-						break;
-					}
-					case ProjectOp::NUMERIC_CASE_VAR_CONST:
-						if (out.nulls[step.in_a_chunk_slot][row] == 0 &&
-							out.int64_columns[step.in_a_chunk_slot][row] != 0)
-						{
-							if (out.nulls[step.in_b_chunk_slot][row] != 0)
-							{
-								out.nulls[step.out_chunk_slot][row] = 1;
-								continue;
-							}
-							out.int64_columns[step.out_chunk_slot][row] =
-								out.int64_columns[step.in_b_chunk_slot][row];
-						}
-						else
-							out.int64_columns[step.out_chunk_slot][row] = step.const_value;
-						break;
-				}
-				out.nulls[step.out_chunk_slot][row] = 0;
-			}
+			ExecuteStep(step, out);
 		}
 
 		if (expr.n_steps == 0 || expr.output_chunk_slot != steps_[expr.first_step_idx + expr.n_steps - 1].out_chunk_slot)
