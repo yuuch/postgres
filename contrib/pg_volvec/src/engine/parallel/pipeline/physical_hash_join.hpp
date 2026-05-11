@@ -58,6 +58,15 @@ public:
 	                 dsa_pointer right_payload_layout_dp,
 	                 dsa_pointer output_columns_dp,
 	                 uint16_t output_column_count,
+	                 dsa_pointer filter_inputs_dp,
+	                 dsa_pointer filter_exprs_dp,
+	                 dsa_pointer filter_steps_dp,
+	                 dsa_pointer filter_string_consts_dp,
+	                 uint16_t n_filter_inputs,
+	                 uint16_t n_filter_exprs,
+	                 uint16_t n_filter_steps,
+	                 uint16_t filter_bool_regs,
+	                 uint32_t filter_string_const_bytes,
 	                 dsa_pointer shared_payload_dp,
 	                 uint16_t n_left_keys,
 	                 uint16_t n_right_keys,
@@ -73,6 +82,15 @@ public:
 		, right_payload_layout_dp_(right_payload_layout_dp)
 		, output_columns_dp_(output_columns_dp)
 		, output_column_count_(output_column_count)
+		, filter_inputs_dp_(filter_inputs_dp)
+		, filter_exprs_dp_(filter_exprs_dp)
+		, filter_steps_dp_(filter_steps_dp)
+		, filter_string_consts_dp_(filter_string_consts_dp)
+		, n_filter_inputs_(n_filter_inputs)
+		, n_filter_exprs_(n_filter_exprs)
+		, n_filter_steps_(n_filter_steps)
+		, filter_bool_regs_(filter_bool_regs)
+		, filter_string_const_bytes_(filter_string_const_bytes)
 		, shared_payload_dp_(shared_payload_dp)
 		, n_left_keys_(n_left_keys)
 		, n_right_keys_(n_right_keys)
@@ -106,6 +124,15 @@ public:
 	dsa_pointer right_payload_layout_dp() const { return right_payload_layout_dp_; }
 	dsa_pointer output_columns_dp() const { return output_columns_dp_; }
 	uint16_t output_column_count() const { return output_column_count_; }
+	dsa_pointer filter_inputs_dp() const { return filter_inputs_dp_; }
+	dsa_pointer filter_exprs_dp() const { return filter_exprs_dp_; }
+	dsa_pointer filter_steps_dp() const { return filter_steps_dp_; }
+	dsa_pointer filter_string_consts_dp() const { return filter_string_consts_dp_; }
+	uint16_t n_filter_inputs() const { return n_filter_inputs_; }
+	uint16_t n_filter_exprs() const { return n_filter_exprs_; }
+	uint16_t n_filter_steps() const { return n_filter_steps_; }
+	uint16_t filter_bool_regs() const { return filter_bool_regs_; }
+	uint32_t filter_string_const_bytes() const { return filter_string_const_bytes_; }
 	dsa_pointer shared_payload_dp() const { return shared_payload_dp_; }
 	uint16_t n_left_keys() const { return n_left_keys_; }
 	uint16_t n_right_keys() const { return n_right_keys_; }
@@ -124,6 +151,15 @@ private:
 	dsa_pointer  right_payload_layout_dp_;
 	dsa_pointer  output_columns_dp_;
 	uint16_t     output_column_count_;
+	dsa_pointer  filter_inputs_dp_;
+	dsa_pointer  filter_exprs_dp_;
+	dsa_pointer  filter_steps_dp_;
+	dsa_pointer  filter_string_consts_dp_;
+	uint16_t     n_filter_inputs_;
+	uint16_t     n_filter_exprs_;
+	uint16_t     n_filter_steps_;
+	uint16_t     filter_bool_regs_;
+	uint32_t     filter_string_const_bytes_;
 	dsa_pointer  shared_payload_dp_;
 	uint16_t     n_left_keys_;
 	uint16_t     n_right_keys_;

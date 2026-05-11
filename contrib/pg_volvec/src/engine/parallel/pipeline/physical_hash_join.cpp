@@ -15,6 +15,7 @@ extern bool pg_volvec_trace_execution_path;
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/pipeline.hpp"
+#include "parallel/pipeline/physical_seq_scan.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 
@@ -302,6 +303,267 @@ BuildRightColumnsBySlot(const TupleDataLayout *right_layout,
 			     static_cast<unsigned>(col.src_col_idx));
 		right_columns_by_slot[col.src_col_idx] = &col;
 	}
+}
+
+static FilterExprDesc *
+ResolveFilterExprs(dsa_area *dsa, dsa_pointer dp)
+{
+	if (!DsaPointerIsValid(dp))
+		return nullptr;
+	return static_cast<FilterExprDesc *>(dsa_get_address(dsa, dp));
+}
+
+static FilterStep *
+ResolveFilterSteps(dsa_area *dsa, dsa_pointer dp)
+{
+	if (!DsaPointerIsValid(dp))
+		return nullptr;
+	return static_cast<FilterStep *>(dsa_get_address(dsa, dp));
+}
+
+static HashJoinFilterInputDesc *
+ResolveFilterInputs(dsa_area *dsa, dsa_pointer dp)
+{
+	if (!DsaPointerIsValid(dp))
+		return nullptr;
+	return static_cast<HashJoinFilterInputDesc *>(dsa_get_address(dsa, dp));
+}
+
+static inline const char *
+ResolveFilterConstPtr(const FilterStep &step, const char *string_consts)
+{
+	if (step.const_len == 0)
+		return "";
+	if (step.const_offset == UINT32_MAX)
+		return reinterpret_cast<const char *>(&step.const_value);
+	if (string_consts == nullptr)
+		return nullptr;
+	return string_consts + step.const_offset;
+}
+
+static inline uint16_t
+RequiredFilterBoolRegs(const FilterExprDesc *exprs, uint16_t n_exprs)
+{
+	uint16_t max_reg = 0;
+	for (uint16_t expr_idx = 0; expr_idx < n_exprs; ++expr_idx)
+		max_reg = std::max<uint16_t>(max_reg, static_cast<uint16_t>(exprs[expr_idx].output_bool_reg + 1));
+	return max_reg;
+}
+
+static inline bool
+EvalFilterStep(const FilterStep &step,
+	       const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk,
+	       const char *string_consts,
+	       uint8_t *bool_values)
+{
+	bool result = false;
+	switch (step.op)
+	{
+		case FilterStepOp::INT32_CMP_CONST:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const int32_t l = filter_chunk.get_int32(step.left_idx, 0);
+				const int32_t r = static_cast<int32_t>(step.const_value);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: result = l <= r; break;
+					case QualOp::LT: result = l <  r; break;
+					case QualOp::EQ: result = l == r; break;
+					case QualOp::GE: result = l >= r; break;
+					case QualOp::GT: result = l >  r; break;
+					case QualOp::NE: result = l != r; break;
+				}
+			}
+			break;
+		}
+		case FilterStepOp::INT64_CMP_CONST:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const int64_t l = filter_chunk.get_int64(step.left_idx, 0);
+				const int64_t r = static_cast<int64_t>(step.const_value);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: result = l <= r; break;
+					case QualOp::LT: result = l <  r; break;
+					case QualOp::EQ: result = l == r; break;
+					case QualOp::GE: result = l >= r; break;
+					case QualOp::GT: result = l >  r; break;
+					case QualOp::NE: result = l != r; break;
+				}
+			}
+			break;
+		}
+		case FilterStepOp::STRING_EQ_CONST:
+		case FilterStepOp::STRING_NE_CONST:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+				const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				const bool eq = (lhs != nullptr || ref.len == 0) && rhs != nullptr &&
+					ref.len == step.const_len &&
+					(step.const_len == 0 || std::memcmp(lhs, rhs, step.const_len) == 0);
+				result = (step.op == FilterStepOp::STRING_EQ_CONST) ? eq : !eq;
+			}
+			break;
+		}
+		case FilterStepOp::STRING_PREFIX_LIKE:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				result = rhs != nullptr && ref.len >= step.const_len;
+				if (result && step.const_len != 0)
+				{
+					if (step.const_len <= sizeof(ref.prefix))
+						result = std::memcmp(&ref.prefix, rhs, step.const_len) == 0;
+					else
+					{
+						const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+						result = lhs != nullptr && std::memcmp(lhs, rhs, step.const_len) == 0;
+					}
+				}
+			}
+			break;
+		}
+		case FilterStepOp::BOOL_AND:
+			result = bool_values[step.left_idx] && bool_values[step.right_idx];
+			break;
+		case FilterStepOp::BOOL_OR:
+			result = bool_values[step.left_idx] || bool_values[step.right_idx];
+			break;
+		case FilterStepOp::BOOL_NOT:
+			result = !bool_values[step.left_idx];
+			break;
+		default:
+			elog(ERROR, "pg_volvec: unsupported hash join filter step op %u", static_cast<unsigned>(step.op));
+	}
+	bool_values[step.out_bool_reg] = result ? 1 : 0;
+	return result;
+}
+
+static inline void
+PopulateJoinFilterChunk(const HashJoinFilterInputDesc *inputs,
+			       uint16_t n_inputs,
+			       const PipelineChunk &probe_chunk,
+			       uint16_t probe_row_idx,
+			       const TupleDataCollection *build_rows,
+			       const uint8_t *build_row,
+			       const TdcColumnDesc *const *right_columns_by_slot,
+			       DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk)
+{
+	filter_chunk.reset();
+	filter_chunk.count = 1;
+	for (uint16_t i = 0; i < n_inputs; ++i)
+	{
+		const HashJoinFilterInputDesc &input = inputs[i];
+		filter_chunk.nulls[i][0] = 0;
+		if (input.side == HashJoinOutputSide::LEFT)
+		{
+			switch (input.decode_kind)
+			{
+				case ColumnDecodeKind::INT32_CHAR:
+				case ColumnDecodeKind::INT32_DATE:
+				case ColumnDecodeKind::INT32_INT4:
+					filter_chunk.int32_columns[i][0] = probe_chunk.get_int32(input.input_chunk_slot, probe_row_idx);
+					break;
+				case ColumnDecodeKind::INT64_INT8:
+				case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+					filter_chunk.int64_columns[i][0] = probe_chunk.get_int64(input.input_chunk_slot, probe_row_idx);
+					break;
+				case ColumnDecodeKind::DOUBLE_FLOAT8:
+					filter_chunk.double_columns[i][0] = probe_chunk.get_double(input.input_chunk_slot, probe_row_idx);
+					break;
+				case ColumnDecodeKind::STRING_REF:
+				{
+					const VecStringRef src = probe_chunk.get_string_ref(input.input_chunk_slot, probe_row_idx);
+					const char *ptr = probe_chunk.get_string_ptr(input.input_chunk_slot, probe_row_idx);
+					filter_chunk.string_columns[i][0] = filter_chunk.store_string_bytes(ptr, src.len);
+					break;
+				}
+				case ColumnDecodeKind::NONE:
+					elog(ERROR, "pg_volvec: invalid LEFT hash join filter decode kind NONE");
+			}
+			continue;
+		}
+
+		const TdcColumnDesc *right_col = right_columns_by_slot[input.input_chunk_slot];
+		if (right_col == nullptr)
+			elog(ERROR, "pg_volvec: hash join filter mapping missing right payload column");
+		switch (input.decode_kind)
+		{
+			case ColumnDecodeKind::INT32_CHAR:
+			case ColumnDecodeKind::INT32_DATE:
+			case ColumnDecodeKind::INT32_INT4:
+				std::memcpy(&filter_chunk.int32_columns[i][0], build_row + right_col->offset, sizeof(int32_t));
+				break;
+			case ColumnDecodeKind::INT64_INT8:
+			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+				std::memcpy(&filter_chunk.int64_columns[i][0], build_row + right_col->offset, sizeof(int64_t));
+				break;
+			case ColumnDecodeKind::DOUBLE_FLOAT8:
+				std::memcpy(&filter_chunk.double_columns[i][0], build_row + right_col->offset, sizeof(double));
+				break;
+			case ColumnDecodeKind::STRING_REF:
+			{
+				VecStringRef ref;
+				std::memcpy(&ref, build_row + right_col->offset, sizeof(ref));
+				const char *ptr = VecStringRefDataPtr(ref,
+					build_rows != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(build_rows)) : nullptr);
+				filter_chunk.string_columns[i][0] = filter_chunk.store_string_bytes(ptr, ref.len);
+				break;
+			}
+			case ColumnDecodeKind::NONE:
+				elog(ERROR, "pg_volvec: invalid RIGHT hash join filter decode kind NONE");
+		}
+	}
+}
+
+static inline bool
+EvaluateJoinFilter(const HashJoinFilterInputDesc *inputs,
+			   uint16_t n_inputs,
+			   const FilterExprDesc *exprs,
+			   uint16_t n_exprs,
+			   const FilterStep *steps,
+			   uint16_t n_steps,
+			   const char *string_consts,
+			   uint16_t required_bool_regs,
+			   const PipelineChunk &probe_chunk,
+			   uint16_t probe_row_idx,
+			   const TupleDataCollection *build_rows,
+			   const uint8_t *build_row,
+			   const TdcColumnDesc *const *right_columns_by_slot,
+			   DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk,
+			   uint8_t *bool_values)
+{
+	if (n_inputs == 0 || n_exprs == 0 || n_steps == 0)
+		return true;
+	PopulateJoinFilterChunk(inputs,
+		n_inputs,
+		probe_chunk,
+		probe_row_idx,
+		build_rows,
+		build_row,
+		right_columns_by_slot,
+		filter_chunk);
+	if (required_bool_regs > 0)
+		std::memset(bool_values, 0, required_bool_regs * sizeof(bool_values[0]));
+	for (uint16_t expr_idx = 0; expr_idx < n_exprs; ++expr_idx)
+	{
+		const FilterExprDesc &expr = exprs[expr_idx];
+		const uint16_t end_step = static_cast<uint16_t>(expr.first_step_idx + expr.n_steps);
+		if (end_step > n_steps)
+			elog(ERROR, "pg_volvec: hash join filter expr step range out of bounds");
+		for (uint16_t step_idx = expr.first_step_idx; step_idx < end_step; ++step_idx)
+			(void) EvalFilterStep(steps[step_idx], filter_chunk, string_consts, bool_values);
+		if (expr.output_bool_reg >= required_bool_regs || bool_values[expr.output_bool_reg] == 0)
+			return false;
+	}
+	return true;
 }
 
 static void
@@ -922,9 +1184,29 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		: (desc_ != nullptr && DsaPointerIsValid(desc_->body.hash_join.output_columns)
 			? static_cast<const HashJoinOutputColumnDesc *>(dsa_get_address(ctx.dsa, desc_->body.hash_join.output_columns))
 			: nullptr);
+	const auto *filter_inputs = DsaPointerIsValid(filter_inputs_dp_)
+		? ResolveFilterInputs(ctx.dsa, filter_inputs_dp_)
+		: (desc_ != nullptr ? ResolveFilterInputs(ctx.dsa, desc_->body.hash_join.filter_inputs) : nullptr);
+	const auto *filter_exprs = DsaPointerIsValid(filter_exprs_dp_)
+		? ResolveFilterExprs(ctx.dsa, filter_exprs_dp_)
+		: (desc_ != nullptr ? ResolveFilterExprs(ctx.dsa, desc_->body.hash_join.filter_exprs) : nullptr);
+	const auto *filter_steps = DsaPointerIsValid(filter_steps_dp_)
+		? ResolveFilterSteps(ctx.dsa, filter_steps_dp_)
+		: (desc_ != nullptr ? ResolveFilterSteps(ctx.dsa, desc_->body.hash_join.filter_steps) : nullptr);
+	const char *filter_string_consts = DsaPointerIsValid(filter_string_consts_dp_)
+		? static_cast<const char *>(dsa_get_address(ctx.dsa, filter_string_consts_dp_))
+		: (desc_ != nullptr && DsaPointerIsValid(desc_->body.hash_join.filter_string_consts)
+			? static_cast<const char *>(dsa_get_address(ctx.dsa, desc_->body.hash_join.filter_string_consts))
+			: nullptr);
 	const TdcColumnDesc *right_columns_by_slot[16];
 	uint16_t output_column_count = output_column_count_ > 0 ? output_column_count_ :
 		(desc_ != nullptr ? desc_->body.hash_join.output_column_count : 0);
+	const uint16_t n_filter_inputs = n_filter_inputs_ > 0 ? n_filter_inputs_ :
+		(desc_ != nullptr ? desc_->body.hash_join.n_filter_inputs : 0);
+	const uint16_t n_filter_exprs = n_filter_exprs_ > 0 ? n_filter_exprs_ :
+		(desc_ != nullptr ? desc_->body.hash_join.n_filter_exprs : 0);
+	const uint16_t n_filter_steps = n_filter_steps_ > 0 ? n_filter_steps_ :
+		(desc_ != nullptr ? desc_->body.hash_join.n_filter_steps : 0);
 	PgVector<HashJoinOutputColumnDesc> fallback_output_columns;
 	if ((output_columns == nullptr || output_column_count == 0) &&
 		left_schema != nullptr && right_schema != nullptr && output_schema != nullptr)
@@ -935,6 +1217,10 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	}
 	if (output_columns == nullptr || output_column_count == 0)
 		elog(ERROR, "pg_volvec: hash join probe missing output column mapping");
+	if ((n_filter_inputs > 0 && filter_inputs == nullptr) ||
+		(n_filter_exprs > 0 && filter_exprs == nullptr) ||
+		(n_filter_steps > 0 && filter_steps == nullptr))
+		elog(ERROR, "pg_volvec: hash join probe missing residual join filter metadata");
 	BuildRightColumnsBySlot(build_row_layout, right_columns_by_slot);
 	if (!DsaPointerIsValid(payload->hash_table_dp) ||
 		!DsaPointerIsValid(payload->hash_links_dp) ||
@@ -944,8 +1230,18 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	auto *bucket_heads = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa, payload->hash_table_dp));
 	auto *links = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa, payload->hash_links_dp));
 	auto *salts = static_cast<const uint16_t *>(dsa_get_address(ctx.dsa, payload->hash_salts_dp));
+	const uint16_t required_bool_regs = filter_exprs != nullptr ?
+		RequiredFilterBoolRegs(filter_exprs, n_filter_exprs) : 0;
 	uint16_t matched_probe_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	const uint8_t *matched_build_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
+	std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>> filter_chunk_holder;
+	uint8_t filter_bool_values[FILTER_MAX_BOOL_REGS];
+	DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> *filter_chunk = nullptr;
+	if (n_filter_inputs > 0 && n_filter_exprs > 0 && n_filter_steps > 0)
+	{
+		filter_chunk_holder = std::make_unique<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>();
+		filter_chunk = filter_chunk_holder.get();
+	}
 	out.reset();
 	uint32_t matched_rows = 0;
 
@@ -986,9 +1282,26 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 			const uint8_t *build_key_row = TupleDataCollectionGetRowConst(build_keys, build_row_idx);
 			if (MatchGroupLayouts(build_key_layout, build_keys, build_key_row, probe_layout, in, op_state.probe_row_idx))
 			{
+				const uint8_t *build_row = TupleDataCollectionGetRowConst(build_rows, build_row_idx);
+				if (!EvaluateJoinFilter(filter_inputs,
+						n_filter_inputs,
+						filter_exprs,
+						n_filter_exprs,
+						filter_steps,
+						n_filter_steps,
+						filter_string_consts,
+						required_bool_regs,
+						in,
+						op_state.probe_row_idx,
+						build_rows,
+						build_row,
+						right_columns_by_slot,
+						*filter_chunk,
+						filter_bool_values))
+					continue;
 				++matched_rows;
 				matched_probe_rows[batch_count] = op_state.probe_row_idx;
-				matched_build_rows[batch_count] = TupleDataCollectionGetRowConst(build_rows, build_row_idx);
+				matched_build_rows[batch_count] = build_row;
 				++batch_count;
 				if (out.count + batch_count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 					break;
