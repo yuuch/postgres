@@ -43,7 +43,7 @@ unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
 
 ## Current Status
 
-Status refreshed: `2026-05-08` (HEAD `6c344eb036d` + uncommitted M-Q1-PERF/M-Q6-RESTORE runtime work; includes `aggregate_hash_table`, `tuple_data_collection`, `tuple_data_layout`, `tuple_data_ops`, `physical_projection`)
+Status refreshed: `2026-05-11` (HEAD `6c344eb036d` + uncommitted runtime fixes; includes generic string-row combine / hash-join payload lookup hardening and the current benchmark refresh)
 
 ### What runs through `pg_volvec` today
 
@@ -57,6 +57,9 @@ runs through this path when `pg_volvec.parallel=on`; its multi-clause date and
 numeric filters are represented by `QualDescriptor` and evaluated in
 `PhysicalSeqScan` before projecting `l_extendedprice * l_discount` into
 `SUM_NUMERIC`. See `AGENTS.md` for the detailed bug ledger.
+
+Current checked-in benchmark coverage is Q1 / Q6 / Q10 / Q14 via
+`contrib/pg_volvec/scripts/bench_tpch_pg_vs_volvec.sh`.
 
 ### Active milestone: `M-FRAME-MIN`
 
@@ -72,7 +75,8 @@ Sequential rebuild on top of the greenfield deletion:
 ### Subsequent milestones
 
 - **`M-Q1-PERF`** — drive Q1 to extreme single-shape performance through the
-  new pipeline runtime; perf tracked in `perf/q1_p3x_progression.md`.
+  new pipeline runtime; perf tracked in `perf/q1_p3x_progression.md` and the
+  checked-in benchmark artifacts under `benchmarks/`.
 - **`M-Q6-RESTORE`** — canonical Q6 is restored for `SeqScan -> plain Agg`
   with date/numeric filter conjunctions. Broader non-Q1 TPC-H shapes remain
   out of scope for the current phase.
@@ -149,6 +153,10 @@ Expected results today:
 - Q1 on the small fixture: 2 rows (`A/F`, `B/O`).
 - Q6 on 10G TPC-H: `1230113636.0101` through the pg_volvec runtime when
   `pg_volvec.parallel=on` and PostgreSQL parallelism is disabled as above.
+
+Current benchmark artifact:
+
+- `benchmarks/tpch_pg_vs_volvec_20260511_174551.tsv`
 
 ## Project Layout
 

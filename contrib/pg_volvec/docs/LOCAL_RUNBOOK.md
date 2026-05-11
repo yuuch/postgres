@@ -223,6 +223,8 @@ Main checked-in benchmark artifacts:
 - `contrib/pg_volvec/benchmarks/tpch_perf_snapshot.svg`
 - `contrib/pg_volvec/benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.tsv`
 - `contrib/pg_volvec/benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.svg`
+- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_174551.tsv`
+- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_174551.log`
 
 Two benchmark modes matter:
 
