@@ -12,7 +12,7 @@ namespace pg_volvec {
 
 template <uint16_t Capacity> struct DataChunk;
 
-constexpr uint16_t PIPELINE_DEFAULT_CHUNK_SIZE = 1024;
+constexpr uint16_t PIPELINE_DEFAULT_CHUNK_SIZE = 2048;
 
 namespace pipeline {
 

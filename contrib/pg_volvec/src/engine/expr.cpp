@@ -1,6 +1,8 @@
 #include "volvec_engine.hpp"
+#include "expr/vector_operations.hpp"
 
 #include <cmath>
+#include <cstring>
 
 extern "C" {
 #include "nodes/nodeFuncs.h"
@@ -211,6 +213,13 @@ TryExtractConstInt32(Const *c, int32_t *out)
 		return true;
 	}
 	return false;
+}
+
+static inline bool
+RegisterStepIsConst(const VecExprStep *const *reg_defs, int reg_idx)
+{
+	return reg_idx >= 0 && reg_idx < MAX_REGISTERS &&
+		reg_defs[reg_idx] != nullptr && reg_defs[reg_idx]->opcode == VecOpCode::EEOP_CONST;
 }
 
 static bool
@@ -1323,6 +1332,36 @@ VecExprProgram::try_compile_jit()
 		if (step.opcode == VecOpCode::EEOP_INT64_DIV_FLOAT8)
 			return;
 	}
+	{
+		bool has_complex = false;
+
+		for (const auto &step : steps)
+		{
+			switch (step.opcode)
+			{
+				case VecOpCode::EEOP_STR_EQ:
+				case VecOpCode::EEOP_STR_NE:
+				case VecOpCode::EEOP_STR_PREFIX_LIKE:
+				case VecOpCode::EEOP_STR_CONTAINS_LIKE:
+				case VecOpCode::EEOP_STR_LIKE_PATTERN:
+				case VecOpCode::EEOP_AND:
+				case VecOpCode::EEOP_OR:
+				case VecOpCode::EEOP_NOT:
+				case VecOpCode::EEOP_INT64_CASE:
+				case VecOpCode::EEOP_FLOAT8_CASE:
+					has_complex = true;
+					break;
+				default:
+					break;
+			}
+		}
+		if (!has_complex)
+		{
+			if (pg_volvec_trace_hooks)
+				elog(LOG, "pg_volvec: expr JIT skipped (pure arithmetic, interpreter SIMD)");
+			return;
+		}
+	}
 	if (jit_func != nullptr || jit_context != nullptr)
 		return;
 	if (final_res_idx < 0)
@@ -2129,6 +2168,8 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 		int left_scale = get_register_scale(step.d.op.left);
 		int right_scale = get_register_scale(step.d.op.right);
 		int res_scale = get_register_scale(step.res_idx);
+		bool left_const = RegisterStepIsConst(reg_defs, step.d.op.left);
+		bool right_const = RegisterStepIsConst(reg_defs, step.d.op.right);
 
 		switch (step.opcode)
 		{
@@ -2198,25 +2239,16 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				}
 				break;
 			case VecOpCode::EEOP_FLOAT8_ADD:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_f8[res + i] = registers_f8[l + i] + registers_f8[r + i];
-				}
-				break;
 			case VecOpCode::EEOP_FLOAT8_SUB:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_f8[res + i] = registers_f8[l + i] - registers_f8[r + i];
-				}
-				break;
 			case VecOpCode::EEOP_FLOAT8_MUL:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_f8[res + i] = registers_f8[l + i] * registers_f8[r + i];
-				}
+				DispatchFloat8Arithmetic(step.opcode,
+					registers_f8, registers_nulls,
+					step.d.op.left * DEFAULT_CHUNK_SIZE,
+					step.d.op.right * DEFAULT_CHUNK_SIZE,
+					res,
+					chunk.count,
+					left_const,
+					right_const);
 				break;
 			case VecOpCode::EEOP_INT64_ADD:
 				for (int i = 0; i < chunk.count; i++)
@@ -2337,60 +2369,30 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				}
 				break;
 			case VecOpCode::EEOP_FLOAT8_LT:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_f8[l + i] < registers_f8[r + i]);
-				}
-				break;
 			case VecOpCode::EEOP_FLOAT8_LE:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_f8[l + i] <= registers_f8[r + i]);
-				}
-				break;
 			case VecOpCode::EEOP_FLOAT8_GT:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_f8[l + i] > registers_f8[r + i]);
-				}
-				break;
 			case VecOpCode::EEOP_FLOAT8_GE:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_f8[l + i] >= registers_f8[r + i]);
-				}
+				DispatchFloat8Compare(step.opcode,
+					registers_f8, registers_i32, registers_nulls,
+					step.d.op.left * DEFAULT_CHUNK_SIZE,
+					step.d.op.right * DEFAULT_CHUNK_SIZE,
+					res,
+					chunk.count,
+					left_const,
+					right_const);
 				break;
 			case VecOpCode::EEOP_DATE_LE:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_i32[l + i] <= registers_i32[r + i]);
-				}
-				break;
 			case VecOpCode::EEOP_DATE_LT:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_i32[l + i] < registers_i32[r + i]);
-				}
-				break;
 			case VecOpCode::EEOP_DATE_GT:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_i32[l + i] > registers_i32[r + i]);
-				}
-				break;
 			case VecOpCode::EEOP_DATE_GE:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i] || registers_nulls[r + i];
-					registers_i32[res + i] = (registers_i32[l + i] >= registers_i32[r + i]);
-				}
+				DispatchDateCompare(step.opcode,
+					registers_i32, registers_nulls,
+					step.d.op.left * DEFAULT_CHUNK_SIZE,
+					step.d.op.right * DEFAULT_CHUNK_SIZE,
+					res,
+					chunk.count,
+					left_const,
+					right_const);
 				break;
 			case VecOpCode::EEOP_DATE_PART_YEAR:
 				for (int i = 0; i < chunk.count; i++)
@@ -2487,12 +2489,10 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				}
 				break;
 			case VecOpCode::EEOP_NOT:
-				for (int i = 0; i < chunk.count; i++)
-				{
-					registers_nulls[res + i] = registers_nulls[l + i];
-					registers_i32[res + i] =
-						registers_nulls[l + i] ? 0 : (registers_i32[l + i] == 0);
-				}
+				DispatchBoolNot(registers_i32, registers_nulls,
+					step.d.op.left * DEFAULT_CHUNK_SIZE,
+					res,
+					chunk.count);
 				break;
 			case VecOpCode::EEOP_INT64_CASE:
 			{
@@ -2526,15 +2526,8 @@ VecExprProgram::evaluate(DataChunk<DEFAULT_CHUNK_SIZE> &chunk)
 				int t = step.d.ternary.if_true * DEFAULT_CHUNK_SIZE;
 				int f = step.d.ternary.if_false * DEFAULT_CHUNK_SIZE;
 
-				for (int i = 0; i < chunk.count; i++)
-				{
-					bool cond_null = registers_nulls[c + i] != 0;
-					bool take_true = (!cond_null && registers_i32[c + i] != 0);
-					int src = take_true ? t : f;
-
-					registers_nulls[res + i] = registers_nulls[src + i];
-					registers_f8[res + i] = registers_f8[src + i];
-				}
+				DispatchFloat8Case(registers_i32, registers_f8, registers_nulls,
+					c, t, f, res, chunk.count);
 				break;
 			}
 				case VecOpCode::EEOP_STR_PREFIX_LIKE:

@@ -36,7 +36,7 @@ extern "C" {
 namespace pg_volvec
 {
 
-static constexpr uint16_t DEFAULT_CHUNK_SIZE = 1024;
+static constexpr uint16_t DEFAULT_CHUNK_SIZE = 2048;
 static constexpr int MAX_REGISTERS = 64;
 static constexpr int DEFAULT_NUMERIC_SCALE = 2;
 static constexpr int VOLVEC_DEC_DIGITS = 4;
@@ -574,4 +574,3 @@ TryFastNumericToScaledWideInt(Datum value, int target_scale, NumericWideInt *out
 }
 
 } // namespace pg_volvec
-

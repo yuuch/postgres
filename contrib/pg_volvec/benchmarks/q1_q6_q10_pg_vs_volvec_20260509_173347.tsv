@@ -1,7 +1,0 @@
-query	mode	run1_ms	run2_ms	run3_ms	median_ms	median_s	status
-q1	pg_parallel	4072	4073	4073	4073	4.073	ok
-q1	volvec_parallel	2059	2064	2048	2059	2.059	ok
-q6	pg_parallel	2057	2057	2054	2057	2.057	ok
-q6	volvec_parallel	2059	2059	1034	2059	2.059	ok
-q10	pg_parallel	3050	3048	3048	3048	3.048	ok
-q10	volvec_parallel	3086	3072	2040	3072	3.072	ok
