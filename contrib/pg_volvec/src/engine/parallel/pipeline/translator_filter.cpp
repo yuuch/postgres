@@ -283,6 +283,38 @@ ExtractStringLikePrefix(Const *c,
 }
 
 static bool
+ExtractStringContainsLike(Const *c,
+			      std::vector<char> &pool,
+			      uint32_t &out_offset,
+			      uint32_t &out_len,
+			      uint64_t &out_value)
+{
+	if (c == nullptr || c->constisnull)
+		return false;
+	if (c->consttype != BPCHAROID && c->consttype != TEXTOID && c->consttype != VARCHAROID)
+		return false;
+	char *pattern = TextDatumGetCString(c->constvalue);
+	const size_t len = std::strlen(pattern);
+	if (len < 3 || pattern[0] != '%' || pattern[len - 1] != '%')
+	{
+		pfree(pattern);
+		return false;
+	}
+	for (size_t i = 1; i + 1 < len; ++i)
+	{
+		if (pattern[i] == '%' || pattern[i] == '_')
+		{
+			pfree(pattern);
+			return false;
+		}
+	}
+	out_len = static_cast<uint32_t>(len - 2);
+	const bool ok = StoreFilterStringConstBytes(pattern + 1, out_len, pool, out_offset, out_value);
+	pfree(pattern);
+	return ok;
+}
+
+static bool
 AllocateFilterBoolReg(uint16_t &next_reg, uint16_t &out_reg)
 {
 	if (next_reg >= FILTER_MAX_BOOL_REGS)
@@ -418,8 +450,13 @@ BuildConstFilterStep(Var *var,
 			}
 			else if (ok && std::strcmp(opname, "~~") == 0)
 			{
-				step.op = FilterStepOp::STRING_PREFIX_LIKE;
-				ok = ExtractStringLikePrefix(c, string_consts, step.const_offset, step.const_len, step.const_value);
+				if (ExtractStringLikePrefix(c, string_consts, step.const_offset, step.const_len, step.const_value))
+					step.op = FilterStepOp::STRING_PREFIX_LIKE;
+				else
+				{
+					step.op = FilterStepOp::STRING_CONTAINS_LIKE;
+					ok = ExtractStringContainsLike(c, string_consts, step.const_offset, step.const_len, step.const_value);
+				}
 			}
 			else
 				ok = false;
@@ -427,6 +464,49 @@ BuildConstFilterStep(Var *var,
 	}
 
 	return ok;
+}
+
+static bool
+BuildVarFilterStep(Var *left_var,
+			   Var *right_var,
+			   Oid opno,
+			   std::vector<FilterInputDesc> &inputs,
+			   FilterStep &step)
+{
+	step.const_offset = UINT32_MAX;
+	step.const_len = 0;
+	step.const_value = 0;
+	step._pad0 = 0;
+	if (left_var == nullptr || right_var == nullptr || left_var->vartype != right_var->vartype)
+		return false;
+	if (left_var->vartype == DATEOID || left_var->vartype == INT4OID)
+	{
+		step.op = FilterStepOp::INT32_CMP_VAR;
+		return MapOpnoToQualOp(opno, step.cmp_op) &&
+			LookupOrAddFilterInput(left_var->varattno,
+				left_var->vartype == DATEOID ? ColumnDecodeKind::INT32_DATE : ColumnDecodeKind::INT32_INT4,
+				inputs,
+				step.left_idx) &&
+			LookupOrAddFilterInput(right_var->varattno,
+				right_var->vartype == DATEOID ? ColumnDecodeKind::INT32_DATE : ColumnDecodeKind::INT32_INT4,
+				inputs,
+				step.right_idx);
+	}
+	if (left_var->vartype == INT8OID)
+	{
+		step.op = FilterStepOp::INT64_CMP_VAR;
+		return MapOpnoToQualOp(opno, step.cmp_op) &&
+			LookupOrAddFilterInput(left_var->varattno, ColumnDecodeKind::INT64_INT8, inputs, step.left_idx) &&
+			LookupOrAddFilterInput(right_var->varattno, ColumnDecodeKind::INT64_INT8, inputs, step.right_idx);
+	}
+	if (left_var->vartype == NUMERICOID)
+	{
+		step.op = FilterStepOp::INT64_CMP_VAR;
+		return MapOpnoToQualOp(opno, step.cmp_op) &&
+			LookupOrAddFilterInput(left_var->varattno, ColumnDecodeKind::INT64_NUMERIC_SCALED, inputs, step.left_idx) &&
+			LookupOrAddFilterInput(right_var->varattno, ColumnDecodeKind::INT64_NUMERIC_SCALED, inputs, step.right_idx);
+	}
+	return false;
 }
 
 static bool
@@ -638,6 +718,31 @@ LowerFilterExprInternal(Expr *expr,
 	if (list_length(op->args) != 2)
 		return false;
 	Expr *left = StripRelabels((Expr *) linitial(op->args));
+	Expr *right = StripRelabels((Expr *) lsecond(op->args));
+	if (left != nullptr && right != nullptr && nodeTag(left) == T_Var && nodeTag(right) == T_Var)
+	{
+		Var *left_var = (Var *) left;
+		Var *right_var = (Var *) right;
+		if (left_var->varattno <= 0 || right_var->varattno <= 0)
+			return false;
+		Oid left_rel_type_oid = InvalidOid;
+		Oid right_rel_type_oid = InvalidOid;
+		int32 left_rel_typmod = -1;
+		int32 right_rel_typmod = -1;
+		if (!LookupRelationAttr(relid, left_var->varattno, left_rel_type_oid, left_rel_typmod) ||
+		    !LookupRelationAttr(relid, right_var->varattno, right_rel_type_oid, right_rel_typmod) ||
+		    left_rel_type_oid != left_var->vartype ||
+		    right_rel_type_oid != right_var->vartype)
+			return false;
+		FilterStep step{};
+		if (!AllocateFilterBoolReg(next_bool_reg, out_bool_reg))
+			return false;
+		step.out_bool_reg = out_bool_reg;
+		if (!BuildVarFilterStep(left_var, right_var, op->opno, inputs, step))
+			return false;
+		steps.push_back(step);
+		return true;
+	}
 	Const *c = nullptr;
 	if (left == nullptr || nodeTag(left) != T_Var ||
 		!ExtractConstFilterExpr((Expr *) lsecond(op->args), c))
@@ -1103,8 +1208,13 @@ LowerHashJoinFilterExprInternal(Expr *expr,
 			}
 			else if (ok && std::strcmp(opname, "~~") == 0)
 			{
-				step.op = FilterStepOp::STRING_PREFIX_LIKE;
-				ok = ExtractStringLikePrefix(c, string_consts, step.const_offset, step.const_len, step.const_value);
+				if (ExtractStringLikePrefix(c, string_consts, step.const_offset, step.const_len, step.const_value))
+					step.op = FilterStepOp::STRING_PREFIX_LIKE;
+				else
+				{
+					step.op = FilterStepOp::STRING_CONTAINS_LIKE;
+					ok = ExtractStringContainsLike(c, string_consts, step.const_offset, step.const_len, step.const_value);
+				}
 			}
 			else
 				ok = false;
@@ -1211,7 +1321,7 @@ ExtractSortKeys(Sort *sort,
 		else
 		{
 			ColumnRef ref{};
-			if (!ResolvePlanExprToColumnRef(expr, agg_plan, ref))
+			if (!ResolveAggGroupVarToColumnRef((Var *) expr, agg, group_cols, ref))
 				return false;
 			uint16_t group_idx = UINT16_MAX;
 			for (uint16_t g = 0; g < group_cols.size(); ++g)

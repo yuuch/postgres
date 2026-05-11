@@ -62,18 +62,18 @@ What is still notably missing or still narrow:
 
 | Query | Status | Evidence / reasoning | Main gap if not done |
 |---|---|---|---|
-| Q1 | **Validated + Benchmarked** | `AGENTS.md` and `README.md` document end-to-end correctness/perf; benchmarked in `bench_tpch_pg_vs_volvec.sh` and the refreshed `tpch_pg_vs_volvec_20260511_174551.tsv` | Keep stable; continue perf work only |
+| Q1 | **Validated + Benchmarked** | `AGENTS.md` and `README.md` document end-to-end correctness/perf; benchmarked in `bench_tpch_pg_vs_volvec.sh` and the refreshed `tpch_pg_vs_volvec_20260511_175310.tsv` | Keep stable; continue perf work only |
 | Q2 | **Parked** | SQL exists, but shape uses scalar subquery with `min(ps_supplycost)` and current plan quality is poor | Better optimizer + reusable subquery/semi-join style support |
 | Q3 | **Unverified but near-term** | SQL is a pure inner-join + group + order shape in this repo (no `LIMIT` in current file) | More robust multi-join admission/coverage; validate grouped join chain at scale |
 | Q4 | **Unverified, later family** | Uses `EXISTS` subquery over `lineitem` | Reusable semi-join / exists lowering |
-| Q5 | **Unverified but near-term** | Pure multi-inner-join + group + order, structurally close to Q10 family | Wider join-chain admission, more generic join-fed agg validation |
+| Q5 | **Benchmarked / Runnable, not yet fully validated** | Current benchmark script exercises it successfully (`ok` in the refreshed TSV), and the shape is still structurally close to the Q10 family | Wider join-chain admission, more generic join-fed agg validation |
 | Q6 | **Validated + Benchmarked** | `README.md` expected result + `AGENTS.md` scope + benchmark TSV | Keep stable |
-| Q7 | **Unverified, medium-term** | Derived-table / subquery form plus `extract(year from l_shipdate)` | Reusable subquery/derived-table lowering + date extract expression support |
-| Q8 | **Unverified, medium-term** | Derived-table + `extract(year ...)` + `CASE` + many joins | Same as Q7, plus broader projection expr coverage |
-| Q9 | **Unverified, medium-term** | Derived-table + `extract(year ...)` + arithmetic over join outputs | Same as Q7, plus broader numeric expression coverage |
+| Q7 | **Benchmarked / Runnable, not yet fully validated** | Current benchmark script exercises it successfully (`ok` in the refreshed TSV) | Reusable subquery/derived-table lowering + date extract expression support |
+| Q8 | **Benchmarked / Runnable, not yet fully validated** | Current benchmark script exercises it successfully (`ok` in the refreshed TSV) | Same as Q7, plus broader projection expr coverage |
+| Q9 | **Benchmarked / Runnable, not yet fully validated** | Current benchmark script exercises it successfully (`ok` in the refreshed TSV) | Same as Q7, plus broader numeric expression coverage |
 | Q10 | **Validated + Benchmarked** | `AGENTS.md` says Q10 runnable/validated; `q10_milestone.md` records grouped row count `381105` matching native; benchmarked in current script/TSV | Keep stable; use as join-heavy regression target |
 | Q11 | **Unverified, later family** | Uses grouped `HAVING` with scalar subquery threshold | Reusable subquery + having/subplan support |
-| Q12 | **Unverified but near/medium-term** | Inner join + grouped aggregates + `CASE` over string equality/inequality; explicitly cited in older planning notes and future unlocks | Generic `CASE` lowering over join-fed string columns |
+| Q12 | **Benchmarked / Runnable, not yet fully validated** | Current benchmark script exercises it successfully (`ok` in the refreshed TSV) | Generic `CASE` lowering over join-fed string columns |
 | Q13 | **Unverified, later family** | Uses `LEFT OUTER JOIN` and grouped derived table | Outer join family + derived-table lowering |
 | Q14 | **Benchmarked / Runnable, not yet promoted to validated target** | Current benchmark script runs it; refreshed benchmark TSV shows `ok` for PG-vs-volvec | Need explicit correctness validation and more hash-join probe speed |
 | Q15 | **Unverified, later family** | Uses `CREATE VIEW`, then scalar subquery with `max(total_revenue)` | View/subquery normalization and reusable scalar-subquery support |
@@ -95,6 +95,11 @@ What is still notably missing or still narrow:
 
 ### Definitely benchmarked in the current script
 
+- **Q5**
+- **Q7**
+- **Q8**
+- **Q9**
+- **Q12**
 - **Q14**
 
 Current benchmark driver:
@@ -103,19 +108,24 @@ Current benchmark driver:
 
 Current benchmark set:
 
-- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_174551.tsv`
+- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_175310.tsv`
 
 That TSV currently records:
 
 - Q1: ok
+- Q5: ok
 - Q6: ok
+- Q7: ok
+- Q8: ok
+- Q9: ok
 - Q10: ok
+- Q12: ok
 - Q14: ok
 
 Important nuance:
 
-- Q14 has **run/benchmark evidence**, but it does **not** yet have the same level of correctness/milestone documentation as Q1/Q6/Q10.
-- So it should be treated as **runnable + benchmarked**, not yet as a fully validated coverage claim.
+- Q5/Q7/Q8/Q9/Q12/Q14 have **run/benchmark evidence**, but they do **not** yet have the same level of correctness/milestone documentation as Q1/Q6/Q10.
+- So they should be treated as **runnable + benchmarked**, not yet as fully validated coverage claims.
 
 ## Recommended implementation order
 
@@ -256,7 +266,7 @@ Needed reusable work:
 
 If the goal is to maximize progress without breaking architecture, the next sequence should be:
 
-1. **Stabilize and keep benchmarking Q1/Q6/Q10/Q14**
+1. **Stabilize and keep benchmarking Q1/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q14**
 2. **Push the reusable inner-join/group/order family to cover Q3**
 3. **Then extend the same family to Q5**
 4. **Then cover Q19 as a join/filter stress query**
@@ -266,7 +276,7 @@ If the goal is to maximize progress without breaking architecture, the next sequ
 
 ## Short summary
 
-- Real, evidence-backed current coverage is **Q1 / Q6 / Q10**, plus **Q14 benchmarked**.
+- Real, evidence-backed current coverage is **Q1 / Q6 / Q10**, plus **Q5 / Q7 / Q8 / Q9 / Q12 / Q14 benchmarked**.
 - The best next non-hacky expansion is **Q3 → Q5 → Q19 → Q12**.
 - After that, the next reusable family is **derived-table / `extract(year ...)` support** for **Q7 / Q9 / Q8**.
 - Queries that fundamentally need new operator families (`EXISTS`, `NOT EXISTS`, outer join, distinct aggregate, scalar/grouped subqueries) should come later.

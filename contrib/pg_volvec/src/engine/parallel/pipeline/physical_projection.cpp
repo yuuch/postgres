@@ -2,6 +2,8 @@
 
 extern "C" {
 #include "postgres.h"
+#include "datatype/timestamp.h"
+#include "utils/datetime.h"
 #include "utils/elog.h"
 }
 
@@ -315,6 +317,142 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 			}
 			return;
 		}
+
+		case ProjectOp::EXTRACT_YEAR_FROM_DATE:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int32_t *const input = out.int32_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				int year = 0, month = 0, day = 0;
+				j2date(static_cast<int>(input[row]) + POSTGRES_EPOCH_JDATE, &year, &month, &day);
+				output[row] = year;
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::STRING_EQ_VAR_CONST:
+		case ProjectOp::STRING_NE_VAR_CONST:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const VecStringRef *const input = out.string_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			const uint32_t rhs_len = step.in_b_chunk_slot;
+			const char *const rhs = reinterpret_cast<const char *>(&step.const_value);
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				const VecStringRef &ref = input[row];
+				const char *lhs = out.get_string_ptr(ref);
+				const bool eq = lhs != nullptr && ref.len == rhs_len && (rhs_len == 0 || std::memcmp(lhs, rhs, rhs_len) == 0);
+				output[row] = (step.op == ProjectOp::STRING_EQ_VAR_CONST ? eq : !eq) ? 1 : 0;
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::NUMERIC_CASE_ELSE_VAR:
+		{
+			const uint8_t *const cond_nulls = out.nulls[step.in_a_chunk_slot];
+			const uint8_t *const then_nulls = out.nulls[step.in_b_chunk_slot];
+			const uint8_t *const else_nulls = out.nulls[static_cast<uint8_t>(step.const_value)];
+			const int64_t *const cond = out.int64_columns[step.in_a_chunk_slot];
+			const int64_t *const then_vals = out.int64_columns[step.in_b_chunk_slot];
+			const int64_t *const else_vals = out.int64_columns[static_cast<uint8_t>(step.const_value)];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				const bool take_then = cond_nulls[row] == 0 && cond[row] != 0;
+				const uint8_t *src_nulls = take_then ? then_nulls : else_nulls;
+				const int64_t *src_vals = take_then ? then_vals : else_vals;
+				if (src_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = src_vals[row];
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::BOOL_AND_VAR_VAR:
+		case ProjectOp::BOOL_OR_VAR_VAR:
+		{
+			const uint8_t *const left_nulls = out.nulls[step.in_a_chunk_slot];
+			const uint8_t *const right_nulls = out.nulls[step.in_b_chunk_slot];
+			const int64_t *const left = out.int64_columns[step.in_a_chunk_slot];
+			const int64_t *const right = out.int64_columns[step.in_b_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (left_nulls[row] != 0 || right_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = (step.op == ProjectOp::BOOL_AND_VAR_VAR) ? ((left[row] != 0 && right[row] != 0) ? 1 : 0)
+					: ((left[row] != 0 || right[row] != 0) ? 1 : 0);
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::BOOL_NOT_VAR:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = input[row] == 0 ? 1 : 0;
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::CONST_INT64:
+		{
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			std::memset(out_nulls, 0, count);
+			for (uint16_t row = 0; row < count; ++row)
+				output[row] = step.const_value;
+			return;
+		}
+
+		case ProjectOp::INT32_TO_INT64_VAR:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int32_t *const input = out.int32_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = input[row];
+				out_nulls[row] = 0;
+			}
+			return;
+		}
 	}
 
 	elog(ERROR, "pg_volvec: unsupported projection opcode %u", static_cast<unsigned>(step.op));
@@ -348,6 +486,8 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 	{
 		if (static_cast<size_t>(expr.first_step_idx) + static_cast<size_t>(expr.n_steps) > steps_.size())
 			elog(ERROR, "pg_volvec: projection step range exceeds step tape");
+		if (expr.n_steps == 0)
+			continue;
 
 		for (uint16_t step_idx = expr.first_step_idx;
 		     step_idx < static_cast<uint16_t>(expr.first_step_idx + expr.n_steps);
@@ -357,7 +497,7 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 			ExecuteStep(step, out);
 		}
 
-		if (expr.n_steps == 0 || expr.output_chunk_slot != steps_[expr.first_step_idx + expr.n_steps - 1].out_chunk_slot)
+		if (expr.output_chunk_slot != steps_[expr.first_step_idx + expr.n_steps - 1].out_chunk_slot)
 			elog(ERROR, "pg_volvec: projection output slot descriptor mismatch");
 	}
 

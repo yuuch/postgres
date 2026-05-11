@@ -42,6 +42,7 @@ LayoutHasStringColumns(const TupleDataLayout *layout)
 static inline bool
 ResolveRowValueLocation(const TupleDataLayout *layout,
 	                    uint16_t chunk_slot,
+	                    TdcColumnKind expected_kind,
 	                    const TdcColumnDesc *&column,
 	                    const TdcAggregateDesc *&aggregate)
 {
@@ -49,7 +50,8 @@ ResolveRowValueLocation(const TupleDataLayout *layout,
 	aggregate = nullptr;
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
-		if (layout->columns[i].src_col_idx == chunk_slot)
+		if (layout->columns[i].src_col_idx == chunk_slot &&
+			layout->columns[i].kind == expected_kind)
 		{
 			column = &layout->columns[i];
 			return true;
@@ -63,6 +65,32 @@ ResolveRowValueLocation(const TupleDataLayout *layout,
 			aggregate = &layout->aggregates[agg_idx];
 			return true;
 		}
+	}
+	return false;
+}
+
+static inline bool
+ColumnDecodeKindToTdcKind(ColumnDecodeKind decode_kind, TdcColumnKind &out)
+{
+	switch (decode_kind)
+	{
+		case ColumnDecodeKind::INT32_CHAR:
+		case ColumnDecodeKind::INT32_INT4:
+		case ColumnDecodeKind::INT32_DATE:
+			out = TdcColumnKind::INT32;
+			return true;
+		case ColumnDecodeKind::INT64_INT8:
+		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+			out = TdcColumnKind::INT64;
+			return true;
+		case ColumnDecodeKind::DOUBLE_FLOAT8:
+			out = TdcColumnKind::DOUBLE;
+			return true;
+		case ColumnDecodeKind::STRING_REF:
+			out = TdcColumnKind::STRING_REF;
+			return true;
+		case ColumnDecodeKind::NONE:
+			return false;
 	}
 	return false;
 }
@@ -97,7 +125,9 @@ EncodeColumnFromRow(const ColumnSchema &col,
 {
 	const TdcColumnDesc *layout_col = nullptr;
 	const TdcAggregateDesc *layout_agg = nullptr;
-	if (!ResolveRowValueLocation(layout, col.chunk_slot, layout_col, layout_agg))
+	TdcColumnKind expected_kind;
+	if (!ColumnDecodeKindToTdcKind(col.decode_kind, expected_kind) ||
+		!ResolveRowValueLocation(layout, col.chunk_slot, expected_kind, layout_col, layout_agg))
 		elog(ERROR, "pg_volvec: output chunk slot %u not present in row layout",
 		     static_cast<unsigned>(col.chunk_slot));
 
@@ -123,6 +153,10 @@ EncodeColumnFromRow(const ColumnSchema &col,
 			const uint16_t offset = layout_col != nullptr ? layout_col->offset : layout_agg->offset;
 			int64_t value;
 			std::memcpy(&value, row_ptr + offset, sizeof(value));
+			if (col.type_oid == BOOLOID)
+				return BoolGetDatum(value != 0);
+			if (col.type_oid == INT4OID)
+				return Int32GetDatum(static_cast<int32_t>(value));
 			return Int64GetDatum(value);
 		}
 		case ColumnDecodeKind::DOUBLE_FLOAT8:

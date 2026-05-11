@@ -91,13 +91,13 @@ AnalyzeAggNode(Agg *agg, SupportedPlanShape &out)
 {
 	if (agg == nullptr || out.agg != nullptr)
 		return false;
-	if (agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_PLAIN)
+	if (agg->aggstrategy != AGG_HASHED && agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_SORTED)
 		return false;
 	if (agg->aggsplit != AGGSPLIT_SIMPLE)
 		return false;
 	if (agg->groupingSets != NIL || agg->chain != NIL)
 		return false;
-	if (agg->numCols > 0 && agg->aggstrategy != AGG_HASHED)
+	if (agg->numCols > 0 && agg->aggstrategy == AGG_PLAIN)
 		return false;
 	if (agg->plan.lefttree == nullptr || agg->plan.righttree != nullptr)
 		return false;
@@ -170,6 +170,36 @@ ExtractGroupCols(Agg *agg, Plan *agg_input_plan, std::vector<ColumnRef> &out)
 }
 
 bool
+ResolveAggGroupVarToColumnRef(Var *var,
+			     Agg *agg,
+			     const std::vector<ColumnRef> &group_cols,
+			     ColumnRef &out)
+{
+	if (var == nullptr || agg == nullptr)
+		return false;
+	if (var->varattno <= 0)
+		return false;
+	if (!IS_SPECIAL_VARNO(var->varno))
+	{
+		out = ColumnRef{static_cast<Index>(var->varno), var->varattno};
+		return out.varno > 0 && out.attno > 0;
+	}
+	if (var->varno != OUTER_VAR)
+		return false;
+	for (int g = 0; g < agg->numCols; ++g)
+	{
+		if (agg->grpColIdx[g] == var->varattno)
+		{
+			if (static_cast<size_t>(g) >= group_cols.size())
+				return false;
+			out = group_cols[g];
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
 ExtractAggrefs(Agg *agg,
 		   Plan *agg_plan,
 		   const std::vector<ColumnRef> &group_cols,
@@ -190,7 +220,7 @@ ExtractAggrefs(Agg *agg,
 		if (tag == T_Var)
 		{
 			ColumnRef ref{};
-			if (!ResolvePlanExprToColumnRef((Expr *) tle->expr, agg_plan, ref))
+			if (!ResolveAggGroupVarToColumnRef((Var *) tle->expr, agg, group_cols, ref))
 				return false;
 			bool is_group = false;
 			for (const ColumnRef &col : group_cols)
@@ -260,6 +290,40 @@ ExtractHashJoinOutputCols(HashJoin *hash_join,
 		if (!ResolvePlanExprToColumnRef((Expr *) tle->expr, &hash_join->join.plan, ref))
 			return false;
 		out.push_back(ref);
+	}
+	return !out.empty();
+}
+
+bool
+CollectPlanTargetInputCols(Plan *plan,
+			   std::vector<ColumnRef> &out)
+{
+	if (plan == nullptr || plan->targetlist == NIL)
+		return false;
+	out.clear();
+	ListCell *lc;
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		if (tle == nullptr || tle->expr == nullptr || tle->resjunk)
+			continue;
+		std::vector<ColumnRef> refs;
+		if (!CollectExprVarCols((Expr *) tle->expr, plan, refs))
+			return false;
+		for (const ColumnRef &ref : refs)
+		{
+			bool seen = false;
+			for (const ColumnRef &existing : out)
+			{
+				if (existing == ref)
+				{
+					seen = true;
+					break;
+				}
+			}
+			if (!seen)
+				out.push_back(ref);
+		}
 	}
 	return !out.empty();
 }

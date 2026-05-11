@@ -132,6 +132,9 @@ bool IsBareVarArg(Expr *arg, Plan *context_plan, ColumnRef &out_ref);
 bool CollectAggrefArgCols(const std::vector<Aggref *> &aggrefs,
 			  Plan *context_plan,
 			  std::vector<ColumnRef> &out);
+bool CollectExprVarCols(Expr *expr,
+			 Plan *context_plan,
+			 std::vector<ColumnRef> &out);
 bool ClassifyAggref(Aggref *ag,
 		    const std::vector<ColumnRef> &raw_cols_ref,
 		    const std::vector<ColumnSchema> &raw_cols,
@@ -194,6 +197,11 @@ bool BuildHashGroupLayout(const std::vector<ColumnRef> &group_cols,
 			  const std::vector<TdcAggKind> &agg_kinds,
 			  const std::vector<int16_t> &agg_numeric_scales,
 			  TupleDataLayout &out);
+bool MapProjectedExprSchema(Oid type_oid,
+			 int32 typmod,
+			 int8_t numeric_scale,
+			 uint8_t slot,
+			 ColumnSchema &out);
 bool BuildAggFinalOutput(const Agg *agg,
 			 const std::vector<ColumnRef> &group_cols,
 			 const std::vector<ColumnRef> &available_cols,
@@ -243,7 +251,13 @@ bool ExtractHashJoinClauseKeys(HashJoin *hash_join,
 			       std::vector<ColumnRef> &right_keys);
 bool ExtractHashJoinOutputCols(HashJoin *hash_join,
 			      std::vector<ColumnRef> &out);
+bool CollectPlanTargetInputCols(Plan *plan,
+			       std::vector<ColumnRef> &out);
 bool ExtractGroupCols(Agg *agg, Plan *agg_input_plan, std::vector<ColumnRef> &out);
+bool ResolveAggGroupVarToColumnRef(Var *var,
+			   Agg *agg,
+			   const std::vector<ColumnRef> &group_cols,
+			   ColumnRef &out);
 bool ExtractAggrefs(Agg *agg,
 		   Plan *agg_plan,
 		   const std::vector<ColumnRef> &group_cols,

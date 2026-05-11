@@ -169,9 +169,12 @@ enum class FilterStepOp : uint8_t {
 	STRING_EQ_CONST    = 2,
 	STRING_NE_CONST    = 3,
 	STRING_PREFIX_LIKE = 4,
-	BOOL_AND           = 5,
-	BOOL_OR            = 6,
-	BOOL_NOT           = 7,
+	STRING_CONTAINS_LIKE = 5,
+	BOOL_AND           = 6,
+	BOOL_OR            = 7,
+	BOOL_NOT           = 8,
+	INT32_CMP_VAR      = 9,
+	INT64_CMP_VAR      = 10,
 };
 
 struct FilterInputDesc {
@@ -240,6 +243,15 @@ enum class ProjectOp : uint8_t {
 	NUMERIC_DIV_VAR_VAR   = 10,
 	STRING_PREFIX_LIKE    = 11,
 	NUMERIC_CASE_VAR_CONST = 12,
+	EXTRACT_YEAR_FROM_DATE = 13,
+	STRING_EQ_VAR_CONST = 14,
+	STRING_NE_VAR_CONST = 15,
+	NUMERIC_CASE_ELSE_VAR = 16,
+	BOOL_AND_VAR_VAR = 17,
+	BOOL_OR_VAR_VAR = 18,
+	BOOL_NOT_VAR = 19,
+	CONST_INT64 = 20,
+	INT32_TO_INT64_VAR = 21,
 };
 
 struct ProjectStep {

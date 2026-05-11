@@ -12,6 +12,79 @@ namespace pg_volvec {
 namespace pipeline {
 namespace translator_detail {
 
+static constexpr int32 kNumericTypmodVarHdrSz = 4;
+
+static int32
+MakeNumericTypmod(int precision, int scale)
+{
+	return ((precision << 16) | (scale & 0x7ff)) + kNumericTypmodVarHdrSz;
+}
+
+bool
+MapProjectedExprSchema(Oid type_oid,
+		       int32 typmod,
+		       int8_t numeric_scale,
+		       uint8_t slot,
+		       ColumnSchema &out)
+{
+	ColumnSchema cs{};
+	cs.type_oid = type_oid;
+	cs.typmod = typmod;
+	cs.chunk_slot = slot;
+	cs.src_attno = 0;
+	cs._pad0 = 0;
+	switch (type_oid)
+	{
+		case BOOLOID:
+			cs.typmod = -1;
+			cs.typlen = 1;
+			cs.typbyval = true;
+			cs.decode_kind = ColumnDecodeKind::INT64_INT8;
+			break;
+		case INT8OID:
+			cs.typmod = -1;
+			cs.typlen = 8;
+			cs.typbyval = true;
+			cs.decode_kind = ColumnDecodeKind::INT64_INT8;
+			break;
+		case FLOAT8OID:
+			cs.typmod = -1;
+			cs.typlen = 8;
+			cs.typbyval = true;
+			cs.decode_kind = ColumnDecodeKind::DOUBLE_FLOAT8;
+			break;
+		case DATEOID:
+			cs.typmod = -1;
+			cs.typlen = 4;
+			cs.typbyval = true;
+			cs.decode_kind = ColumnDecodeKind::INT32_DATE;
+			break;
+		case INT4OID:
+			cs.typmod = -1;
+			cs.typlen = 4;
+			cs.typbyval = true;
+			cs.decode_kind = ColumnDecodeKind::INT64_INT8;
+			break;
+		case NUMERICOID:
+			cs.typmod = MakeNumericTypmod(18, numeric_scale);
+			cs.typlen = -1;
+			cs.typbyval = false;
+			cs.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+			break;
+		case BPCHAROID:
+		case TEXTOID:
+		case VARCHAROID:
+			cs.typlen = -1;
+			cs.typbyval = false;
+			cs.decode_kind = ColumnDecodeKind::STRING_REF;
+			break;
+		default:
+			return false;
+	}
+	out = cs;
+	return true;
+}
+
 static bool
 UseInt32CharDecodeForColumn(Oid type_oid, int32 typmod)
 {
@@ -350,11 +423,11 @@ BuildAggFinalOutput(const Agg *agg,
 		}
 		if (nodeTag(expr) != T_Var)
 		{
-			continue;
+			return false;
 		}
 
 		ColumnRef ref{};
-		if (!ResolvePlanExprToColumnRef(expr, const_cast<Plan *>(&agg->plan), ref))
+		if (!ResolveAggGroupVarToColumnRef((Var *) expr, const_cast<Agg *>(agg), group_cols, ref))
 			return false;
 		const ColumnSchema *src = nullptr;
 		if (!LookupRawColumn(ref, available_cols, available_schema, src) || src == nullptr)

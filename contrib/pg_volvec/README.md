@@ -58,8 +58,9 @@ numeric filters are represented by `QualDescriptor` and evaluated in
 `PhysicalSeqScan` before projecting `l_extendedprice * l_discount` into
 `SUM_NUMERIC`. See `AGENTS.md` for the detailed bug ledger.
 
-Current checked-in benchmark coverage is Q1 / Q6 / Q10 / Q14 via
-`contrib/pg_volvec/scripts/bench_tpch_pg_vs_volvec.sh`.
+Current checked-in benchmark coverage is Q1 / Q5 / Q6 / Q7 / Q8 / Q9 /
+Q10 / Q12 / Q14 via `contrib/pg_volvec/scripts/bench_tpch_pg_vs_volvec.sh`.
+The validated core remains Q1 / Q6 / Q10.
 
 ### Active milestone: `M-FRAME-MIN`
 
@@ -78,8 +79,8 @@ Sequential rebuild on top of the greenfield deletion:
   new pipeline runtime; perf tracked in `perf/q1_p3x_progression.md` and the
   checked-in benchmark artifacts under `benchmarks/`.
 - **`M-Q6-RESTORE`** — canonical Q6 is restored for `SeqScan -> plain Agg`
-  with date/numeric filter conjunctions. Broader non-Q1 TPC-H shapes remain
-  out of scope for the current phase.
+  with date/numeric filter conjunctions. Broader non-benchmark TPC-H shapes
+  remain out of scope for the current phase.
 
 ### Out of scope (intentionally deleted, do not reintroduce)
 
@@ -91,8 +92,8 @@ of the previous era), `LoweredPipeline`, `WorkerPipelineExecutor`,
 `ParallelAggPartialState`, `partial_agg_op.{hpp,cpp}`, `agg_sink.{hpp,cpp}`,
 `seq_scan_source.{hpp,cpp}`, `pipeline_lowering.{hpp,cpp}`, `q1_translator.*`.
 
-Q2 / Q3 / Q4 / Q5 / Q7 / Q8 / Q9 / Q10 / Q11 / Q12 / Q13 / Q14 / Q15 / Q16 /
-Q17 / Q18 / Q19 / Q20 / Q21 / Q22 are all out of scope for the current phase.
+Q2 / Q3 / Q4 / Q11 / Q13 / Q15 / Q16 / Q17 / Q18 / Q19 / Q20 / Q21 / Q22
+are all out of scope for the current phase.
 
 ## Build And Install
 
@@ -156,7 +157,7 @@ Expected results today:
 
 Current benchmark artifact:
 
-- `benchmarks/tpch_pg_vs_volvec_20260511_174551.tsv`
+- `benchmarks/tpch_pg_vs_volvec_20260511_175310.tsv`
 
 ## Project Layout
 

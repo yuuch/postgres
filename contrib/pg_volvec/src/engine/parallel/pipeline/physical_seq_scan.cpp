@@ -197,7 +197,43 @@ EvalFilterStep(const FilterStep &step,
 			}
 			break;
 		}
-			case FilterStepOp::STRING_EQ_CONST:
+		case FilterStepOp::INT32_CMP_VAR:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0] && !filter_chunk.nulls[step.right_idx][0])
+			{
+				const int32_t l = filter_chunk.get_int32(step.left_idx, 0);
+				const int32_t r = filter_chunk.get_int32(step.right_idx, 0);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: result = l <= r; break;
+					case QualOp::LT: result = l <  r; break;
+					case QualOp::EQ: result = l == r; break;
+					case QualOp::GE: result = l >= r; break;
+					case QualOp::GT: result = l >  r; break;
+					case QualOp::NE: result = l != r; break;
+				}
+			}
+			break;
+		}
+		case FilterStepOp::INT64_CMP_VAR:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0] && !filter_chunk.nulls[step.right_idx][0])
+			{
+				const int64_t l = filter_chunk.get_int64(step.left_idx, 0);
+				const int64_t r = filter_chunk.get_int64(step.right_idx, 0);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: result = l <= r; break;
+					case QualOp::LT: result = l <  r; break;
+					case QualOp::EQ: result = l == r; break;
+					case QualOp::GE: result = l >= r; break;
+					case QualOp::GT: result = l >  r; break;
+					case QualOp::NE: result = l != r; break;
+				}
+			}
+			break;
+		}
+		case FilterStepOp::STRING_EQ_CONST:
 			case FilterStepOp::STRING_NE_CONST:
 			{
 				if (!filter_chunk.nulls[step.left_idx][0])
@@ -232,6 +268,29 @@ EvalFilterStep(const FilterStep &step,
 			}
 			break;
 		}
+			case FilterStepOp::STRING_CONTAINS_LIKE:
+			{
+				if (!filter_chunk.nulls[step.left_idx][0])
+				{
+					const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+					const char *rhs = ResolveFilterConstPtr(step, string_consts);
+					const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+					result = rhs != nullptr && lhs != nullptr && step.const_len <= ref.len;
+					if (result)
+					{
+						for (uint32_t start = 0; start + step.const_len <= ref.len; ++start)
+						{
+							if (std::memcmp(lhs + start, rhs, step.const_len) == 0)
+							{
+								result = true;
+								break;
+							}
+							result = false;
+						}
+					}
+				}
+				break;
+			}
 		case FilterStepOp::BOOL_AND:
 			result = bool_values[step.left_idx] && bool_values[step.right_idx];
 			break;

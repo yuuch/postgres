@@ -223,8 +223,8 @@ Main checked-in benchmark artifacts:
 - `contrib/pg_volvec/benchmarks/tpch_perf_snapshot.svg`
 - `contrib/pg_volvec/benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.tsv`
 - `contrib/pg_volvec/benchmarks/tpch_perf_pg_parallel14_vs_pg_volvec_parallel14_20260414_170932.svg`
-- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_174551.tsv`
-- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_174551.log`
+- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_175310.tsv`
+- `contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_175310.log`
 
 Two benchmark modes matter:
 
@@ -323,44 +323,39 @@ This is the fastest way to isolate regressions in:
 
 ## 9. Current Coverage Snapshot
 
-Fully verified offloaded TPCH queries:
+Validated core:
 
 - Q1
-- Q3
-- Q4
-- Q5
 - Q6
+- Q10
+
+Benchmarked / runnable in the current matrix:
+
+- Q5
 - Q7
 - Q8
 - Q9
-- Q10
-- Q11
 - Q12
-- Q13
 - Q14
+
+Parked for now because native plans are poor:
+
+- Q2
+- Q17
+- Q20
+- Q21
+
+Still later-family / unverified:
+
+- Q3
+- Q4
+- Q11
+- Q13
 - Q15
 - Q16
 - Q18
 - Q19
-- Q20
 - Q22
-
-Offloaded with narrower validation:
-
-- Q2
-- Q17
-- Q21
-
-Current process-parallel notes worth remembering:
-
-- Q3 needs `enable_eager_aggregate = off`
-- Q4 works through the process-worker path
-- Q11 is correct but still uses a safe leader-built shared hash bridge on the
-  nested build chain
-- Q12 is correct, but worker-local hash build is still duplicated
-- Q16 supports grouped `COUNT(DISTINCT int-like)` merge
-- Q17 is correct on the live dataset in the current process-worker path, but
-  the full original-query native diff is still limited by native PG timeout
 
 ## 10. Current Limitations
 
