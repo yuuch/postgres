@@ -74,20 +74,20 @@ run_one_query() {
     local tmp_sql="$1"
     local tmp_out
     local start_ms end_ms elapsed_ms
+    local timeout_ms
     tmp_out=$(mktemp -t pgvv_query)
     start_ms=$(python3 -c "import time; print(int(time.time()*1000))")
+    timeout_ms=$((TIMEOUT_SEC * 1000))
 
     ( "$PSQL" -h /tmp -p 5432 -d "$DB_NAME" -v ON_ERROR_STOP=1 -qAt -f "$tmp_sql" > "$tmp_out" 2>&1; echo $? > "${tmp_out}.rc" ) &
     local psql_pid=$!
-    local waited=0
-
     while kill -0 "$psql_pid" 2>/dev/null; do
-        sleep 1
-        waited=$(( waited + 1 ))
-        if [[ $waited -ge $TIMEOUT_SEC ]]; then
+        sleep 0.05
+        end_ms=$(python3 -c "import time; print(int(time.time()*1000))")
+        if [[ $(( end_ms - start_ms )) -ge $timeout_ms ]]; then
             kill -9 "$psql_pid" 2>/dev/null || true
             wait "$psql_pid" 2>/dev/null || true
-            printf '%s\t%s\n' "$((TIMEOUT_SEC * 1000))" "timeout"
+            printf '%s\t%s\n' "$timeout_ms" "timeout"
             rm -f "$tmp_out" "${tmp_out}.rc"
             return
         fi
