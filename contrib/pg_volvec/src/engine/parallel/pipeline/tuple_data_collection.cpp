@@ -222,7 +222,7 @@ TupleDataCollectionRequiredHeapBytesForChunkRow(const TupleDataLayout *layout,
 			continue;
 		Assert(col.src_col_idx < 16);
 		required += HeapBytesNeededForStringLength(
-			chunk.string_columns[col.src_col_idx][row_idx].len);
+			chunk.get_string_ref(col.src_col_idx, row_idx).len);
 	}
 
 	return required > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(required);

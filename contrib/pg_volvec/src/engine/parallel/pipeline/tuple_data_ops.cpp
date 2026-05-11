@@ -155,14 +155,14 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 			case TdcAggKind::SUM_INT64:
 			case TdcAggKind::SUM_NUMERIC:
 				Assert(agg.src_col_idx < 16);
-				delta.values[a] += chunk.int64_columns[agg.src_col_idx][row_idx];
+				delta.values[a] += chunk.get_int64(agg.src_col_idx, row_idx);
 				break;
 			case TdcAggKind::COUNT_STAR:
 				delta.values[a] += 1;
 				break;
 			case TdcAggKind::AVG_NUMERIC:
 				Assert(agg.src_col_idx < 16);
-				delta.values[a] += chunk.int64_columns[agg.src_col_idx][row_idx];
+				delta.values[a] += chunk.get_int64(agg.src_col_idx, row_idx);
 				delta.counts[a] += 1;
 				break;
 		}
@@ -292,27 +292,26 @@ ScatterGroupColumns(const TupleDataLayout *layout,
 			{
 				case TdcColumnKind::INT32:
 			{
-				int32_t v = chunk.int32_columns[col.src_col_idx][row_idx];
+				int32_t v = chunk.get_int32(col.src_col_idx, row_idx);
 				std::memcpy(row_ptr + col.offset, &v, sizeof(v));
 				break;
 			}
 			case TdcColumnKind::INT64:
 			{
-				int64_t v = chunk.int64_columns[col.src_col_idx][row_idx];
+				int64_t v = chunk.get_int64(col.src_col_idx, row_idx);
 				std::memcpy(row_ptr + col.offset, &v, sizeof(v));
 				break;
 			}
 				case TdcColumnKind::DOUBLE:
 				{
-					double v = chunk.double_columns[col.src_col_idx][row_idx];
+					double v = chunk.get_double(col.src_col_idx, row_idx);
 					std::memcpy(row_ptr + col.offset, &v, sizeof(v));
 					break;
 				}
 				case TdcColumnKind::STRING_REF:
 				{
-					const VecStringRef &src = chunk.string_columns[col.src_col_idx][row_idx];
-					const char *ptr = VecStringRefDataPtr(src,
-						reinterpret_cast<const char *>(chunk.string_arena.data()));
+					const VecStringRef src = chunk.get_string_ref(col.src_col_idx, row_idx);
+					const char *ptr = chunk.get_string_ptr(col.src_col_idx, row_idx);
 					VecStringRef dst;
 					if ((ptr == nullptr && src.len != 0) || tdc == nullptr ||
 						!TupleDataCollectionStoreStringBytes(tdc, ptr, src.len, &dst))
@@ -361,7 +360,7 @@ Scatter(const TupleDataLayout *layout,
 	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[a];
-		int64_t v = chunk.int64_columns[agg_chunk_base + a][row_idx];
+		int64_t v = chunk.get_int64(agg_chunk_base + a, row_idx);
 		std::memcpy(row_ptr + agg.offset, &v, sizeof(v));
 		if (agg.kind == TdcAggKind::AVG_NUMERIC)
 		{
@@ -474,24 +473,24 @@ HashGroup(const TupleDataLayout *layout,
 			{
 				case TdcColumnKind::INT32:
 			{
-				value = static_cast<uint32_t>(chunk.int32_columns[col.src_col_idx][row_idx]);
+				value = static_cast<uint32_t>(chunk.get_int32(col.src_col_idx, row_idx));
 				break;
 			}
 			case TdcColumnKind::INT64:
 			{
-				value = static_cast<uint64_t>(chunk.int64_columns[col.src_col_idx][row_idx]);
+				value = static_cast<uint64_t>(chunk.get_int64(col.src_col_idx, row_idx));
 				break;
 			}
 			case TdcColumnKind::DOUBLE:
 			{
-				double v = chunk.double_columns[col.src_col_idx][row_idx];
+				double v = chunk.get_double(col.src_col_idx, row_idx);
 				std::memcpy(&value, &v, sizeof(value));
 				break;
 			}
 				case TdcColumnKind::STRING_REF:
 				{
-					const VecStringRef &ref = chunk.string_columns[col.src_col_idx][row_idx];
-					const char *ptr = chunk.get_string_ptr(ref);
+					const VecStringRef ref = chunk.get_string_ref(col.src_col_idx, row_idx);
+					const char *ptr = chunk.get_string_ptr(col.src_col_idx, row_idx);
 					if (ptr == nullptr && ref.len != 0)
 						elog(ERROR, "pg_volvec: STRING_REF chunk hashing missing arena backing");
 					value = Mix64(ref.prefix ^ static_cast<uint64_t>(ref.len));
@@ -580,7 +579,7 @@ MatchGroup(const TupleDataLayout *layout,
 			{
 				int32_t row_v;
 				std::memcpy(&row_v, row_ptr + col.offset, sizeof(row_v));
-				if (row_v != chunk.int32_columns[col.src_col_idx][row_idx])
+				if (row_v != chunk.get_int32(col.src_col_idx, row_idx))
 					return false;
 				break;
 			}
@@ -588,7 +587,7 @@ MatchGroup(const TupleDataLayout *layout,
 			{
 				int64_t row_v;
 				std::memcpy(&row_v, row_ptr + col.offset, sizeof(row_v));
-				if (row_v != chunk.int64_columns[col.src_col_idx][row_idx])
+				if (row_v != chunk.get_int64(col.src_col_idx, row_idx))
 					return false;
 				break;
 			}
@@ -597,7 +596,8 @@ MatchGroup(const TupleDataLayout *layout,
 					uint64_t row_v;
 					uint64_t chunk_v;
 					std::memcpy(&row_v, row_ptr + col.offset, sizeof(row_v));
-					std::memcpy(&chunk_v, &chunk.double_columns[col.src_col_idx][row_idx], sizeof(chunk_v));
+					double chunk_value = chunk.get_double(col.src_col_idx, row_idx);
+					std::memcpy(&chunk_v, &chunk_value, sizeof(chunk_v));
 					if (row_v != chunk_v)
 						return false;
 				break;
@@ -605,12 +605,12 @@ MatchGroup(const TupleDataLayout *layout,
 				case TdcColumnKind::STRING_REF:
 				{
 					VecStringRef row_ref = *reinterpret_cast<const VecStringRef *>(row_ptr + col.offset);
-					const VecStringRef &chunk_ref = chunk.string_columns[col.src_col_idx][row_idx];
+					const VecStringRef chunk_ref = chunk.get_string_ref(col.src_col_idx, row_idx);
 					if (row_ref.len != chunk_ref.len || row_ref.prefix != chunk_ref.prefix)
 						return false;
 					const char *row_ptr_data = VecStringRefDataPtr(row_ref,
 						tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
-					const char *chunk_ptr_data = chunk.get_string_ptr(chunk_ref);
+					const char *chunk_ptr_data = chunk.get_string_ptr(col.src_col_idx, row_idx);
 					if (row_ref.len != 0 && (row_ptr_data == nullptr || chunk_ptr_data == nullptr))
 						elog(ERROR, "pg_volvec: STRING_REF row-store match missing backing storage");
 					if (row_ref.len > 8 && std::memcmp(row_ptr_data, chunk_ptr_data, row_ref.len) != 0)
@@ -642,26 +642,27 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 		if (row_col.kind != chunk_col.kind || row_col.width != chunk_col.width)
 			return false;
 		Assert(chunk_col.src_col_idx < 16);
-		switch (row_col.kind)
-		{
-			case TdcColumnKind::INT32:
+			switch (row_col.kind)
+			{
+				case TdcColumnKind::INT32:
 			{
 				int32_t row_v;
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
-				return row_v == chunk.int32_columns[chunk_col.src_col_idx][row_idx];
+				return row_v == chunk.get_int32(chunk_col.src_col_idx, row_idx);
 			}
 			case TdcColumnKind::INT64:
 			{
 				int64_t row_v;
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
-				return row_v == chunk.int64_columns[chunk_col.src_col_idx][row_idx];
+				return row_v == chunk.get_int64(chunk_col.src_col_idx, row_idx);
 			}
 			case TdcColumnKind::DOUBLE:
 			{
 				uint64_t row_v;
 				uint64_t chunk_v;
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
-				std::memcpy(&chunk_v, &chunk.double_columns[chunk_col.src_col_idx][row_idx], sizeof(chunk_v));
+				double chunk_value = chunk.get_double(chunk_col.src_col_idx, row_idx);
+				std::memcpy(&chunk_v, &chunk_value, sizeof(chunk_v));
 				return row_v == chunk_v;
 			}
 			case TdcColumnKind::STRING_REF:
@@ -683,8 +684,8 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 		int32_t row_v1;
 		std::memcpy(&row_v0, row_ptr + row_col0.offset, sizeof(row_v0));
 		std::memcpy(&row_v1, row_ptr + row_col1.offset, sizeof(row_v1));
-		return row_v0 == chunk.int32_columns[chunk_col0.src_col_idx][row_idx] &&
-			row_v1 == chunk.int32_columns[chunk_col1.src_col_idx][row_idx];
+		return row_v0 == chunk.get_int32(chunk_col0.src_col_idx, row_idx) &&
+			row_v1 == chunk.get_int32(chunk_col1.src_col_idx, row_idx);
 	}
 
 	for (uint16_t i = 0; i < row_layout->column_count; ++i)
@@ -701,7 +702,7 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 			{
 				int32_t row_v;
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
-				if (row_v != chunk.int32_columns[chunk_col.src_col_idx][row_idx])
+				if (row_v != chunk.get_int32(chunk_col.src_col_idx, row_idx))
 					return false;
 				break;
 			}
@@ -709,7 +710,7 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 			{
 				int64_t row_v;
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
-				if (row_v != chunk.int64_columns[chunk_col.src_col_idx][row_idx])
+				if (row_v != chunk.get_int64(chunk_col.src_col_idx, row_idx))
 					return false;
 				break;
 			}
@@ -718,7 +719,8 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 				uint64_t row_v;
 				uint64_t chunk_v;
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
-				std::memcpy(&chunk_v, &chunk.double_columns[chunk_col.src_col_idx][row_idx], sizeof(chunk_v));
+				double chunk_value = chunk.get_double(chunk_col.src_col_idx, row_idx);
+				std::memcpy(&chunk_v, &chunk_value, sizeof(chunk_v));
 				if (row_v != chunk_v)
 					return false;
 				break;
@@ -727,12 +729,12 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 			{
 				VecStringRef row_ref;
 				std::memcpy(&row_ref, row_ptr + row_col.offset, sizeof(row_ref));
-				const VecStringRef &chunk_ref = chunk.string_columns[chunk_col.src_col_idx][row_idx];
+				const VecStringRef chunk_ref = chunk.get_string_ref(chunk_col.src_col_idx, row_idx);
 				if (row_ref.len != chunk_ref.len || row_ref.prefix != chunk_ref.prefix)
 					return false;
 				const char *row_ptr_data = VecStringRefDataPtr(row_ref,
 					tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
-				const char *chunk_ptr_data = chunk.get_string_ptr(chunk_ref);
+				const char *chunk_ptr_data = chunk.get_string_ptr(chunk_col.src_col_idx, row_idx);
 				if (row_ref.len != 0 && (row_ptr_data == nullptr || chunk_ptr_data == nullptr))
 					elog(ERROR, "pg_volvec: STRING_REF cross-layout match missing backing storage");
 				if (row_ref.len > 8 && std::memcmp(row_ptr_data, chunk_ptr_data, row_ref.len) != 0)
@@ -776,7 +778,7 @@ MatchGroupBatch(const TupleDataLayout *layout,
 					int32_t row_v;
 					std::memcpy(&row_v, row_ptrs[idx] + col.offset, sizeof(row_v));
 					row_vals[lane] = static_cast<uint32_t>(row_v);
-					chunk_vals[lane] = static_cast<uint32_t>(chunk.int32_columns[col.src_col_idx][row_indices[idx]]);
+					chunk_vals[lane] = static_cast<uint32_t>(chunk.get_int32(col.src_col_idx, row_indices[idx]));
 					valid_mask |= static_cast<uint8_t>(1u << lane);
 				}
 				const uint8_t match_mask = NeonLaneMaskEqU32(
@@ -803,9 +805,12 @@ MatchGroupBatch(const TupleDataLayout *layout,
 						continue;
 					std::memcpy(&row_vals[lane], row_ptrs[idx] + col.offset, sizeof(uint64_t));
 					if (col.kind == TdcColumnKind::INT64)
-						chunk_vals[lane] = static_cast<uint64_t>(chunk.int64_columns[col.src_col_idx][row_indices[idx]]);
+						chunk_vals[lane] = static_cast<uint64_t>(chunk.get_int64(col.src_col_idx, row_indices[idx]));
 					else
-						std::memcpy(&chunk_vals[lane], &chunk.double_columns[col.src_col_idx][row_indices[idx]], sizeof(uint64_t));
+					{
+						double chunk_value = chunk.get_double(col.src_col_idx, row_indices[idx]);
+						std::memcpy(&chunk_vals[lane], &chunk_value, sizeof(uint64_t));
+					}
 					valid_mask |= static_cast<uint8_t>(1u << lane);
 				}
 				const uint8_t match_mask = NeonLaneMaskEqU64(
@@ -844,8 +849,8 @@ MatchGroupBatch(const TupleDataLayout *layout,
 				std::memcpy(&row_v1, row_ptrs[idx] + col1.offset, sizeof(row_v1));
 				row0[lane] = static_cast<uint32_t>(row_v0);
 				row1[lane] = static_cast<uint32_t>(row_v1);
-				chunk0[lane] = static_cast<uint32_t>(chunk.int32_columns[col0.src_col_idx][row_indices[idx]]);
-				chunk1[lane] = static_cast<uint32_t>(chunk.int32_columns[col1.src_col_idx][row_indices[idx]]);
+				chunk0[lane] = static_cast<uint32_t>(chunk.get_int32(col0.src_col_idx, row_indices[idx]));
+				chunk1[lane] = static_cast<uint32_t>(chunk.get_int32(col1.src_col_idx, row_indices[idx]));
 				valid_mask |= static_cast<uint8_t>(1u << lane);
 			}
 			const uint32x4_t cmp0 = vceqq_u32(vld1q_u32(row0), vld1q_u32(chunk0));
@@ -927,25 +932,25 @@ UpdateAggregates(const TupleDataLayout *layout,
 
 		switch (agg.kind)
 		{
-			case TdcAggKind::SUM_INT64:
-			case TdcAggKind::SUM_NUMERIC:
-				Assert(agg.src_col_idx < 16);
-				AddInt64At(row_ptr,
-				           agg.offset,
-				           chunk.int64_columns[agg.src_col_idx][row_idx]);
-				break;
+		case TdcAggKind::SUM_INT64:
+		case TdcAggKind::SUM_NUMERIC:
+			Assert(agg.src_col_idx < 16);
+			AddInt64At(row_ptr,
+			           agg.offset,
+			           chunk.get_int64(agg.src_col_idx, row_idx));
+			break;
 			case TdcAggKind::COUNT_STAR:
 				AddInt64At(row_ptr, agg.offset, 1);
 				break;
-			case TdcAggKind::AVG_NUMERIC:
-				Assert(agg.src_col_idx < 16);
-				AddInt64At(row_ptr,
-				           agg.offset,
-				           chunk.int64_columns[agg.src_col_idx][row_idx]);
-				AddInt64At(row_ptr, agg.offset + 8, 1);
-				break;
-		}
+		case TdcAggKind::AVG_NUMERIC:
+			Assert(agg.src_col_idx < 16);
+			AddInt64At(row_ptr,
+			           agg.offset,
+			           chunk.get_int64(agg.src_col_idx, row_idx));
+			AddInt64At(row_ptr, agg.offset + 8, 1);
+			break;
 	}
+}
 }
 
 void

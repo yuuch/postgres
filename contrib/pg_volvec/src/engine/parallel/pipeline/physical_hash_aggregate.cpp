@@ -145,7 +145,7 @@ EncodePerfectHashKey(const TupleDataLayout *layout,
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
-		const int32_t v = chunk.int32_columns[col.src_col_idx][row_idx];
+		const int32_t v = chunk.get_int32(col.src_col_idx, row_idx);
 		if (v < 0 || v > 255)
 			return false;
 		key = (key << 8) | static_cast<uint32_t>(v);

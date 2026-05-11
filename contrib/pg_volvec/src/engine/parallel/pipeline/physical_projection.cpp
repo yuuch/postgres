@@ -341,6 +341,8 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 	out = in;
+	if (out.has_any_dictionary())
+		out.flatten();
 
 	for (const ProjectExprDesc &expr : expr_descs_)
 	{

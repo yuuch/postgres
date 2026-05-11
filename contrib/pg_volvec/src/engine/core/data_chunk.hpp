@@ -8,6 +8,7 @@ namespace pg_volvec
 
 struct SelectionVector { uint16_t row_ids[DEFAULT_CHUNK_SIZE]; uint16_t count; void clear() { count = 0; } };
 struct VecStringRef { uint32_t len; uint32_t offset; uint64_t prefix; };
+struct VecDictionaryDesc { bool active; uint8_t source_slot; uint16_t _pad0; };
 static constexpr uint32_t kVecStringInlineOffset = UINT32_MAX;
 
 static inline bool
@@ -68,6 +69,14 @@ struct alignas(16) DataChunk {
 	alignas(16) int32_t int32_columns[16][Capacity];
 	alignas(16) VecStringRef string_columns[16][Capacity];
 	alignas(16) uint8_t nulls[16][Capacity]; /* Use uint8_t for reliability */
+	alignas(16) uint16_t double_dict_indices[16][Capacity];
+	alignas(16) uint16_t int64_dict_indices[16][Capacity];
+	alignas(16) uint16_t int32_dict_indices[16][Capacity];
+	alignas(16) uint16_t string_dict_indices[16][Capacity];
+	VecDictionaryDesc double_dict[16];
+	VecDictionaryDesc int64_dict[16];
+	VecDictionaryDesc int32_dict[16];
+	VecDictionaryDesc string_dict[16];
 	SelectionVector sel;
 	bool has_selection;
 	VolVecVector<char> string_arena;
@@ -78,9 +87,143 @@ struct alignas(16) DataChunk {
 		  string_arena(PgMemoryContextAllocator<char>(CurrentMemoryContext))
 	{
 		memset(nulls, 0, sizeof(nulls));
+		memset(double_dict, 0, sizeof(double_dict));
+		memset(int64_dict, 0, sizeof(int64_dict));
+		memset(int32_dict, 0, sizeof(int32_dict));
+		memset(string_dict, 0, sizeof(string_dict));
 	}
 
-	void reset() { count = 0; sel.clear(); has_selection = false; memset(nulls, 0, sizeof(nulls)); string_arena.clear(); }
+	void reset() {
+		count = 0;
+		sel.clear();
+		has_selection = false;
+		memset(nulls, 0, sizeof(nulls));
+		memset(double_dict, 0, sizeof(double_dict));
+		memset(int64_dict, 0, sizeof(int64_dict));
+		memset(int32_dict, 0, sizeof(int32_dict));
+		memset(string_dict, 0, sizeof(string_dict));
+		string_arena.clear();
+	}
+
+	bool has_any_dictionary() const
+	{
+		for (int i = 0; i < 16; ++i)
+		{
+			if (double_dict[i].active || int64_dict[i].active ||
+				int32_dict[i].active || string_dict[i].active)
+				return true;
+		}
+		return false;
+	}
+
+	bool has_int32_dictionary(uint8_t slot) const { return int32_dict[slot].active; }
+	bool has_int64_dictionary(uint8_t slot) const { return int64_dict[slot].active; }
+	bool has_double_dictionary(uint8_t slot) const { return double_dict[slot].active; }
+	bool has_string_dictionary(uint8_t slot) const { return string_dict[slot].active; }
+
+	void clear_int32_dictionary(uint8_t slot) { int32_dict[slot] = VecDictionaryDesc{false, 0, 0}; }
+	void clear_int64_dictionary(uint8_t slot) { int64_dict[slot] = VecDictionaryDesc{false, 0, 0}; }
+	void clear_double_dictionary(uint8_t slot) { double_dict[slot] = VecDictionaryDesc{false, 0, 0}; }
+	void clear_string_dictionary(uint8_t slot) { string_dict[slot] = VecDictionaryDesc{false, 0, 0}; }
+
+	void set_int32_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
+	{
+		int32_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		memcpy(int32_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
+	}
+	void set_int64_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
+	{
+		int64_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		memcpy(int64_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
+	}
+	void set_double_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
+	{
+		double_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		memcpy(double_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
+	}
+	void set_string_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
+	{
+		string_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		memcpy(string_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
+	}
+
+	bool column_has_nulls(uint8_t slot, uint16_t row_count) const
+	{
+		return row_count != 0 && std::memchr(nulls[slot], 1, row_count) != nullptr;
+	}
+
+	int32_t get_int32(uint8_t slot, uint16_t row_idx) const
+	{
+		if (int32_dict[slot].active)
+			return int32_columns[int32_dict[slot].source_slot][int32_dict_indices[slot][row_idx]];
+		return int32_columns[slot][row_idx];
+	}
+
+	int64_t get_int64(uint8_t slot, uint16_t row_idx) const
+	{
+		if (int64_dict[slot].active)
+			return int64_columns[int64_dict[slot].source_slot][int64_dict_indices[slot][row_idx]];
+		return int64_columns[slot][row_idx];
+	}
+
+	double get_double(uint8_t slot, uint16_t row_idx) const
+	{
+		if (double_dict[slot].active)
+			return double_columns[double_dict[slot].source_slot][double_dict_indices[slot][row_idx]];
+		return double_columns[slot][row_idx];
+	}
+
+	VecStringRef get_string_ref(uint8_t slot, uint16_t row_idx) const
+	{
+		if (string_dict[slot].active)
+			return string_columns[string_dict[slot].source_slot][string_dict_indices[slot][row_idx]];
+		return string_columns[slot][row_idx];
+	}
+
+	const char *get_string_ptr(uint8_t slot, uint16_t row_idx) const
+	{
+		return VecStringRefDataPtr(get_string_ref(slot, row_idx), string_arena.data());
+	}
+
+	void flatten()
+	{
+		for (uint8_t slot = 0; slot < 16; ++slot)
+		{
+			if (int32_dict[slot].active)
+			{
+				int32_t tmp[Capacity];
+				for (uint16_t row = 0; row < count; ++row)
+					tmp[row] = get_int32(slot, row);
+				memcpy(int32_columns[slot], tmp, count * sizeof(int32_t));
+				clear_int32_dictionary(slot);
+			}
+			if (int64_dict[slot].active)
+			{
+				int64_t tmp[Capacity];
+				for (uint16_t row = 0; row < count; ++row)
+					tmp[row] = get_int64(slot, row);
+				memcpy(int64_columns[slot], tmp, count * sizeof(int64_t));
+				clear_int64_dictionary(slot);
+			}
+			if (double_dict[slot].active)
+			{
+				double tmp[Capacity];
+				for (uint16_t row = 0; row < count; ++row)
+					tmp[row] = get_double(slot, row);
+				memcpy(double_columns[slot], tmp, count * sizeof(double));
+				clear_double_dictionary(slot);
+			}
+			if (string_dict[slot].active)
+			{
+				VecStringRef tmp[Capacity];
+				for (uint16_t row = 0; row < count; ++row)
+					tmp[row] = get_string_ref(slot, row);
+				memcpy(string_columns[slot], tmp, count * sizeof(VecStringRef));
+				clear_string_dictionary(slot);
+			}
+		}
+	}
+
 	VecStringRef store_string_bytes(const char *data, uint32_t len)
 	{
 		VecStringRef ref{len, 0, 0};
@@ -141,4 +284,3 @@ struct DeformBindings { void *columns_data[kMaxDeformTargets]; uint8_t *columns_
 typedef void (*JitDeformFunc)(HeapTupleHeader tuphdr, void **col_data_ptrs, uint8_t **col_null_ptrs, uint32 row_idx, DataChunk<DEFAULT_CHUNK_SIZE> *owner_chunk);
 
 } // namespace pg_volvec
-
