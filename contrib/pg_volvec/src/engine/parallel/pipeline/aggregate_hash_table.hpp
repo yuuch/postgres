@@ -229,6 +229,7 @@ void AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
 void AggregateHashTableCombineRow(AggregateHashTable *aht,
                                   TupleDataCollection *tdc,
                                   const TupleDataLayout *layout,
+								  const TupleDataCollection *src_tdc,
                                   const uint8_t *src_row,
                                   uint64_t hash);
 

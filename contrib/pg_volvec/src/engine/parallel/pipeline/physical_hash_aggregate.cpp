@@ -746,6 +746,7 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 					AggregateHashTableCombineRow(global_aht,
 						global_tdc,
 						global.layout,
+						local_tdc,
 						src_row,
 						hash);
 					ResizeAhtForTdc(ctx,
@@ -809,6 +810,7 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 			AggregateHashTableCombineRow(global_aht,
 				global_tdc,
 				global.layout,
+				local_tdc,
 				src_row,
 				hash);
 			ResizeAhtForTdc(ctx,
