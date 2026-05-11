@@ -570,10 +570,15 @@ BuildHashJoinSubtree(HashJoin *hash_join,
 	std::vector<ColumnRef> left_keys;
 	std::vector<ColumnRef> right_keys;
 	std::vector<HashJoinOutputColumnDesc> output_mappings;
+	std::vector<HashJoinFilterInputDesc> filter_inputs;
+	std::vector<FilterExprDesc> filter_exprs;
+	std::vector<FilterStep> filter_steps;
+	std::vector<char> filter_string_consts;
 	TupleDataLayout left_key_layout;
 	TupleDataLayout right_key_layout;
 	TupleDataLayout left_payload_layout;
 	TupleDataLayout right_payload_layout;
+	uint16_t next_filter_bool_reg = 0;
 	const bool swap_sides = PlanEstimatedRows(hash_join->join.plan.lefttree) <
 		PlanEstimatedRows(hash_join->join.plan.righttree);
 	const std::vector<ColumnRef> &probe_cols = swap_sides ? right_cols : left_cols;
@@ -586,6 +591,17 @@ BuildHashJoinSubtree(HashJoin *hash_join,
 	const uint32_t build_max_rows = EstimateHashJoinBuildRows(build_plan);
 	if (!ExtractHashJoinClauseKeys(hash_join, left_keys, right_keys) ||
 	    !ExtractHashJoinOutputCols(hash_join, out_cols) ||
+	    !ExtractHashJoinFilterQual(hash_join->join.joinqual,
+			&hash_join->join.plan,
+			probe_cols,
+			probe_schema,
+			build_cols,
+			build_schema,
+			filter_inputs,
+			filter_exprs,
+			filter_steps,
+			filter_string_consts,
+			next_filter_bool_reg) ||
 	    !BuildColumnOnlyLayoutForRefs(probe_keys, probe_cols, probe_schema, left_key_layout) ||
 	    !BuildColumnOnlyLayoutForRefs(build_keys, build_cols, build_schema, right_key_layout) ||
 	    !BuildColumnOnlyLayout(probe_schema, left_payload_layout) ||
@@ -609,6 +625,19 @@ BuildHashJoinSubtree(HashJoin *hash_join,
 		output_mappings.data(),
 		sizeof(HashJoinOutputColumnDesc),
 		output_mappings.size());
+	dsa_pointer filter_inputs_dp = BuildFilterArray(state->runtime_dsa,
+		filter_inputs.data(),
+		sizeof(HashJoinFilterInputDesc),
+		filter_inputs.size());
+	dsa_pointer filter_exprs_dp = BuildFilterArray(state->runtime_dsa,
+		filter_exprs.data(),
+		sizeof(FilterExprDesc),
+		filter_exprs.size());
+	dsa_pointer filter_steps_dp = BuildFilterArray(state->runtime_dsa,
+		filter_steps.data(),
+		sizeof(FilterStep),
+		filter_steps.size());
+	dsa_pointer filter_string_consts_dp = BuildCharArray(state->runtime_dsa, filter_string_consts);
 	if (!DsaPointerIsValid(left_schema_dp) || !DsaPointerIsValid(right_schema_dp) ||
 	    !DsaPointerIsValid(output_schema_dp) || !DsaPointerIsValid(left_key_layout_dp) ||
 	    !DsaPointerIsValid(right_key_layout_dp) || !DsaPointerIsValid(left_payload_layout_dp) ||
@@ -624,6 +653,15 @@ BuildHashJoinSubtree(HashJoin *hash_join,
 		right_payload_layout_dp,
 		output_columns_dp,
 		static_cast<uint16_t>(output_mappings.size()),
+		filter_inputs_dp,
+		filter_exprs_dp,
+		filter_steps_dp,
+		filter_string_consts_dp,
+		static_cast<uint16_t>(filter_inputs.size()),
+		static_cast<uint16_t>(filter_exprs.size()),
+		static_cast<uint16_t>(filter_steps.size()),
+		next_filter_bool_reg,
+		static_cast<uint32_t>(filter_string_consts.size()),
 		InvalidDsaPointer,
 		static_cast<uint16_t>(left_keys.size()),
 		static_cast<uint16_t>(right_keys.size()),

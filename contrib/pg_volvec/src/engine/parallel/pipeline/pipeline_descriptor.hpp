@@ -273,6 +273,13 @@ enum class HashJoinOutputSide : uint8_t {
 	RIGHT = 1,
 };
 
+struct HashJoinFilterInputDesc {
+	HashJoinOutputSide side;
+	uint8_t            input_chunk_slot;
+	ColumnDecodeKind   decode_kind;
+	uint8_t            _pad0;
+};
+
 struct HashJoinOutputColumnDesc {
 	HashJoinOutputSide side;
 	uint8_t            input_chunk_slot;
@@ -289,11 +296,20 @@ struct HashJoinOpBody {
 	dsa_pointer left_payload_layout;
 	dsa_pointer right_payload_layout;
 	dsa_pointer output_columns; /* HashJoinOutputColumnDesc[output_column_count] */
+	dsa_pointer filter_inputs; /* HashJoinFilterInputDesc[n_filter_inputs] */
+	dsa_pointer filter_exprs;  /* FilterExprDesc[n_filter_exprs] */
+	dsa_pointer filter_steps;  /* FilterStep[n_filter_steps] */
+	dsa_pointer filter_string_consts; /* char[filter_string_const_bytes] */
 	dsa_pointer shared_payload;
 	uint16_t    n_left_keys;
 	uint16_t    n_right_keys;
 	uint16_t    output_column_count;
+	uint16_t    n_filter_inputs;
+	uint16_t    n_filter_exprs;
+	uint16_t    n_filter_steps;
+	uint16_t    filter_bool_regs;
 	uint16_t    _pad0;
+	uint32_t    filter_string_const_bytes;
 	uint32_t    max_rows;
 };
 

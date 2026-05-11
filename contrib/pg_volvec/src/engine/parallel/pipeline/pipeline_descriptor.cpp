@@ -220,11 +220,20 @@ EmitHashJoin(const PhysicalHashJoin &op, OpDescriptor &out)
 	out.body.hash_join.left_payload_layout = op.left_payload_layout_dp();
 	out.body.hash_join.right_payload_layout = op.right_payload_layout_dp();
 	out.body.hash_join.output_columns = op.output_columns_dp();
+	out.body.hash_join.filter_inputs = op.filter_inputs_dp();
+	out.body.hash_join.filter_exprs = op.filter_exprs_dp();
+	out.body.hash_join.filter_steps = op.filter_steps_dp();
+	out.body.hash_join.filter_string_consts = op.filter_string_consts_dp();
 	out.body.hash_join.shared_payload = op.shared_payload_dp();
 	out.body.hash_join.n_left_keys = op.n_left_keys();
 	out.body.hash_join.n_right_keys = op.n_right_keys();
 	out.body.hash_join.output_column_count = op.output_column_count();
+	out.body.hash_join.n_filter_inputs = op.n_filter_inputs();
+	out.body.hash_join.n_filter_exprs = op.n_filter_exprs();
+	out.body.hash_join.n_filter_steps = op.n_filter_steps();
+	out.body.hash_join.filter_bool_regs = op.filter_bool_regs();
 	out.body.hash_join._pad0 = 0;
+	out.body.hash_join.filter_string_const_bytes = op.filter_string_const_bytes();
 	out.body.hash_join.max_rows = op.max_rows();
 }
 
@@ -346,6 +355,15 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				op.body.hash_join.right_payload_layout,
 				op.body.hash_join.output_columns,
 				op.body.hash_join.output_column_count,
+				op.body.hash_join.filter_inputs,
+				op.body.hash_join.filter_exprs,
+				op.body.hash_join.filter_steps,
+				op.body.hash_join.filter_string_consts,
+				op.body.hash_join.n_filter_inputs,
+				op.body.hash_join.n_filter_exprs,
+				op.body.hash_join.n_filter_steps,
+				op.body.hash_join.filter_bool_regs,
+				op.body.hash_join.filter_string_const_bytes,
 				op.body.hash_join.shared_payload,
 				op.body.hash_join.n_left_keys,
 				op.body.hash_join.n_right_keys,
