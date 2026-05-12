@@ -1,9 +1,0 @@
---- q1 ---
-q1 run1: 99 ms (error)
-q1 run2: 88 ms (error)
-q1 run3: 91 ms (error)
-q1 run4: 93 ms (error)
-q1 run5: 2560 ms (ok)
-q1 median: 93 ms (0.093 s) status=error
-Results TSV: /Users/chenyunwen/proj/postgres/contrib/pg_volvec/benchmarks/bench_tpch_q1_20260511_224746.tsv
-Results LOG: /Users/chenyunwen/proj/postgres/contrib/pg_volvec/benchmarks/bench_tpch_q1_20260511_224746.log

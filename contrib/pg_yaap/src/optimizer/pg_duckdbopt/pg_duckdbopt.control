@@ -1,5 +1,0 @@
-# pg_duckdbopt extension
-comment = 'Optimizing PostgreSQL with DuckDB logical optimizer core'
-default_version = '1.0'
-module_pathname = '$libdir/pg_duckdbopt'
-relocatable = true
