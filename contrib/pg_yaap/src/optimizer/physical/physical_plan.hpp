@@ -41,23 +41,29 @@ public:
     int pg_rtindex;
     unsigned int relid;
     std::string table_name;
+    std::vector<ProjectionIndex> projected_columns;
     std::vector<Expression*> filters;
 
     PhysicalTableScan(TableIndex table_index, int pg_rtindex, unsigned int relid, std::string table_name,
+                      std::vector<ProjectionIndex> projected_columns,
                       std::vector<Expression*> filters, size_t estimated_cardinality)
         : PhysicalOperator(PhysicalOperatorType::TABLE_SCAN, estimated_cardinality),
           table_index(table_index), pg_rtindex(pg_rtindex), relid(relid), table_name(std::move(table_name)),
-          filters(std::move(filters)) {}
+          projected_columns(std::move(projected_columns)), filters(std::move(filters)) {}
 };
 
 class PhysicalProjection : public PhysicalOperator {
 public:
+    TableIndex table_index;
     std::vector<Expression*> select_list;
     std::vector<std::string> output_names;
 
-    PhysicalProjection(std::vector<Expression*> select_list, std::vector<std::string> output_names,
+    PhysicalProjection(TableIndex table_index,
+                       std::vector<Expression*> select_list,
+                       std::vector<std::string> output_names,
                        size_t estimated_cardinality)
         : PhysicalOperator(PhysicalOperatorType::PROJECTION, estimated_cardinality),
+          table_index(table_index),
           select_list(std::move(select_list)), output_names(std::move(output_names)) {}
 };
 

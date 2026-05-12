@@ -6,6 +6,8 @@ extern "C" {
 #include "catalog/pg_type_d.h"
 #include "storage/lockdefs.h"
 #include "utils/rel.h"
+
+extern bool pg_yaap_trace_hooks;
 }
 
 namespace pg_yaap {
@@ -245,7 +247,16 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 		else if (LookupRawColumn(ref, right_cols, right_schema, src))
 			side = HashJoinOutputSide::RIGHT;
 		else
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG,
+					 "pg_yaap: hash join output mapping missing ref=(%u,%d) left_cols=%zu right_cols=%zu",
+					 ref.varno,
+					 ref.attno,
+					 left_cols.size(),
+					 right_cols.size());
 			return false;
+		}
 
 		ColumnSchema out_col = *src;
 		switch (src->decode_kind)
@@ -266,10 +277,24 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 				out_col.chunk_slot = next_int32_slot++;
 				break;
 			case ColumnDecodeKind::NONE:
+				if (pg_yaap_trace_hooks)
+					elog(LOG,
+						 "pg_yaap: hash join output mapping unsupported decode NONE ref=(%u,%d)",
+						 ref.varno,
+						 ref.attno);
 				return false;
 		}
 		if (out_col.chunk_slot >= 16)
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG,
+					 "pg_yaap: hash join output mapping slot overflow ref=(%u,%d) slot=%u decode=%d",
+					 ref.varno,
+					 ref.attno,
+					 out_col.chunk_slot,
+					 static_cast<int>(src->decode_kind));
 			return false;
+		}
 		out_col.src_attno = 0;
 		out_schema.push_back(out_col);
 

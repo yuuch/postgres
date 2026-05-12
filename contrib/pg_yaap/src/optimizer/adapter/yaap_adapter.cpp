@@ -8,6 +8,7 @@ extern "C" {
 #include "access/htup_details.h"
 #include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/value.h"
 #include "optimizer/optimizer.h"
 #include "utils/builtins.h"
@@ -152,6 +153,79 @@ std::string DerivedColumnName(Expression* expression, size_t index) {
         default:
             return "col" + std::to_string(index + 1);
     }
+}
+
+LogicalOperator* SkipTransparentOperators(LogicalOperator* input);
+
+bool CollectAggrefNodesWalker(::Node *node, void *context) {
+    if (node == nullptr) {
+        return false;
+    }
+    if (IsA(node, Aggref)) {
+        auto &aggrefs = *static_cast<std::vector<Aggref *> *>(context);
+        auto *aggref = reinterpret_cast<Aggref *>(node);
+        if (std::find(aggrefs.begin(), aggrefs.end(), aggref) == aggrefs.end()) {
+            aggrefs.push_back(aggref);
+        }
+        return false;
+    }
+    return expression_tree_walker(node, CollectAggrefNodesWalker, context);
+}
+
+std::vector<Aggref *> CollectQueryAggregates(::Query *pg_query) {
+    std::vector<Aggref *> aggrefs;
+    if (pg_query == nullptr) {
+        return aggrefs;
+    }
+
+    ListCell *lc = nullptr;
+    foreach(lc, pg_query->targetList) {
+        auto *te = reinterpret_cast<TargetEntry *>(lfirst(lc));
+        if (te == nullptr || te->resjunk) {
+            continue;
+        }
+        CollectAggrefNodesWalker(reinterpret_cast<Node *>(te->expr), &aggrefs);
+    }
+    if (pg_query->havingQual != nullptr) {
+        CollectAggrefNodesWalker(pg_query->havingQual, &aggrefs);
+    }
+    return aggrefs;
+}
+
+bool TryResolveTargetListBinding(::Query *pg_query,
+                                 TargetEntry *target_entry,
+                                 LogicalOperator *input,
+                                 std::unique_ptr<Expression> &out_expression) {
+    if (pg_query == nullptr || target_entry == nullptr || input == nullptr) {
+        return false;
+    }
+
+    auto *producer = SkipTransparentOperators(input);
+    if (producer == nullptr || producer->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+        return false;
+    }
+
+    auto *projection = static_cast<LogicalProjection *>(producer);
+    size_t projected_idx = 0;
+    ListCell *lc = nullptr;
+    foreach(lc, pg_query->targetList) {
+        auto *candidate = reinterpret_cast<TargetEntry *>(lfirst(lc));
+        if (candidate == nullptr || candidate->resjunk) {
+            continue;
+        }
+        if (candidate == target_entry) {
+            if (projected_idx >= projection->output_names.size()) {
+                return false;
+            }
+            out_expression = std::make_unique<BoundColumnRefExpression>(
+                ColumnBinding{projection->table_index, ProjectionIndex{projected_idx}},
+                "proj",
+                projection->output_names[projected_idx]);
+            return true;
+        }
+        ++projected_idx;
+    }
+    return false;
 }
 
 LogicalOperator* SkipTransparentOperators(LogicalOperator* input) {
@@ -1611,17 +1685,11 @@ std::unique_ptr<LogicalOperator> YaapAdapter::TranslateAggregate(::Query* pg_que
             tle->resname ? tle->resname : DerivedColumnName(aggregate->groups.back().get(), aggregate->group_names.size()));
     }
 
-    foreach(lc, pg_query->targetList) {
-        TargetEntry* te = (TargetEntry*)lfirst(lc);
-        if (te->resjunk || !IsA(te->expr, Aggref)) {
-            continue;
-        }
-        aggregate->expressions.push_back(TranslateExpression((::Node*)te->expr));
-        if (te->resname) {
-            aggregate->aggregate_names.push_back(te->resname);
-        } else {
-            aggregate->aggregate_names.push_back(DerivedColumnName(aggregate->expressions.back().get(), aggregate->aggregate_names.size()));
-        }
+    auto aggrefs = CollectQueryAggregates(pg_query);
+    for (auto *aggref : aggrefs) {
+        aggregate->expressions.push_back(TranslateExpression(reinterpret_cast<::Node *>(aggref)));
+        aggregate->aggregate_names.push_back(
+            DerivedColumnName(aggregate->expressions.back().get(), aggregate->aggregate_names.size()));
     }
 
     aggregate->children.push_back(std::move(input));
@@ -1812,12 +1880,14 @@ std::unique_ptr<LogicalOperator> YaapAdapter::TranslateOrder(::Query* pg_query,
         }
 
         OrderByNode order_node;
-        order_node.expression = TranslateExpression((::Node*)tle->expr);
-        if (!order_node.expression) {
-            throw std::runtime_error("Failed to translate order by expression");
+        if (!TryResolveTargetListBinding(pg_query, tle, input.get(), order_node.expression)) {
+            order_node.expression = TranslateExpression((::Node*)tle->expr);
+            if (!order_node.expression) {
+                throw std::runtime_error("Failed to translate order by expression");
+            }
+            PromoteScalarSubqueryExpression(order_node.expression, input, *this);
+            order_node.expression = RewriteToProducedBinding(input.get(), std::move(order_node.expression));
         }
-        PromoteScalarSubqueryExpression(order_node.expression, input, *this);
-        order_node.expression = RewriteToProducedBinding(input.get(), std::move(order_node.expression));
         order_op->orders.push_back(std::move(order_node));
     }
 

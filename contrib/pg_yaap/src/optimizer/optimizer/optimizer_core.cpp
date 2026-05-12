@@ -240,6 +240,9 @@ std::unique_ptr<LogicalOperator> LogicalOptimizer::Optimize(std::unique_ptr<Logi
     ScanFilterFolding scan_filter_folding;
     RunOptimizer(OptimizerPass::SCAN_FILTER_FOLDING, scan_filter_folding, plan);
 
+    RemoveUnusedColumns remove_unused_columns;
+    RunOptimizer(OptimizerPass::REMOVE_UNUSED_COLUMNS, remove_unused_columns, plan);
+
     CardinalityEstimator cardinality_estimator;
     RunOptimizer(OptimizerPass::CARDINALITY_ESTIMATOR, cardinality_estimator, plan);
 

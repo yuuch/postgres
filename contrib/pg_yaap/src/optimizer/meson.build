@@ -25,6 +25,7 @@ pg_yaap_sources += files(
   'optimizer/join_order_reconstruct.cpp',
   'optimizer/join_order_relation_manager.cpp',
   'optimizer/predicate_propagation.cpp',
+  'optimizer/remove_unused_columns.cpp',
   'optimizer/scan_filter_folding.cpp',
   'optimizer/join_order_relation_set.cpp',
   'optimizer/optimizer_stats.cpp',

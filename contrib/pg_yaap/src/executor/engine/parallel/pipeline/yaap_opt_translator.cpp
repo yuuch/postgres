@@ -61,6 +61,8 @@ using yaap::BoundFunctionExpression;
 using yaap::Expression;
 using yaap::ExpressionType;
 using yaap::PhysicalCrossProduct;
+using yaap::PhysicalDelimGet;
+using yaap::PhysicalDistinct;
 using yaap::PhysicalFilter;
 using yaap::PhysicalHashAggregate;
 using yaap::PhysicalHashJoin;
@@ -69,7 +71,10 @@ using yaap::PhysicalOperator;
 using yaap::PhysicalOperatorType;
 using yaap::PhysicalOrderBy;
 using yaap::PhysicalProjection;
+using yaap::PhysicalSetOperation;
 using yaap::PhysicalTableScan;
+using yaap::PhysicalWindow;
+using yaap::SetOperationType;
 
 using pg_yaap::pipeline::AggFuncDesc;
 using pg_yaap::pipeline::ColumnDecodeKind;
@@ -148,7 +153,11 @@ struct OptimizerNodeTranslation {
 };
 
 static const char *OptimizerOpTypeName(PhysicalOperatorType type);
-static void AppendOptimizerPlanNode(const PhysicalOperator &op, std::string &out);
+static void AppendOptimizerPlanNodeTree(const PhysicalOperator &op,
+										 const std::string &prefix,
+										 bool is_last,
+										 bool is_root,
+										 std::string &out);
 static OptimizerPlanSupportStatus AnalyzeOptimizerPlanNode(const PhysicalOperator &op, SupportContext &ctx);
 static bool TranslateOptimizerNode(const PhysicalOperator &op,
 								   QueryDesc *queryDesc,
@@ -345,21 +354,167 @@ OptimizerOpTypeName(PhysicalOperatorType type)
 }
 
 static void
-AppendOptimizerPlanNode(const PhysicalOperator &op, std::string &out)
+AppendPlanDetailList(std::string &out, const std::vector<std::string> &details)
 {
-	out += OptimizerOpTypeName(op.type);
-	out += "(";
-	out += std::to_string(op.estimated_cardinality);
-	out += ")";
-	for (const auto &child : op.children)
+	if (details.empty())
+		return;
+
+	out += " [";
+	for (size_t i = 0; i < details.size(); ++i)
 	{
-		out += " -> ";
-		if (child == nullptr)
+		if (i != 0)
+			out += ", ";
+		out += details[i];
+	}
+	out += "]";
+}
+
+static const char *
+OptimizerJoinTypeName(int join_type)
+{
+	switch (join_type)
+	{
+		case yaap::JOIN_INNER: return "INNER";
+		case yaap::JOIN_LEFT: return "LEFT";
+		case yaap::JOIN_FULL: return "FULL";
+		case yaap::JOIN_RIGHT: return "RIGHT";
+		case yaap::JOIN_SEMI: return "SEMI";
+		case yaap::JOIN_ANTI: return "ANTI";
+		case yaap::JOIN_MARK: return "MARK";
+		case yaap::JOIN_SINGLE: return "SINGLE";
+		default: return "UNKNOWN";
+	}
+}
+
+static const char *
+OptimizerSetOperationName(SetOperationType setop_type)
+{
+	switch (setop_type)
+	{
+		case SetOperationType::UNION: return "UNION";
+	}
+	return "UNKNOWN";
+}
+
+static std::vector<std::string>
+OptimizerPlanNodeDetails(const PhysicalOperator &op)
+{
+	std::vector<std::string> details;
+	details.push_back("rows=" + std::to_string(op.estimated_cardinality));
+
+	switch (op.type)
+	{
+		case PhysicalOperatorType::TABLE_SCAN:
 		{
-			out += "NULL";
+			const auto &scan = static_cast<const PhysicalTableScan &>(op);
+			details.push_back("table=" + scan.table_name);
+			if (!scan.filters.empty())
+				details.push_back("filters=" + std::to_string(scan.filters.size()));
+			break;
+		}
+		case PhysicalOperatorType::PROJECTION:
+		{
+			const auto &projection = static_cast<const PhysicalProjection &>(op);
+			details.push_back("exprs=" + std::to_string(projection.select_list.size()));
+			break;
+		}
+		case PhysicalOperatorType::FILTER:
+		{
+			const auto &filter = static_cast<const PhysicalFilter &>(op);
+			details.push_back("preds=" + std::to_string(filter.expressions.size()));
+			break;
+		}
+		case PhysicalOperatorType::DISTINCT:
+		{
+			const auto &distinct = static_cast<const PhysicalDistinct &>(op);
+			details.push_back("keys=" + std::to_string(distinct.expressions.size()));
+			break;
+		}
+		case PhysicalOperatorType::SET_OPERATION:
+		{
+			const auto &setop = static_cast<const PhysicalSetOperation &>(op);
+			details.push_back("op=" + std::string(OptimizerSetOperationName(setop.setop_type)));
+			details.push_back(setop.all ? "all=true" : "all=false");
+			break;
+		}
+		case PhysicalOperatorType::LIMIT:
+			break;
+		case PhysicalOperatorType::WINDOW:
+		{
+			const auto &window = static_cast<const PhysicalWindow &>(op);
+			details.push_back("funcs=" + std::to_string(window.function_names.size()));
+			if (!window.partitions.empty())
+				details.push_back("partitions=" + std::to_string(window.partitions.size()));
+			if (!window.orders.empty())
+				details.push_back("orders=" + std::to_string(window.orders.size()));
+			break;
+		}
+		case PhysicalOperatorType::HASH_JOIN:
+		{
+			const auto &join = static_cast<const PhysicalHashJoin &>(op);
+			details.push_back("type=" + std::string(OptimizerJoinTypeName(join.join_type)));
+			if (!join.conditions.empty())
+				details.push_back("conds=" + std::to_string(join.conditions.size()));
+			if (join.dependent)
+				details.push_back("dependent=true");
+			if (join.children_swapped)
+				details.push_back("swapped=true");
+			break;
+		}
+		case PhysicalOperatorType::DELIM_GET:
+		{
+			const auto &delim_get = static_cast<const PhysicalDelimGet &>(op);
+			if (!delim_get.correlated_columns.empty())
+				details.push_back("corr=" + std::to_string(delim_get.correlated_columns.size()));
+			break;
+		}
+		case PhysicalOperatorType::CROSS_PRODUCT:
+			break;
+		case PhysicalOperatorType::HASH_GROUP_BY:
+		{
+			const auto &agg = static_cast<const PhysicalHashAggregate &>(op);
+			if (!agg.groups.empty())
+				details.push_back("groups=" + std::to_string(agg.groups.size()));
+			if (!agg.expressions.empty())
+				details.push_back("aggs=" + std::to_string(agg.expressions.size()));
+			break;
+		}
+		case PhysicalOperatorType::ORDER_BY:
+		{
+			const auto &order = static_cast<const PhysicalOrderBy &>(op);
+			details.push_back("keys=" + std::to_string(order.orders.size()));
+			break;
+		}
+	}
+
+	return details;
+}
+
+static void
+AppendOptimizerPlanNodeTree(const PhysicalOperator &op,
+							 const std::string &prefix,
+							 bool is_last,
+							 bool is_root,
+							 std::string &out)
+{
+	out += prefix;
+	if (!is_root)
+		out += is_last ? "`- " : "|- ";
+	out += OptimizerOpTypeName(op.type);
+	AppendPlanDetailList(out, OptimizerPlanNodeDetails(op));
+	out += "\n";
+
+	const std::string child_prefix = prefix + (is_root ? "" : (is_last ? "   " : "|  "));
+	for (size_t i = 0; i < op.children.size(); ++i)
+	{
+		const bool child_is_last = (i + 1 == op.children.size());
+		if (op.children[i] == nullptr)
+		{
+			out += child_prefix;
+			out += child_is_last ? "`- NULL\n" : "|- NULL\n";
 			continue;
 		}
-		AppendOptimizerPlanNode(*child, out);
+		AppendOptimizerPlanNodeTree(*op.children[i], child_prefix, child_is_last, false, out);
 	}
 }
 
@@ -899,6 +1054,40 @@ BuildAllTableColumnRefs(Oid relid, Index varno, std::vector<ColumnRef> &out_cols
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, attidx);
 		if (attr->attisdropped)
 			continue;
+		out_cols.push_back(ColumnRef{varno, static_cast<AttrNumber>(attidx + 1)});
+	}
+	relation_close(rel, AccessShareLock);
+	return !out_cols.empty();
+}
+
+static bool
+BuildProjectedTableColumnRefs(Oid relid,
+							  Index varno,
+							  const std::vector<yaap::ProjectionIndex> &projected_columns,
+							  std::vector<ColumnRef> &out_cols)
+{
+	if (projected_columns.empty())
+		return BuildAllTableColumnRefs(relid, varno, out_cols);
+
+	Relation rel = relation_open(relid, AccessShareLock);
+	TupleDesc tupdesc = RelationGetDescr(rel);
+	out_cols.clear();
+	for (const auto &projected : projected_columns)
+	{
+		const size_t attidx = projected.index;
+		if (attidx >= static_cast<size_t>(tupdesc->natts))
+		{
+			relation_close(rel, AccessShareLock);
+			out_cols.clear();
+			return false;
+		}
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, static_cast<int>(attidx));
+		if (attr->attisdropped)
+		{
+			relation_close(rel, AccessShareLock);
+			out_cols.clear();
+			return false;
+		}
 		out_cols.push_back(ColumnRef{varno, static_cast<AttrNumber>(attidx + 1)});
 	}
 	relation_close(rel, AccessShareLock);
@@ -2203,6 +2392,13 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 			out_kind = TdcAggKind::SUM_INT64;
 			return true;
 		}
+		if (pg_yaap_trace_hooks)
+			elog(LOG,
+				 "pg_yaap: classify sum fallback bare_ref=%d decode=%d typmod=%d arg_type=%d",
+				 is_bare_ref ? 1 : 0,
+				 bare_col != nullptr ? static_cast<int>(bare_col->decode_kind) : -1,
+				 bare_col != nullptr ? bare_col->typmod : -1,
+				 arg != nullptr ? static_cast<int>(arg->type) : -1);
 		out_kind = TdcAggKind::SUM_NUMERIC;
 	}
 	else if (pg_strcasecmp(agg->function_name.c_str(), "avg") == 0)
@@ -2214,7 +2410,15 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 	{
 		int8_t scale = 0;
 		if (!ColumnNumericScale(*bare_col, scale))
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG,
+					 "pg_yaap: classify aggregate bare ref scale lookup failed fn=%s decode=%d typmod=%d",
+					 agg->function_name.c_str(),
+					 static_cast<int>(bare_col->decode_kind),
+					 bare_col->typmod);
 			return false;
+		}
 		out_desc.input_col_idx = bare_col->chunk_slot;
 		out_numeric_scale = (out_kind == TdcAggKind::AVG_NUMERIC) ? static_cast<int16_t>(scale + kAvgNumericExtraScale) : scale;
 		return true;
@@ -2232,7 +2436,16 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 	const uint16_t first_step_idx = static_cast<uint16_t>(project_steps.size());
 	if (!LowerOptimizerExpr(arg, project_steps, next_int64_slot, cols, schema, &materialized_exprs, lowered_scale, lowered_slot) ||
 		project_steps.size() == first_step_idx)
+	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG,
+				 "pg_yaap: classify aggregate expr lowering failed fn=%s arg_type=%d steps_before=%u steps_after=%zu",
+				 agg->function_name.c_str(),
+				 arg != nullptr ? static_cast<int>(arg->type) : -1,
+				 first_step_idx,
+				 project_steps.size());
 		return false;
+	}
 	project_exprs.push_back(ProjectExprDesc{
 		first_step_idx,
 		static_cast<uint16_t>(project_steps.size() - first_step_idx),
@@ -2439,7 +2652,9 @@ TryBuildPureProjection(const PhysicalProjection &projection,
 		const ColumnSchema *col = nullptr;
 		if (!LookupBindingColumn(col_expr->binding, child.cols, child.schema, ref, col) || col == nullptr)
 			return false;
-		new_cols.push_back(ref);
+		new_cols.push_back(ColumnRef{
+			static_cast<Index>(projection.table_index.index + 1),
+			static_cast<AttrNumber>(new_cols.size() + 1)});
 		new_schema.push_back(*col);
 	}
 	out.op = std::move(child.op);
@@ -2491,7 +2706,17 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 			!LowerOptimizerExpr(expr, steps, next_int64_slot, child.cols, child.schema, nullptr, result_scale, result_slot))
 		{
 			if (pg_yaap_trace_hooks)
-				elog(LOG, "pg_yaap: optimizer projection rejected: expr lowering failed");
+			{
+				if (expr->type == ExpressionType::BOUND_FUNCTION)
+					elog(LOG, "pg_yaap: optimizer projection rejected: expr lowering failed fn=%s",
+						 static_cast<const BoundFunctionExpression *>(expr)->function_name.c_str());
+				else if (expr->type == ExpressionType::BOUND_AGGREGATE)
+					elog(LOG, "pg_yaap: optimizer projection rejected: expr lowering failed agg=%s",
+						 static_cast<const BoundAggregateExpression *>(expr)->function_name.c_str());
+				else
+					elog(LOG, "pg_yaap: optimizer projection rejected: expr lowering failed type=%d",
+						 static_cast<int>(expr->type));
+			}
 			return false;
 		}
 		ColumnSchema mapped{};
@@ -2541,7 +2766,9 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	out.schema = std::move(out_schema);
 	out.cols.clear();
 	for (size_t i = 0; i < projection.select_list.size(); ++i)
-		out.cols.push_back(ColumnRef{1, static_cast<AttrNumber>(i + 1)});
+		out.cols.push_back(ColumnRef{
+			static_cast<Index>(projection.table_index.index + 1),
+			static_cast<AttrNumber>(i + 1)});
 	out.final_sort_keys = std::move(child.final_sort_keys);
 	out.limit_count = child.limit_count;
 	out.estimated_groups = child.estimated_groups;
@@ -2563,10 +2790,15 @@ TranslateTableScanNode(const PhysicalTableScan &scan,
 	}
 
 	std::vector<ColumnRef> all_cols;
-	if (!BuildAllTableColumnRefs(scan.relid, static_cast<Index>(scan.table_index.index + 1), all_cols))
+	if (!BuildProjectedTableColumnRefs(scan.relid,
+									   static_cast<Index>(scan.table_index.index + 1),
+									   scan.projected_columns,
+									   all_cols))
 	{
 		if (pg_yaap_trace_hooks)
-			elog(LOG, "pg_yaap: optimizer scan rejected: failed to enumerate table columns relid=%u", scan.relid);
+			elog(LOG, "pg_yaap: optimizer scan rejected: failed to enumerate projected table columns relid=%u projected=%zu",
+				 scan.relid,
+				 scan.projected_columns.size());
 		return false;
 	}
 	std::vector<ColumnSchema> ordered_cols;
@@ -2841,7 +3073,12 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		return false;
 	}
 
-	const bool swap_sides = left_child.schema.size() < right_child.schema.size();
+	const size_t left_rows = join.children[0] != nullptr ? join.children[0]->estimated_cardinality : 0;
+	const size_t right_rows = join.children[1] != nullptr ? join.children[1]->estimated_cardinality : 0;
+	const bool swap_sides =
+		(left_rows > 0 && right_rows > 0)
+			? (left_rows < right_rows)
+			: (left_child.schema.size() < right_child.schema.size());
 	const auto &probe_cols = swap_sides ? right_child.cols : left_child.cols;
 	const auto &probe_schema = swap_sides ? right_child.schema : left_child.schema;
 	const auto &build_cols = swap_sides ? left_child.cols : right_child.cols;
@@ -3014,7 +3251,12 @@ TranslateCrossProductNode(const PhysicalCrossProduct &join,
 		return false;
 	}
 
-	const bool swap_sides = left_child.schema.size() < right_child.schema.size();
+	const size_t left_rows = join.children[0] != nullptr ? join.children[0]->estimated_cardinality : 0;
+	const size_t right_rows = join.children[1] != nullptr ? join.children[1]->estimated_cardinality : 0;
+	const bool swap_sides =
+		(left_rows > 0 && right_rows > 0)
+			? (left_rows < right_rows)
+			: (left_child.schema.size() < right_child.schema.size());
 	const auto &probe_cols = swap_sides ? right_child.cols : left_child.cols;
 	const auto &probe_schema = swap_sides ? right_child.schema : left_child.schema;
 	const auto &build_cols = swap_sides ? left_child.cols : right_child.cols;
@@ -3283,7 +3525,10 @@ ExtractScanShape(const PhysicalOperator &op,
 	{
 		case PhysicalOperatorType::TABLE_SCAN:
 			out_scan = static_cast<const PhysicalTableScan *>(&op);
-			return BuildAllTableColumnRefs(out_scan->relid, static_cast<Index>(out_scan->table_index.index + 1), out_cols);
+			return BuildProjectedTableColumnRefs(out_scan->relid,
+												 static_cast<Index>(out_scan->table_index.index + 1),
+												 out_scan->projected_columns,
+												 out_cols);
 		case PhysicalOperatorType::PROJECTION:
 		{
 			const auto &projection = static_cast<const PhysicalProjection &>(op);
@@ -3317,7 +3562,9 @@ DescribeOptimizerPlan(const OptimizerPlanBundle &bundle)
 	if (bundle.physical_plan == nullptr)
 		return "NULL";
 	std::string out;
-	AppendOptimizerPlanNode(*bundle.physical_plan, out);
+	AppendOptimizerPlanNodeTree(*bundle.physical_plan, "", true, true, out);
+	if (!out.empty() && out.back() == '\n')
+		out.pop_back();
 	return out;
 }
 

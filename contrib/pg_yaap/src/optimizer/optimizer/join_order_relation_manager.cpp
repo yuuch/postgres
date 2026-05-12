@@ -171,6 +171,9 @@ std::vector<uint64_t> JoinOrderOptimizer::FindJoinComponents(const std::vector<J
     };
 
     for (const auto& condition : conditions) {
+        if (condition.from_residual_predicate) {
+            continue;
+        }
         if (__builtin_popcountll(condition.relation_mask) < 2) {
             continue;
         }

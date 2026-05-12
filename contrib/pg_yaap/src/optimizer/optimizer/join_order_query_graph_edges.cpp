@@ -60,7 +60,7 @@ std::vector<const JoinOrderNeighborInfo*> JoinOrderQueryGraphEdges::GetConnectio
     const JoinOrderRelationSet& other) const {
     std::vector<const JoinOrderNeighborInfo*> connections;
     EnumerateNeighbors(node, [&](const JoinOrderNeighborInfo& info) {
-        if (JoinOrderRelationSet::IsSubset(info.neighbor, other)) {
+        if (JoinOrderRelationSet::IsSubset(other, info.neighbor)) {
             connections.push_back(&info);
         }
         return false;
@@ -117,4 +117,3 @@ bool JoinOrderQueryGraphEdges::EnumerateNeighborsDFS(
 }
 
 } // namespace yaap
-

@@ -22,7 +22,7 @@ void JoinOrderQueryGraphManager::Build(const std::vector<JoinOrderJoinCondition>
 			right &= subset_mask_;
 		}
 
-		auto emit_filter = [&](uint64_t left_mask, uint64_t right_mask, bool residual) {
+		auto emit_filter = [&](uint64_t left_mask, uint64_t right_mask, bool residual, bool create_edge) {
 			if (left_mask == 0 || right_mask == 0 || (left_mask & right_mask) != 0) {
 				return;
 			}
@@ -35,13 +35,27 @@ void JoinOrderQueryGraphManager::Build(const std::vector<JoinOrderJoinCondition>
 			CollectColumnBindingsByMask(condition.expression.get(), left_mask, right_mask, *filter_info);
 			auto* filter_ptr = filter_info.get();
 			filter_infos_.push_back(std::move(filter_info));
-			query_graph_.CreateEdge(left_set, right_set, filter_ptr);
-			query_graph_.CreateEdge(right_set, left_set, filter_ptr);
+			if (create_edge) {
+				query_graph_.CreateEdge(left_set, right_set, filter_ptr);
+				query_graph_.CreateEdge(right_set, left_set, filter_ptr);
+			}
 		};
+
+		bool residual_only = condition.from_residual_predicate || !derived_sides;
+		if (residual_only) {
+			uint64_t left_mask = left;
+			uint64_t right_mask = right;
+			if (left_mask == 0 || right_mask == 0 || (left_mask & right_mask) != 0) {
+				left_mask = condition_mask & (~condition_mask + 1);
+				right_mask = condition_mask ^ left_mask;
+			}
+			emit_filter(left_mask, right_mask, true, false);
+			continue;
+		}
 
 		if (derived_sides && left != 0 && right != 0 &&
 			__builtin_popcountll(left) == 1 && __builtin_popcountll(right) == 1) {
-			emit_filter(left, right, false);
+			emit_filter(left, right, false, true);
 			continue;
 		}
 
@@ -55,7 +69,7 @@ void JoinOrderQueryGraphManager::Build(const std::vector<JoinOrderJoinCondition>
 			if (subset > other) {
 				continue;
 			}
-			emit_filter(subset, other, condition.from_residual_predicate);
+			emit_filter(subset, other, false, true);
 		}
 	}
 }

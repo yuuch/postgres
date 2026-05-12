@@ -42,6 +42,30 @@ std::unique_ptr<LogicalOperator> JoinOrderOptimizer::Rewrite(std::unique_ptr<Log
     }
 
     if (!IsSafeJoinOrderTree(plan.get())) {
+        for (auto& child : plan->children) {
+            if (child) {
+                child = Rewrite(std::move(child));
+            }
+        }
+        for (auto& child : plan->children) {
+            if (!child) {
+                return nullptr;
+            }
+        }
+        if (plan->children.size() == 1 && plan->children[0]) {
+            if (plan->type == LogicalOperatorType::LOGICAL_FILTER) {
+                auto* filter = static_cast<LogicalFilter*>(plan.get());
+                RelationStatisticsHelper statistics_helper;
+                plan->estimated_cardinality = statistics_helper.EstimateFilterCardinality(
+                    statistics_helper.Extract(*plan->children[0]),
+                    filter->expressions);
+            } else if (plan->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+                       plan->type == LogicalOperatorType::LOGICAL_ORDER ||
+                       plan->type == LogicalOperatorType::LOGICAL_WINDOW ||
+                       plan->type == LogicalOperatorType::LOGICAL_LIMIT) {
+                plan->estimated_cardinality = plan->children[0]->estimated_cardinality;
+            }
+        }
         return plan;
     }
 
@@ -76,6 +100,9 @@ std::unique_ptr<LogicalOperator> JoinOrderOptimizer::Rewrite(std::unique_ptr<Log
     std::vector<JoinCondition> conditions;
     dp_stats_.clear();
     ExtractJoinGraph(std::move(plan), relations, conditions);
+
+    elog(LOG, "pg_yaap: join-order extracted relations=%zu conditions=%zu",
+         relations.size(), conditions.size());
 
     if (relations.size() < 2) {
         if (relations.empty()) {
@@ -120,6 +147,8 @@ std::unique_ptr<LogicalOperator> JoinOrderOptimizer::Rewrite(std::unique_ptr<Log
     if (components.empty()) {
         return nullptr;
     }
+
+    elog(LOG, "pg_yaap: join-order components=%zu", components.size());
 
     std::vector<std::unique_ptr<LogicalOperator>> component_plans;
     component_plans.reserve(components.size());

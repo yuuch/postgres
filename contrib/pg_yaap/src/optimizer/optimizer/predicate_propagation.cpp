@@ -10,7 +10,7 @@ OptimizerPass PredicatePropagation::Pass() const {
     return OptimizerPass::PREDICATE_PROPAGATION;
 }
 
-void PredicatePropagation::CollectConjuncts(Expression* expression, std::vector<Expression*>& conjuncts) {
+void PredicatePropagation::CollectConjuncts(Expression* expression, std::vector<Expression*>& conjuncts) const {
     if (!expression) {
         return;
     }
@@ -339,6 +339,113 @@ PredicatePropagation::BuildEqualityClasses(const std::vector<Expression*>& equal
 }
 
 std::map<size_t, std::vector<std::unique_ptr<Expression>>>
+PredicatePropagation::BuildDisjunctiveConstantFilters(LogicalOperator* op) const {
+    std::map<size_t, std::vector<std::unique_ptr<Expression>>> filters;
+    if (!op) {
+        return filters;
+    }
+
+    auto process_expression = [&](Expression* expression) {
+        if (!expression || expression->type != ExpressionType::BOUND_CONJUNCTION) {
+            return;
+        }
+        auto* disjunction = static_cast<BoundConjunctionExpression*>(expression);
+        if (disjunction->bool_expr_type == 0 || disjunction->children.size() < 2) {
+            return;
+        }
+
+        using DisjunctEntry = std::tuple<BoundConstantExpression*, std::string, std::string>;
+        std::vector<std::map<ColumnBindingKey, DisjunctEntry>> disjunct_maps;
+        disjunct_maps.reserve(disjunction->children.size());
+
+        for (auto& child : disjunction->children) {
+            std::vector<Expression*> conjuncts;
+            CollectConjuncts(child.get(), conjuncts);
+
+            std::map<ColumnBindingKey, DisjunctEntry> local;
+            for (auto* conjunct : conjuncts) {
+                ColumnBinding binding;
+                BoundConstantExpression* constant = nullptr;
+                if (!IsColumnConstantEquality(conjunct, binding, constant) || constant == nullptr || constant->is_null) {
+                    continue;
+                }
+
+                auto* function = static_cast<BoundFunctionExpression*>(conjunct);
+                auto* column_ref = static_cast<BoundColumnRefExpression*>(
+                    function->children[0]->type == ExpressionType::BOUND_COLUMN_REF
+                        ? function->children[0].get()
+                        : function->children[1].get());
+                local.emplace(
+                    MakeColumnBindingKey(binding),
+                    std::make_tuple(constant, column_ref->table_name, column_ref->column_name));
+            }
+            if (local.empty()) {
+                return;
+            }
+            disjunct_maps.push_back(std::move(local));
+        }
+
+        if (disjunct_maps.size() < 2) {
+            return;
+        }
+
+        for (const auto& entry : disjunct_maps.front()) {
+            const auto& binding_key = entry.first;
+            bool present_in_all = true;
+            for (size_t i = 1; i < disjunct_maps.size(); ++i) {
+                if (disjunct_maps[i].find(binding_key) == disjunct_maps[i].end()) {
+                    present_in_all = false;
+                    break;
+                }
+            }
+            if (!present_in_all) {
+                continue;
+            }
+
+            auto derived = std::make_unique<BoundConjunctionExpression>(1);
+            for (const auto& disjunct_map : disjunct_maps) {
+                const auto& disjunct_entry = disjunct_map.find(binding_key)->second;
+                auto column = std::make_unique<BoundColumnRefExpression>(
+                    ColumnBinding{TableIndex{binding_key.table_index}, ProjectionIndex{binding_key.column_index}},
+                    std::get<1>(disjunct_entry),
+                    std::get<2>(disjunct_entry));
+                auto constant = std::make_unique<BoundConstantExpression>(
+                    std::get<0>(disjunct_entry)->value,
+                    std::get<0>(disjunct_entry)->is_null);
+                auto equal = std::make_unique<BoundFunctionExpression>("=", 96);
+                equal->children.push_back(std::move(column));
+                equal->children.push_back(std::move(constant));
+                derived->children.push_back(std::move(equal));
+            }
+            filters[binding_key.table_index].push_back(std::move(derived));
+        }
+    };
+
+    switch (op->type) {
+        case LogicalOperatorType::LOGICAL_FILTER: {
+            auto* filter = static_cast<LogicalFilter*>(op);
+            for (auto& expression : filter->expressions) {
+                process_expression(expression.get());
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+        case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+        case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
+            auto* join = static_cast<LogicalComparisonJoin*>(op);
+            for (auto& expression : join->conditions) {
+                process_expression(expression.get());
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    return filters;
+}
+
+std::map<size_t, std::vector<std::unique_ptr<Expression>>>
 PredicatePropagation::BuildPropagatedFilters(const std::map<ColumnBindingKey, EqualityClass>& classes,
                                              const std::set<ColumnBindingKey>& direct_constant_bindings) const {
     std::map<size_t, std::vector<std::unique_ptr<Expression>>> filters;
@@ -407,7 +514,8 @@ std::unique_ptr<LogicalOperator> PredicatePropagation::Rewrite(std::unique_ptr<L
         child = Rewrite(std::move(child));
     }
 
-    if (plan->type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT &&
+    if (plan->type != LogicalOperatorType::LOGICAL_FILTER &&
+        plan->type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT &&
         plan->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
         return plan;
     }
@@ -426,6 +534,13 @@ std::unique_ptr<LogicalOperator> PredicatePropagation::Rewrite(std::unique_ptr<L
 
     auto classes = BuildEqualityClasses(equalities);
     auto propagated_filters = BuildPropagatedFilters(classes, direct_constant_bindings);
+    auto disjunctive_filters = BuildDisjunctiveConstantFilters(plan.get());
+    for (auto& entry : disjunctive_filters) {
+        auto& target = propagated_filters[entry.first];
+        for (auto& expression : entry.second) {
+            target.push_back(std::move(expression));
+        }
+    }
     return InjectFilters(std::move(plan), propagated_filters);
 }
 

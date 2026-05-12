@@ -38,6 +38,7 @@ enum class OptimizerPass {
     JOIN_PREDICATE_EXTRACTION,
     PREDICATE_PROPAGATION,
     SCAN_FILTER_FOLDING,
+    REMOVE_UNUSED_COLUMNS,
     CARDINALITY_ESTIMATOR,
     JOIN_ORDER
 };
@@ -92,7 +93,7 @@ private:
 
     std::unique_ptr<LogicalOperator> Rewrite(std::unique_ptr<LogicalOperator> plan);
     void CollectEqualities(LogicalOperator* op, std::vector<Expression*>& equalities);
-    void CollectConjuncts(Expression* expression, std::vector<Expression*>& conjuncts);
+    void CollectConjuncts(Expression* expression, std::vector<Expression*>& conjuncts) const;
     bool IsEqualityPredicate(Expression* expression) const;
     bool IsColumnConstantEquality(Expression* expression, ColumnBinding& binding, BoundConstantExpression*& constant) const;
     bool IsColumnColumnEquality(Expression* expression, ColumnBinding& left, ColumnBinding& right) const;
@@ -102,6 +103,7 @@ private:
         std::unique_ptr<LogicalOperator> plan,
         std::map<size_t, std::vector<std::unique_ptr<Expression>>>& filters);
     std::map<ColumnBindingKey, EqualityClass> BuildEqualityClasses(const std::vector<Expression*>& equalities) const;
+    std::map<size_t, std::vector<std::unique_ptr<Expression>>> BuildDisjunctiveConstantFilters(LogicalOperator* op) const;
     std::map<size_t, std::vector<std::unique_ptr<Expression>>> BuildPropagatedFilters(
         const std::map<ColumnBindingKey, EqualityClass>& classes,
         const std::set<ColumnBindingKey>& direct_constant_bindings) const;
@@ -115,6 +117,12 @@ public:
 private:
     std::unique_ptr<LogicalOperator> Rewrite(std::unique_ptr<LogicalOperator> plan);
     std::unique_ptr<LogicalOperator> FoldIntoGet(std::unique_ptr<LogicalOperator> filter_plan);
+};
+
+class RemoveUnusedColumns : public OptimizerRule {
+public:
+    OptimizerPass Pass() const override;
+    std::unique_ptr<LogicalOperator> Optimize(std::unique_ptr<LogicalOperator> plan) override;
 };
 
 class CardinalityEstimator : public OptimizerRule {

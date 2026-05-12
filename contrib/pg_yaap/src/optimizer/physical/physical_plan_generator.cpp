@@ -63,6 +63,7 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalGet& 
         op.pg_rtindex,
         op.relid,
         op.table_name,
+        op.projected_columns,
         BorrowExpressions(op.filters),
         EstimateCardinality(op));
 }
@@ -72,7 +73,8 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalProje
         throw std::runtime_error("LogicalProjection expects one child");
     }
     auto child = CreatePlan(*op.children[0]);
-    auto projection = std::make_unique<PhysicalProjection>(BorrowExpressions(op.expressions), op.output_names,
+    auto projection = std::make_unique<PhysicalProjection>(op.table_index,
+                                                            BorrowExpressions(op.expressions), op.output_names,
                                                             EstimateCardinality(op));
     projection->children.push_back(std::move(child));
     return projection;
