@@ -1,0 +1,1000 @@
+extern "C" {
+#include "postgres.h"
+}
+
+#include "decorrelate_dependent_join.hpp"
+#include "decorrelate_rewrite_utils.hpp"
+
+#include "../adapter/duckdb_adapter.hpp"
+#include "../logical/logical_utils.hpp"
+
+#include <algorithm>
+#include <map>
+
+namespace duckdbopt {
+
+namespace {
+
+void MarkChanged(bool* changed) {
+    if (changed) {
+        *changed = true;
+    }
+}
+
+bool ExpressionsReferenceOnlyAllowedTables(const std::vector<std::unique_ptr<Expression>>& expressions,
+                                           const std::set<size_t>& allowed_tables) {
+    for (const auto& expression : expressions) {
+        if (!ExpressionReferencesOnlyAllowedTables(expression.get(), allowed_tables)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool OrdersReferenceOnlyAllowedTables(const LogicalOrder& order, const std::set<size_t>& allowed_tables) {
+    for (const auto& entry : order.orders) {
+        if (!ExpressionReferencesOnlyAllowedTables(entry.expression.get(), allowed_tables)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct ParsedLiftedEquality {
+    std::string key;
+    std::string inner_fingerprint;
+    std::unique_ptr<Expression> inner_expr;
+    std::unique_ptr<Expression> outer_expr;
+};
+
+ssize_t FindProjectionExpressionIndex(LogicalProjection& projection, const std::string& fingerprint);
+bool ParseLiftedEquality(Expression* expression,
+                         const std::set<size_t>& allowed_tables,
+                         ParsedLiftedEquality& parsed);
+
+bool CollectUnaryBranchEqualities(LogicalProjection& projection,
+                                  LogicalOperator* op,
+                                  const std::set<size_t>& branch_allowed_tables,
+                                  std::map<std::string, size_t>& equalities,
+                                  std::map<std::string, ParsedLiftedEquality>* parsed_equalities) {
+    bool found = false;
+    while (op) {
+        if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+            auto* filter = static_cast<LogicalFilter*>(op);
+            for (const auto& expression : filter->expressions) {
+                if (ExpressionReferencesOnlyAllowedTables(expression.get(), branch_allowed_tables)) {
+                    return false;
+                }
+                ParsedLiftedEquality parsed;
+                if (!ParseLiftedEquality(expression.get(), branch_allowed_tables, parsed)) {
+                    return false;
+                }
+                ssize_t projection_index = FindProjectionExpressionIndex(projection, parsed.inner_fingerprint);
+                if (projection_index < 0) {
+                    return false;
+                }
+                auto key = std::to_string(projection_index) + "==" +
+                    DecorrelatedExpressionFingerprint(parsed.outer_expr.get());
+                if (equalities.find(key) != equalities.end()) {
+                    return false;
+                }
+                equalities.emplace(key, static_cast<size_t>(projection_index));
+                if (parsed_equalities) {
+                    parsed_equalities->emplace(std::move(key), std::move(parsed));
+                }
+                found = true;
+            }
+        } else if (op->type == LogicalOperatorType::LOGICAL_GET) {
+            auto* get = static_cast<LogicalGet*>(op);
+            for (const auto& expression : get->filters) {
+                if (ExpressionReferencesOnlyAllowedTables(expression.get(), branch_allowed_tables)) {
+                    return false;
+                }
+                ParsedLiftedEquality parsed;
+                if (!ParseLiftedEquality(expression.get(), branch_allowed_tables, parsed)) {
+                    return false;
+                }
+                ssize_t projection_index = FindProjectionExpressionIndex(projection, parsed.inner_fingerprint);
+                if (projection_index < 0) {
+                    return false;
+                }
+                auto key = std::to_string(projection_index) + "==" +
+                    DecorrelatedExpressionFingerprint(parsed.outer_expr.get());
+                if (equalities.find(key) != equalities.end()) {
+                    return false;
+                }
+                equalities.emplace(key, static_cast<size_t>(projection_index));
+                if (parsed_equalities) {
+                    parsed_equalities->emplace(std::move(key), std::move(parsed));
+                }
+                found = true;
+            }
+            return found;
+        }
+
+        if (op->children.size() != 1) {
+            return false;
+        }
+        op = op->children[0].get();
+    }
+    return false;
+}
+
+LogicalOperator* FindUnaryLeafRoot(LogicalOperator* op) {
+    while (op && op->type != LogicalOperatorType::LOGICAL_GET) {
+        if (op->children.size() != 1) {
+            return nullptr;
+        }
+        op = op->children[0].get();
+    }
+    return op;
+}
+
+bool ParseLiftedEquality(Expression* expression,
+                         const std::set<size_t>& allowed_tables,
+                         ParsedLiftedEquality& parsed) {
+    std::unique_ptr<Expression> inner_expr;
+    std::unique_ptr<Expression> outer_expr;
+    if (!ExtractDecorrelatedEquality(expression, allowed_tables, inner_expr, outer_expr)) {
+        return false;
+    }
+
+    parsed.inner_fingerprint = DecorrelatedExpressionFingerprint(inner_expr.get());
+    auto outer_fingerprint = DecorrelatedExpressionFingerprint(outer_expr.get());
+    parsed.key = parsed.inner_fingerprint + "==" + outer_fingerprint;
+    parsed.inner_expr = std::move(inner_expr);
+    parsed.outer_expr = std::move(outer_expr);
+    return true;
+}
+
+ssize_t FindProjectionExpressionIndex(LogicalProjection& projection, const std::string& fingerprint) {
+    for (size_t idx = 0; idx < projection.expressions.size(); ++idx) {
+        if (DecorrelatedExpressionFingerprint(projection.expressions[idx].get()) == fingerprint) {
+            return static_cast<ssize_t>(idx);
+        }
+    }
+    return -1;
+}
+
+} // namespace
+
+bool DecorrelateDependentJoin::DecorrelateScalarAggregateJoin(std::unique_ptr<LogicalOperator>& plan) {
+    if (!plan || (plan->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+                  plan->type != LogicalOperatorType::LOGICAL_DEPENDENT_JOIN &&
+                  plan->type != LogicalOperatorType::LOGICAL_DELIM_JOIN)) {
+        return false;
+    }
+
+    auto* join = static_cast<LogicalComparisonJoin*>(plan.get());
+    auto* dependent_join = static_cast<LogicalDependentJoin*>(plan.get());
+    if (!join->dependent || join->join_type != JOIN_SINGLE || plan->children.size() != 2) {
+        return false;
+    }
+
+    if (!plan->children[1]) {
+        return false;
+    }
+
+    auto* aggregate_root = plan->children[1].get();
+    while (aggregate_root &&
+           aggregate_root->type == LogicalOperatorType::LOGICAL_PROJECTION &&
+           aggregate_root->children.size() == 1) {
+        aggregate_root = aggregate_root->children[0].get();
+    }
+
+    if (!aggregate_root || aggregate_root->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+        return false;
+    }
+
+    auto* aggregate = static_cast<LogicalAggregate*>(aggregate_root);
+    if (aggregate->children.size() != 1) {
+        return false;
+    }
+
+    if (ContainsBlockingOperator(aggregate->children[0].get())) {
+        return false;
+    }
+
+    std::set<size_t> allowed_tables;
+    CollectOutputTables(aggregate->children[0].get(), allowed_tables);
+
+    struct Correlation {
+        std::unique_ptr<Expression> inner;
+        std::unique_ptr<Expression> outer;
+    };
+    std::vector<Correlation> correlations;
+
+    auto analyze_expression_list =
+        [&](std::vector<std::unique_ptr<Expression>>& expressions) -> bool {
+            SplitConjunctions(expressions);
+            for (auto& expression : expressions) {
+                if (ExpressionReferencesAllowedTables(expression.get(), allowed_tables)) {
+                    continue;
+                }
+
+                std::unique_ptr<Expression> inner_expr;
+                std::unique_ptr<Expression> outer_expr;
+                if (!ExtractDecorrelatedEquality(expression.get(), allowed_tables, inner_expr, outer_expr)) {
+                    return false;
+                }
+                correlations.push_back({std::move(inner_expr), std::move(outer_expr)});
+            }
+            return true;
+        };
+
+    auto analyze = [&](auto&& self, LogicalOperator* op) -> bool {
+        if (!op) {
+            return true;
+        }
+
+        for (auto& child : op->children) {
+            if (!self(self, child.get())) {
+                return false;
+            }
+        }
+
+        if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+            auto* filter = static_cast<LogicalFilter*>(op);
+            return analyze_expression_list(filter->expressions);
+        }
+
+        if (op->type == LogicalOperatorType::LOGICAL_GET) {
+            auto* get = static_cast<LogicalGet*>(op);
+            return analyze_expression_list(get->filters);
+        }
+
+        if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+            op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+            op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+            auto* nested_join = static_cast<LogicalComparisonJoin*>(op);
+            return analyze_expression_list(nested_join->conditions);
+        }
+
+        if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+            auto* projection = static_cast<LogicalProjection*>(op);
+            for (auto& expression : projection->expressions) {
+                if (!ExpressionReferencesAllowedTables(expression.get(), allowed_tables)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        return true;
+    };
+
+    if (!analyze(analyze, aggregate->children[0].get())) {
+        return false;
+    }
+
+    if (correlations.empty()) {
+        return false;
+    }
+
+    std::vector<std::unique_ptr<Expression>> lifted_filters;
+    if (!PushDownCorrelatedNode(aggregate->children[0], allowed_tables, lifted_filters)) {
+        return false;
+    }
+
+    auto add_group_key = [&](std::unique_ptr<Expression> inner_expr) -> size_t {
+        auto fingerprint = DecorrelatedExpressionFingerprint(inner_expr.get());
+        for (size_t idx = 0; idx < aggregate->groups.size(); ++idx) {
+            if (DecorrelatedExpressionFingerprint(aggregate->groups[idx].get()) == fingerprint) {
+                return idx;
+            }
+        }
+
+        size_t group_idx = aggregate->groups.size();
+        aggregate->group_names.push_back(DerivedDecorrelatedOutputName(inner_expr.get(), group_idx));
+        aggregate->groups.push_back(std::move(inner_expr));
+        return group_idx;
+    };
+
+    for (auto& correlation : correlations) {
+        size_t group_idx = add_group_key(std::move(correlation.inner));
+        std::string group_name = group_idx < aggregate->group_names.size()
+            ? aggregate->group_names[group_idx]
+            : DerivedDecorrelatedOutputName(nullptr, group_idx);
+        auto group_ref = std::make_unique<BoundColumnRefExpression>(
+            ColumnBinding{aggregate->group_index, ProjectionIndex{group_idx}},
+            "agg",
+            group_name);
+        auto condition = std::make_unique<BoundFunctionExpression>("=", InvalidOid);
+        condition->children.push_back(std::move(correlation.outer));
+        condition->children.push_back(std::move(group_ref));
+        AppendUniqueFilter(join->conditions, std::move(condition));
+    }
+
+    join->dependent = false;
+    if (plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+        plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+        auto decorrelated_type = join->join_type == JOIN_MARK
+            ? LogicalOperatorType::LOGICAL_DELIM_JOIN
+            : (dependent_join->correlated_columns.empty() || !dependent_join->perform_delim
+                   ? LogicalOperatorType::LOGICAL_COMPARISON_JOIN
+                   : LogicalOperatorType::LOGICAL_DELIM_JOIN);
+        plan->type = decorrelated_type;
+        if (decorrelated_type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+            dependent_join->correlated_columns.clear();
+            dependent_join->perform_delim = false;
+        }
+    }
+    return true;
+}
+
+bool DecorrelateDependentJoin::ExpressionReferencesAllowedTables(
+    Expression* expression,
+    const std::set<size_t>& allowed_tables) const {
+    if (!expression) {
+        return true;
+    }
+
+    std::set<size_t> referenced_tables;
+    CollectReferencedTables(expression, referenced_tables);
+    for (auto table_index : referenced_tables) {
+        if (allowed_tables.find(table_index) == allowed_tables.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DecorrelateDependentJoin::SubtreeHasCorrelatedReferences(
+    LogicalOperator* op,
+    const std::set<size_t>& allowed_tables) const {
+    if (!op) {
+        return false;
+    }
+
+    switch (op->type) {
+        case LogicalOperatorType::LOGICAL_GET: {
+            auto* get = static_cast<LogicalGet*>(op);
+            if (!ExpressionsReferenceOnlyAllowedTables(get->filters, allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_FILTER: {
+            auto* filter = static_cast<LogicalFilter*>(op);
+            if (!ExpressionsReferenceOnlyAllowedTables(filter->expressions, allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_PROJECTION: {
+            auto* projection = static_cast<LogicalProjection*>(op);
+            if (!ExpressionsReferenceOnlyAllowedTables(projection->expressions, allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+            auto* aggregate = static_cast<LogicalAggregate*>(op);
+            if (!ExpressionsReferenceOnlyAllowedTables(aggregate->groups, allowed_tables) ||
+                !ExpressionsReferenceOnlyAllowedTables(aggregate->expressions, allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_SET_OPERATION:
+            break;
+        case LogicalOperatorType::LOGICAL_DISTINCT: {
+            auto* distinct = static_cast<LogicalDistinct*>(op);
+            if (!ExpressionsReferenceOnlyAllowedTables(distinct->expressions, allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_ORDER: {
+            auto* order = static_cast<LogicalOrder*>(op);
+            if (!OrdersReferenceOnlyAllowedTables(*order, allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_WINDOW: {
+            auto* window = static_cast<LogicalWindow*>(op);
+            if (!ExpressionsReferenceOnlyAllowedTables(window->partitions, allowed_tables)) {
+                return true;
+            }
+            for (const auto& order : window->orders) {
+                if (!ExpressionReferencesAllowedTables(order.expression.get(), allowed_tables)) {
+                    return true;
+                }
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_LIMIT: {
+            auto* limit = static_cast<LogicalLimit*>(op);
+            if (!ExpressionReferencesAllowedTables(limit->limit_count.get(), allowed_tables) ||
+                !ExpressionReferencesAllowedTables(limit->limit_offset.get(), allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+        case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+        case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
+            auto* join = static_cast<LogicalComparisonJoin*>(op);
+            if (!ExpressionsReferenceOnlyAllowedTables(join->conditions, allowed_tables)) {
+                return true;
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+        case LogicalOperatorType::LOGICAL_DELIM_GET:
+            break;
+        default:
+            return true;
+    }
+
+    for (auto& child : op->children) {
+        if (SubtreeHasCorrelatedReferences(child.get(), allowed_tables)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DecorrelateDependentJoin::InitializeTableIndexAllocator(LogicalOperator* plan) {
+    next_table_index_ = 0;
+    std::set<size_t> table_indexes;
+    CollectOutputTables(plan, table_indexes);
+    for (auto table_index : table_indexes) {
+        next_table_index_ = std::max(next_table_index_, table_index + 1);
+    }
+}
+
+TableIndex DecorrelateDependentJoin::AllocateTableIndex() {
+    return TableIndex{next_table_index_++};
+}
+
+void DecorrelateDependentJoin::SplitConjunctions(std::vector<std::unique_ptr<Expression>>& expressions) {
+    std::vector<std::unique_ptr<Expression>> split;
+    for (auto& expression : expressions) {
+        if (expression && expression->type == ExpressionType::BOUND_CONJUNCTION) {
+            auto* conjunction = static_cast<BoundConjunctionExpression*>(expression.get());
+            if (conjunction->bool_expr_type == 0) {
+                for (auto& child : conjunction->children) {
+                    split.push_back(std::move(child));
+                }
+                continue;
+            }
+        }
+        split.push_back(std::move(expression));
+    }
+    expressions = std::move(split);
+}
+
+bool DecorrelateDependentJoin::ContainsBlockingOperator(LogicalOperator* op) const {
+    if (!op) {
+        return false;
+    }
+
+    switch (op->type) {
+        case LogicalOperatorType::LOGICAL_GET:
+        case LogicalOperatorType::LOGICAL_FILTER:
+        case LogicalOperatorType::LOGICAL_PROJECTION:
+        case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+        case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+        case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+        case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+        case LogicalOperatorType::LOGICAL_DELIM_GET:
+            break;
+        default:
+            return true;
+    }
+
+    for (auto& child : op->children) {
+        if (ContainsBlockingOperator(child.get())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DecorrelateDependentJoin::ExtractCorrelatedExpressions(
+    std::vector<std::unique_ptr<Expression>>& expressions,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    SplitConjunctions(expressions);
+
+    std::vector<std::unique_ptr<Expression>> keep_filters;
+    for (auto& expression : expressions) {
+        if (ExpressionReferencesAllowedTables(expression.get(), allowed_tables)) {
+            keep_filters.push_back(std::move(expression));
+        } else {
+            lifted_filters.push_back(std::move(expression));
+        }
+    }
+    expressions = std::move(keep_filters);
+}
+
+bool DecorrelateDependentJoin::PushDownGet(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* get = static_cast<LogicalGet*>(plan.get());
+    ExtractCorrelatedExpressions(get->filters, allowed_tables, lifted_filters);
+    return true;
+}
+
+bool DecorrelateDependentJoin::PushDownFilter(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    if (plan->children.size() != 1 || !PushDownCorrelatedNode(plan->children[0], allowed_tables, lifted_filters)) {
+        return false;
+    }
+
+    auto* filter = static_cast<LogicalFilter*>(plan.get());
+    ExtractCorrelatedExpressions(filter->expressions, allowed_tables, lifted_filters);
+    if (filter->expressions.empty()) {
+        auto child = std::move(plan->children[0]);
+        plan = std::move(child);
+    }
+    return true;
+}
+
+bool DecorrelateDependentJoin::PushDownProjection(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* projection = static_cast<LogicalProjection*>(plan.get());
+    if (!ExpressionsReferenceOnlyAllowedTables(projection->expressions, allowed_tables) ||
+        plan->children.size() != 1) {
+        return false;
+    }
+    if (!PushDownCorrelatedNode(plan->children[0], allowed_tables, lifted_filters)) {
+        return false;
+    }
+    return RewriteLiftedFiltersThroughProjection(*projection, allowed_tables, lifted_filters);
+}
+
+bool DecorrelateDependentJoin::PushDownAggregate(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* aggregate = static_cast<LogicalAggregate*>(plan.get());
+    if (!ExpressionsReferenceOnlyAllowedTables(aggregate->groups, allowed_tables) ||
+        !ExpressionsReferenceOnlyAllowedTables(aggregate->expressions, allowed_tables) ||
+        plan->children.size() != 1) {
+        return false;
+    }
+    if (!PushDownCorrelatedNode(plan->children[0], allowed_tables, lifted_filters)) {
+        return false;
+    }
+    return RewriteLiftedFiltersThroughAggregate(*aggregate, allowed_tables, lifted_filters);
+}
+
+bool DecorrelateDependentJoin::PushDownDistinct(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* distinct = static_cast<LogicalDistinct*>(plan.get());
+    if (!ExpressionsReferenceOnlyAllowedTables(distinct->expressions, allowed_tables) ||
+        plan->children.size() != 1) {
+        return false;
+    }
+    if (!PushDownCorrelatedNode(plan->children[0], allowed_tables, lifted_filters)) {
+        return false;
+    }
+    return AddCorrelatedKeysToDistinct(*distinct, allowed_tables, lifted_filters);
+}
+
+bool DecorrelateDependentJoin::PushDownSetOperation(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* setop = static_cast<LogicalSetOperation*>(plan.get());
+    if (setop->setop_type != SetOperationType::UNION || !setop->all || plan->children.size() != 2) {
+        return false;
+    }
+
+    auto* left_projection = plan->children[0] && plan->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION
+        ? static_cast<LogicalProjection*>(plan->children[0].get())
+        : nullptr;
+    auto* right_projection = plan->children[1] && plan->children[1]->type == LogicalOperatorType::LOGICAL_PROJECTION
+        ? static_cast<LogicalProjection*>(plan->children[1].get())
+        : nullptr;
+    if (!left_projection || !right_projection ||
+        !ExpressionsReferenceOnlyAllowedTables(left_projection->expressions, allowed_tables) ||
+        !ExpressionsReferenceOnlyAllowedTables(right_projection->expressions, allowed_tables) ||
+        plan->children[0]->children.size() != 1 ||
+        plan->children[1]->children.size() != 1) {
+        return false;
+    }
+
+    std::set<size_t> left_allowed_tables;
+    std::set<size_t> right_allowed_tables;
+    CollectOutputTables(plan->children[0]->children[0].get(), left_allowed_tables);
+    CollectOutputTables(plan->children[1]->children[0].get(), right_allowed_tables);
+
+    if (!FindUnaryLeafRoot(plan->children[0]->children[0].get()) ||
+        !FindUnaryLeafRoot(plan->children[1]->children[0].get())) {
+        return false;
+    }
+
+    std::map<std::string, size_t> left_equalities;
+    std::map<std::string, size_t> right_equalities;
+    std::map<std::string, ParsedLiftedEquality> rewritten_equalities;
+    if (!CollectUnaryBranchEqualities(*left_projection, plan->children[0]->children[0].get(), left_allowed_tables,
+                                      left_equalities, &rewritten_equalities) ||
+        !CollectUnaryBranchEqualities(*right_projection, plan->children[1]->children[0].get(), right_allowed_tables,
+                                      right_equalities, nullptr)) {
+        return false;
+    }
+
+    if (left_equalities.size() != right_equalities.size()) {
+        return false;
+    }
+    for (const auto& entry : left_equalities) {
+        auto right_it = right_equalities.find(entry.first);
+        if (right_it == right_equalities.end() || right_it->second != entry.second ||
+            entry.second >= setop->output_names.size()) {
+            return false;
+        }
+    }
+
+    std::vector<std::unique_ptr<Expression>> left_lifted_filters;
+    std::vector<std::unique_ptr<Expression>> right_lifted_filters;
+    if (!PushDownCorrelatedNode(plan->children[0]->children[0], left_allowed_tables, left_lifted_filters) ||
+        !PushDownCorrelatedNode(plan->children[1]->children[0], right_allowed_tables, right_lifted_filters) ||
+        left_lifted_filters.size() != rewritten_equalities.size() ||
+        right_lifted_filters.size() != rewritten_equalities.size()) {
+        return false;
+    }
+
+    std::vector<std::unique_ptr<Expression>> rewritten_filters;
+    for (auto& entry : rewritten_equalities) {
+        auto left_it = left_equalities.find(entry.first);
+        if (left_it == left_equalities.end() || left_it->second >= setop->output_names.size()) {
+            return false;
+        }
+
+        auto equality = std::make_unique<BoundFunctionExpression>("=", InvalidOid);
+        equality->children.push_back(std::make_unique<BoundColumnRefExpression>(
+            ColumnBinding{setop->table_index, ProjectionIndex{left_it->second}},
+            "setop",
+            setop->output_names[left_it->second]));
+        equality->children.push_back(std::move(entry.second.outer_expr));
+        rewritten_filters.push_back(std::move(equality));
+    }
+
+    lifted_filters = std::move(rewritten_filters);
+    return true;
+}
+
+bool DecorrelateDependentJoin::PushDownOrder(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* order = static_cast<LogicalOrder*>(plan.get());
+    if (!OrdersReferenceOnlyAllowedTables(*order, allowed_tables) || plan->children.size() != 1) {
+        return false;
+    }
+    return PushDownCorrelatedNode(plan->children[0], allowed_tables, lifted_filters);
+}
+
+bool DecorrelateDependentJoin::PushDownWindow(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* window = static_cast<LogicalWindow*>(plan.get());
+    if (!ExpressionsReferenceOnlyAllowedTables(window->partitions, allowed_tables) ||
+        plan->children.size() != 1) {
+        return false;
+    }
+    for (const auto& order : window->orders) {
+        if (!ExpressionReferencesAllowedTables(order.expression.get(), allowed_tables)) {
+            return false;
+        }
+    }
+    return PushDownCorrelatedNode(plan->children[0], allowed_tables, lifted_filters);
+}
+
+bool DecorrelateDependentJoin::PushDownLimit(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* limit = static_cast<LogicalLimit*>(plan.get());
+    if (!ExpressionReferencesAllowedTables(limit->limit_count.get(), allowed_tables) ||
+        !ExpressionReferencesAllowedTables(limit->limit_offset.get(), allowed_tables) ||
+        plan->children.size() != 1) {
+        return false;
+    }
+
+    LogicalOperator* base_child = plan->children[0].get();
+    if (base_child && base_child->type == LogicalOperatorType::LOGICAL_ORDER) {
+        auto* order = static_cast<LogicalOrder*>(base_child);
+        if (!OrdersReferenceOnlyAllowedTables(*order, allowed_tables) || order->children.size() != 1) {
+            return false;
+        }
+        base_child = order->children[0].get();
+    }
+
+    if (!SubtreeHasCorrelatedReferences(base_child, allowed_tables)) {
+        return PushDownCorrelatedNode(plan->children[0], allowed_tables, lifted_filters);
+    }
+
+    std::vector<OrderByNode> orders;
+    std::unique_ptr<LogicalOperator> child = std::move(plan->children[0]);
+    if (child && child->type == LogicalOperatorType::LOGICAL_ORDER) {
+        auto* order = static_cast<LogicalOrder*>(child.get());
+        orders = CloneDecorrelatedOrders(order->orders);
+        child = std::move(order->children[0]);
+    }
+
+    std::vector<std::unique_ptr<Expression>> child_lifted_filters;
+    if (!PushDownCorrelatedNode(child, allowed_tables, child_lifted_filters)) {
+        return false;
+    }
+
+    std::vector<std::unique_ptr<Expression>> partitions;
+    std::vector<std::unique_ptr<Expression>> remaining_lifted;
+    for (auto& expression : child_lifted_filters) {
+        std::set<size_t> referenced_tables;
+        CollectReferencedTables(expression.get(), referenced_tables);
+
+        bool has_allowed_ref = false;
+        for (auto table_index : referenced_tables) {
+            if (allowed_tables.find(table_index) != allowed_tables.end()) {
+                has_allowed_ref = true;
+                break;
+            }
+        }
+
+        std::unique_ptr<Expression> inner_expr;
+        std::unique_ptr<Expression> outer_expr;
+        if (ExtractDecorrelatedEquality(expression.get(), allowed_tables, inner_expr, outer_expr)) {
+            partitions.push_back(std::move(inner_expr));
+            remaining_lifted.push_back(std::move(expression));
+            continue;
+        }
+        if (!has_allowed_ref) {
+            remaining_lifted.push_back(std::move(expression));
+            continue;
+        }
+        return false;
+    }
+
+    if (partitions.empty()) {
+        return false;
+    }
+
+    auto window = std::make_unique<LogicalWindow>(AllocateTableIndex());
+    window->estimated_cardinality = child->estimated_cardinality;
+    window->function_names.push_back("row_number");
+    window->output_names.push_back("limit_rownum");
+    window->partitions = std::move(partitions);
+    window->orders = std::move(orders);
+    window->children.push_back(std::move(child));
+
+    auto filter = std::make_unique<LogicalFilter>();
+    filter->estimated_cardinality = plan->estimated_cardinality;
+    auto rownum_filter = BuildDecorrelatedLimitRowNumberFilter(
+        limit->limit_count.get(),
+        limit->limit_offset.get(),
+        window->table_index);
+    if (!rownum_filter) {
+        return false;
+    }
+    filter->expressions.push_back(std::move(rownum_filter));
+    filter->children.push_back(std::move(window));
+    plan = std::move(filter);
+
+    for (auto& expression : remaining_lifted) {
+        lifted_filters.push_back(std::move(expression));
+    }
+    return true;
+}
+
+bool DecorrelateDependentJoin::PushDownJoin(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    auto* join = static_cast<LogicalComparisonJoin*>(plan.get());
+    if (join->dependent || plan->children.size() != 2) {
+        return false;
+    }
+
+    bool left_has_correlation = SubtreeHasCorrelatedReferences(plan->children[0].get(), allowed_tables);
+    bool right_has_correlation = SubtreeHasCorrelatedReferences(plan->children[1].get(), allowed_tables);
+    bool join_conditions_are_local = ExpressionsReferenceOnlyAllowedTables(join->conditions, allowed_tables);
+
+    // Correlated predicates inside an outer join ON clause are not safe to lift into
+    // the parent dependent-join condition set in this simplified rewrite model.
+    if (IsOuterJoinType(join->join_type) && !join_conditions_are_local) {
+        return false;
+    }
+
+    std::vector<std::unique_ptr<Expression>> local_lifted_filters;
+    switch (join->join_type) {
+        case JOIN_INNER:
+            if ((left_has_correlation &&
+                 !PushDownCorrelatedNode(plan->children[0], allowed_tables, local_lifted_filters)) ||
+                (right_has_correlation &&
+                 !PushDownCorrelatedNode(plan->children[1], allowed_tables, local_lifted_filters))) {
+                return false;
+            }
+            break;
+        case JOIN_LEFT:
+            if (right_has_correlation) {
+                return false;
+            }
+            if (left_has_correlation &&
+                !PushDownCorrelatedNode(plan->children[0], allowed_tables, local_lifted_filters)) {
+                return false;
+            }
+            break;
+        case JOIN_RIGHT:
+            if (left_has_correlation) {
+                return false;
+            }
+            if (right_has_correlation &&
+                !PushDownCorrelatedNode(plan->children[1], allowed_tables, local_lifted_filters)) {
+                return false;
+            }
+            break;
+        case JOIN_FULL:
+            if (left_has_correlation || right_has_correlation) {
+                return false;
+            }
+            break;
+        default:
+            if (!PushDownCorrelatedNode(plan->children[0], allowed_tables, local_lifted_filters) ||
+                !PushDownCorrelatedNode(plan->children[1], allowed_tables, local_lifted_filters)) {
+                return false;
+            }
+            break;
+    }
+
+    ExtractCorrelatedExpressions(join->conditions, allowed_tables, local_lifted_filters);
+    for (auto& expression : local_lifted_filters) {
+        lifted_filters.push_back(std::move(expression));
+    }
+    if (plan->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+        join->join_type == JOIN_INNER &&
+        join->conditions.empty()) {
+        auto cross = std::make_unique<LogicalCrossProduct>();
+        cross->estimated_cardinality = plan->estimated_cardinality;
+        cross->children.push_back(std::move(plan->children[0]));
+        cross->children.push_back(std::move(plan->children[1]));
+        plan = std::move(cross);
+    }
+    return true;
+}
+
+bool DecorrelateDependentJoin::PushDownCrossProduct(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    if (plan->children.size() != 2) {
+        return false;
+    }
+
+    bool left_has_correlation = SubtreeHasCorrelatedReferences(plan->children[0].get(), allowed_tables);
+    bool right_has_correlation = SubtreeHasCorrelatedReferences(plan->children[1].get(), allowed_tables);
+
+    std::vector<std::unique_ptr<Expression>> local_lifted_filters;
+    if ((left_has_correlation &&
+         !PushDownCorrelatedNode(plan->children[0], allowed_tables, local_lifted_filters)) ||
+        (right_has_correlation &&
+         !PushDownCorrelatedNode(plan->children[1], allowed_tables, local_lifted_filters))) {
+        return false;
+    }
+
+    for (auto& expression : local_lifted_filters) {
+        lifted_filters.push_back(std::move(expression));
+    }
+    return true;
+}
+
+bool DecorrelateDependentJoin::PushDownCorrelatedNode(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& allowed_tables,
+    std::vector<std::unique_ptr<Expression>>& lifted_filters) {
+    if (!plan) {
+        return true;
+    }
+
+    switch (plan->type) {
+        case LogicalOperatorType::LOGICAL_FILTER:
+            return PushDownFilter(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_PROJECTION:
+            return PushDownProjection(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+            return PushDownAggregate(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_DISTINCT:
+            return PushDownDistinct(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_SET_OPERATION:
+            return PushDownSetOperation(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_ORDER:
+            return PushDownOrder(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_WINDOW:
+            return PushDownWindow(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_LIMIT:
+            return PushDownLimit(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+        case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+        case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+            return PushDownJoin(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+            return PushDownCrossProduct(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_GET:
+            return PushDownGet(plan, allowed_tables, lifted_filters);
+        case LogicalOperatorType::LOGICAL_DELIM_GET:
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::unique_ptr<LogicalOperator> DecorrelateDependentJoin::Rewrite(std::unique_ptr<LogicalOperator> plan,
+                                                                   bool* changed) {
+    for (auto& child : plan->children) {
+        child = Rewrite(std::move(child), changed);
+    }
+
+    if (plan->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+        plan->type != LogicalOperatorType::LOGICAL_DEPENDENT_JOIN &&
+        plan->type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+        return plan;
+    }
+
+    auto* join = static_cast<LogicalComparisonJoin*>(plan.get());
+    auto* dependent_join = static_cast<LogicalDependentJoin*>(plan.get());
+    if (!join->dependent || plan->children.size() != 2) {
+        return plan;
+    }
+
+    if (DecorrelateScalarAggregateJoin(plan)) {
+        MarkChanged(changed);
+        return plan;
+    }
+
+    std::set<size_t> allowed_tables;
+    CollectOutputTables(plan->children[1].get(), allowed_tables);
+    std::vector<std::unique_ptr<Expression>> lifted_filters;
+    auto right = std::move(plan->children[1]);
+    if (!PushDownCorrelatedNode(right, allowed_tables, lifted_filters)) {
+        plan->children[1] = std::move(right);
+        return plan;
+    }
+
+    plan->children[1] = std::move(right);
+    if (!lifted_filters.empty()) {
+        for (auto& lifted : lifted_filters) {
+            AppendUniqueFilter(join->conditions, std::move(lifted));
+        }
+    }
+
+    join->dependent = false;
+    if (plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+        plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+        auto decorrelated_type = join->join_type == JOIN_MARK
+            ? LogicalOperatorType::LOGICAL_DELIM_JOIN
+            : (dependent_join->correlated_columns.empty() || !dependent_join->perform_delim
+                   ? LogicalOperatorType::LOGICAL_COMPARISON_JOIN
+                   : LogicalOperatorType::LOGICAL_DELIM_JOIN);
+        plan->type = decorrelated_type;
+        if (decorrelated_type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+            dependent_join->correlated_columns.clear();
+            dependent_join->perform_delim = false;
+        }
+    }
+
+    MarkChanged(changed);
+    return plan;
+}
+
+std::unique_ptr<LogicalOperator> DecorrelateDependentJoin::Optimize(std::unique_ptr<LogicalOperator> plan,
+                                                                    bool* changed) {
+    if (!plan) {
+        return nullptr;
+    }
+    InitializeTableIndexAllocator(plan.get());
+    return Rewrite(std::move(plan), changed);
+}
+
+} // namespace duckdbopt

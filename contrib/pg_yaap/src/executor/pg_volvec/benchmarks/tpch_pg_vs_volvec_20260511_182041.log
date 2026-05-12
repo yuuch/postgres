@@ -1,0 +1,93 @@
+--- q1 pg_parallel ---
+q1 pg_parallel run1: 3229 ms (ok)
+q1 pg_parallel run2: 3197 ms (ok)
+q1 pg_parallel run3: 3095 ms (ok)
+q1 pg_parallel median: 3197 ms (3.197 s) status=ok
+--- q5 pg_parallel ---
+q5 pg_parallel run1: 3301 ms (ok)
+q5 pg_parallel run2: 3231 ms (ok)
+q5 pg_parallel run3: 3244 ms (ok)
+q5 pg_parallel median: 3244 ms (3.244 s) status=ok
+--- q6 pg_parallel ---
+q6 pg_parallel run1: 1471 ms (ok)
+q6 pg_parallel run2: 1397 ms (ok)
+q6 pg_parallel run3: 1405 ms (ok)
+q6 pg_parallel median: 1405 ms (1.405 s) status=ok
+--- q7 pg_parallel ---
+q7 pg_parallel run1: 1740 ms (ok)
+q7 pg_parallel run2: 1742 ms (ok)
+q7 pg_parallel run3: 1651 ms (ok)
+q7 pg_parallel median: 1740 ms (1.740 s) status=ok
+--- q8 pg_parallel ---
+q8 pg_parallel run1: 3917 ms (ok)
+q8 pg_parallel run2: 3872 ms (ok)
+q8 pg_parallel run3: 3820 ms (ok)
+q8 pg_parallel median: 3872 ms (3.872 s) status=ok
+--- q9 pg_parallel ---
+q9 pg_parallel run1: 7884 ms (ok)
+q9 pg_parallel run2: 7776 ms (ok)
+q9 pg_parallel run3: 7711 ms (ok)
+q9 pg_parallel median: 7776 ms (7.776 s) status=ok
+--- q10 pg_parallel ---
+q10 pg_parallel run1: 2821 ms (ok)
+q10 pg_parallel run2: 2797 ms (ok)
+q10 pg_parallel run3: 2853 ms (ok)
+q10 pg_parallel median: 2821 ms (2.821 s) status=ok
+--- q12 pg_parallel ---
+q12 pg_parallel run1: 1909 ms (ok)
+q12 pg_parallel run2: 1889 ms (ok)
+q12 pg_parallel run3: 1826 ms (ok)
+q12 pg_parallel median: 1889 ms (1.889 s) status=ok
+--- q14 pg_parallel ---
+q14 pg_parallel run1: 1338 ms (ok)
+q14 pg_parallel run2: 1346 ms (ok)
+q14 pg_parallel run3: 1255 ms (ok)
+q14 pg_parallel median: 1338 ms (1.338 s) status=ok
+--- q1 volvec_parallel ---
+q1 volvec_parallel run1: 1527 ms (ok)
+q1 volvec_parallel run2: 1455 ms (ok)
+q1 volvec_parallel run3: 1467 ms (ok)
+q1 volvec_parallel median: 1467 ms (1.467 s) status=ok
+--- q5 volvec_parallel ---
+q5 volvec_parallel run1: 2098 ms (ok)
+q5 volvec_parallel run2: 1990 ms (ok)
+q5 volvec_parallel run3: 1941 ms (ok)
+q5 volvec_parallel median: 1990 ms (1.990 s) status=ok
+--- q6 volvec_parallel ---
+q6 volvec_parallel run1: 1061 ms (ok)
+q6 volvec_parallel run2: 990 ms (ok)
+q6 volvec_parallel run3: 892 ms (ok)
+q6 volvec_parallel median: 990 ms (0.990 s) status=ok
+--- q7 volvec_parallel ---
+q7 volvec_parallel run1: 1659 ms (ok)
+q7 volvec_parallel run2: 1675 ms (ok)
+q7 volvec_parallel run3: 1675 ms (ok)
+q7 volvec_parallel median: 1675 ms (1.675 s) status=ok
+--- q8 volvec_parallel ---
+q8 volvec_parallel run1: 1854 ms (ok)
+q8 volvec_parallel run2: 1667 ms (ok)
+q8 volvec_parallel run3: 1694 ms (ok)
+q8 volvec_parallel median: 1694 ms (1.694 s) status=ok
+--- q9 volvec_parallel ---
+q9 volvec_parallel run1: 3703 ms (ok)
+q9 volvec_parallel run2: 3363 ms (ok)
+q9 volvec_parallel run3: 3585 ms (ok)
+q9 volvec_parallel median: 3585 ms (3.585 s) status=ok
+--- q10 volvec_parallel ---
+q10 volvec_parallel run1: 1881 ms (ok)
+q10 volvec_parallel run2: 1884 ms (ok)
+q10 volvec_parallel run3: 1846 ms (ok)
+q10 volvec_parallel median: 1881 ms (1.881 s) status=ok
+--- q12 volvec_parallel ---
+q12 volvec_parallel run1: 1380 ms (ok)
+q12 volvec_parallel run2: 1212 ms (ok)
+q12 volvec_parallel run3: 1307 ms (ok)
+q12 volvec_parallel median: 1307 ms (1.307 s) status=ok
+--- q14 volvec_parallel ---
+q14 volvec_parallel run1: 1287 ms (ok)
+q14 volvec_parallel run2: 1218 ms (ok)
+q14 volvec_parallel run3: 1144 ms (ok)
+q14 volvec_parallel median: 1218 ms (1.218 s) status=ok
+
+Results TSV: /Users/chenyunwen/proj/postgres/contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_182041.tsv
+Results LOG: /Users/chenyunwen/proj/postgres/contrib/pg_volvec/benchmarks/tpch_pg_vs_volvec_20260511_182041.log

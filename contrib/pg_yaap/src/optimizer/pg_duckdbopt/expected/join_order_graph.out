@@ -1,0 +1,98 @@
+\c postgres
+SET client_min_messages = warning;
+DROP DATABASE IF EXISTS pg_opt_join_graph;
+CREATE DATABASE pg_opt_join_graph;
+\c pg_opt_join_graph
+SET client_min_messages = warning;
+CREATE TABLE t1(id int, col int);
+CREATE TABLE t2(id int, col int);
+CREATE TABLE t3(id int, col int);
+CREATE TABLE t4(id int, col int);
+INSERT INTO t1
+SELECT i, i
+FROM generate_series(1, 20) AS g(i);
+INSERT INTO t2
+SELECT i, i
+FROM generate_series(1, 20) AS g(i);
+INSERT INTO t3
+SELECT i, i
+FROM generate_series(1, 100) AS g(i);
+INSERT INTO t4
+SELECT i, i
+FROM generate_series(1, 100) AS g(i);
+ANALYZE t1;
+ANALYZE t2;
+ANALYZE t3;
+ANALYZE t4;
+LOAD 'pg_duckdbopt';
+SET client_min_messages = error;
+\pset format unaligned
+\t on
+CREATE FUNCTION explain_filter(text) RETURNS SETOF text
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    ln text;
+BEGIN
+    FOR ln IN EXECUTE $1 LOOP
+        ln := regexp_replace(ln, 'relid=[0-9]+', 'relid=NNN', 'g');
+        ln := regexp_replace(ln, '#[0-9]+', '#NNN', 'g');
+        IF ln ~ '^[[:space:]]*explain_filter[[:space:]]*$' THEN
+            ln := 'explain_filter';
+        ELSIF ln ~ '^[[:space:]-]+$' THEN
+            ln := '----------------';
+        ELSIF ln <> '' THEN
+            ln := ' ' || ln;
+        END IF;
+        RETURN NEXT ln;
+    END LOOP;
+END;
+$$;
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1, t2, t3, t4 WHERE t1.id = t2.id AND t3.id = t4.id$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col, id, col, id, col, id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1]), BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t3.col, binding=#[2.1]), BoundColumnRef(t4.id, binding=#[3.0]), BoundColumnRef(t4.col, binding=#[3.1])], estimated_cardinality=160000)
+   LogicalCrossProduct(estimated_cardinality=160000)
+     LogicalComparisonJoin(type=INNER, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=80)
+       LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=20)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=2, relid=NNN, filters=[], estimated_cardinality=20)
+     LogicalComparisonJoin(type=INNER, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t4.id, binding=#[3.0])])], estimated_cardinality=2000)
+       LogicalGet(table=t3, table_index=#NNN, pg_rtindex=3, relid=NNN, filters=[], estimated_cardinality=100)
+       LogicalGet(table=t4, table_index=#NNN, pg_rtindex=4, relid=NNN, filters=[], estimated_cardinality=100)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1]), BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t3.col, binding=#[2.1]), BoundColumnRef(t4.id, binding=#[3.0]), BoundColumnRef(t4.col, binding=#[3.1])], output_names=[id, col, id, col, id, col, id, col], estimated_cardinality=160000)
+   PhysicalCrossProduct(estimated_cardinality=160000)
+     PhysicalHashJoin(type=INNER, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=80)
+       PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=20)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=2, filters=[], estimated_cardinality=20)
+     PhysicalHashJoin(type=INNER, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t4.id, binding=#[3.0])])], estimated_cardinality=2000)
+       PhysicalTableScan(table=t3, table_index=#NNN, pg_rtindex=3, filters=[], estimated_cardinality=100)
+       PhysicalTableScan(table=t4, table_index=#NNN, pg_rtindex=4, filters=[], estimated_cardinality=100)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1, t2, t3, t4 WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col, id, col, id, col, id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1]), BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t3.col, binding=#[2.1]), BoundColumnRef(t4.id, binding=#[3.0]), BoundColumnRef(t4.col, binding=#[3.1])], estimated_cardinality=32000)
+   LogicalComparisonJoin(type=INNER, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t4.id, binding=#[3.0])])], estimated_cardinality=32000)
+     LogicalComparisonJoin(type=INNER, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t3.id, binding=#[2.0])])], estimated_cardinality=1600)
+       LogicalComparisonJoin(type=INNER, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=80)
+         LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=20)
+         LogicalGet(table=t2, table_index=#NNN, pg_rtindex=2, relid=NNN, filters=[], estimated_cardinality=20)
+       LogicalGet(table=t3, table_index=#NNN, pg_rtindex=3, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalGet(table=t4, table_index=#NNN, pg_rtindex=4, relid=NNN, filters=[], estimated_cardinality=100)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1]), BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t3.col, binding=#[2.1]), BoundColumnRef(t4.id, binding=#[3.0]), BoundColumnRef(t4.col, binding=#[3.1])], output_names=[id, col, id, col, id, col, id, col], estimated_cardinality=32000)
+   PhysicalHashJoin(type=INNER, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t4.id, binding=#[3.0])])], estimated_cardinality=32000)
+     PhysicalHashJoin(type=INNER, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t3.id, binding=#[2.0])])], estimated_cardinality=1600)
+       PhysicalHashJoin(type=INNER, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=80)
+         PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=20)
+         PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=2, filters=[], estimated_cardinality=20)
+       PhysicalTableScan(table=t3, table_index=#NNN, pg_rtindex=3, filters=[], estimated_cardinality=100)
+     PhysicalTableScan(table=t4, table_index=#NNN, pg_rtindex=4, filters=[], estimated_cardinality=100)
+
+\t off
+\pset format aligned
+\c postgres
+DROP DATABASE pg_opt_join_graph;

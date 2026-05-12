@@ -1,0 +1,713 @@
+\c postgres
+SET client_min_messages = warning;
+DROP DATABASE IF EXISTS pg_opt_subquery;
+CREATE DATABASE pg_opt_subquery;
+\c pg_opt_subquery
+SET client_min_messages = warning;
+CREATE TABLE t1(id int, col int);
+CREATE TABLE t2(id int, col int);
+INSERT INTO t1
+SELECT i,
+       CASE
+         WHEN i <= 20 THEN 1
+         WHEN i <= 30 THEN 2
+         ELSE i
+       END
+FROM generate_series(1, 100) AS g(i);
+INSERT INTO t2
+SELECT i,
+       CASE
+         WHEN i <= 10 THEN NULL::int
+         ELSE i
+       END
+FROM generate_series(1, 50) AS g(i);
+ANALYZE t1;
+ANALYZE t2;
+LOAD 'pg_duckdbopt';
+SET client_min_messages = error;
+\pset format unaligned
+\t on
+CREATE FUNCTION explain_filter(text) RETURNS SETOF text
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    ln text;
+BEGIN
+    FOR ln IN EXECUTE $1 LOOP
+        ln := regexp_replace(ln, 'relid=[0-9]+', 'relid=NNN', 'g');
+        ln := regexp_replace(ln, '#[0-9]+', '#NNN', 'g');
+        IF ln ~ '^[[:space:]]*explain_filter[[:space:]]*$' THEN
+            ln := 'explain_filter';
+        ELSIF ln ~ '^[[:space:]-]+$' THEN
+            ln := '----------------';
+        ELSIF ln <> '' THEN
+            ln := ' ' || ln;
+        END IF;
+        RETURN NEXT ln;
+    END LOOP;
+END;
+$$;
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=SEMI, children_swapped=true, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=SEMI, dependent=false, children_swapped=true, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 JOIN t2 AS t3 ON t2.id = t3.id WHERE t2.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=SEMI, children_swapped=true, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalComparisonJoin(type=INNER, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t3.id, binding=#[2.0])])], estimated_cardinality=500)
+         LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+         LogicalGet(table=t3, table_index=#NNN, pg_rtindex=2, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=SEMI, dependent=false, children_swapped=true, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalHashJoin(type=INNER, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t3.id, binding=#[2.0])])], estimated_cardinality=500)
+         PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+         PhysicalTableScan(table=t3, table_index=#NNN, pg_rtindex=2, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=ANTI, children_swapped=true, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=ANTI, dependent=false, children_swapped=true, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE (EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)) IS TRUE$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=SEMI, children_swapped=true, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=SEMI, dependent=false, children_swapped=true, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE (EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)) IS NOT TRUE$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=ANTI, children_swapped=true, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=ANTI, dependent=false, children_swapped=true, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t1.col = 1 AND t2.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=SEMI, children_swapped=true, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.?column?, binding=#[2.0]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=SEMI, dependent=false, children_swapped=true, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.?column?, binding=#[2.0]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t1.col = 1 AND t2.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=ANTI, children_swapped=true, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.?column?, binding=#[2.0]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=ANTI, dependent=false, children_swapped=true, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.?column?, binding=#[2.0]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t2.id, binding=#[1.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE id = (SELECT max(id) FROM t2 WHERE t2.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=20)
+   LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(subquery.max, binding=#[4.0])])], estimated_cardinality=20)
+     LogicalComparisonJoin(type=SINGLE, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(agg.id, binding=#[2.0])])], estimated_cardinality=100)
+       LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+       LogicalProjection(table_index=#NNN, output_names=[max], expressions=[BoundColumnRef(agg.max, binding=#[3.0])], estimated_cardinality=50)
+         LogicalAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[max], groups=[BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=50)
+           LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=20)
+   PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(subquery.max, binding=#[4.0])])], estimated_cardinality=20)
+     PhysicalHashJoin(type=SINGLE, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(agg.id, binding=#[2.0])])], estimated_cardinality=100)
+       PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+       PhysicalProjection(select_list=[BoundColumnRef(agg.max, binding=#[3.0])], output_names=[max], estimated_cardinality=50)
+         PhysicalHashAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[max], groups=[BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=50)
+           PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE col = (SELECT max(t2.col) FROM t2 WHERE t2.id = t1.id AND EXISTS (SELECT 1 FROM t2 AS t3 WHERE t3.id = t2.id AND t3.col = t1.col))$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=20)
+   LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.max, binding=#[7.0])])], estimated_cardinality=20)
+     LogicalComparisonJoin(type=SINGLE, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(agg.col, binding=#[5.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(agg.id, binding=#[5.1])])], estimated_cardinality=100)
+       LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+       LogicalProjection(table_index=#NNN, output_names=[max], expressions=[BoundColumnRef(agg.max, binding=#[6.0])], estimated_cardinality=50)
+         LogicalAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[col, id], aggregate_names=[max], groups=[BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[1.1])])], estimated_cardinality=50)
+           LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.1]), BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+             LogicalProjection(table_index=#NNN, output_names=[?column?, id, col], expressions=[BoundConstant(1), BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t3.col, binding=#[2.1])], estimated_cardinality=50)
+               LogicalGet(table=t3, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=20)
+   PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.max, binding=#[7.0])])], estimated_cardinality=20)
+     PhysicalHashJoin(type=SINGLE, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(agg.col, binding=#[5.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(agg.id, binding=#[5.1])])], estimated_cardinality=100)
+       PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+       PhysicalProjection(select_list=[BoundColumnRef(agg.max, binding=#[6.0])], output_names=[max], estimated_cardinality=50)
+         PhysicalHashAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[col, id], aggregate_names=[max], groups=[BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[1.1])])], estimated_cardinality=50)
+           PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.1]), BoundColumnRef(t2.id, binding=#[1.0])])], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+             PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t3.id, binding=#[2.0]), BoundColumnRef(t3.col, binding=#[2.1])], output_names=[?column?, id, col], estimated_cardinality=50)
+               PhysicalTableScan(table=t3, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT (SELECT max(id) FROM t2 WHERE t2.id = t1.id) FROM t1$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[max], expressions=[BoundColumnRef(subquery.max, binding=#[5.0])], estimated_cardinality=100)
+   LogicalComparisonJoin(type=SINGLE, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(agg.id, binding=#[3.0])])], estimated_cardinality=100)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[max], expressions=[BoundColumnRef(agg.max, binding=#[4.0])], estimated_cardinality=50)
+       LogicalAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[max], groups=[BoundColumnRef(t2.id, binding=#[2.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.id, binding=#[2.0])])], estimated_cardinality=50)
+         LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(subquery.max, binding=#[5.0])], output_names=[max], estimated_cardinality=100)
+   PhysicalHashJoin(type=SINGLE, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(agg.id, binding=#[3.0])])], estimated_cardinality=100)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundColumnRef(agg.max, binding=#[4.0])], output_names=[max], estimated_cardinality=50)
+       PhysicalHashAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[max], groups=[BoundColumnRef(t2.id, binding=#[2.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.id, binding=#[2.0])])], estimated_cardinality=50)
+         PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT (SELECT max(t2.col) FROM t2 WHERE EXISTS (SELECT 1 FROM t2 AS t3 WHERE t3.id = t2.id AND t3.col = t1.col)) FROM t1$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[max], expressions=[BoundColumnRef(subquery.max, binding=#[8.0])], estimated_cardinality=100)
+   LogicalComparisonJoin(type=SINGLE, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(agg.col, binding=#[6.0])])], estimated_cardinality=100)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[max], expressions=[BoundColumnRef(agg.max, binding=#[7.0])], estimated_cardinality=41)
+       LogicalAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[col], aggregate_names=[max], groups=[BoundColumnRef(proj.col, binding=#[4.2])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[2.1])])], estimated_cardinality=41)
+         LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.1]), BoundColumnRef(t2.id, binding=#[2.0])])], estimated_cardinality=50)
+           LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+           LogicalProjection(table_index=#NNN, output_names=[?column?, id, col], expressions=[BoundConstant(1), BoundColumnRef(t3.id, binding=#[3.0]), BoundColumnRef(t3.col, binding=#[3.1])], estimated_cardinality=50)
+             LogicalGet(table=t3, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(subquery.max, binding=#[8.0])], output_names=[max], estimated_cardinality=100)
+   PhysicalHashJoin(type=SINGLE, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(agg.col, binding=#[6.0])])], estimated_cardinality=100)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundColumnRef(agg.max, binding=#[7.0])], output_names=[max], estimated_cardinality=41)
+       PhysicalHashAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[col], aggregate_names=[max], groups=[BoundColumnRef(proj.col, binding=#[4.2])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[2.1])])], estimated_cardinality=41)
+         PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.1]), BoundColumnRef(t2.id, binding=#[2.0])])], estimated_cardinality=50)
+           PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+           PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(t3.id, binding=#[3.0]), BoundColumnRef(t3.col, binding=#[3.1])], output_names=[?column?, id, col], estimated_cardinality=50)
+             PhysicalTableScan(table=t3, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT t2.id, (SELECT max(t3.col) FROM t2 AS t3 WHERE t3.id = t2.id AND t3.col = t1.col) AS mx FROM t2) s WHERE s.id = t1.id AND s.mx = t1.col)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[7.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[7.2]), BoundColumnRef(t1.id, binding=#[0.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.mx, binding=#[7.3]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id, mx], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[2.2]), BoundColumnRef(s.id, binding=#[2.0]), BoundColumnRef(s.mx, binding=#[2.1])], estimated_cardinality=50)
+       LogicalProjection(table_index=#NNN, output_names=[id, mx, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(subquery.max, binding=#[6.0]), BoundColumnRef(agg.col, binding=#[4.1])], estimated_cardinality=50)
+         LogicalComparisonJoin(type=SINGLE, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(agg.id, binding=#[4.0])])], estimated_cardinality=50)
+           LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+           LogicalProjection(table_index=#NNN, output_names=[max], expressions=[BoundColumnRef(agg.max, binding=#[5.0])], estimated_cardinality=50)
+             LogicalAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id, col], aggregate_names=[max], groups=[BoundColumnRef(t3.id, binding=#[3.0]), BoundColumnRef(t3.col, binding=#[3.1])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t3.col, binding=#[3.1])])], estimated_cardinality=50)
+               LogicalGet(table=t3, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[7.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[7.2]), BoundColumnRef(t1.id, binding=#[0.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.mx, binding=#[7.3]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[2.2]), BoundColumnRef(s.id, binding=#[2.0]), BoundColumnRef(s.mx, binding=#[2.1])], output_names=[?column?, col, id, mx], estimated_cardinality=50)
+       PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(subquery.max, binding=#[6.0]), BoundColumnRef(agg.col, binding=#[4.1])], output_names=[id, mx, col], estimated_cardinality=50)
+         PhysicalHashJoin(type=SINGLE, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(agg.id, binding=#[4.0])])], estimated_cardinality=50)
+           PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+           PhysicalProjection(select_list=[BoundColumnRef(agg.max, binding=#[5.0])], output_names=[max], estimated_cardinality=50)
+             PhysicalHashAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id, col], aggregate_names=[max], groups=[BoundColumnRef(t3.id, binding=#[3.0]), BoundColumnRef(t3.col, binding=#[3.1])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t3.col, binding=#[3.1])])], estimated_cardinality=50)
+               PhysicalTableScan(table=t3, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT max(t2.col) AS mx FROM t2 WHERE t2.id = t1.id) s WHERE s.mx = t1.col)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.1]), BoundColumnRef(t1.id, binding=#[0.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.mx, binding=#[5.2]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id, mx], expressions=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[4.1]), BoundColumnRef(s.mx, binding=#[4.0])], estimated_cardinality=50)
+       LogicalProjection(table_index=#NNN, output_names=[mx, id], expressions=[BoundColumnRef(agg.mx, binding=#[3.0]), BoundColumnRef(agg.id, binding=#[2.0])], estimated_cardinality=50)
+         LogicalAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[mx], groups=[BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[1.1])])], estimated_cardinality=50)
+           LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.1]), BoundColumnRef(t1.id, binding=#[0.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.mx, binding=#[5.2]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[4.1]), BoundColumnRef(s.mx, binding=#[4.0])], output_names=[?column?, id, mx], estimated_cardinality=50)
+       PhysicalProjection(select_list=[BoundColumnRef(agg.mx, binding=#[3.0]), BoundColumnRef(agg.id, binding=#[2.0])], output_names=[mx, id], estimated_cardinality=50)
+         PhysicalHashAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[mx], groups=[BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[1.1])])], estimated_cardinality=50)
+           PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT max(t2.col) AS mx FROM t2 WHERE t2.id = t1.id) s WHERE s.mx > 0)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=10)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=10)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[4.1])], estimated_cardinality=10)
+       LogicalProjection(table_index=#NNN, output_names=[mx, id], expressions=[BoundColumnRef(agg.mx, binding=#[3.0]), BoundColumnRef(agg.id, binding=#[2.0])], estimated_cardinality=10)
+         LogicalFilter(expressions=[BoundFunction(>#NNN, children=[BoundColumnRef(agg.mx, binding=#[3.0]), BoundConstant(0)])], estimated_cardinality=10)
+           LogicalAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[mx], groups=[BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[1.1])])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=10)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=10)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[4.1])], output_names=[?column?, id], estimated_cardinality=10)
+       PhysicalProjection(select_list=[BoundColumnRef(agg.mx, binding=#[3.0]), BoundColumnRef(agg.id, binding=#[2.0])], output_names=[mx, id], estimated_cardinality=10)
+         PhysicalFilter(expressions=[BoundFunction(>#NNN, children=[BoundColumnRef(agg.mx, binding=#[3.0]), BoundConstant(0)])], estimated_cardinality=10)
+           PhysicalHashAggregate(group_index=#NNN, aggregate_index=#NNN, group_names=[id], aggregate_names=[mx], groups=[BoundColumnRef(t2.id, binding=#[1.0])], expressions=[BoundAggregate(max#NNN, children=[BoundColumnRef(t2.col, binding=#[1.1])])], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE col IN (SELECT id FROM t2)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=100)
+   LogicalComparisonJoin(type=MARK, mark_index=#NNN, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=100)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=100)
+   PhysicalHashJoin(type=MARK, dependent=false, mark_index=#NNN, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=100)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0])], output_names=[id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE col NOT IN (SELECT id FROM t2)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=100)
+   LogicalComparisonJoin(type=MARK, mark_index=#NNN, perform_delim=false, any_join=false, invert_result=true, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=100)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=100)
+   PhysicalHashJoin(type=MARK, dependent=false, mark_index=#NNN, invert_result=true, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=100)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0])], output_names=[id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE (col IN (SELECT id FROM t2)) IS TRUE$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1000)
+   LogicalComparisonJoin(type=MARK, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=1000)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1000)
+   PhysicalHashJoin(type=MARK, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=1000)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0])], output_names=[id], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE (id, col) = (SELECT id, col FROM t2 WHERE t2.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=100)
+   LogicalComparisonJoin(type=SINGLE, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(subquery.id, binding=#[2.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.col, binding=#[2.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.0]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=100)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=50)
+       LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=100)
+   PhysicalHashJoin(type=SINGLE, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(subquery.id, binding=#[2.0])]), BoundFunction(=#NNN, children=[BoundColumnRef(t1.col, binding=#[0.1]), BoundColumnRef(subquery.col, binding=#[2.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[2.0]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=100)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, col], estimated_cardinality=50)
+       PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT t2.id FROM t2 WHERE t2.id = t1.id) s WHERE s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=50)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[2.0])], estimated_cardinality=50)
+       LogicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[2.0])], estimated_cardinality=50)
+         LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+           LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=50)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=50)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[2.0])], output_names=[?column?, id], estimated_cardinality=50)
+       PhysicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[2.0])], estimated_cardinality=50)
+         PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0])], output_names=[id], estimated_cardinality=50)
+           PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT t2.id FROM t2 WHERE t2.col = t1.col) s WHERE s.id > 10)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=55)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[3.1]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=55)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[2.1])], estimated_cardinality=40)
+       LogicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[2.0]), BoundColumnRef(proj.col, binding=#[2.1])], estimated_cardinality=40)
+         LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=40)
+           LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[BoundFunction(>#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundConstant(10)])], estimated_cardinality=40)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=55)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[3.1]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=55)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[2.1])], output_names=[?column?, col], estimated_cardinality=40)
+       PhysicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[2.0]), BoundColumnRef(proj.col, binding=#[2.1])], estimated_cardinality=40)
+         PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, col], estimated_cardinality=40)
+           PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[BoundFunction(>#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundConstant(10)])], estimated_cardinality=40)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE id = (SELECT id FROM t2 WHERE t2.col = t1.col ORDER BY t2.id LIMIT 1)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=20)
+   LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=20)
+     LogicalComparisonJoin(type=SINGLE, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[2.1]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=100)
+       LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+       LogicalFilter(expressions=[BoundFunction(<=#NNN, children=[BoundColumnRef(window.limit_rownum, binding=#[4.0]), BoundConstant(1)])], estimated_cardinality=10)
+         LogicalWindow(table_index=#NNN, functions=[row_number], output_names=[limit_rownum], partitions=[BoundColumnRef(proj.col, binding=#[2.1])], orders=[BoundColumnRef(proj.id, binding=#[2.0])], estimated_cardinality=50)
+           LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=20)
+   PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(subquery.id, binding=#[2.0])])], estimated_cardinality=20)
+     PhysicalHashJoin(type=SINGLE, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[2.1]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=100)
+       PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+       PhysicalFilter(expressions=[BoundFunction(<=#NNN, children=[BoundColumnRef(window.limit_rownum, binding=#[4.0]), BoundConstant(1)])], estimated_cardinality=10)
+         PhysicalWindow(table_index=#NNN, functions=[row_number], output_names=[limit_rownum], partitions=[BoundColumnRef(proj.col, binding=#[2.1])], orders=[BoundColumnRef(proj.id, binding=#[2.0])], estimated_cardinality=50)
+           PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, col], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT t2.id FROM t2 WHERE t2.col = t1.col ORDER BY t2.id LIMIT 1) s WHERE s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[3.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[2.1]), BoundColumnRef(s.id, binding=#[2.0])], estimated_cardinality=10)
+       LogicalFilter(expressions=[BoundFunction(<=#NNN, children=[BoundColumnRef(window.limit_rownum, binding=#[6.0]), BoundConstant(1)])], estimated_cardinality=10)
+         LogicalWindow(table_index=#NNN, functions=[row_number], output_names=[limit_rownum], partitions=[BoundColumnRef(proj.col, binding=#[2.1])], orders=[BoundColumnRef(proj.id, binding=#[2.0])], estimated_cardinality=50)
+           LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[3.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[3.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[2.1]), BoundColumnRef(s.id, binding=#[2.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalFilter(expressions=[BoundFunction(<=#NNN, children=[BoundColumnRef(window.limit_rownum, binding=#[6.0]), BoundConstant(1)])], estimated_cardinality=10)
+         PhysicalWindow(table_index=#NNN, functions=[row_number], output_names=[limit_rownum], partitions=[BoundColumnRef(proj.col, binding=#[2.1])], orders=[BoundColumnRef(proj.id, binding=#[2.0])], estimated_cardinality=50)
+           PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, col], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT t2.id, row_number() OVER (PARTITION BY t2.col ORDER BY t2.id) AS rn FROM t2 WHERE t2.col = t1.col) s WHERE s.rn = 1 AND s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], estimated_cardinality=10)
+       LogicalProjection(table_index=#NNN, output_names=[id, rn, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.rn, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+         LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.rn, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+           LogicalWindow(table_index=#NNN, functions=[row_number], output_names=[rn], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.rn, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, rn, col], estimated_cardinality=10)
+         PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.rn, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+           PhysicalWindow(table_index=#NNN, functions=[row_number], output_names=[rn], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT t2.id, rank() OVER (PARTITION BY t2.col ORDER BY t2.id) AS rk FROM t2 WHERE t2.col = t1.col) s WHERE s.rk = 1 AND s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], estimated_cardinality=10)
+       LogicalProjection(table_index=#NNN, output_names=[id, rk, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.rk, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+         LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.rk, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+           LogicalWindow(table_index=#NNN, functions=[rank], output_names=[rk], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.rk, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, rk, col], estimated_cardinality=10)
+         PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.rk, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+           PhysicalWindow(table_index=#NNN, functions=[rank], output_names=[rk], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT t2.id, dense_rank() OVER (PARTITION BY t2.col ORDER BY t2.id) AS dr FROM t2 WHERE t2.col = t1.col) s WHERE s.dr = 1 AND s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], estimated_cardinality=10)
+       LogicalProjection(table_index=#NNN, output_names=[id, dr, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.dr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+         LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.dr, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+           LogicalWindow(table_index=#NNN, functions=[dense_rank], output_names=[dr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.dr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, dr, col], estimated_cardinality=10)
+         PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.dr, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+           PhysicalWindow(table_index=#NNN, functions=[dense_rank], output_names=[dr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT t2.id, percent_rank() OVER (PARTITION BY t2.col ORDER BY t2.id) AS pr FROM t2 WHERE t2.col = t1.col) s WHERE s.pr = 0 AND s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], estimated_cardinality=10)
+       LogicalProjection(table_index=#NNN, output_names=[id, pr, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.pr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+         LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.pr, binding=#[2.0]), BoundConstant(0)])], estimated_cardinality=10)
+           LogicalWindow(table_index=#NNN, functions=[percent_rank], output_names=[pr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.pr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, pr, col], estimated_cardinality=10)
+         PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.pr, binding=#[2.0]), BoundConstant(0)])], estimated_cardinality=10)
+           PhysicalWindow(table_index=#NNN, functions=[percent_rank], output_names=[pr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT t2.id, cume_dist() OVER (PARTITION BY t2.col ORDER BY t2.id) AS cd FROM t2 WHERE t2.col = t1.col) s WHERE s.cd < 0.5 AND s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], estimated_cardinality=10)
+       LogicalProjection(table_index=#NNN, output_names=[id, cd, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.cd, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+         LogicalFilter(expressions=[BoundFunction(<#NNN, children=[BoundColumnRef(window.cd, binding=#[2.0]), BoundConstant(0.5)])], estimated_cardinality=10)
+           LogicalWindow(table_index=#NNN, functions=[cume_dist], output_names=[cd], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[4.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[3.2]), BoundColumnRef(s.id, binding=#[3.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.cd, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, cd, col], estimated_cardinality=10)
+         PhysicalFilter(expressions=[BoundFunction(<#NNN, children=[BoundColumnRef(window.cd, binding=#[2.0]), BoundConstant(0.5)])], estimated_cardinality=10)
+           PhysicalWindow(table_index=#NNN, functions=[cume_dist], output_names=[cd], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT id, pr FROM (SELECT t2.id, percent_rank() OVER (PARTITION BY t2.col ORDER BY t2.id) AS pr FROM t2 WHERE t2.col = t1.col) w) s WHERE s.pr = 0 AND s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[5.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[4.2]), BoundColumnRef(s.id, binding=#[4.0])], estimated_cardinality=10)
+       LogicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[4.0]), BoundColumnRef(proj.pr, binding=#[4.1]), BoundColumnRef(proj.col, binding=#[4.2])], estimated_cardinality=10)
+         LogicalProjection(table_index=#NNN, output_names=[id, pr, col], expressions=[BoundColumnRef(w.id, binding=#[3.0]), BoundColumnRef(w.pr, binding=#[3.1]), BoundColumnRef(proj.col, binding=#[3.2])], estimated_cardinality=10)
+           LogicalProjection(table_index=#NNN, output_names=[id, pr, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.pr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+             LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.pr, binding=#[2.0]), BoundConstant(0)])], estimated_cardinality=10)
+               LogicalWindow(table_index=#NNN, functions=[percent_rank], output_names=[pr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+                 LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[5.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[4.2]), BoundColumnRef(s.id, binding=#[4.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[4.0]), BoundColumnRef(proj.pr, binding=#[4.1]), BoundColumnRef(proj.col, binding=#[4.2])], estimated_cardinality=10)
+         PhysicalProjection(select_list=[BoundColumnRef(w.id, binding=#[3.0]), BoundColumnRef(w.pr, binding=#[3.1]), BoundColumnRef(proj.col, binding=#[3.2])], output_names=[id, pr, col], estimated_cardinality=10)
+           PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.pr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, pr, col], estimated_cardinality=10)
+             PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.pr, binding=#[2.0]), BoundConstant(0)])], estimated_cardinality=10)
+               PhysicalWindow(table_index=#NNN, functions=[percent_rank], output_names=[pr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+                 PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT id FROM (SELECT t2.id, rank() OVER (PARTITION BY t2.col ORDER BY t2.id) AS rk FROM t2 WHERE t2.col = t1.col) w WHERE rk = 1) s WHERE s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[5.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(s.id, binding=#[4.0])], estimated_cardinality=10)
+       LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(w.id, binding=#[3.0]), BoundColumnRef(proj.col, binding=#[3.2])], estimated_cardinality=10)
+         LogicalProjection(table_index=#NNN, output_names=[id, rk, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.rk, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+           LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.rk, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+             LogicalWindow(table_index=#NNN, functions=[rank], output_names=[rk], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+               LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[5.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(s.id, binding=#[4.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalProjection(select_list=[BoundColumnRef(w.id, binding=#[3.0]), BoundColumnRef(proj.col, binding=#[3.2])], output_names=[id, col], estimated_cardinality=10)
+         PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.rk, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, rk, col], estimated_cardinality=10)
+           PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.rk, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+             PhysicalWindow(table_index=#NNN, functions=[rank], output_names=[rk], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+               PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT id FROM (SELECT t2.id, dense_rank() OVER (PARTITION BY t2.col ORDER BY t2.id) AS dr FROM t2 WHERE t2.col = t1.col) w WHERE dr = 1) s WHERE s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=1)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[5.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, col, id], expressions=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(s.id, binding=#[4.0])], estimated_cardinality=10)
+       LogicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[4.0]), BoundColumnRef(proj.col, binding=#[4.1])], estimated_cardinality=10)
+         LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(w.id, binding=#[3.0]), BoundColumnRef(proj.col, binding=#[3.2])], estimated_cardinality=10)
+           LogicalProjection(table_index=#NNN, output_names=[id, dr, col], expressions=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.dr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], estimated_cardinality=10)
+             LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.dr, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+               LogicalWindow(table_index=#NNN, functions=[dense_rank], output_names=[dr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+                 LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=1)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.col, binding=#[5.1]), BoundColumnRef(t1.col, binding=#[0.1])]), BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[5.2]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=1)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.col, binding=#[4.1]), BoundColumnRef(s.id, binding=#[4.0])], output_names=[?column?, col, id], estimated_cardinality=10)
+       PhysicalDistinct(expressions=[BoundColumnRef(proj.id, binding=#[4.0]), BoundColumnRef(proj.col, binding=#[4.1])], estimated_cardinality=10)
+         PhysicalProjection(select_list=[BoundColumnRef(w.id, binding=#[3.0]), BoundColumnRef(proj.col, binding=#[3.2])], output_names=[id, col], estimated_cardinality=10)
+           PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(window.dr, binding=#[2.0]), BoundColumnRef(t2.col, binding=#[1.1])], output_names=[id, dr, col], estimated_cardinality=10)
+             PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(window.dr, binding=#[2.0]), BoundConstant(1)])], estimated_cardinality=10)
+               PhysicalWindow(table_index=#NNN, functions=[dense_rank], output_names=[dr], partitions=[BoundColumnRef(t2.col, binding=#[1.1])], orders=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+                 PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT id FROM t2 WHERE t2.id = t1.id UNION ALL SELECT id FROM t2 WHERE t2.id = t1.id) s WHERE s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=100)
+   LogicalComparisonJoin(type=SEMI, perform_delim=false, any_join=false, invert_result=false, propagate_null_values=false, is_lateral_join=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[7.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=100)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?, id], expressions=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[6.0])], estimated_cardinality=100)
+       LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(setop.id, binding=#[5.0])], estimated_cardinality=100)
+         LogicalSetOperation(type=UNION, all=true, table_index=#NNN, output_names=[id], estimated_cardinality=100)
+           LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+           LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[3.0])], estimated_cardinality=50)
+             LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=50)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=100)
+   PhysicalHashJoin(type=SEMI, dependent=false, invert_result=false, conditions=[BoundFunction(=#NNN, children=[BoundColumnRef(proj.id, binding=#[7.1]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=100)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1), BoundColumnRef(proj.id, binding=#[6.0])], output_names=[?column?, id], estimated_cardinality=100)
+       PhysicalProjection(select_list=[BoundColumnRef(setop.id, binding=#[5.0])], output_names=[id], estimated_cardinality=100)
+         PhysicalSetOperation(type=UNION, all=true, table_index=#NNN, output_names=[id], estimated_cardinality=100)
+           PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0])], output_names=[id], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+           PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[3.0])], output_names=[id], estimated_cardinality=50)
+             PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=50)
+
+SELECT explain_filter($$EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM (SELECT id FROM t2 WHERE t2.id = t1.id UNION ALL SELECT id FROM t2 WHERE t2.col = t1.col) s WHERE s.id = t1.id)$$);
+ Custom Scan (DuckDBScan)
+   DuckDB Logical Plan: Logical Plan:
+ LogicalProjection(table_index=#NNN, output_names=[id, col], expressions=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], estimated_cardinality=20)
+   LogicalDependentJoin(type=SEMI, correlated_columns=[#NNN.0, #NNN.1], perform_delim=true, any_join=false, invert_result=false, propagate_null_values=true, is_lateral_join=false, conditions=[], estimated_cardinality=20)
+     LogicalGet(table=t1, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[], estimated_cardinality=100)
+     LogicalProjection(table_index=#NNN, output_names=[?column?], expressions=[BoundConstant(1)], estimated_cardinality=4)
+       LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(setop.id, binding=#[5.0])], estimated_cardinality=4)
+         LogicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(setop.id, binding=#[5.0]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=4)
+           LogicalSetOperation(type=UNION, all=true, table_index=#NNN, output_names=[id], estimated_cardinality=20)
+             LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[1.0])], estimated_cardinality=10)
+               LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=10)
+             LogicalProjection(table_index=#NNN, output_names=[id], expressions=[BoundColumnRef(t2.id, binding=#[3.0])], estimated_cardinality=10)
+               LogicalGet(table=t2, table_index=#NNN, pg_rtindex=1, relid=NNN, filters=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.col, binding=#[3.1]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=10)
+
+ Physical Plan:
+ PhysicalProjection(select_list=[BoundColumnRef(t1.id, binding=#[0.0]), BoundColumnRef(t1.col, binding=#[0.1])], output_names=[id, col], estimated_cardinality=20)
+   PhysicalHashJoin(type=SEMI, dependent=true, correlated_columns=[(0.0), (0.1)], invert_result=false, conditions=[], estimated_cardinality=20)
+     PhysicalTableScan(table=t1, table_index=#NNN, pg_rtindex=1, filters=[], estimated_cardinality=100)
+     PhysicalProjection(select_list=[BoundConstant(1)], output_names=[?column?], estimated_cardinality=4)
+       PhysicalProjection(select_list=[BoundColumnRef(setop.id, binding=#[5.0])], output_names=[id], estimated_cardinality=4)
+         PhysicalFilter(expressions=[BoundFunction(=#NNN, children=[BoundColumnRef(setop.id, binding=#[5.0]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=4)
+           PhysicalSetOperation(type=UNION, all=true, table_index=#NNN, output_names=[id], estimated_cardinality=20)
+             PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[1.0])], output_names=[id], estimated_cardinality=10)
+               PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.id, binding=#[1.0]), BoundColumnRef(t1.id, binding=#[0.0])])], estimated_cardinality=10)
+             PhysicalProjection(select_list=[BoundColumnRef(t2.id, binding=#[3.0])], output_names=[id], estimated_cardinality=10)
+               PhysicalTableScan(table=t2, table_index=#NNN, pg_rtindex=1, filters=[BoundFunction(=#NNN, children=[BoundColumnRef(t2.col, binding=#[3.1]), BoundColumnRef(t1.col, binding=#[0.1])])], estimated_cardinality=10)
+
+\t off
+\pset format aligned
+\c postgres
+DROP DATABASE pg_opt_subquery;
