@@ -8,6 +8,8 @@ extern "C" {
 #include "utils/numeric.h"
 #include "varatt.h"
 
+extern bool pg_yaap_trace_hooks;
+
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
 extern Datum numeric_mul(PG_FUNCTION_ARGS);
 extern Datum numeric_int8(PG_FUNCTION_ARGS);
@@ -32,6 +34,16 @@ DataChunkDeformer::deform_tuple_header(HeapTupleHeader tuphdr,
 									   uint32 row_idx,
 									   const DeformBindings &bindings)
 {
+	if (!jit_path_logged_ && pg_yaap_trace_hooks)
+	{
+		jit_path_logged_ = true;
+		elog(LOG,
+			 "pg_yaap: deformer dispatch targets=%d last_att=%d path=%s",
+			 program_.ntargets,
+			 program_.last_att_index,
+			 jit_func_ != nullptr ? "jit" : "interpreter");
+	}
+
 	if (jit_func_ != nullptr)
 	{
 		jit_func_(tuphdr,

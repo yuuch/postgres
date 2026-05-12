@@ -20,6 +20,7 @@ extern "C" {
 extern int  pg_yaap_parallel_max_workers;
 extern bool pg_yaap_jit_deform;
 extern bool pg_yaap_disable_jit_for_parallel_worker;
+extern bool pg_yaap_trace_hooks;
 extern bool pg_yaap_trace_execution_path;
 
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
@@ -54,6 +55,26 @@ SeqScanTraceEnabled(const ExecCtx &ctx)
 {
 	return ctx.control != nullptr &&
 		pg_atomic_read_u32(&ctx.control->trace_execution_path) != 0;
+}
+
+static void
+LogSeqScanDeformerJitDecision(const ExecCtx &ctx,
+							 const char *kind,
+							 const DeformProgram &program,
+							 bool compiled,
+							 const char *reason)
+{
+	if (!pg_yaap_trace_hooks && !SeqScanTraceEnabled(ctx))
+		return;
+	elog(LOG,
+		 "pg_yaap: SeqScan %s deformer worker=%d targets=%d last_att=%d jit=%s%s%s",
+		 kind,
+		 ctx.worker_index,
+		 program.ntargets,
+		 program.last_att_index,
+		 compiled ? "on" : "off",
+		 (reason != nullptr && reason[0] != '\0') ? " reason=" : "",
+		 (reason != nullptr && reason[0] != '\0') ? reason : "");
 }
 
 static SchemaDescriptor *
@@ -865,6 +886,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		{
 			local.proj_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
 			                                                           &local.proj_deform_program);
+			bool proj_jit_compiled = false;
+			const char *proj_jit_reason = nullptr;
 #ifdef USE_LLVM
 			if (pg_yaap_jit_deform &&
 			    !(ctx.worker_index != LEADER_WORKER_INDEX &&
@@ -878,14 +901,28 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				                                                    &fn, &jc, &err) &&
 				    fn != nullptr)
 				{
+					proj_jit_compiled    = true;
 					local.proj_jit_func    = fn;
 					local.proj_jit_context = jc;
 					local.proj_deformer->set_jit_func(fn);
 					if (jc != nullptr)
 						pg_yaap_register_llvm_jit_context(jc);
 				}
+				else
+					proj_jit_reason =
+						(err != nullptr && err[0] != '\0') ?
+						err : "compile returned false without failure reason";
 			}
+			else if (!pg_yaap_jit_deform)
+				proj_jit_reason = "disabled by pg_yaap.jit_deform";
+			else
+				proj_jit_reason = "disabled for parallel worker";
 #endif
+			LogSeqScanDeformerJitDecision(ctx,
+										 "projection",
+										 local.proj_deform_program,
+										 proj_jit_compiled,
+										 proj_jit_reason);
 		}
 
 		/* Filter side: only built if a real predicate exists. Empty filter tapes
@@ -901,6 +938,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				new DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>());
 			local.filter_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
 								    &local.filter_deform_program);
+			bool filter_jit_compiled = false;
+			const char *filter_jit_reason = nullptr;
 #ifdef USE_LLVM
 			if (pg_yaap_jit_deform &&
 			    !(ctx.worker_index != LEADER_WORKER_INDEX &&
@@ -914,14 +953,28 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				                                                    &fn, &jc, &err) &&
 				    fn != nullptr)
 				{
+					filter_jit_compiled    = true;
 					local.filter_jit_func    = fn;
 					local.filter_jit_context = jc;
 					local.filter_deformer->set_jit_func(fn);
 					if (jc != nullptr)
 						pg_yaap_register_llvm_jit_context(jc);
 				}
+				else
+					filter_jit_reason =
+						(err != nullptr && err[0] != '\0') ?
+						err : "compile returned false without failure reason";
 			}
+			else if (!pg_yaap_jit_deform)
+				filter_jit_reason = "disabled by pg_yaap.jit_deform";
+			else
+				filter_jit_reason = "disabled for parallel worker";
 #endif
+			LogSeqScanDeformerJitDecision(ctx,
+										 "filter",
+										 local.filter_deform_program,
+										 filter_jit_compiled,
+										 filter_jit_reason);
 		}
 		local.deform_programs_built = true;
 	}

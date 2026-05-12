@@ -1313,12 +1313,6 @@ void
 VecExprProgram::try_compile_jit()
 {
 #ifdef USE_LLVM
-	if (!jit_enabled)
-	{
-		if (pg_yaap_trace_hooks)
-			elog(LOG, "pg_yaap: expr JIT disabled by core jit=off");
-		return;
-	}
 	for (int reg_idx = 0; reg_idx < max_reg_idx; reg_idx++)
 	{
 		if (get_register_numeric_width(reg_idx) == VecNumericWidth::Wide128)

@@ -5,6 +5,7 @@
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #include "executor/executor.h"
+#include "jit/jit.h"
 #include "optimizer/planner.h"
 #include "storage/dsm_registry.h"
 #include "storage/ipc.h"
@@ -28,6 +29,12 @@ static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+
+static int
+pg_yaap_forced_jit_flags(void)
+{
+	return PGJIT_PERFORM | PGJIT_EXPR | PGJIT_DEFORM | PGJIT_OPT3 | PGJIT_INLINE;
+}
 
 static bool pg_yaap_enabled = true;
 bool pg_yaap_trace_hooks = false;
@@ -383,7 +390,7 @@ pg_yaap_build_plannedstmt(Query *parse)
 	result->transientPlan = false;
 	result->dependsOnRole = false;
 	result->parallelModeNeeded = false;
-	result->jitFlags = 0;
+	result->jitFlags = pg_yaap_forced_jit_flags();
 	plan->plan.targetlist = copyObject(parse->targetList);
 	plan->plan.qual = NIL;
 	plan->plan.lefttree = NULL;
@@ -443,7 +450,9 @@ pg_yaap_start_optimizer_executor(QueryDesc *queryDesc, int eflags)
 	estate->es_crosscheck_snapshot = RegisterSnapshot(queryDesc->crosscheck_snapshot);
 	estate->es_top_eflags = eflags | EXEC_FLAG_SKIP_TRIGGERS;
 	estate->es_instrument = queryDesc->instrument_options;
-	estate->es_jit_flags = queryDesc->plannedstmt->jitFlags;
+	estate->es_jit_flags = queryDesc->plannedstmt->jitFlags != 0 ?
+		queryDesc->plannedstmt->jitFlags :
+		pg_yaap_forced_jit_flags();
 
 	if (!ExecCheckPermissions(queryDesc->plannedstmt->rtable,
 							  queryDesc->plannedstmt->permInfos,

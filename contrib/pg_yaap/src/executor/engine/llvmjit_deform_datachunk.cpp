@@ -73,9 +73,17 @@ load_jit_symbols(const char **failure_reason)
 	const char *provider_name;
 
 	if (pg_llvm_create_context != nullptr)
+	{
+		elog(LOG, "pg_yaap: deform JIT pid=%d reusing already-resolved LLVM entry points",
+			 MyProcPid);
 		return true;
+	}
 	if (resolve_jit_symbols_from_process())
+	{
+		elog(LOG, "pg_yaap: deform JIT pid=%d resolved LLVM entry points from process",
+			 MyProcPid);
 		return true;
+	}
 
 	provider_name = (jit_provider != nullptr && jit_provider[0] != '\0') ?
 		jit_provider : "llvmjit";
@@ -91,7 +99,11 @@ load_jit_symbols(const char **failure_reason)
 
 	load_file(provider_path, false);
 	if (resolve_jit_symbols_from_process())
+	{
+		elog(LOG, "pg_yaap: deform JIT pid=%d loaded provider %s and resolved LLVM entry points",
+			 MyProcPid, provider_name);
 		return true;
+	}
 
 	if (failure_reason != nullptr)
 		*failure_reason = "loaded JIT provider but LLVM entry points are unavailable";
@@ -1088,18 +1100,39 @@ pg_yaap_try_compile_jit_deform_to_datachunk(TupleDesc desc,
 	uint64_t serial;
 
 	if (out_func != nullptr) *out_func = nullptr;
+	elog(LOG, "pg_yaap: deform JIT compile begin pid=%d targets=%d last_att=%d",
+		 MyProcPid,
+		 program != nullptr ? program->ntargets : -1,
+		 program != nullptr ? program->last_att_index : -1);
 
 	if (!load_jit_symbols(failure_reason)) {
 		if (failure_reason != nullptr && *failure_reason == nullptr)
 			*failure_reason = "failed to load PostgreSQL LLVM entry points";
+		elog(LOG, "pg_yaap: deform JIT compile pid=%d failed during symbol load reason=%s",
+			 MyProcPid,
+			 (failure_reason != nullptr && *failure_reason != nullptr) ? *failure_reason : "unknown");
 		return false;
 	}
-	if (!pg_yaap_jit_deform_supported(desc, program, failure_reason)) return false;
+	if (!pg_yaap_jit_deform_supported(desc, program, failure_reason))
+	{
+		elog(LOG, "pg_yaap: deform JIT compile pid=%d rejected by support check reason=%s",
+			 MyProcPid,
+			 (failure_reason != nullptr && *failure_reason != nullptr) ? *failure_reason : "unknown");
+		return false;
+	}
 
 	if (out_context != nullptr && *out_context != nullptr)
 		context = (LLVMJitContext *) *out_context;
 	else {
 		context = (LLVMJitContext *) pg_llvm_create_context(PGJIT_PERFORM | PGJIT_DEFORM | PGJIT_OPT3);
+		if (context == nullptr)
+		{
+			if (failure_reason != nullptr)
+				*failure_reason = "llvm_create_context returned null";
+			elog(LOG, "pg_yaap: deform JIT compile pid=%d failed to create LLVM context",
+				 MyProcPid);
+			return false;
+		}
 		created_context = true;
 	}
 	char base_name[96];
@@ -1108,6 +1141,16 @@ pg_yaap_try_compile_jit_deform_to_datachunk(TupleDesc desc,
 			 (const void *) context,
 			 (unsigned long long) serial);
 	funcname = pg_llvm_expand_funcname(context, base_name);
+	if (funcname == nullptr)
+	{
+		if (created_context)
+			pg_llvm_release_context_direct(context);
+		if (failure_reason != nullptr)
+			*failure_reason = "llvm_expand_funcname returned null";
+		elog(LOG, "pg_yaap: deform JIT compile pid=%d failed to allocate function name",
+			 MyProcPid);
+		return false;
+	}
 	PG_TRY();
 	{
 		fn = compile_deform_to_datachunk(context, desc, program, funcname);
@@ -1120,8 +1163,17 @@ pg_yaap_try_compile_jit_deform_to_datachunk(TupleDesc desc,
 			if (out_context != nullptr && *out_context == nullptr)
 				*out_context = &context->base;
 			success = (out_func == nullptr || *out_func != nullptr);
+			if (!success && failure_reason != nullptr)
+				*failure_reason = "llvm_get_function returned null";
 			if (success)
+			{
 				pg_yaap_register_llvm_jit_context(&context->base);
+				elog(LOG, "pg_yaap: deform JIT compile pid=%d succeeded func=%s",
+					 MyProcPid, funcname);
+			}
+			else
+				elog(LOG, "pg_yaap: deform JIT compile pid=%d failed to resolve callable symbol func=%s",
+					 MyProcPid, funcname);
 		}
 	}
 	PG_CATCH();
