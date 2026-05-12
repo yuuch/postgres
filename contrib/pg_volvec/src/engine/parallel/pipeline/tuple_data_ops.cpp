@@ -137,9 +137,17 @@ NeonLaneMaskEqU64(uint64x2_t cmp)
 struct AggDelta
 {
 	uint8_t *row_ptr = nullptr;
-	int64_t values[TUPLE_DATA_MAX_COLUMNS] = {0};
-	int64_t counts[TUPLE_DATA_MAX_COLUMNS] = {0};
+	int64_t values[TUPLE_DATA_MAX_COLUMNS];
+	int64_t counts[TUPLE_DATA_MAX_COLUMNS];
 };
+
+static inline void
+InitAggDelta(AggDelta &delta, uint8_t *row_ptr, uint16_t aggregate_count)
+{
+	delta.row_ptr = row_ptr;
+	std::fill_n(delta.values, aggregate_count, int64_t{0});
+	std::fill_n(delta.counts, aggregate_count, int64_t{0});
+}
 
 static inline void
 AccumulateAggDelta(const TupleDataLayout *layout,
@@ -206,8 +214,7 @@ UpdateAggregatesBatchGroupedGeneric(const TupleDataLayout *layout,
 			if (existing == AGG_DELTA_EMPTY_SLOT)
 			{
 				delta_idx = delta_count;
-				deltas[delta_idx] = AggDelta{};
-				deltas[delta_idx].row_ptr = row_ptrs[i];
+				InitAggDelta(deltas[delta_idx], row_ptrs[i], layout->aggregate_count);
 				delta_slots[slot] = delta_idx;
 				++delta_count;
 				break;
@@ -253,9 +260,10 @@ UpdateAggregatesGatherGroupedGeneric(const TupleDataLayout *layout,
 			if (existing == AGG_DELTA_EMPTY_SLOT)
 			{
 				delta_idx = delta_count;
-				deltas[delta_idx] = AggDelta{};
 				delta_row_indices[delta_idx] = canonical_idx;
-				deltas[delta_idx].row_ptr = tdc_base + static_cast<size_t>(canonical_idx) * row_width;
+				InitAggDelta(deltas[delta_idx],
+				             tdc_base + static_cast<size_t>(canonical_idx) * row_width,
+				             layout->aggregate_count);
 				delta_slots[slot] = delta_idx;
 				++delta_count;
 				break;

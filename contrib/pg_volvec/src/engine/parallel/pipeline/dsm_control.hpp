@@ -110,6 +110,7 @@ struct PipelineSharedControl
 	 * worker slot; the leader aggregates after all workers have stopped.
 	 */
 	pg_atomic_uint32 profile_enabled;
+	pg_atomic_uint32 trace_execution_path;
 	dsa_pointer      profile_records_root;
 	dsa_pointer      profile_slot_pids_root;
 	uint32           profile_event_count;

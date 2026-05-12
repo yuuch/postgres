@@ -14,7 +14,7 @@ PG_WORKERS="${PG_WORKERS:-14}"
 VOLVEC_WORKERS="${VOLVEC_WORKERS:-14}"
 TRACE_EXECUTION_PATH="${TRACE_EXECUTION_PATH:-off}"
 
-QUERIES=(1 5 6 7 8 9 10 12 14)
+QUERIES=(1 3 5 6 7 8 9 10 12 14)
 TS=$(date +%Y%m%d_%H%M%S)
 OUT_TSV="$OUT_DIR/tpch_pg_vs_volvec_${TS}.tsv"
 OUT_LOG="$OUT_DIR/tpch_pg_vs_volvec_${TS}.log"

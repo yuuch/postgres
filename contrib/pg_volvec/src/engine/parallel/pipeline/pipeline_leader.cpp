@@ -39,6 +39,7 @@ extern "C" {
 extern "C" {
 extern int pg_volvec_parallel_max_workers;
 extern bool pg_volvec_parallel_leader_participation;
+extern bool pg_volvec_trace_execution_path;
 }
 
 namespace pg_volvec {
@@ -494,9 +495,11 @@ PgvolvecPipelineRun(QueryDesc *queryDesc,
 		scheduler.BindRuntime(control, queue, dsa);
 		scheduler.AllocateEventShmStates();
 		PipelineProfileAllocate(control,
-						 dsa,
-						 scheduler.event_count(),
-						 static_cast<uint32>(bgworker_count));
+							 dsa,
+							 scheduler.event_count(),
+							 static_cast<uint32>(bgworker_count));
+		pg_atomic_write_u32(&control->trace_execution_path,
+							 pg_volvec_trace_execution_path ? 1u : 0u);
 		PipelineProfileRegisterProcess(control,
 							  dsa,
 							  LEADER_WORKER_INDEX,

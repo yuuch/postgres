@@ -9,32 +9,34 @@ unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
 > and the legacy morsel parallel runtime) was **intentionally deleted** in
 > commits `53ac06adcb7` (step 1) and `fd9a8aaf326` (step 2) and replaced
 > by a DuckDB-style `PhysicalOperator` + `MetaPipeline` runtime. As of HEAD
-> `6c344eb036d` plus this cycle's uncommitted work, the new runtime is
+> `6c344eb036d` plus the current uncommitted work, the new runtime is
 > plumbed end-to-end: **SeqScan → HashAgg → Order → OutputSink** runs in
 > leader+workers, cross-process descriptor publish/load works, and the
 > leader drains the global TDC after FINALIZE. Q1 remains the primary
-> performance target (`M-Q1-PERF`), and the Q6 `SeqScan -> HashAgg` shape
-> has been restored for the canonical TPC-H filter/`SUM(extprice*discount)`
-> path. Anything in `docs/` dated `2026-04-17`
+> performance target (`M-Q1-PERF`), Q6 `SeqScan -> HashAgg` is restored for
+> the canonical TPC-H filter/`SUM(extprice*discount)` path, and the current
+> benchmark matrix also includes Q3 for exploratory coverage. Anything in
+> `docs/` dated `2026-04-17`
 > describes the pre-greenfield codebase and should not be trusted; see
 > `docs/ARCHITECTURE_DEVIATIONS.md` for the diff vs the reference
 > architecture in `pg_duckdb_architecture.md`.
 
-## What It Is (target architecture)
+## Current runtime architecture
 
 - PostgreSQL still owns parsing, rewriting, planning, snapshots, and result
   delivery.
 - `pg_volvec` hooks `ExecutorStart` / `ExecutorRun` / `ExecutorFinish` /
-  `ExecutorEnd` and, for supported plan subtrees, replaces execution with a
+  `ExecutorEnd` and, for admitted plan subtrees, replaces execution with a
   `DataChunk`-oriented columnar engine.
-- Plans are translated into a `pg_volvec::pipeline::PhysicalOperator` IR
+- Plans are translated into a `pg_volvec::pipeline::PhysicalOperator` tree
   (DuckDB-faithful unified `Source/Operator/Sink` base, see
   `src/engine/parallel/pipeline/physical_operator.hpp`).
-- The `PhysicalOperator` tree is sliced into `MetaPipeline` chains at
-  blocking operators (`HashAggregate`, `Order`); each chain is dispatched as
-  Tasks over a DSM `TaskQueue` to PostgreSQL parallel bgworkers.
-- Scan hot paths use **tuple deform JIT** (`llvmjit_deform_datachunk.cpp`) to
-  decode heap tuples directly into typed column arrays.
+- The tree is sliced into `MetaPipeline` chains at blocking operators
+  (`HashAggregate`, `Order`) and dispatched as Tasks over a DSM `TaskQueue`
+  to PostgreSQL parallel bgworkers.
+- SeqScan uses page-wise block claiming plus **tuple deform JIT**
+  (`llvmjit_deform_datachunk.cpp`) to decode heap tuples directly into typed
+  column arrays.
 - Expression evaluation lowers to a linear IR (`expr.cpp`) and, when
   supported, compiles to fused LLVM row loops (`llvmjit_expr.cpp`).
 - TPC-H-style `NUMERIC(15,2)` runs as scaled `int64` in the hot path with
@@ -43,26 +45,44 @@ unchanged and offloads supported OLAP plan subtrees into a vectorized executor.
 
 ## Current Status
 
-Status refreshed: `2026-05-11` (HEAD `6c344eb036d` + uncommitted runtime fixes; includes generic string-row combine / hash-join payload lookup hardening and the current benchmark refresh)
+Status refreshed: `2026-05-12` (HEAD `6c344eb036d` + uncommitted runtime fixes; includes the current scan tracing / AggDelta cleanup work and the latest benchmark refresh)
 
 ### What runs through `pg_volvec` today
 
 For Q1, `Translator::Translate` now produces a real `PhysicalOperator` tree,
-the bundle slices into 3
-`MetaPipeline` chains (`P0=[Order→Output]`, `P1=[HashAgg→Order]`,
-`P2=[SeqScan→HashAgg]`), workers attach DSA, drain `DsmTaskQueue`, write
-`DataChunk` into the global TDC, and the leader runs FINALIZE → drains the
-TDC into the `DestReceiver`. Q6's canonical `SeqScan -> plain Agg` shape also
-runs through this path when `pg_volvec.parallel=on`; its multi-clause date and
-numeric filters are represented by `QualDescriptor` and evaluated in
-`PhysicalSeqScan` before projecting `l_extendedprice * l_discount` into
-`SUM_NUMERIC`. See `AGENTS.md` for the detailed bug ledger.
+the bundle slices into 3 `MetaPipeline` chains (`P0=[Order→Output]`,
+`P1=[HashAgg→Order]`, `P2=[SeqScan→HashAgg]`), workers attach DSA, drain
+`DsmTaskQueue`, write `DataChunk` into the global TDC, and the leader runs
+FINALIZE → drains the TDC into the `DestReceiver`. Q6's canonical `SeqScan ->
+plain Agg` shape also runs through this path when `pg_volvec.parallel=on`;
+its multi-clause date and numeric filters are represented by `QualDescriptor`
+and evaluated in `PhysicalSeqScan` before projecting
+`l_extendedprice * l_discount` into `SUM_NUMERIC`. Q10 is the current join-
+heavy validated path, and Q3 is now part of the benchmark matrix for
+exploratory coverage. See `AGENTS.md` for the detailed bug ledger.
 
-Current checked-in benchmark coverage is Q1 / Q5 / Q6 / Q7 / Q8 / Q9 /
+Current checked-in benchmark coverage is Q1 / Q3 / Q5 / Q6 / Q7 / Q8 / Q9 /
 Q10 / Q12 / Q14 via `contrib/pg_volvec/scripts/bench_tpch_pg_vs_volvec.sh`.
-The validated core remains Q1 / Q6 / Q10.
+The validated core remains Q1 / Q6 / Q10; Q3 is benchmarked but not yet
+treated as a primary validation target.
 
-### Active milestone: `M-FRAME-MIN`
+Latest PG-vs-VolVec comparison (`benchmarks/tpch_pg_vs_volvec_20260511_184037.tsv`, 2026-05-11 18:40:37):
+
+| query | PG parallel | VolVec parallel | speedup |
+|---|---:|---:|---:|
+| Q1 | 3.057 s | 1.461 s | 2.09x |
+| Q5 | 3.353 s | 2.091 s | 1.60x |
+| Q6 | 1.399 s | 0.964 s | 1.45x |
+| Q7 | 1.757 s | 1.684 s | 1.04x |
+| Q8 | 3.853 s | 1.677 s | 2.30x |
+| Q9 | 7.572 s | 3.562 s | 2.13x |
+| Q10 | 2.841 s | 1.760 s | 1.61x |
+| Q12 | 1.815 s | 1.302 s | 1.39x |
+| Q14 | 1.249 s | 1.221 s | 1.02x |
+
+Best current win in that snapshot is Q8 at ~2.30x; Q1 is ~2.09x.
+
+### Current implementation line: `M-FRAME-MIN`
 
 Sequential rebuild on top of the greenfield deletion:
 
@@ -73,14 +93,17 @@ Sequential rebuild on top of the greenfield deletion:
 | Step 3: `MetaPipeline` runtime (Event DAG, `Task`, DSM `TaskQueue`, `TaskScheduler`) | 🚧 plumbed end-to-end; closing Bug G + Bug I | `6c344eb036d` (last) |
 | Step 4: Q1 shape-matcher inside `Translator::TranslatePlan` | ✅ done (Q1 plumbed) | uncommitted |
 
-### Subsequent milestones
+### Current workstreams
 
-- **`M-Q1-PERF`** — drive Q1 to extreme single-shape performance through the
-  new pipeline runtime; perf tracked in `perf/q1_p3x_progression.md` and the
-  checked-in benchmark artifacts under `benchmarks/`.
-- **`M-Q6-RESTORE`** — canonical Q6 is restored for `SeqScan -> plain Agg`
-  with date/numeric filter conjunctions. Broader non-benchmark TPC-H shapes
-  remain out of scope for the current phase.
+- **`M-Q1-PERF`** — continue driving Q1 through the new pipeline runtime;
+  perf tracked in `perf/q1_p3x_progression.md` and the checked-in benchmark
+  artifacts under `benchmarks/`.
+- **`M-Q6-RESTORE`** — keep the canonical Q6 `SeqScan -> plain Agg` path
+  stable with date/numeric filter conjunctions.
+- **Q10 / join-heavy validation** — keep the validated join-fed path healthy
+  while the runtime matures.
+- **Q3 benchmark coverage** — included in the current benchmark matrix for
+  exploratory comparison, but not yet a primary validation target.
 
 ### Out of scope (intentionally deleted, do not reintroduce)
 
@@ -92,10 +115,11 @@ of the previous era), `LoweredPipeline`, `WorkerPipelineExecutor`,
 `ParallelAggPartialState`, `partial_agg_op.{hpp,cpp}`, `agg_sink.{hpp,cpp}`,
 `seq_scan_source.{hpp,cpp}`, `pipeline_lowering.{hpp,cpp}`, `q1_translator.*`.
 
-Q2 / Q3 / Q4 / Q11 / Q13 / Q15 / Q16 / Q17 / Q18 / Q19 / Q20 / Q21 / Q22
-are all out of scope for the current phase.
+Q2 / Q4 / Q11 / Q13 / Q15 / Q16 / Q17 / Q18 / Q19 / Q20 / Q21 / Q22 are all
+out of scope for the current phase. Q3 is benchmarked, but still treated as
+exploratory coverage rather than a primary supported shape.
 
-## Build And Install
+## Build and install
 
 Use PostgreSQL's top-level Meson build.
 
@@ -119,7 +143,7 @@ CCACHE_DISABLE=1 PATH=/opt/homebrew/bin:$PATH meson install -C build --only-chan
 After every `meson install`, **always** restart PostgreSQL before testing.
 The backend will not pick up a freshly installed `pg_volvec.so` on its own.
 
-## Test
+## Test and benchmark
 
 ```bash
 # Regress (smoke + q1 + q6 only) — invoked via the suite name
@@ -157,9 +181,9 @@ Expected results today:
 
 Current benchmark artifact:
 
-- `benchmarks/tpch_pg_vs_volvec_20260511_175310.tsv`
+- `benchmarks/tpch_pg_vs_volvec_20260511_184037.tsv` (2026-05-11 18:40:37)
 
-## Project Layout
+## Project layout
 
 ```
 contrib/pg_volvec/

@@ -9,6 +9,7 @@ extern "C" {
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "storage/bufmgr.h"
+#include "storage/predicate.h"
 #include "storage/read_stream.h"
 #include "utils/date.h"
 #include "utils/elog.h"
@@ -19,6 +20,7 @@ extern "C" {
 extern int  pg_volvec_parallel_max_workers;
 extern bool pg_volvec_jit_deform;
 extern bool pg_volvec_disable_jit_for_parallel_worker;
+extern bool pg_volvec_trace_execution_path;
 
 extern Datum int8_numeric(PG_FUNCTION_ARGS);
 extern Datum numeric_mul(PG_FUNCTION_ARGS);
@@ -45,6 +47,13 @@ ResolveSeqScanPayload(ExecCtx &ctx, dsa_pointer dp)
 	if (!DsaPointerIsValid(dp))
 		return nullptr;
 	return static_cast<SeqScanSharedPayload *>(dsa_get_address(ctx.dsa, dp));
+}
+
+static inline bool
+SeqScanTraceEnabled(const ExecCtx &ctx)
+{
+	return ctx.control != nullptr &&
+		pg_atomic_read_u32(&ctx.control->trace_execution_path) != 0;
 }
 
 static SchemaDescriptor *
@@ -94,6 +103,7 @@ struct SeqScanBlockStreamState {
 	SeqScanSharedPayload *shared = nullptr;
 	ParallelBlockTableScanWorker worker = nullptr;
 	BlockNumber startblock = InvalidBlockNumber;
+	int worker_index = LEADER_WORKER_INDEX;
 };
 
 static BlockNumber
@@ -115,9 +125,18 @@ SeqScanReadStreamNextBlock(ReadStream *stream,
 			state->startblock,
 			InvalidBlockNumber);
 
-	return table_block_parallelscan_nextpage(state->rel,
+	BlockNumber block = table_block_parallelscan_nextpage(state->rel,
 		state->worker,
 		&state->shared->pbscan);
+	if (pg_volvec_trace_execution_path)
+		ereport(LOG,
+			(errmsg("pg_volvec scan prefetch worker=%d startblock=%u nextblock=%u total_blocks=%u chunk_size=%u",
+				state->worker_index,
+				state->startblock,
+				block,
+				state->shared != nullptr ? state->shared->total_blocks : 0,
+				state->worker->phsw_chunk_size)));
+	return block;
 }
 
 /*
@@ -550,7 +569,94 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 	instr_time prepare_start;
 	if (profile_on)
 		INSTR_TIME_SET_CURRENT(prepare_start);
-	heap_prepare_pagescan((TableScanDesc) local.scan_desc);
+	{
+		HeapScanDesc scan = local.scan_desc;
+		Buffer buffer = scan->rs_cbuf;
+		Snapshot snapshot = scan->rs_base.rs_snapshot;
+		Page page;
+		int lines;
+		bool all_visible;
+		bool check_serializable;
+		int ntup = 0;
+		BatchMVCCState batchmvcc;
+
+		/*
+		 * pg_volvec AP/Q1 path only needs page-at-a-time visibility state
+		 * (rs_vistuples/rs_ntuples). PostgreSQL's heap_prepare_pagescan() also
+		 * does opportunistic heap_page_prune_opt(), which shows up as hot work in
+		 * xctrace but is maintenance, not scan correctness. Keep the pagemode
+		 * visible-tuple contract and skip the prune step.
+		 */
+		Assert(scan->rs_base.rs_flags & SO_ALLOW_PAGEMODE);
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		lines = PageGetMaxOffsetNumber(page);
+		all_visible = PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
+		check_serializable =
+			CheckForSerializableConflictOutNeeded(scan->rs_base.rs_rd, snapshot);
+
+		for (OffsetNumber lineoff = FirstOffsetNumber;
+			 lineoff <= lines;
+			 lineoff++)
+		{
+			ItemId lpp = PageGetItemId(page, lineoff);
+			HeapTuple tup;
+
+			if (unlikely(!ItemIdIsNormal(lpp)))
+				continue;
+
+			if (!all_visible || check_serializable)
+			{
+				tup = &batchmvcc.tuples[ntup];
+				tup->t_data = (HeapTupleHeader) PageGetItem(page, lpp);
+				tup->t_len = ItemIdGetLength(lpp);
+				tup->t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
+				ItemPointerSet(&(tup->t_self), scan->rs_cblock, lineoff);
+			}
+
+			if (all_visible)
+			{
+				if (check_serializable)
+					batchmvcc.visible[ntup] = true;
+				scan->rs_vistuples[ntup] = lineoff;
+			}
+
+			ntup++;
+		}
+
+		Assert(ntup <= MaxHeapTuplesPerPage);
+
+		if (all_visible)
+			scan->rs_ntuples = ntup;
+		else
+			scan->rs_ntuples = HeapTupleSatisfiesMVCCBatch(snapshot,
+										   buffer,
+										   ntup,
+										   &batchmvcc,
+										   scan->rs_vistuples);
+
+		if (check_serializable)
+		{
+			for (int i = 0; i < ntup; i++)
+			{
+				HeapCheckForSerializableConflictOut(batchmvcc.visible[i],
+									   scan->rs_base.rs_rd,
+									   &batchmvcc.tuples[i],
+									   buffer,
+									   snapshot);
+			}
+		}
+	if (SeqScanTraceEnabled(ctx))
+		ereport(LOG,
+			(errmsg("pg_volvec scan load_page worker=%d block=%u visible=%u all_visible=%d serializable=%d",
+				ctx.worker_index,
+					local.scan_desc->rs_cblock,
+					ntup,
+					all_visible ? 1 : 0,
+					check_serializable ? 1 : 0)));
+
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	}
 	if (profile_on)
 	{
 		instr_time prepare_end;
@@ -561,7 +667,6 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 			prepare_start,
 			local.scan_desc->rs_ntuples);
 	}
-
 	local.page_visible_index = 0;
 	return true;
 }
@@ -686,6 +791,13 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 	stream_state->shared = global.shared;
 	stream_state->worker = &local->parallel_scan_worker;
 	stream_state->startblock = local->scan_desc->rs_startblock;
+	stream_state->worker_index = ctx.worker_index;
+	if (SeqScanTraceEnabled(ctx))
+		ereport(LOG,
+			(errmsg("pg_volvec scan read_stream worker=%d startblock=%u total_blocks=%u",
+				ctx.worker_index,
+				stream_state->startblock,
+				global.shared != nullptr ? global.shared->total_blocks : 0)));
 	local->read_stream = read_stream_begin_relation(READ_STREAM_SEQUENTIAL |
 	                                                READ_STREAM_USE_BATCHING,
 	                                                local->scan_desc->rs_strategy,

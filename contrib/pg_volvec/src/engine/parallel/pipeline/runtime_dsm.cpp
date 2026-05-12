@@ -74,6 +74,7 @@ CreateRuntimeDsm(PgVolVecQueryState *state, const char **error_out)
 	control->db_oid = MyDatabaseId;
 	control->num_workers = num_workers;
 	pg_atomic_init_u32(&control->profile_enabled, 0);
+	pg_atomic_init_u32(&control->trace_execution_path, 0);
 	control->profile_records_root = InvalidDsaPointer;
 	control->profile_event_count = 0;
 	control->profile_worker_slots = 0;
