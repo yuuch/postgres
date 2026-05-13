@@ -5,12 +5,14 @@ extern "C" {
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "access/relation.h"
 #include "access/htup_details.h"
 #include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/value.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/plancat.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -19,6 +21,7 @@ extern "C" {
 #include "yaap_adapter.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <sstream>
 #include <set>
@@ -1055,19 +1058,21 @@ size_t YaapAdapter::EstimateBaseCardinality(::RangeTblEntry* rte) {
         return 0;
     }
 
-    HeapTuple tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
-    if (!HeapTupleIsValid(tuple)) {
+    Relation rel = relation_open(rte->relid, NoLock);
+    if (rel == nullptr) {
         return 0;
     }
 
-    Form_pg_class rel = (Form_pg_class)GETSTRUCT(tuple);
-    double reltuples = rel->reltuples;
-    ReleaseSysCache(tuple);
+    BlockNumber pages = 0;
+    double reltuples = 0;
+    double allvisfrac = 0;
+    estimate_rel_size(rel, nullptr, &pages, &reltuples, &allvisfrac);
+    relation_close(rel, NoLock);
 
     if (reltuples <= 0) {
         return 0;
     }
-    return static_cast<size_t>(reltuples);
+    return std::max<size_t>(1, static_cast<size_t>(std::ceil(reltuples)));
 }
 
 void YaapAdapter::RegisterOutputBindings(int rtindex, ::RangeTblEntry* rte, LogicalOperator* plan) {

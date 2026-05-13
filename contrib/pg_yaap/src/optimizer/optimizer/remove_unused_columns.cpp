@@ -88,6 +88,120 @@ std::set<size_t> OutputTablesOf(LogicalOperator *op) {
     return tables;
 }
 
+bool GetOperatorOutputBindings(LogicalOperator *op, std::vector<ColumnBinding> &out) {
+    out.clear();
+    if (!op) {
+        return false;
+    }
+
+    switch (op->type) {
+        case LogicalOperatorType::LOGICAL_FILTER:
+        case LogicalOperatorType::LOGICAL_ORDER:
+        case LogicalOperatorType::LOGICAL_DISTINCT:
+        case LogicalOperatorType::LOGICAL_LIMIT:
+            return !op->children.empty() && GetOperatorOutputBindings(op->children[0].get(), out);
+        case LogicalOperatorType::LOGICAL_PROJECTION: {
+            auto &projection = static_cast<LogicalProjection &>(*op);
+            out.reserve(projection.expressions.size());
+            for (size_t idx = 0; idx < projection.expressions.size(); ++idx) {
+                out.push_back(ColumnBinding{projection.table_index, ProjectionIndex{idx}});
+            }
+            return true;
+        }
+        case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+            auto &aggregate = static_cast<LogicalAggregate &>(*op);
+            out.reserve(aggregate.groups.size() + aggregate.expressions.size());
+            for (size_t idx = 0; idx < aggregate.groups.size(); ++idx) {
+                out.push_back(ColumnBinding{aggregate.group_index, ProjectionIndex{idx}});
+            }
+            for (size_t idx = 0; idx < aggregate.expressions.size(); ++idx) {
+                out.push_back(ColumnBinding{aggregate.aggregate_index, ProjectionIndex{idx}});
+            }
+            return true;
+        }
+        case LogicalOperatorType::LOGICAL_GET: {
+            auto &get = static_cast<LogicalGet &>(*op);
+            if (get.projected_columns.empty()) {
+                return false;
+            }
+            out.reserve(get.projected_columns.size());
+            for (const auto &column : get.projected_columns) {
+                out.push_back(ColumnBinding{get.table_index, column});
+            }
+            return true;
+        }
+        case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+        case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+        case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+        case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
+            if (op->children.size() != 2) {
+                return false;
+            }
+            std::vector<ColumnBinding> left;
+            std::vector<ColumnBinding> right;
+            if (!GetOperatorOutputBindings(op->children[0].get(), left) ||
+                !GetOperatorOutputBindings(op->children[1].get(), right)) {
+                return false;
+            }
+            out = std::move(left);
+            out.insert(out.end(), right.begin(), right.end());
+            return true;
+        }
+        case LogicalOperatorType::LOGICAL_DELIM_GET: {
+            auto &delim_get = static_cast<LogicalDelimGet &>(*op);
+            out = delim_get.correlated_columns;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+bool IsIdentityProjection(LogicalProjection &projection) {
+    if (projection.children.size() != 1 || !projection.children[0]) {
+        return false;
+    }
+
+    std::vector<ColumnBinding> child_outputs;
+    if (!GetOperatorOutputBindings(projection.children[0].get(), child_outputs) ||
+        child_outputs.size() != projection.expressions.size()) {
+        return false;
+    }
+
+    for (size_t idx = 0; idx < projection.expressions.size(); ++idx) {
+        auto *column = dynamic_cast<BoundColumnRefExpression *>(projection.expressions[idx].get());
+        if (!column) {
+            return false;
+        }
+        if (column->binding.table_index.index != child_outputs[idx].table_index.index ||
+            column->binding.column_index.index != child_outputs[idx].column_index.index) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::unique_ptr<LogicalOperator> EliminateIdentityProjections(std::unique_ptr<LogicalOperator> plan) {
+    if (!plan) {
+        return nullptr;
+    }
+
+    for (auto &child : plan->children) {
+        child = EliminateIdentityProjections(std::move(child));
+    }
+
+    if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+        return plan;
+    }
+
+    auto *projection = static_cast<LogicalProjection *>(plan.get());
+    if (!IsIdentityProjection(*projection)) {
+        return plan;
+    }
+
+    return std::move(plan->children[0]);
+}
+
 void AddBindingsForTables(const std::set<BindingKey> &required,
                           const std::set<size_t> &tables,
                           std::set<BindingKey> &out) {
@@ -298,7 +412,7 @@ std::unique_ptr<LogicalOperator> RemoveUnusedColumns::Optimize(std::unique_ptr<L
         return nullptr;
     }
     PruneRequiredColumns(*plan, {}, true);
-    return plan;
+    return EliminateIdentityProjections(std::move(plan));
 }
 
 } // namespace yaap

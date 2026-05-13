@@ -48,8 +48,14 @@ std::unique_ptr<LogicalOperator> CleanupRedundantDelimJoins(std::unique_ptr<Logi
     if (join->dependent || ContainsDelimGet(plan->children[1].get())) {
         return plan;
     }
+    if (join->join_type == JOIN_SEMI || join->join_type == JOIN_ANTI) {
+        return plan;
+    }
 
     auto* dependent_join = static_cast<LogicalDependentJoin*>(plan.get());
+    if (!dependent_join->correlated_columns.empty() || dependent_join->perform_delim) {
+        return plan;
+    }
     dependent_join->correlated_columns.clear();
     dependent_join->perform_delim = false;
     dependent_join->any_join = false;

@@ -308,11 +308,15 @@ bool DecorrelateDependentJoin::DecorrelateScalarAggregateJoin(std::unique_ptr<Lo
     join->dependent = false;
     if (plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
         plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-        auto decorrelated_type = join->join_type == JOIN_MARK
-            ? LogicalOperatorType::LOGICAL_DELIM_JOIN
-            : (dependent_join->correlated_columns.empty() || !dependent_join->perform_delim
-                   ? LogicalOperatorType::LOGICAL_COMPARISON_JOIN
-                   : LogicalOperatorType::LOGICAL_DELIM_JOIN);
+        auto decorrelated_type =
+            (join->join_type == JOIN_MARK ||
+             join->join_type == JOIN_SEMI ||
+             join->join_type == JOIN_ANTI ||
+             join->join_type == JOIN_SINGLE)
+                ? LogicalOperatorType::LOGICAL_DELIM_JOIN
+                : (dependent_join->correlated_columns.empty() || !dependent_join->perform_delim
+                       ? LogicalOperatorType::LOGICAL_COMPARISON_JOIN
+                       : LogicalOperatorType::LOGICAL_DELIM_JOIN);
         plan->type = decorrelated_type;
         if (decorrelated_type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
             dependent_join->correlated_columns.clear();
@@ -972,11 +976,15 @@ std::unique_ptr<LogicalOperator> DecorrelateDependentJoin::Rewrite(std::unique_p
     join->dependent = false;
     if (plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
         plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-        auto decorrelated_type = join->join_type == JOIN_MARK
-            ? LogicalOperatorType::LOGICAL_DELIM_JOIN
-            : (dependent_join->correlated_columns.empty() || !dependent_join->perform_delim
-                   ? LogicalOperatorType::LOGICAL_COMPARISON_JOIN
-                   : LogicalOperatorType::LOGICAL_DELIM_JOIN);
+        auto decorrelated_type =
+            (join->join_type == JOIN_MARK ||
+             join->join_type == JOIN_SEMI ||
+             join->join_type == JOIN_ANTI ||
+             join->join_type == JOIN_SINGLE)
+                ? LogicalOperatorType::LOGICAL_DELIM_JOIN
+                : (dependent_join->correlated_columns.empty() || !dependent_join->perform_delim
+                       ? LogicalOperatorType::LOGICAL_COMPARISON_JOIN
+                       : LogicalOperatorType::LOGICAL_DELIM_JOIN);
         plan->type = decorrelated_type;
         if (decorrelated_type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
             dependent_join->correlated_columns.clear();

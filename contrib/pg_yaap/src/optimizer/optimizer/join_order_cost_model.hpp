@@ -28,7 +28,8 @@ public:
                                uint64_t right,
                                size_t join_cardinality,
                                const std::map<uint64_t, std::unique_ptr<JoinOrderDPJoinNode>>& plans,
-                               const std::vector<JoinOrderJoinRelation>& relations) const;
+                               const std::vector<JoinOrderJoinRelation>& relations,
+                               const std::vector<const JoinOrderNeighborInfo*>& connections) const;
 
 private:
     JoinOrderOptimizer& optimizer_;

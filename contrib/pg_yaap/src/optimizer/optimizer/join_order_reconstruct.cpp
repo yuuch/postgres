@@ -5,8 +5,10 @@
 #include "join_order_plan_node.hpp"
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 namespace yaap {
 
@@ -21,6 +23,117 @@ std::unique_ptr<LogicalOperator> PushResidualFilters(std::unique_ptr<LogicalOper
 	filter->expressions = std::move(filters);
 	filter->children.push_back(std::move(node));
 	return filter;
+}
+
+using BindingKey = ColumnBindingKey;
+
+BindingKey ToBindingKey(ColumnBinding binding) {
+	return BindingKey{binding.table_index.index, binding.column_index.index};
+}
+
+bool TryExtractColumnEquality(Expression* expression, ColumnBinding& left, ColumnBinding& right) {
+	if (!expression || expression->type != ExpressionType::BOUND_FUNCTION) {
+		return false;
+	}
+	auto* function = static_cast<BoundFunctionExpression*>(expression);
+	if (function->function_name != "=" || function->children.size() != 2) {
+		return false;
+	}
+	if (function->children[0]->type != ExpressionType::BOUND_COLUMN_REF ||
+		function->children[1]->type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	left = static_cast<BoundColumnRefExpression*>(function->children[0].get())->binding;
+	right = static_cast<BoundColumnRefExpression*>(function->children[1].get())->binding;
+	return true;
+}
+
+struct EqualitySet {
+	std::map<BindingKey, BindingKey> parent;
+
+	void Ensure(BindingKey key) {
+		if (parent.find(key) == parent.end()) {
+			parent[key] = key;
+		}
+	}
+
+	BindingKey Find(BindingKey key) {
+		Ensure(key);
+		auto it = parent.find(key);
+		if (it->second.table_index == key.table_index && it->second.column_index == key.column_index) {
+			return key;
+		}
+		it->second = Find(it->second);
+		return it->second;
+	}
+
+	bool Union(BindingKey left, BindingKey right) {
+		left = Find(left);
+		right = Find(right);
+		if (left.table_index == right.table_index && left.column_index == right.column_index) {
+			return false;
+		}
+		parent[right] = left;
+		return true;
+	}
+};
+
+void CollectSubtreeEqualities(LogicalOperator* op, EqualitySet& equalities) {
+	if (!op) {
+		return;
+	}
+
+	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto* filter = static_cast<LogicalFilter*>(op);
+		for (const auto& expression : filter->expressions) {
+			ColumnBinding left;
+			ColumnBinding right;
+			if (TryExtractColumnEquality(expression.get(), left, right)) {
+				equalities.Union(ToBindingKey(left), ToBindingKey(right));
+			}
+		}
+	} else if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+			   op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+			   op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		auto* join = static_cast<LogicalComparisonJoin*>(op);
+		if (!join->dependent && join->join_type == JOIN_INNER) {
+			for (const auto& expression : join->conditions) {
+				ColumnBinding left;
+				ColumnBinding right;
+				if (TryExtractColumnEquality(expression.get(), left, right)) {
+					equalities.Union(ToBindingKey(left), ToBindingKey(right));
+				}
+			}
+		}
+	}
+
+	for (const auto& child : op->children) {
+		CollectSubtreeEqualities(child.get(), equalities);
+	}
+}
+
+std::vector<const JoinOrderFilterInfo*> PruneRedundantInnerJoinFilters(
+	const std::vector<const JoinOrderFilterInfo*>& join_filters,
+	LogicalOperator* left,
+	LogicalOperator* right) {
+	EqualitySet equalities;
+	CollectSubtreeEqualities(left, equalities);
+	CollectSubtreeEqualities(right, equalities);
+
+	std::vector<const JoinOrderFilterInfo*> pruned;
+	pruned.reserve(join_filters.size());
+	for (const auto* filter : join_filters) {
+		ColumnBinding left_binding;
+		ColumnBinding right_binding;
+		if (!TryExtractColumnEquality(filter->condition.expression.get(), left_binding, right_binding)) {
+			pruned.push_back(filter);
+			continue;
+		}
+		if (equalities.Union(ToBindingKey(left_binding), ToBindingKey(right_binding))) {
+			pruned.push_back(filter);
+		}
+	}
+	return pruned;
 }
 
 } // namespace
@@ -155,6 +268,9 @@ std::unique_ptr<LogicalOperator> JoinOrderReconstructor::MakeJoinNode(
     if (swap_children) {
         std::swap(left, right);
     }
+    if (join_type == JOIN_INNER) {
+        join_filters = PruneRedundantInnerJoinFilters(join_filters, left.op.get(), right.op.get());
+    }
 
     std::vector<std::unique_ptr<Expression>> join_conditions;
     join_conditions.reserve(join_filters.size() + residual_filters.size());
@@ -170,16 +286,18 @@ std::unique_ptr<LogicalOperator> JoinOrderReconstructor::MakeJoinNode(
         auto join = std::make_unique<LogicalComparisonJoin>(join_type);
         join->children_swapped = swap_children;
         join->conditions = std::move(join_conditions);
-        for (const auto* residual : residual_filters) {
-            join->conditions.push_back(CloneExpressionTree(residual->condition.expression.get()));
-        }
         join->children.push_back(std::move(left.op));
         join->children.push_back(std::move(right.op));
         join->estimated_cardinality = node.cardinality;
         if (IsSemiOrAntiJoinType(join_type)) {
             join->estimated_cardinality = std::min(join->estimated_cardinality, join->children[0]->estimated_cardinality);
         }
-        return std::move(join);
+        std::vector<std::unique_ptr<Expression>> residual_conditions;
+        residual_conditions.reserve(residual_filters.size());
+        for (const auto* residual : residual_filters) {
+            residual_conditions.push_back(CloneExpressionTree(residual->condition.expression.get()));
+        }
+        return PushResidualFilters(std::move(join), std::move(residual_conditions));
     }
 
     auto cross_product = std::make_unique<LogicalCrossProduct>();

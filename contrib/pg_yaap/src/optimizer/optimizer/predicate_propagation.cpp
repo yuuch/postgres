@@ -1,5 +1,6 @@
 #include "optimizer_core.hpp"
 
+#include "../logical/filter_rewrite_utils.hpp"
 #include "../logical/logical_utils.hpp"
 
 #include <sstream>
@@ -484,6 +485,60 @@ PredicatePropagation::BuildPropagatedFilters(const std::map<ColumnBindingKey, Eq
     return filters;
 }
 
+std::vector<std::unique_ptr<Expression>> PredicatePropagation::BuildPropagatedEqualities(
+    const std::map<ColumnBindingKey, EqualityClass>& classes,
+    const std::set<std::string>& direct_column_equalities) const {
+    std::vector<std::unique_ptr<Expression>> equalities;
+
+    auto make_pair_key = [](const ColumnBindingKey& left, const ColumnBindingKey& right) {
+        const auto& first = (left.table_index < right.table_index ||
+                             (left.table_index == right.table_index && left.column_index <= right.column_index))
+            ? left
+            : right;
+        const auto& second = (&first == &left) ? right : left;
+        return std::to_string(first.table_index) + "." + std::to_string(first.column_index) + "=" +
+               std::to_string(second.table_index) + "." + std::to_string(second.column_index);
+    };
+
+    for (const auto& entry : classes) {
+        const auto& cls = entry.second;
+        if (cls.columns.size() < 3) {
+            continue;
+        }
+
+        std::vector<ColumnBindingKey> columns(cls.columns.begin(), cls.columns.end());
+        for (size_t i = 0; i < columns.size(); ++i) {
+            for (size_t j = i + 1; j < columns.size(); ++j) {
+                if (columns[i].table_index == columns[j].table_index) {
+                    continue;
+                }
+
+                auto pair_key = make_pair_key(columns[i], columns[j]);
+                if (direct_column_equalities.find(pair_key) != direct_column_equalities.end()) {
+                    continue;
+                }
+
+                auto left_label = cls.labels.find(columns[i]);
+                auto right_label = cls.labels.find(columns[j]);
+                auto left = std::make_unique<BoundColumnRefExpression>(
+                    ColumnBinding{TableIndex{columns[i].table_index}, ProjectionIndex{columns[i].column_index}},
+                    left_label != cls.labels.end() ? left_label->second.first : "t" + std::to_string(columns[i].table_index),
+                    left_label != cls.labels.end() ? left_label->second.second : "col" + std::to_string(columns[i].column_index + 1));
+                auto right = std::make_unique<BoundColumnRefExpression>(
+                    ColumnBinding{TableIndex{columns[j].table_index}, ProjectionIndex{columns[j].column_index}},
+                    right_label != cls.labels.end() ? right_label->second.first : "t" + std::to_string(columns[j].table_index),
+                    right_label != cls.labels.end() ? right_label->second.second : "col" + std::to_string(columns[j].column_index + 1));
+                auto equal = std::make_unique<BoundFunctionExpression>("=", 96);
+                equal->children.push_back(std::move(left));
+                equal->children.push_back(std::move(right));
+                equalities.push_back(std::move(equal));
+            }
+        }
+    }
+
+    return equalities;
+}
+
 std::unique_ptr<LogicalOperator> PredicatePropagation::InjectFilters(
     std::unique_ptr<LogicalOperator> plan,
     std::map<size_t, std::vector<std::unique_ptr<Expression>>>& filters) {
@@ -524,11 +579,29 @@ std::unique_ptr<LogicalOperator> PredicatePropagation::Rewrite(std::unique_ptr<L
     CollectEqualities(plan.get(), equalities);
 
     std::set<ColumnBindingKey> direct_constant_bindings;
+    std::set<std::string> direct_column_equalities;
+    auto make_pair_key = [](const ColumnBindingKey& left, const ColumnBindingKey& right) {
+        const auto& first = (left.table_index < right.table_index ||
+                             (left.table_index == right.table_index && left.column_index <= right.column_index))
+            ? left
+            : right;
+        const auto& second = (&first == &left) ? right : left;
+        return std::to_string(first.table_index) + "." + std::to_string(first.column_index) + "=" +
+               std::to_string(second.table_index) + "." + std::to_string(second.column_index);
+    };
     for (auto* expression : equalities) {
         ColumnBinding binding;
         BoundConstantExpression* constant = nullptr;
         if (IsColumnConstantEquality(expression, binding, constant) && constant != nullptr && !constant->is_null) {
             direct_constant_bindings.insert(MakeColumnBindingKey(binding));
+            continue;
+        }
+
+        ColumnBinding left;
+        ColumnBinding right;
+        if (IsColumnColumnEquality(expression, left, right)) {
+            direct_column_equalities.insert(
+                make_pair_key(MakeColumnBindingKey(left), MakeColumnBindingKey(right)));
         }
     }
 
@@ -541,7 +614,13 @@ std::unique_ptr<LogicalOperator> PredicatePropagation::Rewrite(std::unique_ptr<L
             target.push_back(std::move(expression));
         }
     }
-    return InjectFilters(std::move(plan), propagated_filters);
+    plan = InjectFilters(std::move(plan), propagated_filters);
+
+    auto propagated_equalities = BuildPropagatedEqualities(classes, direct_column_equalities);
+    if (!propagated_equalities.empty()) {
+        plan = MakeFilterNode(std::move(plan), std::move(propagated_equalities));
+    }
+    return plan;
 }
 
 std::unique_ptr<LogicalOperator> PredicatePropagation::Optimize(std::unique_ptr<LogicalOperator> plan) {

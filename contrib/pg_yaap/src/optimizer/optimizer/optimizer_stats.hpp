@@ -36,6 +36,7 @@ struct ColumnStats {
     DistinctCount distinct;
     double null_fraction = 0.0;
     bool has_stats = false;
+    bool has_catalog_stats = false;
     std::string table_name;
     std::string column_name;
     Oid type_oid = InvalidOid;
@@ -95,6 +96,7 @@ private:
     RelationStats ExtractGetStats(LogicalGet& get) const;
     RelationStats ExtractProjectionStats(LogicalProjection& projection) const;
     RelationStats ExtractAggregateStats(LogicalAggregate& aggregate) const;
+    RelationStats ExtractFilterStats(LogicalFilter& filter) const;
     RelationStats ExtractDistinctStats(LogicalDistinct& distinct) const;
     RelationStats ExtractLimitStats(LogicalLimit& limit) const;
     RelationStats ExtractDelimGetStats(LogicalDelimGet& delim_get) const;

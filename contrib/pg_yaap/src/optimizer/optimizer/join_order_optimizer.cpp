@@ -161,7 +161,17 @@ std::unique_ptr<LogicalOperator> JoinOrderOptimizer::Rewrite(std::unique_ptr<Log
     }
 
     if (component_plans.size() == 1) {
-        return std::move(component_plans[0]);
+        auto result = std::move(component_plans[0]);
+        if (!residual_filters.empty()) {
+            auto filter = std::make_unique<LogicalFilter>();
+            filter->expressions = std::move(residual_filters);
+            filter->children.push_back(std::move(result));
+            RelationStatisticsHelper statistics_helper;
+            filter->estimated_cardinality = statistics_helper.EstimateFilterCardinality(
+                statistics_helper.Extract(*filter->children[0]), filter->expressions);
+            result = std::move(filter);
+        }
+        return result;
     }
 
     std::sort(component_plans.begin(), component_plans.end(),

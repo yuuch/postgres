@@ -1,8 +1,10 @@
 extern "C" {
 #include "postgres.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "catalog/pg_statistic.h"
 #include "fmgr.h"
+#include "utils/rel.h"
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -388,6 +390,8 @@ RelationStats RelationStatisticsHelper::Extract(LogicalOperator& op) const {
             return ExtractProjectionStats(static_cast<LogicalProjection&>(op));
         case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
             return ExtractAggregateStats(static_cast<LogicalAggregate&>(op));
+        case LogicalOperatorType::LOGICAL_FILTER:
+            return ExtractFilterStats(static_cast<LogicalFilter&>(op));
         case LogicalOperatorType::LOGICAL_DISTINCT:
             return ExtractDistinctStats(static_cast<LogicalDistinct&>(op));
         case LogicalOperatorType::LOGICAL_SET_OPERATION: {
@@ -415,19 +419,22 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet& get) const {
         return stats;
     }
 
-    for (int attno = 1; ; ++attno) {
+    Relation rel = RelationIdGetRelation(static_cast<Oid>(get.relid));
+    if (rel == nullptr) {
+        return stats;
+    }
+
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    for (int attno = 1; attno <= tupdesc->natts; ++attno) {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
+        if (attr->attisdropped) {
+            continue;
+        }
+
         HeapTuple tuple = SearchSysCache3(STATRELATTINH,
                                           ObjectIdGetDatum(static_cast<Oid>(get.relid)),
                                           Int16GetDatum(attno),
                                           BoolGetDatum(false));
-        if (!HeapTupleIsValid(tuple)) {
-            if (attno == 1) {
-                return stats;
-            }
-            break;
-        }
-
-        auto* pg_stats = reinterpret_cast<Form_pg_statistic>(GETSTRUCT(tuple));
         ColumnBinding binding{get.table_index, ProjectionIndex{static_cast<size_t>(attno - 1)}};
         Oid atttype = InvalidOid;
         int32 atttypmod = -1;
@@ -440,34 +447,43 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet& get) const {
 
         ColumnStats column;
         column.binding = binding;
-        column.distinct.distinct_count = DistinctFromPG(pg_stats->stadistinct, stats.cardinality);
-        column.null_fraction = pg_stats->stanullfrac;
         column.has_stats = true;
         column.table_name = get.table_name;
-        column.column_name = "col" + std::to_string(attno);
+        column.column_name = NameStr(attr->attname);
         column.type_oid = atttype;
         column.collation_oid = attcollation;
         column.type_len = typLen;
         column.type_by_val = typByVal;
 
-        ExtractedStatsSlot mcv_slot;
-        if (LoadStatsSlot(tuple, STATISTIC_KIND_MCV, InvalidOid, ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS, mcv_slot)) {
-            column.mcv_total_frequency = SumFrequencies(mcv_slot.numbers);
-            column.mcv_values = std::move(mcv_slot.values);
-            column.mcv_frequencies = std::move(mcv_slot.numbers);
-        }
+        if (HeapTupleIsValid(tuple)) {
+            auto* pg_stats = reinterpret_cast<Form_pg_statistic>(GETSTRUCT(tuple));
+            column.has_catalog_stats = true;
+            column.distinct.distinct_count = DistinctFromPG(pg_stats->stadistinct, stats.cardinality);
+            column.null_fraction = pg_stats->stanullfrac;
 
-        ExtractedStatsSlot histogram_slot;
-        if (LoadStatsSlot(tuple, STATISTIC_KIND_HISTOGRAM, InvalidOid, ATTSTATSSLOT_VALUES, histogram_slot)) {
-            column.sort_op = histogram_slot.staop;
-            column.histogram_bounds = std::move(histogram_slot.values);
+            ExtractedStatsSlot mcv_slot;
+            if (LoadStatsSlot(tuple, STATISTIC_KIND_MCV, InvalidOid, ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS, mcv_slot)) {
+                column.mcv_total_frequency = SumFrequencies(mcv_slot.numbers);
+                column.mcv_values = std::move(mcv_slot.values);
+                column.mcv_frequencies = std::move(mcv_slot.numbers);
+            }
+
+            ExtractedStatsSlot histogram_slot;
+            if (LoadStatsSlot(tuple, STATISTIC_KIND_HISTOGRAM, InvalidOid, ATTSTATSSLOT_VALUES, histogram_slot)) {
+                column.sort_op = histogram_slot.staop;
+                column.histogram_bounds = std::move(histogram_slot.values);
+            }
+            ReleaseSysCache(tuple);
+        } else {
+            column.distinct.distinct_count = std::max<size_t>(1, stats.cardinality == 0 ? 1 : stats.cardinality);
         }
 
         stats.column_distinct_count.push_back(column.distinct);
         stats.column_names.push_back(column.column_name);
         stats.column_stats[MakeColumnBindingKey(binding)] = column;
-        ReleaseSysCache(tuple);
     }
+
+    RelationClose(rel);
 
     if (!get.filters.empty()) {
         stats.cardinality = EstimateFilterCardinality(stats, get.filters);
@@ -584,6 +600,13 @@ RelationStats RelationStatisticsHelper::ExtractDistinctStats(LogicalDistinct& di
     RelationStats input_stats = Extract(*distinct.children[0]);
     RelationStats stats = input_stats;
     stats.cardinality = EstimateDistinctCardinality(input_stats, distinct.expressions);
+    return stats;
+}
+
+RelationStats RelationStatisticsHelper::ExtractFilterStats(LogicalFilter& filter) const {
+    RelationStats input_stats = Extract(*filter.children[0]);
+    RelationStats stats = input_stats;
+    stats.cardinality = EstimateFilterCardinality(input_stats, filter.expressions);
     return stats;
 }
 
@@ -761,7 +784,7 @@ size_t RelationStatisticsHelper::EstimateSingleFilter(size_t input_cardinality,
         }
 
         auto column_stats = LookupColumnStats(input_stats, binding);
-        if (column_stats.has_stats) {
+        if (column_stats.has_stats && column_stats.has_catalog_stats) {
             double selectivity = EstimateColumnComparisonSelectivity(column_stats, constant, op_name);
             if (selectivity >= 0.0) {
                 return ClampCardinality(static_cast<double>(input_cardinality) * selectivity, input_cardinality);

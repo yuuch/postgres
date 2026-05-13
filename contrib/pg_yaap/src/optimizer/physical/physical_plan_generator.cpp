@@ -58,14 +58,20 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalOpera
 }
 
 std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalGet& op) {
-    return std::make_unique<PhysicalTableScan>(
+    auto scan = std::make_unique<PhysicalTableScan>(
         op.table_index,
         op.pg_rtindex,
         op.relid,
         op.table_name,
         op.projected_columns,
-        BorrowExpressions(op.filters),
+        std::vector<Expression*>{},
         EstimateCardinality(op));
+    if (op.filters.empty()) {
+        return scan;
+    }
+    auto filter = std::make_unique<PhysicalFilter>(BorrowExpressions(op.filters), EstimateCardinality(op));
+    filter->children.push_back(std::move(scan));
+    return filter;
 }
 
 std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalProjection& op) {
@@ -172,6 +178,10 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalDepen
     auto physical = CreatePlan(static_cast<LogicalComparisonJoin&>(op));
     auto* hash_join = static_cast<PhysicalHashJoin*>(physical.get());
     hash_join->correlated_columns = op.correlated_columns;
+    hash_join->delim_join =
+        (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) ||
+        (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN &&
+         (op.join_type == JOIN_SEMI || op.join_type == JOIN_ANTI || op.join_type == JOIN_SINGLE));
     hash_join->mark_index = op.mark_index;
     hash_join->has_mark_index = op.has_mark_index;
     hash_join->invert_result = op.invert_result;

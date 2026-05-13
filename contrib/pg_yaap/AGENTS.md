@@ -114,6 +114,8 @@ The only C files in the project live here. This layer is the outer boundary betw
 
 A DuckDB-inspired optimizer pipeline that converts PostgreSQL's `Query` parse tree into a YAAP physical plan.
 
+**Project constraint:** keep the optimizer architecture, join-order/query-graph machinery, and rule responsibilities as close to DuckDB as practical. If a YAAP plan diverges materially from DuckDB, fix the optimizer/planner modules first rather than compensating in `yaap_opt_translator` or other explain-only code.
+
 **Pipeline:**
 ```
 PG Query → YaapAdapter::TranslatePGQuery → LogicalOperator tree

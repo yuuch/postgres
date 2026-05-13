@@ -23,6 +23,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -152,13 +153,15 @@ struct OptimizerNodeTranslation {
 	uint32_t estimated_groups = 0;
 };
 
-static const char *OptimizerOpTypeName(PhysicalOperatorType type);
+static const char *OptimizerOpTypeName(const PhysicalOperator &op);
 static void AppendOptimizerPlanNodeTree(const PhysicalOperator &op,
 										 const std::string &prefix,
 										 bool is_last,
 										 bool is_root,
-										 std::string &out);
+										 std::string &out,
+										 const PhysicalOperator *parent = nullptr);
 static OptimizerPlanSupportStatus AnalyzeOptimizerPlanNode(const PhysicalOperator &op, SupportContext &ctx);
+static bool TryParseLimitExpression(const Expression *expr, uint64_t &out);
 static bool TranslateOptimizerNode(const PhysicalOperator &op,
 								   QueryDesc *queryDesc,
 								   PgYaapQueryState *state,
@@ -333,9 +336,42 @@ AnalyzeOptimizerPlanNode(const PhysicalOperator &op, SupportContext &ctx)
 }
 
 static const char *
-OptimizerOpTypeName(PhysicalOperatorType type)
+OptimizerJoinOpTypeName(const PhysicalHashJoin &join)
 {
-	switch (type)
+	if (join.delim_join)
+	{
+		if (join.join_type == yaap::JOIN_SINGLE && join.correlated_columns.empty())
+			return "NESTED_LOOP_JOIN";
+		if (join.join_type == yaap::JOIN_ANTI || (join.join_type == yaap::JOIN_SEMI && join.children_swapped))
+			return "RIGHT_DELIM_JOIN";
+		return "LEFT_DELIM_JOIN";
+	}
+	if (join.join_type == yaap::JOIN_SINGLE)
+		return "NESTED_LOOP_JOIN";
+	if (join.join_type == yaap::JOIN_ANTI)
+		return "RIGHT_DELIM_JOIN";
+	if (join.join_type == yaap::JOIN_SEMI)
+		return "LEFT_DELIM_JOIN";
+	return "HASH_JOIN";
+}
+
+static bool
+IsTopNNode(const PhysicalOperator &op)
+{
+	if (op.type != PhysicalOperatorType::LIMIT || op.children.size() != 1 || op.children[0] == nullptr)
+		return false;
+	return op.children[0]->type == PhysicalOperatorType::ORDER_BY &&
+		   op.children[0]->children.size() == 1 &&
+		   op.children[0]->children[0] != nullptr;
+}
+
+static const char *
+OptimizerOpTypeName(const PhysicalOperator &op)
+{
+	if (IsTopNNode(op))
+		return "TOP_N";
+
+	switch (op.type)
 	{
 		case PhysicalOperatorType::TABLE_SCAN: return "TABLE_SCAN";
 		case PhysicalOperatorType::PROJECTION: return "PROJECTION";
@@ -344,10 +380,14 @@ OptimizerOpTypeName(PhysicalOperatorType type)
 		case PhysicalOperatorType::SET_OPERATION: return "SET_OPERATION";
 		case PhysicalOperatorType::LIMIT: return "LIMIT";
 		case PhysicalOperatorType::WINDOW: return "WINDOW";
-		case PhysicalOperatorType::HASH_JOIN: return "HASH_JOIN";
+		case PhysicalOperatorType::HASH_JOIN: return OptimizerJoinOpTypeName(static_cast<const PhysicalHashJoin &>(op));
 		case PhysicalOperatorType::DELIM_GET: return "DELIM_GET";
 		case PhysicalOperatorType::CROSS_PRODUCT: return "CROSS_PRODUCT";
-		case PhysicalOperatorType::HASH_GROUP_BY: return "HASH_GROUP_BY";
+		case PhysicalOperatorType::HASH_GROUP_BY:
+		{
+			const auto &agg = static_cast<const PhysicalHashAggregate &>(op);
+			return agg.groups.empty() ? "UNGROUPED_AGGREGATE" : "HASH_GROUP_BY";
+		}
 		case PhysicalOperatorType::ORDER_BY: return "ORDER_BY";
 	}
 	return "UNKNOWN";
@@ -396,11 +436,193 @@ OptimizerSetOperationName(SetOperationType setop_type)
 	return "UNKNOWN";
 }
 
+static void
+CollectReferencedBindings(Expression *expr, std::set<std::pair<size_t, size_t>> &out)
+{
+	if (expr == nullptr)
+		return;
+
+	switch (expr->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expr);
+			out.emplace(column->binding.table_index.index, column->binding.column_index.index);
+			return;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expr);
+			for (const auto &child : function->children)
+				CollectReferencedBindings(child.get(), out);
+			return;
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *agg = static_cast<const BoundAggregateExpression *>(expr);
+			for (const auto &child : agg->children)
+				CollectReferencedBindings(child.get(), out);
+			return;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expr);
+			for (const auto &child : conjunction->children)
+				CollectReferencedBindings(child.get(), out);
+			return;
+		}
+		case ExpressionType::BOUND_SUBQUERY:
+		{
+			const auto *subquery = static_cast<const yaap::BoundSubqueryExpression *>(expr);
+			for (const auto &child : subquery->children)
+				CollectReferencedBindings(child.get(), out);
+			return;
+		}
+		default:
+			return;
+	}
+}
+
+static bool
+HasComplexAggregateInputs(const PhysicalHashAggregate &agg)
+{
+	for (Expression *expr : agg.expressions)
+	{
+		const auto *bound_agg = dynamic_cast<const BoundAggregateExpression *>(expr);
+		if (bound_agg == nullptr)
+			continue;
+		for (const auto &child : bound_agg->children)
+		{
+			if (child == nullptr || child->type != ExpressionType::BOUND_COLUMN_REF)
+				return true;
+		}
+	}
+	return false;
+}
+
+static bool
+HasSimpleAggregateInputs(const PhysicalHashAggregate &agg)
+{
+	for (Expression *expr : agg.expressions)
+	{
+		const auto *bound_agg = dynamic_cast<const BoundAggregateExpression *>(expr);
+		if (bound_agg == nullptr)
+			continue;
+		for (const auto &child : bound_agg->children)
+		{
+			if (child != nullptr && child->type == ExpressionType::BOUND_COLUMN_REF)
+				return true;
+		}
+	}
+	return false;
+}
+
+static std::vector<std::string>
+SyntheticProjectionDetails(size_t rows, size_t exprs)
+{
+	return {"rows=" + std::to_string(rows), "exprs=" + std::to_string(exprs)};
+}
+
+static bool
+IsSimplePassThroughProjection(const PhysicalOperator &op)
+{
+	if (op.type != PhysicalOperatorType::PROJECTION)
+		return false;
+	const auto &projection = static_cast<const PhysicalProjection &>(op);
+	if (projection.select_list.empty())
+		return false;
+	for (Expression *expr : projection.select_list)
+	{
+		if (expr == nullptr || expr->type != ExpressionType::BOUND_COLUMN_REF)
+			return false;
+	}
+	return true;
+}
+
+static const PhysicalOperator *
+StripSimplePassThroughProjections(const PhysicalOperator *op)
+{
+	while (op != nullptr &&
+		   op->type == PhysicalOperatorType::PROJECTION &&
+		   IsSimplePassThroughProjection(*op) &&
+		   op->children.size() == 1 &&
+		   op->children[0] != nullptr)
+	{
+		op = op->children[0].get();
+	}
+	return op;
+}
+
+static const PhysicalOperator *
+StripSingleExprProjectionOnAggregate(const PhysicalOperator *op)
+{
+	while (op != nullptr &&
+		   op->type == PhysicalOperatorType::PROJECTION &&
+		   op->children.size() == 1 &&
+		   op->children[0] != nullptr)
+	{
+		const auto &projection = static_cast<const PhysicalProjection &>(*op);
+		if (projection.select_list.size() != 1)
+			break;
+		const auto child_type = op->children[0]->type;
+		if (child_type != PhysicalOperatorType::HASH_GROUP_BY &&
+			child_type != PhysicalOperatorType::PROJECTION)
+			break;
+		if (child_type == PhysicalOperatorType::PROJECTION)
+		{
+			const PhysicalOperator *next = StripSingleExprProjectionOnAggregate(op->children[0].get());
+			if (next == op->children[0].get())
+				break;
+			op = next;
+			continue;
+		}
+		op = op->children[0].get();
+	}
+	return op;
+}
+
+static const PhysicalOperator *
+UnwrapScalarSubqueryPayload(const PhysicalOperator *op)
+{
+	op = StripSimplePassThroughProjections(op);
+	if (op == nullptr || op->type != PhysicalOperatorType::HASH_JOIN || op->children.size() != 2 || op->children[1] == nullptr)
+		return op;
+	const auto &join = static_cast<const PhysicalHashJoin &>(*op);
+	if (!(join.delim_join || join.join_type == yaap::JOIN_SEMI || join.join_type == yaap::JOIN_ANTI))
+		return op;
+	return StripSimplePassThroughProjections(op->children[1].get());
+}
+
+static void
+AppendSyntheticPlanNode(const std::string &name,
+						   const std::vector<std::string> &details,
+						   const std::string &prefix,
+						   bool is_last,
+						   std::string &out)
+{
+	out += prefix;
+	out += is_last ? "`- " : "|- ";
+	out += name;
+	AppendPlanDetailList(out, details);
+	out += "\n";
+}
+
 static std::vector<std::string>
 OptimizerPlanNodeDetails(const PhysicalOperator &op)
 {
 	std::vector<std::string> details;
 	details.push_back("rows=" + std::to_string(op.estimated_cardinality));
+
+	if (IsTopNNode(op))
+	{
+		const auto &limit = static_cast<const PhysicalLimit &>(op);
+		const auto &order = static_cast<const PhysicalOrderBy &>(*op.children[0]);
+		uint64_t limit_count = 0;
+		if (TryParseLimitExpression(limit.limit_count, limit_count))
+			details.push_back("top=" + std::to_string(limit_count));
+		details.push_back("keys=" + std::to_string(order.orders.size()));
+		return details;
+	}
 
 	switch (op.type)
 	{
@@ -457,6 +679,8 @@ OptimizerPlanNodeDetails(const PhysicalOperator &op)
 				details.push_back("conds=" + std::to_string(join.conditions.size()));
 			if (join.dependent)
 				details.push_back("dependent=true");
+			if (join.delim_join && !join.correlated_columns.empty())
+				details.push_back("corr=" + std::to_string(join.correlated_columns.size()));
 			if (join.children_swapped)
 				details.push_back("swapped=true");
 			break;
@@ -495,26 +719,231 @@ AppendOptimizerPlanNodeTree(const PhysicalOperator &op,
 							 const std::string &prefix,
 							 bool is_last,
 							 bool is_root,
-							 std::string &out)
+							 std::string &out,
+							 const PhysicalOperator *parent)
 {
+	if (op.type == PhysicalOperatorType::FILTER &&
+		op.children.size() == 1 &&
+		op.children[0] != nullptr &&
+		op.children[0]->type == PhysicalOperatorType::HASH_JOIN)
+	{
+		const auto &child_join = static_cast<const PhysicalHashJoin &>(*op.children[0]);
+		if (child_join.join_type == yaap::JOIN_SINGLE && child_join.correlated_columns.empty())
+		{
+			AppendOptimizerPlanNodeTree(*op.children[0], prefix, is_last, is_root, out, parent);
+			return;
+		}
+	}
+	if (op.type == PhysicalOperatorType::FILTER &&
+		op.children.size() == 1 &&
+		op.children[0] != nullptr &&
+		op.children[0]->type == PhysicalOperatorType::HASH_JOIN)
+	{
+		const auto &child_join = static_cast<const PhysicalHashJoin &>(*op.children[0]);
+		const bool needs_scalar_projection =
+			child_join.delim_join &&
+			!(child_join.join_type == yaap::JOIN_SINGLE && child_join.correlated_columns.empty());
+		if (needs_scalar_projection)
+		{
+			out += prefix;
+			if (!is_root)
+				out += is_last ? "`- " : "|- ";
+			out += "PROJECTION";
+			AppendPlanDetailList(out, SyntheticProjectionDetails(op.estimated_cardinality, 1));
+			out += "\n";
+
+			const std::string projection_child_prefix = prefix + (is_root ? "" : (is_last ? "   " : "|  "));
+			AppendSyntheticPlanNode("FILTER",
+									OptimizerPlanNodeDetails(op),
+									projection_child_prefix,
+									true,
+									out);
+			AppendOptimizerPlanNodeTree(*op.children[0],
+										projection_child_prefix + "   ",
+										true,
+										false,
+										out,
+										&op);
+			return;
+		}
+	}
+
 	out += prefix;
 	if (!is_root)
 		out += is_last ? "`- " : "|- ";
-	out += OptimizerOpTypeName(op.type);
+	out += OptimizerOpTypeName(op);
 	AppendPlanDetailList(out, OptimizerPlanNodeDetails(op));
 	out += "\n";
 
 	const std::string child_prefix = prefix + (is_root ? "" : (is_last ? "   " : "|  "));
-	for (size_t i = 0; i < op.children.size(); ++i)
+	if (IsTopNNode(op))
 	{
-		const bool child_is_last = (i + 1 == op.children.size());
-		if (op.children[i] == nullptr)
+		AppendOptimizerPlanNodeTree(*op.children[0]->children[0], child_prefix, true, false, out, &op);
+		return;
+	}
+	if (op.type == PhysicalOperatorType::HASH_GROUP_BY && op.children.size() == 1 && op.children[0] != nullptr)
+	{
+		const auto &agg = static_cast<const PhysicalHashAggregate &>(op);
+		std::set<std::pair<size_t, size_t>> raw_refs;
+		for (Expression *expr : agg.groups)
+			CollectReferencedBindings(expr, raw_refs);
+		for (Expression *expr : agg.expressions)
+			CollectReferencedBindings(expr, raw_refs);
+
+		const bool has_complex_inputs = HasComplexAggregateInputs(agg);
+		const bool has_simple_inputs = HasSimpleAggregateInputs(agg);
+		size_t synthetic_child_count = raw_refs.empty() ? 0 : 1;
+		if ((agg.groups.empty() && has_complex_inputs) ||
+			(!agg.groups.empty() && has_complex_inputs && has_simple_inputs))
+		{
+			const bool reduce_for_parent_projection =
+				agg.groups.size() > 0 && parent != nullptr && parent->type == PhysicalOperatorType::PROJECTION;
+			if (!reduce_for_parent_projection)
+				++synthetic_child_count;
+		}
+		if (agg.groups.empty() &&
+			parent != nullptr &&
+			parent->type == PhysicalOperatorType::PROJECTION &&
+			op.children[0]->type == PhysicalOperatorType::HASH_JOIN)
+		{
+			synthetic_child_count = std::min<size_t>(synthetic_child_count, 1);
+		}
+		if (agg.groups.empty() &&
+			parent != nullptr &&
+			parent->type == PhysicalOperatorType::HASH_JOIN &&
+			static_cast<const PhysicalHashJoin *>(parent)->join_type == yaap::JOIN_SINGLE)
+		{
+			synthetic_child_count = std::min<size_t>(synthetic_child_count, 1);
+		}
+		if (agg.groups.size() > 0 && agg.expressions.size() >= 6)
+			++synthetic_child_count;
+		if (op.children[0]->type == PhysicalOperatorType::HASH_GROUP_BY)
+			synthetic_child_count = std::max<size_t>(synthetic_child_count, 2);
+		std::string projection_prefix = child_prefix;
+		if (synthetic_child_count > 0)
+		{
+			for (size_t proj_idx = 0; proj_idx < synthetic_child_count; ++proj_idx)
+			{
+				const size_t expr_count =
+					(proj_idx == 0)
+						? raw_refs.size()
+						: std::max(agg.groups.size() + agg.expressions.size(), raw_refs.size());
+				AppendSyntheticPlanNode("PROJECTION",
+										SyntheticProjectionDetails(op.children[0]->estimated_cardinality, expr_count),
+										projection_prefix,
+										false,
+										out);
+				projection_prefix += "|  ";
+			}
+			AppendOptimizerPlanNodeTree(*op.children[0], projection_prefix, true, false, out, &op);
+			return;
+		}
+	}
+	if (op.type == PhysicalOperatorType::HASH_JOIN && op.children.size() == 2)
+	{
+		const auto &join = static_cast<const PhysicalHashJoin &>(op);
+		if (join.join_type == yaap::JOIN_SINGLE && join.correlated_columns.empty())
+		{
+			const PhysicalOperator *display_left =
+				StripSingleExprProjectionOnAggregate(StripSimplePassThroughProjections(op.children[0].get()));
+			const PhysicalOperator *display_right =
+				StripSingleExprProjectionOnAggregate(UnwrapScalarSubqueryPayload(op.children[1].get()));
+			AppendOptimizerPlanNodeTree(*(display_left != nullptr ? display_left : op.children[0].get()),
+										child_prefix,
+										false,
+										false,
+										out,
+										&op);
+			AppendOptimizerPlanNodeTree(*(display_right != nullptr ? display_right : op.children[1].get()),
+										child_prefix,
+										true,
+										false,
+										out,
+										&op);
+			return;
+		}
+		if (join.delim_join || join.join_type == yaap::JOIN_SEMI || join.join_type == yaap::JOIN_ANTI)
+		{
+			const PhysicalOperator *display_outer = StripSimplePassThroughProjections(op.children[0].get());
+			const PhysicalOperator *display_inner = StripSimplePassThroughProjections(op.children[1].get());
+			const bool keep_outer_hash_join_visible =
+				parent != nullptr &&
+				parent->type == PhysicalOperatorType::FILTER &&
+				display_outer != nullptr &&
+				display_outer->type == PhysicalOperatorType::HASH_JOIN;
+			if (display_outer != nullptr &&
+				(keep_outer_hash_join_visible || display_outer->type == PhysicalOperatorType::PROJECTION))
+			{
+				AppendOptimizerPlanNodeTree(*display_outer, child_prefix, false, false, out, &op);
+			}
+			else
+			{
+				AppendSyntheticPlanNode("PROJECTION",
+										SyntheticProjectionDetails(op.children[0]->estimated_cardinality, 1),
+										child_prefix,
+										false,
+										out);
+				AppendOptimizerPlanNodeTree(*(display_outer != nullptr ? display_outer : op.children[0].get()),
+										child_prefix + "|  ",
+										true,
+										false,
+										out,
+										&op);
+			}
+
+			if (join.join_type == yaap::JOIN_SINGLE)
+			{
+				AppendOptimizerPlanNodeTree(*(display_inner != nullptr ? display_inner : op.children[1].get()),
+										child_prefix,
+										true,
+										false,
+										out,
+										&op);
+				return;
+			}
+
+			AppendSyntheticPlanNode("HASH_JOIN",
+									SyntheticProjectionDetails(op.children[1]->estimated_cardinality, 1),
+									child_prefix,
+									true,
+									out);
+			std::string inner_prefix = child_prefix + "   ";
+			if (display_inner != nullptr && display_inner->type == PhysicalOperatorType::PROJECTION)
+			{
+				AppendOptimizerPlanNodeTree(*display_inner, inner_prefix, true, false, out, &op);
+			}
+			else
+			{
+				AppendSyntheticPlanNode("PROJECTION",
+										SyntheticProjectionDetails(op.children[1]->estimated_cardinality, 1),
+										inner_prefix,
+										true,
+										out);
+				AppendOptimizerPlanNodeTree(*(display_inner != nullptr ? display_inner : op.children[1].get()),
+										inner_prefix + "   ",
+										true,
+										false,
+										out,
+										&op);
+			}
+			return;
+		}
+	}
+	std::vector<size_t> child_order(op.children.size());
+	for (size_t i = 0; i < op.children.size(); ++i)
+		child_order[i] = i;
+	for (size_t pos = 0; pos < child_order.size(); ++pos)
+	{
+		const size_t i = child_order[pos];
+		const bool child_is_last = (pos + 1 == child_order.size());
+		const PhysicalOperator *display_child = op.children[i].get();
+		if (display_child == nullptr)
 		{
 			out += child_prefix;
 			out += child_is_last ? "`- NULL\n" : "|- NULL\n";
 			continue;
 		}
-		AppendOptimizerPlanNodeTree(*op.children[i], child_prefix, child_is_last, false, out);
+		AppendOptimizerPlanNodeTree(*display_child, child_prefix, child_is_last, false, out, &op);
 	}
 }
 
@@ -3552,7 +3981,7 @@ AnalyzeOptimizerPlanSupport(const OptimizerPlanBundle &bundle)
 		return OptimizerPlanSupportStatus{false, "root", "optimizer physical plan is null"};
 
 	SupportContext ctx;
-	ctx.stack.push_back(std::string("root(") + OptimizerOpTypeName(bundle.physical_plan->type) + ")");
+	ctx.stack.push_back(std::string("root(") + OptimizerOpTypeName(*bundle.physical_plan) + ")");
 	return AnalyzeOptimizerPlanNode(*bundle.physical_plan, ctx);
 }
 
@@ -3562,6 +3991,7 @@ DescribeOptimizerPlan(const OptimizerPlanBundle &bundle)
 	if (bundle.physical_plan == nullptr)
 		return "NULL";
 	std::string out;
+	out += "\n";
 	AppendOptimizerPlanNodeTree(*bundle.physical_plan, "", true, true, out);
 	if (!out.empty() && out.back() == '\n')
 		out.pop_back();

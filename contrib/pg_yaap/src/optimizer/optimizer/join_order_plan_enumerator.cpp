@@ -24,6 +24,14 @@ int PrimaryJoinType(const std::vector<const JoinOrderNeighborInfo*>& connections
     return primary_join_type;
 }
 
+size_t ConnectionFilterCount(const std::vector<const JoinOrderNeighborInfo*>& connections) {
+    size_t count = 0;
+    for (const auto* connection : connections) {
+        count += connection->filters.size();
+    }
+    return count;
+}
+
 } // namespace
 
 JoinOrderPlanEnumerator::JoinOrderPlanEnumerator(JoinOrderOptimizer& optimizer,
@@ -149,6 +157,31 @@ void JoinOrderPlanEnumerator::TryEmitPair(uint64_t left, uint64_t right) {
                 auto existing_left_stats =
                     optimizer_.GetDPStats(existing->second->left_set.mask, plans_, relations_);
                 replace = candidate_left_stats.cardinality < existing_left_stats.cardinality;
+            } else {
+                const size_t candidate_filter_count = ConnectionFilterCount(candidate_connections);
+                const size_t existing_filter_count =
+                    existing->second->info ? existing->second->info->filters.size() : 0;
+                if (candidate_filter_count != existing_filter_count) {
+                    replace = candidate_filter_count > existing_filter_count;
+                } else {
+                    auto candidate_right_stats =
+                        optimizer_.GetDPStats(candidate_right, plans_, relations_);
+                    auto existing_right_stats =
+                        optimizer_.GetDPStats(existing->second->right_set.mask, plans_, relations_);
+                    if (candidate_right_stats.cardinality != existing_right_stats.cardinality) {
+                        replace = candidate_right_stats.cardinality < existing_right_stats.cardinality;
+                    } else {
+                        auto candidate_left_stats =
+                            optimizer_.GetDPStats(candidate_left, plans_, relations_);
+                        auto existing_left_stats =
+                            optimizer_.GetDPStats(existing->second->left_set.mask, plans_, relations_);
+                        if (candidate_left_stats.cardinality != existing_left_stats.cardinality) {
+                            replace = candidate_left_stats.cardinality < existing_left_stats.cardinality;
+                        } else {
+                            replace = cardinality < existing->second->cardinality;
+                        }
+                    }
+                }
             }
         }
 
@@ -164,7 +197,7 @@ void JoinOrderPlanEnumerator::TryEmitPair(uint64_t left, uint64_t right) {
         node->cardinality = cardinality;
         plans_[union_mask] = std::move(node);
         optimizer_.dp_stats_[union_mask] =
-            cost_model_.CombineStats(candidate_left, candidate_right, cardinality, plans_, relations_);
+            cost_model_.CombineStats(candidate_left, candidate_right, cardinality, plans_, relations_, candidate_connections);
     };
 
     try_record(left, right, connections);

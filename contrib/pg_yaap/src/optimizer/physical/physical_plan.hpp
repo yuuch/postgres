@@ -146,6 +146,7 @@ class PhysicalHashJoin : public PhysicalOperator {
 public:
     int join_type;
     bool dependent = false;
+    bool delim_join = false;
     bool children_swapped = false;
     TableIndex mark_index{static_cast<size_t>(-1)};
     bool has_mark_index = false;

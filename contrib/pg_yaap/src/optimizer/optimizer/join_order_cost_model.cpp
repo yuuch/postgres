@@ -5,6 +5,52 @@
 
 namespace yaap {
 
+namespace {
+
+void PropagateEquivalentColumnStats(RelationStats& stats,
+                                    const JoinOrderFilterInfo& filter,
+                                    RelationStatisticsHelper& statistics_helper) {
+    if (!filter.has_left_binding || !filter.has_right_binding) {
+        return;
+    }
+
+    auto left_column = statistics_helper.LookupColumnStats(stats, filter.left_binding);
+    auto right_column = statistics_helper.LookupColumnStats(stats, filter.right_binding);
+    if (!left_column.has_stats && !right_column.has_stats) {
+        return;
+    }
+
+    size_t unified_distinct = 0;
+    if (left_column.has_stats && left_column.distinct.distinct_count > 0) {
+        unified_distinct = left_column.distinct.distinct_count;
+    }
+    if (right_column.has_stats && right_column.distinct.distinct_count > 0) {
+        unified_distinct = unified_distinct == 0
+            ? right_column.distinct.distinct_count
+            : std::min(unified_distinct, right_column.distinct.distinct_count);
+    }
+
+    auto apply_column = [&](ColumnBinding binding, ColumnStats column, const ColumnStats& fallback) {
+        if (!column.has_stats) {
+            column = fallback;
+            column.binding = binding;
+        }
+        if (column.has_stats && unified_distinct > 0) {
+            column.distinct.distinct_count = unified_distinct;
+        }
+        if (column.has_stats) {
+            stats.column_stats[MakeColumnBindingKey(binding)] = column;
+        }
+    };
+
+    if (left_column.has_stats || right_column.has_stats) {
+        apply_column(filter.left_binding, left_column, right_column);
+        apply_column(filter.right_binding, right_column, left_column);
+    }
+}
+
+} // namespace
+
 JoinOrderCostModel::JoinOrderCostModel(JoinOrderOptimizer& optimizer)
     : optimizer_(optimizer) {
 }
@@ -115,11 +161,22 @@ RelationStats JoinOrderCostModel::CombineStats(uint64_t left,
                                                uint64_t right,
                                                size_t join_cardinality,
                                                const std::map<uint64_t, std::unique_ptr<JoinOrderDPJoinNode>>& plans,
-                                               const std::vector<JoinOrderJoinRelation>& relations) const {
+                                               const std::vector<JoinOrderJoinRelation>& relations,
+                                               const std::vector<const JoinOrderNeighborInfo*>& connections) const {
     auto left_stats = optimizer_.GetDPStats(left, plans, relations);
     auto right_stats = optimizer_.GetDPStats(right, plans, relations);
     RelationStatisticsHelper statistics_helper;
-    return statistics_helper.CombineReorderableStats(left_stats, right_stats, join_cardinality);
+    auto stats = statistics_helper.CombineReorderableStats(left_stats, right_stats, join_cardinality);
+    std::set<const JoinOrderFilterInfo*> seen_filters;
+    for (const auto* connection : connections) {
+        for (const auto* filter : connection->filters) {
+            if (!seen_filters.insert(filter).second || filter->from_residual_predicate) {
+                continue;
+            }
+            PropagateEquivalentColumnStats(stats, *filter, statistics_helper);
+        }
+    }
+    return stats;
 }
 
 } // namespace yaap

@@ -33,7 +33,7 @@ bool IsExistsStyleMarkJoinCandidate(LogicalOperator* plan) {
     if (join->join_type != JOIN_MARK || !join->convert_mark_to_semi || plan->children.size() != 2) {
         return false;
     }
-    return IsExistsStyleMarkJoinRHS(plan->children[1].get());
+    return true;
 }
 
 void ConvertMarkJoinToSemiOrAnti(std::unique_ptr<LogicalOperator>& plan, bool positive) {

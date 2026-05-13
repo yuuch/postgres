@@ -87,8 +87,8 @@ void JoinOrderOptimizer::ExtractJoinGraph(std::unique_ptr<LogicalOperator> plan,
         if (plan->children.size() != 2 || !plan->children[0] || !plan->children[1]) {
             std::set<size_t> output_tables;
             CollectOutputTables(plan.get(), output_tables);
-            RelationStats relation_stats;
-            relation_stats.cardinality = plan->estimated_cardinality;
+            RelationStatisticsHelper statistics_helper;
+            auto relation_stats = statistics_helper.Extract(*plan);
             relations.push_back({std::move(plan), std::move(output_tables), 0, std::move(relation_stats)});
             relations.back().estimated_cardinality = relations.back().plan->estimated_cardinality;
             relations.back().stats.cardinality = relations.back().estimated_cardinality;
@@ -128,8 +128,8 @@ void JoinOrderOptimizer::ExtractJoinGraph(std::unique_ptr<LogicalOperator> plan,
 
     std::set<size_t> output_tables;
     CollectOutputTables(plan.get(), output_tables);
-    RelationStats relation_stats;
-    relation_stats.cardinality = plan->estimated_cardinality;
+    RelationStatisticsHelper statistics_helper;
+    auto relation_stats = statistics_helper.Extract(*plan);
     relations.push_back({std::move(plan), std::move(output_tables), 0, std::move(relation_stats)});
     relations.back().estimated_cardinality = relations.back().plan->estimated_cardinality;
     relations.back().stats.cardinality = relations.back().estimated_cardinality;

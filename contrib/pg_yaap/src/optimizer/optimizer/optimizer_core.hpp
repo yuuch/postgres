@@ -107,6 +107,9 @@ private:
     std::map<size_t, std::vector<std::unique_ptr<Expression>>> BuildPropagatedFilters(
         const std::map<ColumnBindingKey, EqualityClass>& classes,
         const std::set<ColumnBindingKey>& direct_constant_bindings) const;
+    std::vector<std::unique_ptr<Expression>> BuildPropagatedEqualities(
+        const std::map<ColumnBindingKey, EqualityClass>& classes,
+        const std::set<std::string>& direct_column_equalities) const;
 };
 
 class ScanFilterFolding : public OptimizerRule {
