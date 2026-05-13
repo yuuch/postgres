@@ -7,6 +7,7 @@ extern "C" {
 
 #include "../adapter/yaap_adapter.hpp"
 #include "../logical/logical_utils.hpp"
+#include "../optimizer/optimizer_stats.hpp"
 
 #include <algorithm>
 #include <map>
@@ -38,6 +39,121 @@ bool OrdersReferenceOnlyAllowedTables(const LogicalOrder& order, const std::set<
         }
     }
     return true;
+}
+
+size_t FindBindingDistinctUpperBound(LogicalOperator& op,
+                                     ColumnBinding binding,
+                                     const RelationStatisticsHelper& statistics_helper) {
+    size_t best = 0;
+
+    auto stats = statistics_helper.Extract(op);
+    auto column = statistics_helper.LookupColumnStats(stats, binding);
+    if (column.has_stats && column.distinct.distinct_count > 0) {
+        best = std::max<size_t>(
+            1,
+            std::min(column.distinct.distinct_count, std::max<size_t>(1, stats.cardinality)));
+    }
+
+    for (const auto& child : op.children) {
+        if (!child) {
+            continue;
+        }
+        auto child_best = FindBindingDistinctUpperBound(*child, binding, statistics_helper);
+        if (child_best == 0) {
+            continue;
+        }
+        best = best == 0 ? child_best : std::min(best, child_best);
+    }
+
+    return best;
+}
+
+std::unique_ptr<Expression> CloneExpressionWithBindingReplacements(
+    Expression* expression,
+    const std::map<std::pair<size_t, size_t>, ColumnBinding>& replacements) {
+    if (!expression) {
+        return nullptr;
+    }
+
+    switch (expression->type) {
+        case ExpressionType::BOUND_COLUMN_REF: {
+            auto* column = static_cast<BoundColumnRefExpression*>(expression);
+            auto key = std::make_pair(column->binding.table_index.index, column->binding.column_index.index);
+            auto it = replacements.find(key);
+            if (it != replacements.end()) {
+                return std::make_unique<BoundColumnRefExpression>(it->second, column->table_name, column->column_name);
+            }
+            return std::make_unique<BoundColumnRefExpression>(column->binding, column->table_name, column->column_name);
+        }
+        case ExpressionType::BOUND_CONSTANT: {
+            auto* constant = static_cast<BoundConstantExpression*>(expression);
+            return std::make_unique<BoundConstantExpression>(constant->value, constant->is_null);
+        }
+        case ExpressionType::BOUND_FUNCTION: {
+            auto* function = static_cast<BoundFunctionExpression*>(expression);
+            auto clone = std::make_unique<BoundFunctionExpression>(function->function_name, function->op_oid);
+            for (auto& child : function->children) {
+                clone->children.push_back(CloneExpressionWithBindingReplacements(child.get(), replacements));
+            }
+            return clone;
+        }
+        case ExpressionType::BOUND_AGGREGATE: {
+            auto* aggregate = static_cast<BoundAggregateExpression*>(expression);
+            auto clone = std::make_unique<BoundAggregateExpression>(
+                aggregate->function_name, aggregate->agg_oid, aggregate->is_distinct);
+            for (auto& child : aggregate->children) {
+                clone->children.push_back(CloneExpressionWithBindingReplacements(child.get(), replacements));
+            }
+            return clone;
+        }
+        case ExpressionType::BOUND_CONJUNCTION: {
+            auto* conjunction = static_cast<BoundConjunctionExpression*>(expression);
+            auto clone = std::make_unique<BoundConjunctionExpression>(conjunction->bool_expr_type);
+            for (auto& child : conjunction->children) {
+                clone->children.push_back(CloneExpressionWithBindingReplacements(child.get(), replacements));
+            }
+            return clone;
+        }
+        case ExpressionType::BOUND_SUBQUERY: {
+            auto* subquery = static_cast<BoundSubqueryExpression*>(expression);
+            auto clone = std::make_unique<BoundSubqueryExpression>(subquery->sublink_type, subquery->sublink_name);
+            clone->subquery_plan = nullptr;
+            for (auto& child : subquery->children) {
+                clone->children.push_back(CloneExpressionWithBindingReplacements(child.get(), replacements));
+            }
+            return clone;
+        }
+        default:
+            return nullptr;
+    }
+}
+
+bool SubtreeCoversTables(LogicalOperator* op, const std::set<size_t>& required_tables) {
+    if (!op) {
+        return false;
+    }
+    std::set<size_t> output_tables;
+    CollectOutputTables(op, output_tables);
+    for (auto table_index : required_tables) {
+        if (output_tables.find(table_index) == output_tables.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::unique_ptr<LogicalOperator>* FindDeepestCoveringSubtree(
+    std::unique_ptr<LogicalOperator>& plan,
+    const std::set<size_t>& required_tables) {
+    if (!plan || !SubtreeCoversTables(plan.get(), required_tables)) {
+        return nullptr;
+    }
+    for (auto& child : plan->children) {
+        if (auto* result = FindDeepestCoveringSubtree(child, required_tables)) {
+            return result;
+        }
+    }
+    return &plan;
 }
 
 struct ParsedLiftedEquality {
@@ -271,9 +387,95 @@ bool DecorrelateDependentJoin::DecorrelateScalarAggregateJoin(std::unique_ptr<Lo
         return false;
     }
 
+    std::set<size_t> correlation_inner_tables;
+    for (const auto& correlation : correlations) {
+        CollectReferencedTables(correlation.inner.get(), correlation_inner_tables);
+    }
+    if (correlation_inner_tables.empty()) {
+        return false;
+    }
+
     std::vector<std::unique_ptr<Expression>> lifted_filters;
     if (!PushDownCorrelatedNode(aggregate->children[0], allowed_tables, lifted_filters)) {
         return false;
+    }
+
+    RelationStatisticsHelper statistics_helper;
+    auto outer_stats = plan->children[0] ? statistics_helper.Extract(*plan->children[0]) : RelationStats{};
+    size_t delim_cardinality = std::max<size_t>(1, outer_stats.cardinality);
+    double correlated_distinct = 1.0;
+    bool used_outer_stats = false;
+    for (const auto& correlation : correlations) {
+        if (!correlation.outer || correlation.outer->type != ExpressionType::BOUND_COLUMN_REF) {
+            continue;
+        }
+        auto binding = static_cast<BoundColumnRefExpression*>(correlation.outer.get())->binding;
+        auto distinct_upper_bound = plan->children[0]
+            ? FindBindingDistinctUpperBound(*plan->children[0], binding, statistics_helper)
+            : 0;
+        if (distinct_upper_bound == 0) {
+            auto column = statistics_helper.LookupColumnStats(outer_stats, binding);
+            if (!column.has_stats || column.distinct.distinct_count == 0) {
+                continue;
+            }
+            distinct_upper_bound = column.distinct.distinct_count;
+        }
+        correlated_distinct *= static_cast<double>(distinct_upper_bound);
+        used_outer_stats = true;
+    }
+    if (used_outer_stats) {
+        delim_cardinality = std::min(
+            delim_cardinality,
+            std::max<size_t>(1, static_cast<size_t>(std::ceil(correlated_distinct))));
+    }
+
+    auto delim_table_index = AllocateTableIndex();
+    auto delim_get = std::make_unique<LogicalDelimGet>(delim_table_index);
+    delim_get->estimated_cardinality = delim_cardinality;
+    std::vector<ColumnBinding> delim_bindings;
+    delim_bindings.reserve(correlations.size());
+    std::vector<std::string> delim_output_names;
+    delim_output_names.reserve(correlations.size());
+    std::map<std::pair<size_t, size_t>, ColumnBinding> outer_binding_replacements;
+    for (size_t idx = 0; idx < correlations.size(); ++idx) {
+        auto output_name = DerivedDecorrelatedOutputName(correlations[idx].outer.get(), idx);
+        ColumnBinding delim_binding{delim_table_index, ProjectionIndex{idx}};
+        delim_get->correlated_columns.push_back(delim_binding);
+        delim_get->output_names.push_back(output_name);
+        delim_bindings.push_back(delim_binding);
+        delim_output_names.push_back(output_name);
+        if (correlations[idx].outer && correlations[idx].outer->type == ExpressionType::BOUND_COLUMN_REF) {
+            auto outer_binding = static_cast<BoundColumnRefExpression*>(correlations[idx].outer.get())->binding;
+            outer_binding_replacements[std::make_pair(
+            outer_binding.table_index.index,
+            outer_binding.column_index.index)] = delim_binding;
+        }
+    }
+
+    auto* target_subtree = FindDeepestCoveringSubtree(aggregate->children[0], correlation_inner_tables);
+    if (!target_subtree) {
+        return false;
+    }
+    const size_t target_cardinality = *target_subtree ? (*target_subtree)->estimated_cardinality : 0;
+    auto delim_cross = std::make_unique<LogicalCrossProduct>();
+    delim_cross->estimated_cardinality = target_cardinality > 0
+        ? target_cardinality * delim_cardinality
+        : delim_cardinality;
+    delim_cross->children.push_back(std::move(*target_subtree));
+    delim_cross->children.push_back(std::move(delim_get));
+    if (!lifted_filters.empty()) {
+        auto delim_filter = std::make_unique<LogicalFilter>();
+        delim_filter->estimated_cardinality = target_cardinality > 0 ? target_cardinality : delim_cardinality;
+        for (const auto& lifted : lifted_filters) {
+            auto rewritten = CloneExpressionWithBindingReplacements(lifted.get(), outer_binding_replacements);
+            if (rewritten) {
+                delim_filter->expressions.push_back(std::move(rewritten));
+            }
+        }
+        delim_filter->children.push_back(std::move(delim_cross));
+        *target_subtree = std::move(delim_filter);
+    } else {
+        *target_subtree = std::move(delim_cross);
     }
 
     auto add_group_key = [&](std::unique_ptr<Expression> inner_expr) -> size_t {
@@ -290,8 +492,14 @@ bool DecorrelateDependentJoin::DecorrelateScalarAggregateJoin(std::unique_ptr<Lo
         return group_idx;
     };
 
-    for (auto& correlation : correlations) {
-        size_t group_idx = add_group_key(std::move(correlation.inner));
+    for (size_t idx = 0; idx < correlations.size(); ++idx) {
+        auto delim_ref = std::make_unique<BoundColumnRefExpression>(
+            delim_bindings[idx],
+            "delim",
+            idx < delim_output_names.size()
+                ? delim_output_names[idx]
+                : DerivedDecorrelatedOutputName(correlations[idx].outer.get(), idx));
+        size_t group_idx = add_group_key(std::move(delim_ref));
         std::string group_name = group_idx < aggregate->group_names.size()
             ? aggregate->group_names[group_idx]
             : DerivedDecorrelatedOutputName(nullptr, group_idx);
@@ -300,7 +508,7 @@ bool DecorrelateDependentJoin::DecorrelateScalarAggregateJoin(std::unique_ptr<Lo
             "agg",
             group_name);
         auto condition = std::make_unique<BoundFunctionExpression>("=", InvalidOid);
-        condition->children.push_back(std::move(correlation.outer));
+        condition->children.push_back(std::move(correlations[idx].outer));
         condition->children.push_back(std::move(group_ref));
         AppendUniqueFilter(join->conditions, std::move(condition));
     }

@@ -78,6 +78,8 @@ enum class TdcAggKind : uint8_t {
 	COUNT_STAR   = 1,
 	SUM_NUMERIC  = 2,
 	AVG_NUMERIC  = 3,
+	MIN_INT64    = 4,
+	MIN_NUMERIC  = 5,
 };
 
 /*

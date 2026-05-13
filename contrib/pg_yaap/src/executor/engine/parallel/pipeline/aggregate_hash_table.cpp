@@ -681,6 +681,15 @@ AggregateHashTableCombineRow(AggregateHashTable *aht,
 					break;
 				}
 				CopyGroupColumns(layout, src_tdc, src_row, tdc, new_row);
+				for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
+				{
+					const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
+					if (agg.kind == TdcAggKind::MIN_INT64 || agg.kind == TdcAggKind::MIN_NUMERIC)
+					{
+						const int64_t init_min = INT64_MAX;
+						std::memcpy(new_row + agg.offset, &init_min, sizeof(int64_t));
+					}
+				}
 				e.value       = PackEntry(our_salt, new_idx);
 				canonical_row = new_row;
 				break;

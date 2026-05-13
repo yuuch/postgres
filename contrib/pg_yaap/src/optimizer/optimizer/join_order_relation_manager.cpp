@@ -13,21 +13,98 @@ OptimizerPass JoinOrderOptimizer::Pass() const {
     return OptimizerPass::JOIN_ORDER;
 }
 
+namespace {
+
+bool IsReorderableJoinNode(LogicalOperator* op) {
+    if (!op) {
+        return false;
+    }
+    if (op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+        return true;
+    }
+    if (op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+        op->type != LogicalOperatorType::LOGICAL_DEPENDENT_JOIN &&
+        op->type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+        return false;
+    }
+    auto* join = static_cast<LogicalComparisonJoin*>(op);
+    return !join->dependent && (join->join_type == JOIN_INNER || IsSemiOrAntiJoinType(join->join_type));
+}
+
+void RecomputeBinaryOperatorCardinality(LogicalOperator* plan) {
+    if (!plan || plan->children.size() != 2 || !plan->children[0] || !plan->children[1]) {
+        return;
+    }
+
+    RelationStatisticsHelper statistics_helper;
+    auto left_stats = statistics_helper.Extract(*plan->children[0]);
+    auto right_stats = statistics_helper.Extract(*plan->children[1]);
+
+    if (plan->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+        size_t left = left_stats.cardinality;
+        size_t right = right_stats.cardinality;
+        plan->estimated_cardinality = (left == 0 || right == 0) ? 0 : left * right;
+        return;
+    }
+
+    if (plan->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+        plan->type != LogicalOperatorType::LOGICAL_DEPENDENT_JOIN &&
+        plan->type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+        return;
+    }
+
+    auto* join = static_cast<LogicalComparisonJoin*>(plan);
+    if (join->dependent || join->join_type != JOIN_INNER) {
+        size_t estimated_cardinality = left_stats.cardinality;
+        if (join->join_type == JOIN_MARK) {
+            estimated_cardinality = left_stats.cardinality;
+        } else if (IsSemiOrAntiJoinType(join->join_type)) {
+            if (!join->conditions.empty()) {
+                std::vector<Expression*> conditions;
+                conditions.reserve(join->conditions.size());
+                for (auto& condition : join->conditions) {
+                    conditions.push_back(condition.get());
+                }
+                estimated_cardinality = std::min(
+                    left_stats.cardinality,
+                    statistics_helper.EstimateJoinCardinality(left_stats, right_stats, conditions));
+            } else {
+                estimated_cardinality = std::max<size_t>(
+                    1,
+                    static_cast<size_t>(std::ceil(
+                        static_cast<double>(left_stats.cardinality) *
+                        RelationStatisticsHelper::DEFAULT_SELECTIVITY)));
+            }
+        }
+        if (join->join_type == JOIN_LEFT) {
+            estimated_cardinality = std::max(estimated_cardinality, left_stats.cardinality);
+        } else if (join->join_type == JOIN_RIGHT) {
+            estimated_cardinality = std::max(estimated_cardinality, right_stats.cardinality);
+        } else if (join->join_type == JOIN_FULL) {
+            estimated_cardinality = std::max({estimated_cardinality, left_stats.cardinality, right_stats.cardinality});
+        }
+        plan->estimated_cardinality = estimated_cardinality;
+        return;
+    }
+
+    std::vector<Expression*> conditions;
+    conditions.reserve(join->conditions.size());
+    for (auto& condition : join->conditions) {
+        conditions.push_back(condition.get());
+    }
+    plan->estimated_cardinality = statistics_helper.EstimateJoinCardinality(left_stats, right_stats, conditions);
+}
+
+} // namespace
+
 bool JoinOrderOptimizer::IsReorderableJoinTree(LogicalOperator* op) {
     if (!op) {
         return false;
     }
     if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
-        return op->children.size() == 1 && op->children[0] && IsSafeJoinOrderTree(op->children[0].get());
+        return op->children.size() == 1 && op->children[0] && IsReorderableJoinTree(op->children[0].get());
     }
-    if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-        op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
-        op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-        auto* join = static_cast<LogicalComparisonJoin*>(op);
-		return !join->dependent &&
-		       (join->join_type == JOIN_INNER || IsSemiOrAntiJoinType(join->join_type));
-    }
-    return op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT;
+    return IsReorderableJoinNode(op);
 }
 
 bool JoinOrderOptimizer::IsSafeJoinOrderTree(LogicalOperator* op) {
@@ -37,6 +114,7 @@ bool JoinOrderOptimizer::IsSafeJoinOrderTree(LogicalOperator* op) {
 
     switch (op->type) {
         case LogicalOperatorType::LOGICAL_GET:
+        case LogicalOperatorType::LOGICAL_DELIM_GET:
             return true;
         case LogicalOperatorType::LOGICAL_FILTER:
         case LogicalOperatorType::LOGICAL_PROJECTION:
@@ -95,18 +173,36 @@ void JoinOrderOptimizer::ExtractJoinGraph(std::unique_ptr<LogicalOperator> plan,
             return;
         }
 
-        if (plan->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-            plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
-            plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-            auto* join = static_cast<LogicalComparisonJoin*>(plan.get());
-            for (auto& condition : join->conditions) {
-				conditions.push_back({std::move(condition), 0, join->join_type, join->invert_result, false});
-			}
-		}
+        if (IsReorderableJoinNode(plan.get())) {
+            if (plan->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+                plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+                plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+                auto* join = static_cast<LogicalComparisonJoin*>(plan.get());
+                for (auto& condition : join->conditions) {
+					conditions.push_back({std::move(condition), 0, 0, 0, 0, 0, join->join_type, join->invert_result, false});
+    			}
+    		}
 
-		ExtractJoinGraph(std::move(plan->children[0]), relations, conditions);
-		ExtractJoinGraph(std::move(plan->children[1]), relations, conditions);
-		return;
+    		ExtractJoinGraph(std::move(plan->children[0]), relations, conditions);
+    		ExtractJoinGraph(std::move(plan->children[1]), relations, conditions);
+    		return;
+    	}
+
+        for (auto& child : plan->children) {
+            child = Rewrite(std::move(child));
+            if (!child) {
+                return;
+            }
+        }
+        RecomputeBinaryOperatorCardinality(plan.get());
+        std::set<size_t> output_tables;
+        CollectOutputTables(plan.get(), output_tables);
+        RelationStatisticsHelper statistics_helper;
+        auto relation_stats = statistics_helper.Extract(*plan);
+        relations.push_back({std::move(plan), std::move(output_tables), 0, std::move(relation_stats)});
+        relations.back().estimated_cardinality = relations.back().plan->estimated_cardinality;
+        relations.back().stats.cardinality = relations.back().estimated_cardinality;
+        return;
 	}
 
 	if (plan->children.size() == 1 && plan->children[0] && IsSafeJoinOrderTree(plan->children[0].get())) {

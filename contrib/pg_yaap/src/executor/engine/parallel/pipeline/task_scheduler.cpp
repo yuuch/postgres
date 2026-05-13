@@ -252,7 +252,13 @@ TaskScheduler::DeriveRunTaskCount(Pipeline &pipeline) const
 		if (v > 0)
 			bound = std::min(bound, static_cast<uint32_t>(v));
 	};
-	apply(pipeline.source->MaxThreads(ctx));
+	/*
+	 * Only sources that explicitly implement parallel morsel ownership may fan
+	 * out RUN tasks. Pipeline-breaker sources such as HASH_AGGREGATE expose a
+	 * single shared cursor in GetData(); letting multiple workers consume them
+	 * duplicates rows. Today SEQ_SCAN is the only parallel source.
+	 */
+	apply(pipeline.source->ParallelSource() ? pipeline.source->MaxThreads(ctx) : 1);
 	for (auto *op : pipeline.ops)
 		apply(op->MaxThreads(ctx));
 	apply(pipeline.sink->MaxThreads(ctx));

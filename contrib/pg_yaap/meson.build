@@ -70,6 +70,7 @@ tests += {
   'regress': {
     'sql': [
       'select_star',
+      'min_parallel',
     ],
   },
 }

@@ -143,6 +143,7 @@ public:
 	bool IsSource() const override { return true; }
 	bool IsSink() const override { return false; }
 	bool IsPipelineBreaker() const override { return false; }
+	bool ParallelSource() const override { return true; }
 
 	std::unique_ptr<GlobalSourceState> GetGlobalSourceState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSourceState>  GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate) override;

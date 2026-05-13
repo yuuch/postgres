@@ -5,6 +5,42 @@
 
 namespace yaap {
 
+namespace {
+
+void CapDelimGetCardinality(LogicalOperator* plan, size_t upper_bound) {
+    if (!plan) {
+        return;
+    }
+    if (plan->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+        plan->estimated_cardinality = std::max<size_t>(
+            1,
+            std::min(std::max<size_t>(1, plan->estimated_cardinality), std::max<size_t>(1, upper_bound)));
+    }
+    for (auto& child : plan->children) {
+        CapDelimGetCardinality(child.get(), upper_bound);
+    }
+}
+
+size_t FindMinDelimGetCardinality(LogicalOperator* plan) {
+    if (!plan) {
+        return 0;
+    }
+    size_t best = 0;
+    if (plan->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+        best = std::max<size_t>(1, plan->estimated_cardinality);
+    }
+    for (auto& child : plan->children) {
+        auto child_best = FindMinDelimGetCardinality(child.get());
+        if (child_best == 0) {
+            continue;
+        }
+        best = best == 0 ? child_best : std::min(best, child_best);
+    }
+    return best;
+}
+
+} // namespace
+
 OptimizerPass CardinalityEstimator::Pass() const {
     return OptimizerPass::CARDINALITY_ESTIMATOR;
 }
@@ -32,6 +68,9 @@ RelationStats CardinalityEstimator::Rewrite(LogicalOperator& plan) {
         case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
             auto& join = static_cast<LogicalComparisonJoin&>(plan);
             auto left_stats = statistics_helper_.Extract(*join.children[0]);
+            if (join.join_type == JOIN_SINGLE || plan.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+                CapDelimGetCardinality(join.children[1].get(), left_stats.cardinality);
+            }
             auto right_stats = statistics_helper_.Extract(*join.children[1]);
             if (join.dependent || join.join_type != JOIN_INNER) {
                 size_t estimated_cardinality = left_stats.cardinality;
@@ -121,25 +160,13 @@ RelationStats CardinalityEstimator::Rewrite(LogicalOperator& plan) {
                 if (aggregate.groups.empty()) {
                     plan.estimated_cardinality = 1;
                 } else {
-                    size_t groups = 1;
-                    bool has_group_stats = false;
-                    for (const auto& group : aggregate.groups) {
-                        std::vector<ColumnBinding> group_bindings;
-                        if (group->type == ExpressionType::BOUND_COLUMN_REF) {
-                            group_bindings.push_back(static_cast<BoundColumnRefExpression*>(group.get())->binding);
-                        }
-                        for (auto binding : group_bindings) {
-                            auto column = statistics_helper_.LookupColumnStats(input_stats, binding);
-                            if (column.has_stats && column.distinct.distinct_count > 0) {
-                                groups *= column.distinct.distinct_count;
-                                has_group_stats = true;
-        }
-    }
-}
-
-                    plan.estimated_cardinality = has_group_stats ?
-                        std::min(groups, plan.children[0]->estimated_cardinality) :
-                        plan.children[0]->estimated_cardinality;
+                    plan.estimated_cardinality = statistics_helper_.EstimateDistinctCardinality(
+                        input_stats,
+                        aggregate.groups);
+                    auto delim_upper_bound = FindMinDelimGetCardinality(plan.children[0].get());
+                    if (delim_upper_bound > 0) {
+                        plan.estimated_cardinality = std::min(plan.estimated_cardinality, delim_upper_bound);
+                    }
                 }
             }
             break;
@@ -243,11 +270,17 @@ std::unique_ptr<LogicalOperator> LogicalOptimizer::Optimize(std::unique_ptr<Logi
     RemoveUnusedColumns remove_unused_columns;
     RunOptimizer(OptimizerPass::REMOVE_UNUSED_COLUMNS, remove_unused_columns, plan);
 
+    // Column pruning can expose new FILTER -> GET shapes after the initial pushdown/folding pass.
+    // Fold once more so later cardinality/join-order work does not double-count scan-local predicates.
+    RunOptimizer(OptimizerPass::SCAN_FILTER_FOLDING, scan_filter_folding, plan);
+
     CardinalityEstimator cardinality_estimator;
     RunOptimizer(OptimizerPass::CARDINALITY_ESTIMATOR, cardinality_estimator, plan);
 
     JoinOrderOptimizer join_order_optimizer;
     RunOptimizer(OptimizerPass::JOIN_ORDER, join_order_optimizer, plan);
+
+    RunOptimizer(OptimizerPass::CARDINALITY_ESTIMATOR, cardinality_estimator, plan);
 
     return plan;
 }

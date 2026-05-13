@@ -189,7 +189,7 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalDepen
 }
 
 std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalDelimGet& op) {
-    auto physical = std::make_unique<PhysicalDelimGet>(op.table_index, EstimateCardinality(op));
+    auto physical = std::make_unique<PhysicalDelimScan>(op.table_index, EstimateCardinality(op));
     physical->correlated_columns = op.correlated_columns;
     physical->output_names = op.output_names;
     return physical;

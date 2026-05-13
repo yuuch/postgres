@@ -59,12 +59,13 @@ struct PipelineSharedControl;        /* defined in dsm_control.hpp */
  * ------------------------------------------------------------------------- */
 enum class OpKind : uint8_t {
 	SEQ_SCAN       = 0,
-	HASH_AGGREGATE = 1,
-	PERFECT_HASH_AGGREGATE = 2,
-	HASH_JOIN      = 3,
-	ORDER          = 4,
-	OUTPUT         = 5,
-	PROJECTION     = 6,
+	DELIM_SCAN     = 1,
+	HASH_AGGREGATE = 2,
+	PERFECT_HASH_AGGREGATE = 3,
+	HASH_JOIN      = 4,
+	ORDER          = 5,
+	OUTPUT         = 6,
+	PROJECTION     = 7,
 };
 
 /* -------------------------------------------------------------------------
@@ -427,6 +428,11 @@ struct HashAggOpBody {
 	uint32_t    perfect_hash_capacity;
 };
 
+struct DelimScanOpBody {
+	dsa_pointer input_schema;        /* SchemaDescriptor */
+	dsa_pointer shared_payload;      /* HashAggSharedPayload wrapper */
+};
+
 struct OrderOpBody {
 	dsa_pointer input_schema;        /* SchemaDescriptor */
 	dsa_pointer sort_keys;           /* SortKeyDesc[n_sort_keys] */
@@ -466,6 +472,7 @@ struct OpDescriptor {
 
 	union OpBodyUnion {
 		SeqScanOpBody seq_scan;
+		DelimScanOpBody delim_scan;
 		HashAggOpBody hash_agg;
 		HashAggOpBody perfect_hash_agg;
 		HashJoinOpBody hash_join;

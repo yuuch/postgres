@@ -16,7 +16,7 @@ enum class PhysicalOperatorType {
     LIMIT,
     WINDOW,
     HASH_JOIN,
-    DELIM_GET,
+    DELIM_SCAN,
     CROSS_PRODUCT,
     HASH_GROUP_BY,
     ORDER_BY
@@ -159,14 +159,14 @@ public:
           join_type(join_type), conditions(std::move(conditions)) {}
 };
 
-class PhysicalDelimGet : public PhysicalOperator {
+class PhysicalDelimScan : public PhysicalOperator {
 public:
     TableIndex table_index;
     std::vector<ColumnBinding> correlated_columns;
     std::vector<std::string> output_names;
 
-    PhysicalDelimGet(TableIndex table_index, size_t estimated_cardinality)
-        : PhysicalOperator(PhysicalOperatorType::DELIM_GET, estimated_cardinality), table_index(table_index) {}
+    PhysicalDelimScan(TableIndex table_index, size_t estimated_cardinality)
+        : PhysicalOperator(PhysicalOperatorType::DELIM_SCAN, estimated_cardinality), table_index(table_index) {}
 };
 
 class PhysicalHashAggregate : public PhysicalOperator {

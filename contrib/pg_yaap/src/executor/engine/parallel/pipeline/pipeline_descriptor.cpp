@@ -30,6 +30,7 @@ extern "C" {
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/output_sink.hpp"
+#include "parallel/pipeline/physical_delim_scan.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
@@ -146,6 +147,15 @@ EmitSeqScan(const PhysicalSeqScan &op, OpDescriptor &out)
 }
 
 static void
+EmitDelimScan(const PhysicalDelimScan &op, OpDescriptor &out)
+{
+	out.kind = OpKind::DELIM_SCAN;
+	out.n_children = 0;
+	out.body.delim_scan.input_schema = op.input_schema_dp();
+	out.body.delim_scan.shared_payload = op.shared_payload_dp();
+}
+
+static void
 EmitHashAgg(const PhysicalHashAggregate &op, OpDescriptor &out, dsa_area *dsa)
 {
 	out.kind = op.type() == PhysicalOperatorType::PERFECT_HASH_AGGREGATE
@@ -258,6 +268,13 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				op.body.seq_scan.filter_bool_regs,
 				op.body.seq_scan.filter_string_const_bytes,
 				op.body.seq_scan.shared_payload,
+				const_cast<OpDescriptor *>(&op));
+
+		case OpKind::DELIM_SCAN:
+			return std::make_unique<PhysicalDelimScan>(
+				op.body.delim_scan.input_schema,
+				op.body.delim_scan.shared_payload,
+				nullptr,
 				const_cast<OpDescriptor *>(&op));
 
 		case OpKind::HASH_AGGREGATE:
@@ -418,6 +435,11 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 				static_cast<PhysicalSeqScan &>(*pipeline.source).AttachDescriptor(&ops[idx]);
 				idx++;
 				break;
+			case PhysicalOperatorType::DELIM_SCAN:
+				EmitDelimScan(static_cast<const PhysicalDelimScan &>(*pipeline.source), ops[idx]);
+				static_cast<PhysicalDelimScan &>(*pipeline.source).AttachDescriptor(&ops[idx]);
+				idx++;
+				break;
 			case PhysicalOperatorType::HASH_AGGREGATE:
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
 				EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*pipeline.source), ops[idx], dsa);
@@ -544,6 +566,13 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 					desc->body.seq_scan.shared_payload = payload_dp;
 			break;
 		}
+		case PhysicalOperatorType::DELIM_SCAN:
+		{
+			for (OpDescriptor *desc : static_cast<const PhysicalDelimScan *>(op)->descs())
+				if (desc != nullptr)
+					desc->body.delim_scan.shared_payload = payload_dp;
+			break;
+		}
 		case PhysicalOperatorType::HASH_AGGREGATE:
 		case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
 		{
@@ -625,6 +654,11 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 		{
 			OpDescriptor *desc = static_cast<const PhysicalSeqScan *>(op)->desc();
 			return desc != nullptr ? desc->body.seq_scan.shared_payload : InvalidDsaPointer;
+		}
+		case PhysicalOperatorType::DELIM_SCAN:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalDelimScan *>(op)->desc();
+			return desc != nullptr ? desc->body.delim_scan.shared_payload : InvalidDsaPointer;
 		}
 		case PhysicalOperatorType::HASH_AGGREGATE:
 		case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:

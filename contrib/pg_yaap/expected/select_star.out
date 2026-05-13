@@ -8,7 +8,7 @@ CREATE TABLE yaap_scan_t (
 );
 INSERT INTO yaap_scan_t VALUES (1, 'x'), (2, 'y');
 SELECT * FROM yaap_scan_t;
- a | b
+ a | b 
 ---+---
  1 | x
  2 | y

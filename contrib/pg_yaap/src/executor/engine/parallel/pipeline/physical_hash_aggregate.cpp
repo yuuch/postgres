@@ -443,11 +443,17 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 	state->layout = ResolveLayout(ctx.dsa, state->layout_dp);
 	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp_) ? shared_payload_dp_ : SharedPayloadDpFromDescriptor();
 	state->max_groups = MaxGroupsFromDescriptor();
+	state->payload = ResolvePayload(ctx.dsa, state->shared_payload_dp);
 
 	if (state->layout == nullptr)
 		elog(ERROR, "pg_yaap: hash aggregate missing TupleDataLayout");
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	const bool needs_init =
+		state->payload == nullptr ||
+		!DsaPointerIsValid(state->payload->partitions_dp) ||
+		state->payload->partition_count == 0;
+
+	if (ctx.worker_index == LEADER_WORKER_INDEX && needs_init)
 	{
 		const uint32_t perfect_capacity = PerfectHashCapacityFromDescriptor();
 		const bool use_perfect_hash = perfect_capacity > 0 &&
@@ -457,7 +463,8 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			HashAggChoosePartitionCount(workers, state->layout->row_width);
 		const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
 
-		state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(HashAggSharedPayload));
+		if (!DsaPointerIsValid(state->shared_payload_dp))
+			state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(HashAggSharedPayload));
 		state->payload = ResolvePayload(ctx.dsa, state->shared_payload_dp);
 		state->payload->partition_count = state->partition_count;
 		state->payload->partition_mask = state->partition_count - 1u;

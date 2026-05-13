@@ -14,13 +14,9 @@ void JoinOrderQueryGraphManager::Build(const std::vector<JoinOrderJoinCondition>
 		if (__builtin_popcountll(condition_mask) < 2) {
 			continue;
 		}
-		uint64_t left = 0;
-		uint64_t right = 0;
-		bool derived_sides = TryExtractJoinSides(condition.expression.get(), left, right);
-		if (derived_sides) {
-			left &= subset_mask_;
-			right &= subset_mask_;
-		}
+		uint64_t left = condition.left_relation_mask & subset_mask_;
+		uint64_t right = condition.right_relation_mask & subset_mask_;
+		bool derived_sides = left != 0 && right != 0 && (left & right) == 0;
 
 		auto emit_filter = [&](uint64_t left_mask, uint64_t right_mask, bool residual, bool create_edge) {
 			if (left_mask == 0 || right_mask == 0 || (left_mask & right_mask) != 0) {
@@ -32,7 +28,10 @@ void JoinOrderQueryGraphManager::Build(const std::vector<JoinOrderJoinCondition>
 				condition, left_set, right_set, filter_index++, condition.join_type);
 			filter_info->invert_result = condition.invert_result;
 			filter_info->from_residual_predicate = residual;
-			CollectColumnBindingsByMask(condition.expression.get(), left_mask, right_mask, *filter_info);
+			CollectColumnBindingsByMask(condition.expression.get(),
+                                        condition.left_table_mask,
+                                        condition.right_table_mask,
+                                        *filter_info);
 			auto* filter_ptr = filter_info.get();
 			filter_infos_.push_back(std::move(filter_info));
 			if (create_edge) {

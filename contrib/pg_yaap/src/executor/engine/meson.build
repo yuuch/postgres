@@ -15,6 +15,7 @@ pg_yaap_sources += files(
   'parallel/pipeline/runtime_dsm.cpp',
   'parallel/pipeline/task_scheduler.cpp',
   'parallel/pipeline/physical_seq_scan.cpp',
+  'parallel/pipeline/physical_delim_scan.cpp',
   'parallel/pipeline/columnar_filter.cpp',
   'parallel/pipeline/physical_projection.cpp',
   'parallel/pipeline/physical_hash_aggregate.cpp',

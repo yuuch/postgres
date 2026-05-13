@@ -27,6 +27,7 @@ namespace pipeline {
 
 enum class PhysicalOperatorType : uint8_t {
 	SEQ_SCAN,
+	DELIM_SCAN,
 	HASH_AGGREGATE,
 	PERFECT_HASH_AGGREGATE,
 	HASH_JOIN,
@@ -50,6 +51,7 @@ public:
 
 	virtual bool IsSource() const { return false; }
 	virtual bool IsSink() const { return false; }
+	virtual bool ParallelSource() const { return false; }
 
 	/* Pipeline-breakers split MetaPipeline construction. HashAggregate / Order = true. */
 	virtual bool IsPipelineBreaker() const { return IsSink(); }

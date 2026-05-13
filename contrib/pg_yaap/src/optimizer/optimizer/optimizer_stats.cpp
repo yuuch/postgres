@@ -4,6 +4,7 @@ extern "C" {
 #include "access/relation.h"
 #include "catalog/pg_statistic.h"
 #include "fmgr.h"
+#include "optimizer/plancat.h"
 #include "utils/rel.h"
 #include "utils/array.h"
 #include "utils/datum.h"
@@ -32,6 +33,12 @@ struct ExtractedStatsSlot {
     std::vector<double> numbers;
 };
 
+struct ColumnFilterConstraint {
+    BoundConstantExpression* constant = nullptr;
+    std::string op_name;
+    Expression* expression = nullptr;
+};
+
 size_t ClampCardinality(double value, size_t upper_bound) {
     if (value <= 0.0) {
         return 0;
@@ -54,6 +61,21 @@ size_t DistinctFromPG(double stadistinct, size_t cardinality) {
         return ClampCardinality(std::abs(stadistinct) * static_cast<double>(cardinality), cardinality);
     }
     return cardinality;
+}
+
+size_t EstimateBaseRelationCardinality(Relation rel, size_t fallback) {
+    if (rel == nullptr) {
+        return fallback;
+    }
+
+    BlockNumber pages = 0;
+    double reltuples = 0;
+    double allvisfrac = 0;
+    estimate_rel_size(rel, nullptr, &pages, &reltuples, &allvisfrac);
+    if (reltuples <= 0) {
+        return fallback;
+    }
+    return std::max<size_t>(1, static_cast<size_t>(std::ceil(reltuples)));
 }
 
 void MergeColumnStats(RelationStats& target, const RelationStats& source) {
@@ -156,6 +178,34 @@ bool CompareDatums(Datum left, Datum right, Oid opno, Oid collation) {
 
 bool DatumEquals(Datum left, Datum right, bool typbyval, int16 typlen) {
     return datumIsEqual(left, right, typbyval, typlen);
+}
+
+bool DatumSatisfiesComparison(Datum value,
+                              Datum constant,
+                              const std::string& op_name,
+                              const ColumnStats& column) {
+    bool equal = DatumEquals(value, constant, column.type_by_val, column.type_len);
+    if (op_name == "=") {
+        return equal;
+    }
+    if (!OidIsValid(column.sort_op)) {
+        return false;
+    }
+    bool value_lt_const = CompareDatums(value, constant, column.sort_op, column.collation_oid);
+    bool const_lt_value = CompareDatums(constant, value, column.sort_op, column.collation_oid);
+    if (op_name == "<") {
+        return value_lt_const;
+    }
+    if (op_name == "<=") {
+        return value_lt_const || equal;
+    }
+    if (op_name == ">") {
+        return const_lt_value;
+    }
+    if (op_name == ">=") {
+        return const_lt_value || equal;
+    }
+    return false;
 }
 
 std::string DistinctExpressionKey(Expression* expression) {
@@ -374,6 +424,100 @@ double EstimateColumnComparisonSelectivity(const ColumnStats& column,
     return -1.0;
 }
 
+double EstimateCombinedColumnSelectivity(const ColumnStats& column,
+                                         const std::vector<ColumnFilterConstraint>& constraints) {
+    if (constraints.empty()) {
+        return -1.0;
+    }
+
+    Datum equality_value = 0;
+    BoundConstantExpression* equality_constant = nullptr;
+    for (const auto& constraint : constraints) {
+        if (constraint.op_name != "=") {
+            continue;
+        }
+        Datum value = 0;
+        if (!ConvertConstantToDatum(constraint.constant, column.type_oid, value)) {
+            return -1.0;
+        }
+        if (equality_constant != nullptr &&
+            !DatumEquals(value, equality_value, column.type_by_val, column.type_len)) {
+            return 0.0;
+        }
+        equality_constant = constraint.constant;
+        equality_value = value;
+    }
+
+    if (equality_constant != nullptr) {
+        for (const auto& constraint : constraints) {
+            if (!DatumSatisfiesComparison(equality_value, equality_value, constraint.op_name, column) &&
+                constraint.op_name == "=") {
+                return 0.0;
+            }
+            if (constraint.op_name != "=" &&
+                !DatumSatisfiesComparison(equality_value,
+                                          [&]() {
+                                              Datum value = 0;
+                                              ConvertConstantToDatum(constraint.constant, column.type_oid, value);
+                                              return value;
+                                          }(),
+                                          constraint.op_name,
+                                          column)) {
+                return 0.0;
+            }
+        }
+        return EstimateEqualitySelectivity(column, equality_constant);
+    }
+
+    if (column.histogram_bounds.empty() || !OidIsValid(column.sort_op)) {
+        return -1.0;
+    }
+
+    std::vector<Datum> constraint_values;
+    constraint_values.reserve(constraints.size());
+    for (const auto& constraint : constraints) {
+        Datum value = 0;
+        if (!ConvertConstantToDatum(constraint.constant, column.type_oid, value)) {
+            return -1.0;
+        }
+        constraint_values.push_back(value);
+    }
+
+    double histogram_fraction = 0.0;
+    for (const auto& bound : column.histogram_bounds) {
+        bool satisfies_all = true;
+        for (size_t i = 0; i < constraints.size(); ++i) {
+            if (!DatumSatisfiesComparison(bound, constraint_values[i], constraints[i].op_name, column)) {
+                satisfies_all = false;
+                break;
+            }
+        }
+        if (satisfies_all) {
+            histogram_fraction += 1.0;
+        }
+    }
+    histogram_fraction /= static_cast<double>(column.histogram_bounds.size());
+
+    double non_null = std::max(0.0, 1.0 - column.null_fraction);
+    double non_mcv = std::max(0.0, non_null - column.mcv_total_frequency);
+
+    double mcv_fraction = 0.0;
+    for (size_t i = 0; i < column.mcv_values.size() && i < column.mcv_frequencies.size(); ++i) {
+        bool satisfies_all = true;
+        for (size_t j = 0; j < constraints.size(); ++j) {
+            if (!DatumSatisfiesComparison(column.mcv_values[i], constraint_values[j], constraints[j].op_name, column)) {
+                satisfies_all = false;
+                break;
+            }
+        }
+        if (satisfies_all) {
+            mcv_fraction += column.mcv_frequencies[i];
+        }
+    }
+
+    return std::clamp(mcv_fraction + histogram_fraction * non_mcv, 0.0, 1.0);
+}
+
 } // namespace
 
 ColumnBindingKey MakeColumnBindingKey(ColumnBinding binding) {
@@ -411,18 +555,21 @@ RelationStats RelationStatisticsHelper::Extract(LogicalOperator& op) const {
 
 RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet& get) const {
     RelationStats stats;
-    stats.cardinality = get.estimated_cardinality;
     stats.stats_initialized = true;
     stats.table_name = get.table_name;
 
     if (get.relid == 0) {
+        stats.cardinality = get.estimated_cardinality;
         return stats;
     }
 
     Relation rel = RelationIdGetRelation(static_cast<Oid>(get.relid));
     if (rel == nullptr) {
+        stats.cardinality = get.estimated_cardinality;
         return stats;
     }
+    const size_t base_cardinality = EstimateBaseRelationCardinality(rel, get.estimated_cardinality);
+    stats.cardinality = base_cardinality;
 
     TupleDesc tupdesc = RelationGetDescr(rel);
     for (int attno = 1; attno <= tupdesc->natts; ++attno) {
@@ -458,7 +605,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet& get) const {
         if (HeapTupleIsValid(tuple)) {
             auto* pg_stats = reinterpret_cast<Form_pg_statistic>(GETSTRUCT(tuple));
             column.has_catalog_stats = true;
-            column.distinct.distinct_count = DistinctFromPG(pg_stats->stadistinct, stats.cardinality);
+            column.distinct.distinct_count = DistinctFromPG(pg_stats->stadistinct, base_cardinality);
             column.null_fraction = pg_stats->stanullfrac;
 
             ExtractedStatsSlot mcv_slot;
@@ -475,7 +622,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet& get) const {
             }
             ReleaseSysCache(tuple);
         } else {
-            column.distinct.distinct_count = std::max<size_t>(1, stats.cardinality == 0 ? 1 : stats.cardinality);
+            column.distinct.distinct_count = std::max<size_t>(1, base_cardinality == 0 ? 1 : base_cardinality);
         }
 
         stats.column_distinct_count.push_back(column.distinct);
@@ -486,7 +633,9 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet& get) const {
     RelationClose(rel);
 
     if (!get.filters.empty()) {
-        stats.cardinality = EstimateFilterCardinality(stats, get.filters);
+        stats.cardinality = ClampCardinality(
+            static_cast<double>(base_cardinality) * DEFAULT_SELECTIVITY,
+            base_cardinality);
     }
 
     return stats;
@@ -664,14 +813,80 @@ RelationStats RelationStatisticsHelper::ExtractJoinStats(LogicalOperator& op) co
 
     auto left_stats = Extract(*op.children[0]);
     auto right_stats = Extract(*op.children[1]);
-    return CombineReorderableStats(left_stats, right_stats, op.estimated_cardinality);
+    stats = CombineReorderableStats(left_stats, right_stats, op.estimated_cardinality);
+
+    if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+        op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+        op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+        auto& join = static_cast<LogicalComparisonJoin&>(op);
+        for (const auto& condition : join.conditions) {
+            ColumnBinding left_binding;
+            ColumnBinding right_binding;
+            if (!TryExtractEqualityColumns(condition.get(), left_binding, right_binding)) {
+                continue;
+            }
+
+            auto left_column = LookupColumnStats(stats, left_binding);
+            auto right_column = LookupColumnStats(stats, right_binding);
+            if (!left_column.has_stats || !right_column.has_stats ||
+                left_column.distinct.distinct_count == 0 || right_column.distinct.distinct_count == 0) {
+                continue;
+            }
+
+            auto unified_distinct = std::max<size_t>(
+                1,
+                std::min({left_column.distinct.distinct_count,
+                          right_column.distinct.distinct_count,
+                          std::max<size_t>(1, stats.cardinality)}));
+            left_column.distinct.distinct_count = unified_distinct;
+            right_column.distinct.distinct_count = unified_distinct;
+            stats.column_stats[MakeColumnBindingKey(left_binding)] = left_column;
+            stats.column_stats[MakeColumnBindingKey(right_binding)] = right_column;
+        }
+    }
+
+    return stats;
 }
 
 size_t RelationStatisticsHelper::EstimateFilterCardinality(
     const RelationStats& input_stats,
     const std::vector<std::unique_ptr<Expression>>& filters) const {
     size_t cardinality = input_stats.cardinality;
+    std::map<ColumnBindingKey, std::vector<ColumnFilterConstraint>> grouped_constraints;
     for (const auto& filter : filters) {
+        ColumnBinding binding;
+        BoundConstantExpression* constant = nullptr;
+        std::string op_name;
+        if (TryExtractColumnConstantComparison(filter.get(), binding, constant, op_name) &&
+            constant != nullptr && !constant->is_null) {
+            grouped_constraints[MakeColumnBindingKey(binding)].push_back({constant, op_name, filter.get()});
+        }
+    }
+
+    std::set<Expression*> handled_filters;
+    for (const auto& entry : grouped_constraints) {
+        if (entry.second.size() < 2) {
+            continue;
+        }
+        ColumnBinding binding{TableIndex{entry.first.table_index}, ProjectionIndex{entry.first.column_index}};
+        auto column_stats = LookupColumnStats(input_stats, binding);
+        if (!column_stats.has_stats) {
+            continue;
+        }
+        double selectivity = EstimateCombinedColumnSelectivity(column_stats, entry.second);
+        if (selectivity < 0.0) {
+            continue;
+        }
+        cardinality = ClampCardinality(static_cast<double>(cardinality) * selectivity, input_stats.cardinality);
+        for (const auto& constraint : entry.second) {
+            handled_filters.insert(constraint.expression);
+        }
+    }
+
+    for (const auto& filter : filters) {
+        if (handled_filters.find(filter.get()) != handled_filters.end()) {
+            continue;
+        }
         cardinality = EstimateSingleFilter(cardinality, input_stats, filter.get());
     }
     return cardinality;

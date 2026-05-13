@@ -805,7 +805,7 @@ int
 PhysicalHashJoin::MaxThreads(ExecCtx &ctx) const
 {
 	(void) ctx;
-	return std::max(1, pg_yaap_parallel_max_workers);
+	return 1;
 }
 
 void

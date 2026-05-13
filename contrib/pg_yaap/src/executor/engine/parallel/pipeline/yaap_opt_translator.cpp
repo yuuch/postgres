@@ -31,6 +31,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 #include "adapter/yaap_adapter.hpp"
 #include "optimizer_registry.hpp"
 #include "parallel/pipeline/output_sink.hpp"
+#include "parallel/pipeline/physical_delim_scan.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
@@ -62,7 +63,7 @@ using yaap::BoundFunctionExpression;
 using yaap::Expression;
 using yaap::ExpressionType;
 using yaap::PhysicalCrossProduct;
-using yaap::PhysicalDelimGet;
+using yaap::PhysicalDelimScan;
 using yaap::PhysicalDistinct;
 using yaap::PhysicalFilter;
 using yaap::PhysicalHashAggregate;
@@ -91,6 +92,7 @@ using OutputSink = pg_yaap::pipeline::OutputSink;
 template <typename T>
 using PgVector = pg_yaap::PgVector<T>;
 using PipelineOperator = pg_yaap::pipeline::PhysicalOperator;
+using PipelineDelimScan = pg_yaap::pipeline::PhysicalDelimScan;
 using PipelineHashAggregate = pg_yaap::pipeline::PhysicalHashAggregate;
 using PipelineHashJoin = pg_yaap::pipeline::PhysicalHashJoin;
 using PipelinePerfectHashAggregate = pg_yaap::pipeline::PhysicalPerfectHashAggregate;
@@ -167,6 +169,8 @@ static bool TranslateOptimizerNode(const PhysicalOperator &op,
 								   PgYaapQueryState *state,
 								   const std::vector<Expression *> &pending_filters,
 								   const std::vector<ColumnRef> *required_output_cols,
+								   const PhysicalOperator *delim_outer_child,
+								   const std::vector<yaap::ColumnBinding> *delim_outer_bindings,
 								   OptimizerNodeTranslation &out);
 
 static std::string
@@ -299,6 +303,16 @@ AnalyzeHashAggregateNode(const PhysicalHashAggregate &agg, SupportContext &ctx)
 }
 
 static OptimizerPlanSupportStatus
+AnalyzeDelimScanNode(const PhysicalDelimScan &scan, SupportContext &ctx)
+{
+	if (!scan.children.empty())
+		return MakeSupportError(ctx, "DELIM_SCAN should not have children");
+	if (scan.correlated_columns.empty())
+		return MakeSupportError(ctx, "DELIM_SCAN missing correlated columns");
+	return {true, {}};
+}
+
+static OptimizerPlanSupportStatus
 AnalyzeOrderByNode(const PhysicalOrderBy &order, SupportContext &ctx)
 {
 	for (Expression *expr : order.orders)
@@ -328,6 +342,8 @@ AnalyzeOptimizerPlanNode(const PhysicalOperator &op, SupportContext &ctx)
 			return AnalyzeCrossProductNode(static_cast<const PhysicalCrossProduct &>(op), ctx);
 		case PhysicalOperatorType::HASH_GROUP_BY:
 			return AnalyzeHashAggregateNode(static_cast<const PhysicalHashAggregate &>(op), ctx);
+		case PhysicalOperatorType::DELIM_SCAN:
+			return AnalyzeDelimScanNode(static_cast<const PhysicalDelimScan &>(op), ctx);
 		case PhysicalOperatorType::ORDER_BY:
 			return AnalyzeOrderByNode(static_cast<const PhysicalOrderBy &>(op), ctx);
 		default:
@@ -381,7 +397,7 @@ OptimizerOpTypeName(const PhysicalOperator &op)
 		case PhysicalOperatorType::LIMIT: return "LIMIT";
 		case PhysicalOperatorType::WINDOW: return "WINDOW";
 		case PhysicalOperatorType::HASH_JOIN: return OptimizerJoinOpTypeName(static_cast<const PhysicalHashJoin &>(op));
-		case PhysicalOperatorType::DELIM_GET: return "DELIM_GET";
+		case PhysicalOperatorType::DELIM_SCAN: return "DELIM_SCAN";
 		case PhysicalOperatorType::CROSS_PRODUCT: return "CROSS_PRODUCT";
 		case PhysicalOperatorType::HASH_GROUP_BY:
 		{
@@ -685,11 +701,11 @@ OptimizerPlanNodeDetails(const PhysicalOperator &op)
 				details.push_back("swapped=true");
 			break;
 		}
-		case PhysicalOperatorType::DELIM_GET:
+		case PhysicalOperatorType::DELIM_SCAN:
 		{
-			const auto &delim_get = static_cast<const PhysicalDelimGet &>(op);
-			if (!delim_get.correlated_columns.empty())
-				details.push_back("corr=" + std::to_string(delim_get.correlated_columns.size()));
+			const auto &delim_scan = static_cast<const PhysicalDelimScan &>(op);
+			if (!delim_scan.correlated_columns.empty())
+				details.push_back("corr=" + std::to_string(delim_scan.correlated_columns.size()));
 			break;
 		}
 		case PhysicalOperatorType::CROSS_PRODUCT:
@@ -1117,6 +1133,46 @@ FilterRequestedColumns(const std::vector<ColumnRef> &available,
 }
 
 static bool
+InferSyntheticParentVarno(const std::vector<ColumnRef> *required,
+						  Index &out_varno)
+{
+	if (required == nullptr || required->empty())
+		return false;
+
+	const Index varno = required->front().varno;
+	if (varno == 0)
+		return false;
+
+	for (const ColumnRef &ref : *required)
+	{
+		if (ref.varno != varno)
+			return false;
+	}
+
+	out_varno = varno;
+	return true;
+}
+
+static std::vector<ColumnRef>
+BuildParentFacingOutputCols(const std::vector<ColumnRef> &selected_raw_output_cols,
+							const std::vector<ColumnRef> *required_output_cols)
+{
+	Index synthetic_varno = 0;
+	if (!InferSyntheticParentVarno(required_output_cols, synthetic_varno))
+		return selected_raw_output_cols;
+
+	std::vector<ColumnRef> out_cols;
+	out_cols.reserve(selected_raw_output_cols.size());
+	for (size_t i = 0; i < selected_raw_output_cols.size(); ++i)
+	{
+		out_cols.push_back(ColumnRef{
+			synthetic_varno,
+			static_cast<AttrNumber>(i + 1)});
+	}
+	return out_cols;
+}
+
+static bool
 LookupBindingColumn(const yaap::ColumnBinding &binding,
 					const std::vector<ColumnRef> &cols,
 					const std::vector<ColumnSchema> &schema,
@@ -1125,6 +1181,44 @@ LookupBindingColumn(const yaap::ColumnBinding &binding,
 {
 	out_ref = BindingToColumnRef(binding);
 	return LookupRawColumn(out_ref, cols, schema, out_col);
+}
+
+static bool
+LookupExprInputColumn(const yaap::ColumnBinding &binding,
+					  const std::vector<ColumnRef> &cols,
+					  const std::vector<ColumnSchema> &schema,
+					  ColumnRef &out_ref,
+					  const ColumnSchema *&out_col)
+{
+	if (LookupBindingColumn(binding, cols, schema, out_ref, out_col))
+		return true;
+	if (cols.size() != schema.size())
+		return false;
+	if (binding.column_index.index >= schema.size())
+		return false;
+
+	out_ref = cols[binding.column_index.index];
+	out_col = &schema[binding.column_index.index];
+	return true;
+}
+
+static bool
+LookupPassthroughColumn(const ColumnRef &ref,
+						const std::vector<ColumnRef> &cols,
+						const std::vector<ColumnSchema> &schema,
+						const ColumnSchema *&out_col)
+{
+	if (LookupRawColumn(ref, cols, schema, out_col))
+		return true;
+	if (cols.size() != schema.size())
+		return false;
+	if (ref.attno <= 0)
+		return false;
+	const size_t ordinal = static_cast<size_t>(ref.attno - 1);
+	if (ordinal >= schema.size())
+		return false;
+	out_col = &schema[ordinal];
+	return true;
 }
 
 static bool
@@ -2669,7 +2763,7 @@ LowerOptimizerExpr(const Expression *expr,
 		ColumnRef ref{};
 		const ColumnSchema *col = nullptr;
 		const auto *bound = static_cast<const BoundColumnRefExpression *>(expr);
-		if (!LookupBindingColumn(bound->binding, cols, schema, ref, col) || col == nullptr || !ColumnNumericScale(*col, out_scale))
+		if (!LookupExprInputColumn(bound->binding, cols, schema, ref, col) || col == nullptr || !ColumnNumericScale(*col, out_scale))
 			return false;
 		out_slot = col->chunk_slot;
 		return true;
@@ -2698,7 +2792,7 @@ InferProjectionExprSchema(const Expression *expr,
 	{
 		ColumnRef ref{};
 		const ColumnSchema *col = nullptr;
-		if (!LookupBindingColumn(static_cast<const BoundColumnRefExpression *>(expr)->binding, cols, schema, ref, col) || col == nullptr)
+		if (!LookupExprInputColumn(static_cast<const BoundColumnRefExpression *>(expr)->binding, cols, schema, ref, col) || col == nullptr)
 			return false;
 		out_type_oid = col->type_oid;
 		out_typmod = col->typmod;
@@ -2798,7 +2892,7 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 	const ColumnSchema *bare_col = nullptr;
 	bool is_bare_ref = false;
 	if (arg != nullptr && arg->type == ExpressionType::BOUND_COLUMN_REF)
-		is_bare_ref = LookupBindingColumn(static_cast<const BoundColumnRefExpression *>(arg)->binding, cols, schema, bare_ref, bare_col);
+		is_bare_ref = LookupExprInputColumn(static_cast<const BoundColumnRefExpression *>(arg)->binding, cols, schema, bare_ref, bare_col);
 
 	if (pg_strcasecmp(agg->function_name.c_str(), "sum") == 0)
 	{
@@ -2832,6 +2926,29 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 	}
 	else if (pg_strcasecmp(agg->function_name.c_str(), "avg") == 0)
 		out_kind = TdcAggKind::AVG_NUMERIC;
+	else if (pg_strcasecmp(agg->function_name.c_str(), "min") == 0)
+	{
+		if (is_bare_ref && bare_col != nullptr &&
+			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 || bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
+		{
+			if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
+			{
+				if (next_int64_slot >= 16)
+					return false;
+				const uint16_t first = static_cast<uint16_t>(project_steps.size());
+				const uint8_t cast_slot = next_int64_slot++;
+				project_steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, bare_col->chunk_slot, 0, cast_slot, 0});
+				project_exprs.push_back(ProjectExprDesc{first, 1, cast_slot, 0, 0});
+				materialized_exprs.push_back(MaterializedOptExpr{arg, 0, cast_slot});
+				out_desc.input_col_idx = cast_slot;
+			}
+			else
+				out_desc.input_col_idx = bare_col->chunk_slot;
+			out_kind = TdcAggKind::MIN_INT64;
+			return true;
+		}
+		out_kind = TdcAggKind::MIN_NUMERIC;
+	}
 	else
 		return false;
 
@@ -2910,12 +3027,12 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 		if (!LookupBindingColumn(col_expr->binding, input_cols, input_schema, ref, src) || src == nullptr)
 			return false;
 		ColumnSchema cs = *src;
-		cs.chunk_slot = src->chunk_slot;
+		cs.chunk_slot = static_cast<uint8_t>(i);
 		cs.src_attno = 0;
 		out_schema.push_back(cs);
-		out_cols.push_back(ColumnRef{
-			static_cast<Index>(agg.group_index.index + 1),
-			static_cast<AttrNumber>(i + 1)});
+		out_cols.push_back(BindingToColumnRef(yaap::ColumnBinding{
+			agg.group_index,
+			yaap::ProjectionIndex{i}}));
 	}
 
 	for (size_t i = 0; i < agg_state.agg_kinds.size(); ++i)
@@ -2928,6 +3045,7 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 		{
 			case TdcAggKind::COUNT_STAR:
 			case TdcAggKind::SUM_INT64:
+			case TdcAggKind::MIN_INT64:
 				cs.type_oid = INT8OID;
 				cs.typmod = -1;
 				cs.typlen = 8;
@@ -2936,6 +3054,7 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 				break;
 			case TdcAggKind::SUM_NUMERIC:
 			case TdcAggKind::AVG_NUMERIC:
+			case TdcAggKind::MIN_NUMERIC:
 				cs.type_oid = NUMERICOID;
 				cs.typmod = MakeNumericTypmod(18, agg_state.agg_numeric_scales[i]);
 				cs.typlen = -1;
@@ -3010,6 +3129,21 @@ CollectJoinKeys(const Expression *expr,
 	const bool rhs_right = LookupBindingColumn(rhs->binding, right_cols, right_schema, rhs_ref, rhs_schema);
 	if (lhs_schema == nullptr || rhs_schema == nullptr || lhs_schema->decode_kind != rhs_schema->decode_kind)
 	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG,
+				 "pg_yaap: collect join keys schema mismatch lhs=(%zu,%zu left=%d right=%d) rhs=(%zu,%zu left=%d right=%d) lhs_schema=%p rhs_schema=%p lhs_decode=%d rhs_decode=%d",
+				 lhs->binding.table_index.index,
+				 lhs->binding.column_index.index,
+				 lhs_left ? 1 : 0,
+				 lhs_right ? 1 : 0,
+				 rhs->binding.table_index.index,
+				 rhs->binding.column_index.index,
+				 rhs_left ? 1 : 0,
+				 rhs_right ? 1 : 0,
+				 lhs_schema,
+				 rhs_schema,
+				 lhs_schema != nullptr ? static_cast<int>(lhs_schema->decode_kind) : -1,
+				 rhs_schema != nullptr ? static_cast<int>(rhs_schema->decode_kind) : -1);
 		residuals.push_back(const_cast<Expression *>(expr));
 		return true;
 	}
@@ -3025,6 +3159,17 @@ CollectJoinKeys(const Expression *expr,
 		right_keys.push_back(lhs_ref);
 		return true;
 	}
+	if (pg_yaap_trace_hooks)
+		elog(LOG,
+			 "pg_yaap: collect join keys side miss lhs=(%zu,%zu left=%d right=%d) rhs=(%zu,%zu left=%d right=%d)",
+			 lhs->binding.table_index.index,
+			 lhs->binding.column_index.index,
+			 lhs_left ? 1 : 0,
+			 lhs_right ? 1 : 0,
+			 rhs->binding.table_index.index,
+			 rhs->binding.column_index.index,
+			 rhs_left ? 1 : 0,
+			 rhs_right ? 1 : 0);
 	residuals.push_back(const_cast<Expression *>(expr));
 	return true;
 }
@@ -3079,7 +3224,7 @@ TryBuildPureProjection(const PhysicalProjection &projection,
 			return false;
 		ColumnRef ref{};
 		const ColumnSchema *col = nullptr;
-		if (!LookupBindingColumn(col_expr->binding, child.cols, child.schema, ref, col) || col == nullptr)
+		if (!LookupExprInputColumn(col_expr->binding, child.cols, child.schema, ref, col) || col == nullptr)
 			return false;
 		new_cols.push_back(ColumnRef{
 			static_cast<Index>(projection.table_index.index + 1),
@@ -3099,6 +3244,9 @@ static bool
 TranslateProjectionNode(const PhysicalProjection &projection,
 						QueryDesc *queryDesc,
 						PgYaapQueryState *state,
+						const std::vector<ColumnRef> *required_output_cols,
+						const PhysicalOperator *delim_outer_child,
+						const std::vector<yaap::ColumnBinding> *delim_outer_bindings,
 						OptimizerNodeTranslation &out)
 {
 	if (projection.children.size() != 1 || projection.children[0] == nullptr)
@@ -3109,15 +3257,51 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	}
 	OptimizerNodeTranslation child;
 	std::vector<ColumnRef> child_required;
+	if (required_output_cols != nullptr)
+		child_required = *required_output_cols;
 	for (Expression *expr : projection.select_list)
 		CollectReferencedColumns(expr, child_required);
-	if (!TranslateOptimizerNode(*projection.children[0], queryDesc, state, {}, &child_required, child) || child.op == nullptr)
+	if (!TranslateOptimizerNode(*projection.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer projection rejected: child translation failed");
 		return false;
 	}
-	if (TryBuildPureProjection(projection, child, out))
+	if (pg_yaap_trace_hooks)
+	{
+		elog(LOG,
+			 "pg_yaap: projection table_index=%zu select_count=%zu child_cols=%zu child_schema=%zu",
+			 projection.table_index.index,
+			 projection.select_list.size(),
+			 child.cols.size(),
+			 child.schema.size());
+		for (size_t i = 0; i < projection.select_list.size(); ++i)
+		{
+			if (projection.select_list[i] != nullptr &&
+				projection.select_list[i]->type == ExpressionType::BOUND_COLUMN_REF)
+			{
+				const auto *col_expr =
+					static_cast<const BoundColumnRefExpression *>(projection.select_list[i]);
+				elog(LOG,
+					 "pg_yaap: projection select[%zu] binding=(%zu,%zu)",
+					 i,
+					 col_expr->binding.table_index.index,
+					 col_expr->binding.column_index.index);
+			}
+		}
+	}
+	std::vector<ColumnRef> hidden_passthrough;
+	if (required_output_cols != nullptr)
+	{
+		for (const ColumnRef &ref : *required_output_cols)
+		{
+			const ColumnSchema *col = nullptr;
+			if (LookupPassthroughColumn(ref, child.cols, child.schema, col) && col != nullptr)
+				AppendUniqueColumnRef(ref, hidden_passthrough);
+		}
+	}
+
+	if (hidden_passthrough.empty() && TryBuildPureProjection(projection, child, out))
 		return true;
 
 	std::vector<ProjectStep> steps;
@@ -3136,6 +3320,21 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		{
 			if (pg_yaap_trace_hooks)
 			{
+				if (expr->type == ExpressionType::BOUND_COLUMN_REF)
+				{
+					const auto *col_expr = static_cast<const BoundColumnRefExpression *>(expr);
+					elog(LOG,
+						 "pg_yaap: optimizer projection missing bound col=(%zu,%zu) child_cols=%zu",
+						 col_expr->binding.table_index.index,
+						 col_expr->binding.column_index.index,
+						 child.cols.size());
+					for (size_t j = 0; j < child.cols.size(); ++j)
+						elog(LOG,
+							 "pg_yaap: optimizer projection child_col[%zu]=(%u,%d)",
+							 j,
+							 child.cols[j].varno,
+							 child.cols[j].attno);
+				}
 				if (expr->type == ExpressionType::BOUND_FUNCTION)
 					elog(LOG, "pg_yaap: optimizer projection rejected: expr lowering failed fn=%s",
 						 static_cast<const BoundFunctionExpression *>(expr)->function_name.c_str());
@@ -3162,6 +3361,20 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 			static_cast<uint16_t>(steps.size() - first_step_idx),
 			result_slot,
 			result_scale,
+			0});
+	}
+
+	for (const ColumnRef &ref : hidden_passthrough)
+	{
+		const ColumnSchema *col = nullptr;
+		if (!LookupPassthroughColumn(ref, child.cols, child.schema, col) || col == nullptr)
+			return false;
+		out_schema.push_back(*col);
+		expr_descs.push_back(ProjectExprDesc{
+			static_cast<uint16_t>(steps.size()),
+			0,
+			col->chunk_slot,
+			0,
 			0});
 	}
 
@@ -3198,6 +3411,23 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		out.cols.push_back(ColumnRef{
 			static_cast<Index>(projection.table_index.index + 1),
 			static_cast<AttrNumber>(i + 1)});
+	for (const ColumnRef &ref : hidden_passthrough)
+		out.cols.push_back(ref);
+	if (pg_yaap_trace_hooks)
+	{
+		elog(LOG,
+			 "pg_yaap: projection output table_index=%zu out_cols=%zu out_schema=%zu hidden_passthrough=%zu",
+			 projection.table_index.index,
+			 out.cols.size(),
+			 out.schema.size(),
+			 hidden_passthrough.size());
+		for (size_t i = 0; i < out.cols.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: projection out_col[%zu]=(%u,%d)",
+				 i,
+				 out.cols[i].varno,
+				 out.cols[i].attno);
+	}
 	out.final_sort_keys = std::move(child.final_sort_keys);
 	out.limit_count = child.limit_count;
 	out.estimated_groups = child.estimated_groups;
@@ -3290,6 +3520,8 @@ static bool
 TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 						   QueryDesc *queryDesc,
 						   PgYaapQueryState *state,
+						   const PhysicalOperator *delim_outer_child,
+						   const std::vector<yaap::ColumnBinding> *delim_outer_bindings,
 						   OptimizerNodeTranslation &out)
 {
 	if (agg.children.size() != 1 || agg.children[0] == nullptr || state == nullptr || state->runtime_dsa == nullptr)
@@ -3304,7 +3536,7 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 		CollectReferencedColumns(group_expr, child_required);
 	for (Expression *agg_expr : agg.expressions)
 		CollectReferencedColumns(agg_expr, child_required);
-	if (!TranslateOptimizerNode(*agg.children[0], queryDesc, state, {}, &child_required, child) || child.op == nullptr)
+	if (!TranslateOptimizerNode(*agg.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer agg rejected: child translation failed");
@@ -3441,11 +3673,99 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 }
 
 static bool
+TranslateDelimScanNode(const PhysicalDelimScan &scan,
+					   QueryDesc *queryDesc,
+					   PgYaapQueryState *state,
+					   const std::vector<Expression *> &pending_filters,
+					   const PhysicalOperator *delim_outer_child,
+					   const std::vector<yaap::ColumnBinding> *delim_outer_bindings,
+					   OptimizerNodeTranslation &out)
+{
+	if (state == nullptr || state->runtime_dsa == nullptr || delim_outer_child == nullptr)
+		return false;
+	if (!pending_filters.empty() || !scan.children.empty() || scan.correlated_columns.empty())
+		return false;
+
+	std::vector<ColumnRef> required_cols;
+	required_cols.reserve(scan.correlated_columns.size());
+	const auto *outer_bindings =
+		(delim_outer_bindings != nullptr && delim_outer_bindings->size() == scan.correlated_columns.size())
+			? delim_outer_bindings
+			: &scan.correlated_columns;
+	for (const auto &binding : *outer_bindings)
+		AppendUniqueColumnRef(BindingToColumnRef(binding), required_cols);
+
+	OptimizerNodeTranslation producer_child;
+	if (!TranslateOptimizerNode(*delim_outer_child,
+			queryDesc,
+			state,
+			{},
+			&required_cols,
+			nullptr,
+			nullptr,
+			producer_child) ||
+		producer_child.op == nullptr)
+		return false;
+	if (producer_child.cols.empty() || producer_child.cols.size() != producer_child.schema.size())
+		return false;
+
+	TupleDataLayout group_layout{};
+	if (!BuildHashGroupLayout(producer_child.cols,
+			producer_child.cols,
+			producer_child.schema,
+			{},
+			{},
+			{},
+			group_layout))
+		return false;
+
+	const dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(producer_child.schema, state->runtime_dsa);
+	const dsa_pointer layout_dp = SerializeTupleDataLayout(group_layout, state->runtime_dsa);
+	const dsa_pointer shared_payload_dp = dsa_allocate0(state->runtime_dsa, sizeof(pipeline::HashAggSharedPayload));
+	if (!DsaPointerIsValid(input_schema_dp) ||
+		!DsaPointerIsValid(layout_dp) ||
+		!DsaPointerIsValid(shared_payload_dp))
+		return false;
+
+	PgVector<uint16_t> group_keys;
+	group_keys.reserve(producer_child.cols.size());
+	for (uint16_t i = 0; i < producer_child.cols.size(); ++i)
+		group_keys.push_back(i);
+
+	auto producer_sink = std::make_unique<PipelineHashAggregate>(
+		layout_dp,
+		std::move(group_keys),
+		PgVector<AggFuncDesc>{},
+		shared_payload_dp,
+		std::max<uint32_t>(static_cast<uint32_t>(producer_child.estimated_groups), 1024u));
+	producer_sink->AddChild(std::move(producer_child.op));
+
+	out.op = std::make_unique<PipelineDelimScan>(
+		input_schema_dp,
+		shared_payload_dp,
+		std::move(producer_sink));
+	out.cols.clear();
+	for (size_t i = 0; i < producer_child.cols.size(); ++i)
+	{
+		out.cols.push_back(ColumnRef{
+			static_cast<Index>(scan.table_index.index + 1),
+			static_cast<AttrNumber>(i + 1)});
+	}
+	out.schema = std::move(producer_child.schema);
+	out.final_sort_keys.clear();
+	out.limit_count = 0;
+	out.estimated_groups = 0;
+	return true;
+}
+
+static bool
 TranslateHashJoinNode(const PhysicalHashJoin &join,
 					  QueryDesc *queryDesc,
 					  PgYaapQueryState *state,
 					  const std::vector<Expression *> &pending_filters,
 					  const std::vector<ColumnRef> *required_output_cols,
+					  const PhysicalOperator *delim_outer_child,
+					  const std::vector<yaap::ColumnBinding> *delim_outer_bindings,
 					  OptimizerNodeTranslation &out)
 {
 	if (join.children.size() != 2 || join.children[0] == nullptr || join.children[1] == nullptr || state == nullptr || state->runtime_dsa == nullptr)
@@ -3454,7 +3774,8 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 			elog(LOG, "pg_yaap: optimizer hash join rejected: invalid children/state");
 		return false;
 	}
-	if (join.join_type != yaap::JOIN_INNER)
+	const bool scalar_delim_join = join.delim_join && join.join_type == yaap::JOIN_SINGLE;
+	if (join.join_type != yaap::JOIN_INNER && !scalar_delim_join)
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer hash join rejected: join_type=%d", join.join_type);
@@ -3470,8 +3791,15 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		CollectReferencedColumns(expr, child_required);
 	for (Expression *expr : pending_filters)
 		CollectReferencedColumns(expr, child_required);
-	if (!TranslateOptimizerNode(*join.children[0], queryDesc, state, {}, &child_required, left_child) ||
-		!TranslateOptimizerNode(*join.children[1], queryDesc, state, {}, &child_required, right_child) ||
+	if (!TranslateOptimizerNode(*join.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, left_child) ||
+		!TranslateOptimizerNode(*join.children[1],
+			queryDesc,
+			state,
+			{},
+			&child_required,
+			scalar_delim_join ? join.children[0].get() : delim_outer_child,
+			scalar_delim_join ? &join.correlated_columns : delim_outer_bindings,
+			right_child) ||
 		left_child.op == nullptr || right_child.op == nullptr)
 	{
 		if (pg_yaap_trace_hooks)
@@ -3494,11 +3822,45 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	if (left_keys.empty() || left_keys.size() != right_keys.size())
 	{
 		if (pg_yaap_trace_hooks)
+		{
+			for (size_t i = 0; i < left_child.cols.size(); ++i)
+				elog(LOG,
+					 "pg_yaap: optimizer hash join left_col[%zu]=(%u,%d)",
+					 i,
+					 left_child.cols[i].varno,
+					 left_child.cols[i].attno);
+			for (size_t i = 0; i < right_child.cols.size(); ++i)
+				elog(LOG,
+					 "pg_yaap: optimizer hash join right_col[%zu]=(%u,%d)",
+					 i,
+					 right_child.cols[i].varno,
+					 right_child.cols[i].attno);
+			for (size_t i = 0; i < join.conditions.size(); ++i)
+			{
+				const Expression *expr = join.conditions[i];
+				if (expr != nullptr && expr->type == ExpressionType::BOUND_FUNCTION)
+				{
+					const auto *func = static_cast<const BoundFunctionExpression *>(expr);
+					elog(LOG,
+						 "pg_yaap: optimizer hash join cond[%zu] fn=%s children=%zu",
+						 i,
+						 func->function_name.c_str(),
+						 func->children.size());
+				}
+				else
+				{
+					elog(LOG,
+						 "pg_yaap: optimizer hash join cond[%zu] type=%d",
+						 i,
+						 expr != nullptr ? static_cast<int>(expr->type) : -1);
+				}
+			}
 			elog(LOG,
 				 "pg_yaap: optimizer hash join rejected: no usable equi-join keys (left=%zu right=%zu residuals=%zu)",
 				 left_keys.size(),
 				 right_keys.size(),
 				 residuals.size());
+		}
 		return false;
 	}
 
@@ -3517,6 +3879,30 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 
 	std::vector<ColumnRef> raw_output_cols = probe_cols;
 	raw_output_cols.insert(raw_output_cols.end(), build_cols.begin(), build_cols.end());
+	if (pg_yaap_trace_hooks && scalar_delim_join)
+	{
+		elog(LOG,
+			 "pg_yaap: scalar delim join probe_cols=%zu build_cols=%zu raw_output_cols=%zu required_output_cols=%zu",
+			 probe_cols.size(),
+			 build_cols.size(),
+			 raw_output_cols.size(),
+			 required_output_cols != nullptr ? required_output_cols->size() : 0);
+		for (size_t i = 0; i < raw_output_cols.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: scalar delim join raw_output_col[%zu]=(%u,%d)",
+				 i,
+				 raw_output_cols[i].varno,
+				 raw_output_cols[i].attno);
+		if (required_output_cols != nullptr)
+		{
+			for (size_t i = 0; i < required_output_cols->size(); ++i)
+				elog(LOG,
+					 "pg_yaap: scalar delim join required_output_col[%zu]=(%u,%d)",
+					 i,
+					 (*required_output_cols)[i].varno,
+					 (*required_output_cols)[i].attno);
+		}
+	}
 	std::vector<ColumnRef> requested_output_cols;
 	FilterRequestedColumns(raw_output_cols, required_output_cols, requested_output_cols);
 	if (requested_output_cols.empty())
@@ -3573,7 +3959,18 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		!DsaPointerIsValid(right_payload_layout_dp) || !DsaPointerIsValid(output_columns_dp))
 	{
 		if (pg_yaap_trace_hooks)
-			elog(LOG, "pg_yaap: optimizer hash join rejected: DSA publish failed");
+			elog(LOG,
+				 "pg_yaap: optimizer hash join rejected: DSA publish failed left_schema=%d right_schema=%d output_schema=%d left_key=%d right_key=%d left_payload=%d right_payload=%d output_cols=%d output_mappings=%zu output_schema_cols=%zu",
+				 DsaPointerIsValid(left_schema_dp) ? 1 : 0,
+				 DsaPointerIsValid(right_schema_dp) ? 1 : 0,
+				 DsaPointerIsValid(output_schema_dp) ? 1 : 0,
+				 DsaPointerIsValid(left_key_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(right_key_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(left_payload_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(right_payload_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(output_columns_dp) ? 1 : 0,
+				 output_mappings.size(),
+				 output_schema.size());
 		return false;
 	}
 
@@ -3611,8 +4008,10 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		join_op->AddChild(std::move(right_child.op));
 	}
 
+	std::vector<ColumnRef> parent_facing_cols =
+		BuildParentFacingOutputCols(requested_output_cols, required_output_cols);
 	out.op = std::move(join_op);
-	out.cols = std::move(requested_output_cols);
+	out.cols = std::move(parent_facing_cols);
 	out.schema = std::move(output_schema);
 	out.final_sort_keys.clear();
 	out.limit_count = 0;
@@ -3622,11 +4021,13 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 
 static bool
 TranslateCrossProductNode(const PhysicalCrossProduct &join,
-						 QueryDesc *queryDesc,
-						 PgYaapQueryState *state,
-						 const std::vector<Expression *> &pending_filters,
-						 const std::vector<ColumnRef> *required_output_cols,
-						 OptimizerNodeTranslation &out)
+						  QueryDesc *queryDesc,
+						  PgYaapQueryState *state,
+						  const std::vector<Expression *> &pending_filters,
+						  const std::vector<ColumnRef> *required_output_cols,
+						  const PhysicalOperator *delim_outer_child,
+						  const std::vector<yaap::ColumnBinding> *delim_outer_bindings,
+						  OptimizerNodeTranslation &out)
 {
 	if (join.children.size() != 2 || join.children[0] == nullptr || join.children[1] == nullptr || state == nullptr || state->runtime_dsa == nullptr)
 	{
@@ -3648,8 +4049,8 @@ TranslateCrossProductNode(const PhysicalCrossProduct &join,
 		child_required = *required_output_cols;
 	for (Expression *expr : pending_filters)
 		CollectReferencedColumns(expr, child_required);
-	if (!TranslateOptimizerNode(*join.children[0], queryDesc, state, {}, &child_required, left_child) ||
-		!TranslateOptimizerNode(*join.children[1], queryDesc, state, {}, &child_required, right_child) ||
+	if (!TranslateOptimizerNode(*join.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, left_child) ||
+		!TranslateOptimizerNode(*join.children[1], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, right_child) ||
 		left_child.op == nullptr || right_child.op == nullptr)
 	{
 		if (pg_yaap_trace_hooks)
@@ -3751,7 +4152,18 @@ TranslateCrossProductNode(const PhysicalCrossProduct &join,
 		!DsaPointerIsValid(right_payload_layout_dp) || !DsaPointerIsValid(output_columns_dp))
 	{
 		if (pg_yaap_trace_hooks)
-			elog(LOG, "pg_yaap: optimizer cross product rejected: DSA publish failed");
+			elog(LOG,
+				 "pg_yaap: optimizer cross product rejected: DSA publish failed left_schema=%d right_schema=%d output_schema=%d left_key=%d right_key=%d left_payload=%d right_payload=%d output_cols=%d output_mappings=%zu output_schema_cols=%zu",
+				 DsaPointerIsValid(left_schema_dp) ? 1 : 0,
+				 DsaPointerIsValid(right_schema_dp) ? 1 : 0,
+				 DsaPointerIsValid(output_schema_dp) ? 1 : 0,
+				 DsaPointerIsValid(left_key_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(right_key_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(left_payload_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(right_payload_layout_dp) ? 1 : 0,
+				 DsaPointerIsValid(output_columns_dp) ? 1 : 0,
+				 output_mappings.size(),
+				 output_schema.size());
 		return false;
 	}
 
@@ -3789,8 +4201,10 @@ TranslateCrossProductNode(const PhysicalCrossProduct &join,
 		join_op->AddChild(std::move(right_child.op));
 	}
 
+	std::vector<ColumnRef> parent_facing_cols =
+		BuildParentFacingOutputCols(requested_output_cols, required_output_cols);
 	out.op = std::move(join_op);
-	out.cols = std::move(requested_output_cols);
+	out.cols = std::move(parent_facing_cols);
 	out.schema = std::move(output_schema);
 	out.final_sort_keys.clear();
 	out.limit_count = 0;
@@ -3857,6 +4271,8 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 					   PgYaapQueryState *state,
 					   const std::vector<Expression *> &pending_filters,
 					   const std::vector<ColumnRef> *required_output_cols,
+					   const PhysicalOperator *delim_outer_child,
+					   const std::vector<yaap::ColumnBinding> *delim_outer_bindings,
 					   OptimizerNodeTranslation &out)
 {
 	switch (op.type)
@@ -3871,24 +4287,27 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 				return false;
 			std::vector<Expression *> next_filters = pending_filters;
 			next_filters.insert(next_filters.end(), filter.expressions.begin(), filter.expressions.end());
-			return TranslateOptimizerNode(*filter.children[0], queryDesc, state, next_filters, required_output_cols, out);
+			return TranslateOptimizerNode(*filter.children[0], queryDesc, state, next_filters, required_output_cols, delim_outer_child, delim_outer_bindings, out);
 		}
 
 		case PhysicalOperatorType::PROJECTION:
 			if (!pending_filters.empty())
 				return false;
-			return TranslateProjectionNode(static_cast<const PhysicalProjection &>(op), queryDesc, state, out);
+			return TranslateProjectionNode(static_cast<const PhysicalProjection &>(op), queryDesc, state, required_output_cols, delim_outer_child, delim_outer_bindings, out);
 
 		case PhysicalOperatorType::HASH_GROUP_BY:
 			if (!pending_filters.empty())
 				return false;
-			return TranslateHashAggregateNode(static_cast<const PhysicalHashAggregate &>(op), queryDesc, state, out);
+			return TranslateHashAggregateNode(static_cast<const PhysicalHashAggregate &>(op), queryDesc, state, delim_outer_child, delim_outer_bindings, out);
 
 		case PhysicalOperatorType::HASH_JOIN:
-			return TranslateHashJoinNode(static_cast<const PhysicalHashJoin &>(op), queryDesc, state, pending_filters, required_output_cols, out);
+			return TranslateHashJoinNode(static_cast<const PhysicalHashJoin &>(op), queryDesc, state, pending_filters, required_output_cols, delim_outer_child, delim_outer_bindings, out);
 
 		case PhysicalOperatorType::CROSS_PRODUCT:
-			return TranslateCrossProductNode(static_cast<const PhysicalCrossProduct &>(op), queryDesc, state, pending_filters, required_output_cols, out);
+			return TranslateCrossProductNode(static_cast<const PhysicalCrossProduct &>(op), queryDesc, state, pending_filters, required_output_cols, delim_outer_child, delim_outer_bindings, out);
+
+		case PhysicalOperatorType::DELIM_SCAN:
+			return TranslateDelimScanNode(static_cast<const PhysicalDelimScan &>(op), queryDesc, state, pending_filters, delim_outer_child, delim_outer_bindings, out);
 
 		case PhysicalOperatorType::ORDER_BY:
 		{
@@ -3897,7 +4316,7 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 			const auto &order = static_cast<const PhysicalOrderBy &>(op);
 			if (order.children.size() != 1 || order.children[0] == nullptr)
 				return false;
-			if (!TranslateOptimizerNode(*order.children[0], queryDesc, state, {}, required_output_cols, out))
+			if (!TranslateOptimizerNode(*order.children[0], queryDesc, state, {}, required_output_cols, delim_outer_child, delim_outer_bindings, out))
 			{
 				if (pg_yaap_trace_hooks)
 					elog(LOG, "pg_yaap: optimizer order rejected: child translation failed");
@@ -3913,13 +4332,14 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 			const auto &limit = static_cast<const PhysicalLimit &>(op);
 			if (limit.children.size() != 1 || limit.children[0] == nullptr)
 				return false;
-			if (!TryParseLimitExpression(limit.limit_count, out.limit_count))
+			uint64_t limit_count = 0;
+			if (!TryParseLimitExpression(limit.limit_count, limit_count))
 				return false;
 			OptimizerNodeTranslation child;
-			if (!TranslateOptimizerNode(*limit.children[0], queryDesc, state, {}, required_output_cols, child))
+			if (!TranslateOptimizerNode(*limit.children[0], queryDesc, state, {}, required_output_cols, delim_outer_child, delim_outer_bindings, child))
 				return false;
 			out = std::move(child);
-			out.limit_count = out.limit_count == 0 ? 0 : out.limit_count;
+			out.limit_count = limit_count;
 			return true;
 		}
 
@@ -4027,7 +4447,7 @@ TranslateOptimizerPlan(QueryDesc *queryDesc,
 		elog(LOG, "pg_yaap: optimizer plan matched recursive node adapter path");
 
 	OptimizerNodeTranslation node;
-	if (!TranslateOptimizerNode(*bundle.physical_plan, queryDesc, state, {}, nullptr, node) || node.op == nullptr)
+	if (!TranslateOptimizerNode(*bundle.physical_plan, queryDesc, state, {}, nullptr, nullptr, nullptr, node) || node.op == nullptr)
 		return nullptr;
 
 	return BuildOutputContract(node, queryDesc, state);

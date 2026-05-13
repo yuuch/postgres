@@ -74,6 +74,7 @@ size_t JoinOrderCostModel::EstimateCardinality(uint64_t left,
 	const auto& right_set = plans.find(right)->second->set;
 	double cardinality = static_cast<double>(left_stats.cardinality) * static_cast<double>(right_stats.cardinality);
 	bool used_column_stats = false;
+	size_t max_stat_divisor = 1;
     for (const auto* connection : connections) {
         for (const auto* filter : connection->filters) {
             if (!seen_filters.insert(filter).second) {
@@ -103,7 +104,7 @@ size_t JoinOrderCostModel::EstimateCardinality(uint64_t left,
 					if (left_column.has_stats && right_column.has_stats &&
 						left_column.distinct.distinct_count > 0 && right_column.distinct.distinct_count > 0) {
 						auto divisor = std::max(left_column.distinct.distinct_count, right_column.distinct.distinct_count);
-						cardinality /= static_cast<double>(divisor);
+						max_stat_divisor = std::max(max_stat_divisor, divisor);
 						used_column_stats = true;
 						continue;
 					}
@@ -111,6 +112,10 @@ size_t JoinOrderCostModel::EstimateCardinality(uint64_t left,
 				join_conditions.push_back(filter->condition.expression.get());
             }
 		}
+	}
+
+	if (used_column_stats && max_stat_divisor > 1) {
+		cardinality /= static_cast<double>(max_stat_divisor);
 	}
 
 	int primary_join_type = 0;

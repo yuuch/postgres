@@ -175,6 +175,16 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 				delta.values[a] += chunk.get_int64(agg.src_col_idx, row_idx);
 				delta.counts[a] += 1;
 				break;
+			case TdcAggKind::MIN_INT64:
+			case TdcAggKind::MIN_NUMERIC:
+			{
+				Assert(agg.src_col_idx < 16);
+				const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
+				if (delta.counts[a] == 0 || value < delta.values[a])
+					delta.values[a] = value;
+				delta.counts[a] = 1;
+				break;
+			}
 		}
 	}
 }
@@ -185,9 +195,27 @@ ApplyAggDelta(const TupleDataLayout *layout, const AggDelta &delta)
 	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[a];
-		AddInt64At(delta.row_ptr, agg.offset, delta.values[a]);
-		if (agg.kind == TdcAggKind::AVG_NUMERIC)
-			AddInt64At(delta.row_ptr, agg.offset + 8, delta.counts[a]);
+		switch (agg.kind)
+		{
+			case TdcAggKind::SUM_INT64:
+			case TdcAggKind::SUM_NUMERIC:
+			case TdcAggKind::COUNT_STAR:
+				AddInt64At(delta.row_ptr, agg.offset, delta.values[a]);
+				break;
+			case TdcAggKind::AVG_NUMERIC:
+				AddInt64At(delta.row_ptr, agg.offset, delta.values[a]);
+				AddInt64At(delta.row_ptr, agg.offset + 8, delta.counts[a]);
+				break;
+			case TdcAggKind::MIN_INT64:
+			case TdcAggKind::MIN_NUMERIC:
+				if (delta.counts[a] != 0)
+				{
+					int64_t current = ReadInt64At(delta.row_ptr, agg.offset);
+					if (current == INT64_MAX || delta.values[a] < current)
+						std::memcpy(delta.row_ptr + agg.offset, &delta.values[a], sizeof(int64_t));
+				}
+				break;
+		}
 	}
 }
 
@@ -352,6 +380,15 @@ ScatterGroupOnly(const TupleDataLayout *layout,
 	Assert(layout != nullptr && row_ptr != nullptr);
 	Assert(row_idx < chunk.count);
 	ScatterGroupColumns(layout, tdc, row_ptr, chunk, row_idx);
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		if (agg.kind == TdcAggKind::MIN_INT64 || agg.kind == TdcAggKind::MIN_NUMERIC)
+		{
+			const int64_t init_min = INT64_MAX;
+			std::memcpy(row_ptr + agg.offset, &init_min, sizeof(int64_t));
+		}
+	}
 }
 
 void
@@ -976,6 +1013,16 @@ UpdateAggregates(const TupleDataLayout *layout,
 			           chunk.get_int64(agg.src_col_idx, row_idx));
 			AddInt64At(row_ptr, agg.offset + 8, 1);
 			break;
+		case TdcAggKind::MIN_INT64:
+		case TdcAggKind::MIN_NUMERIC:
+		{
+			Assert(agg.src_col_idx < 16);
+			const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
+			const int64_t current = ReadInt64At(row_ptr, agg.offset);
+			if (current == INT64_MAX || value < current)
+				std::memcpy(row_ptr + agg.offset, &value, sizeof(int64_t));
+			break;
+		}
 	}
 }
 }
@@ -1037,6 +1084,15 @@ CombineAggregates(const TupleDataLayout *layout,
 				AddInt64At(dst_row, agg.offset, ReadInt64At(src_row, agg.offset));
 				AddInt64At(dst_row, agg.offset + 8, ReadInt64At(src_row, agg.offset + 8));
 				break;
+			case TdcAggKind::MIN_INT64:
+			case TdcAggKind::MIN_NUMERIC:
+			{
+				const int64_t src = ReadInt64At(src_row, agg.offset);
+				const int64_t dst = ReadInt64At(dst_row, agg.offset);
+				if (dst == INT64_MAX || src < dst)
+					std::memcpy(dst_row + agg.offset, &src, sizeof(int64_t));
+				break;
+			}
 		}
 	}
 

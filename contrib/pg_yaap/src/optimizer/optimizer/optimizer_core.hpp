@@ -28,6 +28,10 @@ struct JoinOrderJoinRelation {
 struct JoinOrderJoinCondition {
     std::unique_ptr<Expression> expression;
     uint64_t relation_mask = 0;
+    uint64_t left_table_mask = 0;
+    uint64_t right_table_mask = 0;
+    uint64_t left_relation_mask = 0;
+    uint64_t right_relation_mask = 0;
     int join_type = 0;
     bool invert_result = false;
     bool from_residual_predicate = false;

@@ -45,6 +45,8 @@ TupleDataLayoutAggregateWidth(TdcAggKind kind)
 		case TdcAggKind::COUNT_STAR:   return 8;
 		case TdcAggKind::SUM_NUMERIC:  return 8;
 		case TdcAggKind::AVG_NUMERIC:  return 16;
+		case TdcAggKind::MIN_INT64:    return 8;
+		case TdcAggKind::MIN_NUMERIC:  return 8;
 	}
 	elog(ERROR, "pg_yaap: TupleDataLayoutAggregateWidth: unknown TdcAggKind %u",
 		 static_cast<unsigned>(kind));
