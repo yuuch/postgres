@@ -39,7 +39,12 @@ namespace pipeline {
 
 namespace {
 
-static constexpr uint64_t kTupleDataCollectionMaxFlatAllocBytes = 900ull * 1024ull * 1024ull;
+/*
+ * Keep the single-allocation TDC safely below the 32-bit string offset space
+ * used by VecStringRef while allowing string-heavy 10G queries like Q10 to
+ * materialize large group/output buffers without tripping an overly small cap.
+ */
+static constexpr uint64_t kTupleDataCollectionMaxFlatAllocBytes = 3ull * 1024ull * 1024ull * 1024ull;
 
 static inline uint32_t
 HeapBytesNeededForStringLength(uint32_t len)
@@ -123,6 +128,21 @@ TupleDataCollectionCheckedAllocSize(uint32_t row_capacity,
 {
 	TupleDataCollectionCheckFlatAllocSize(row_capacity, row_width, heap_capacity);
 	return TupleDataCollectionAllocSize(row_capacity, row_width, heap_capacity);
+}
+
+dsa_pointer
+TupleDataCollectionAllocate(dsa_area *dsa,
+	                       uint32_t row_capacity,
+	                       uint32_t row_width,
+	                       uint32_t heap_capacity)
+{
+	const size_t alloc_size = TupleDataCollectionCheckedAllocSize(row_capacity,
+		row_width,
+		heap_capacity);
+	int flags = DSA_ALLOC_ZERO;
+	if (!AllocSizeIsValid(alloc_size))
+		flags |= DSA_ALLOC_HUGE;
+	return dsa_allocate_extended(dsa, alloc_size, flags);
 }
 
 uint32_t

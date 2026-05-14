@@ -182,7 +182,12 @@ struct alignas(16) DataChunk {
 
 	const char *get_string_ptr(uint8_t slot, uint16_t row_idx) const
 	{
-		return VecStringRefDataPtr(get_string_ref(slot, row_idx), string_arena.data());
+		const VecStringRef *ref = nullptr;
+		if (string_dict[slot].active)
+			ref = &string_columns[string_dict[slot].source_slot][string_dict_indices[slot][row_idx]];
+		else
+			ref = &string_columns[slot][row_idx];
+		return VecStringRefDataPtr(*ref, string_arena.data());
 	}
 
 	void flatten()

@@ -75,8 +75,10 @@ BuildOutputTdc(dsa_area *dsa,
 		       uint32_t row_capacity)
 {
 	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(&layout, row_capacity);
-	dsa_pointer payload_dp = dsa_allocate0(dsa,
-		TupleDataCollectionCheckedAllocSize(row_capacity, layout.row_width, heap_capacity));
+	dsa_pointer payload_dp = TupleDataCollectionAllocate(dsa,
+		row_capacity,
+		layout.row_width,
+		heap_capacity);
 	if (!DsaPointerIsValid(payload_dp))
 		return InvalidDsaPointer;
 	auto *tdc = static_cast<TupleDataCollection *>(dsa_get_address(dsa, payload_dp));

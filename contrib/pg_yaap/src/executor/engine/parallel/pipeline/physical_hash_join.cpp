@@ -6,6 +6,7 @@ extern "C" {
 
 extern int pg_yaap_parallel_max_workers;
 extern bool pg_yaap_trace_execution_path;
+extern bool pg_yaap_trace_hooks;
 }
 
 #include <algorithm>
@@ -169,8 +170,10 @@ GrowJoinTdc(ExecCtx &ctx,
 				layout->row_width,
 				heap_capacity,
 				required_heap_bytes)));
-	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(new_capacity, layout->row_width, heap_capacity));
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		new_capacity,
+		layout->row_width,
+		heap_capacity);
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc,
 		new_capacity,
@@ -380,7 +383,42 @@ RequiredFilterBoolRegs(const FilterExprDesc *exprs, uint16_t n_exprs)
 }
 
 static inline bool
+Pow10Int64Local(uint8_t exp, int64_t &out)
+{
+	int64_t value = 1;
+	for (uint8_t i = 0; i < exp; ++i)
+	{
+		if (value > PG_INT64_MAX / 10)
+			return false;
+		value *= 10;
+	}
+	out = value;
+	return true;
+}
+
+static inline bool
+RescaleNumericForCompare(int64_t value, uint8_t from_scale, uint8_t to_scale, int64_t &out)
+{
+	if (from_scale == to_scale)
+	{
+		out = value;
+		return true;
+	}
+	if (from_scale > to_scale)
+		return false;
+	int64_t factor = 0;
+	if (!Pow10Int64Local(static_cast<uint8_t>(to_scale - from_scale), factor))
+		return false;
+	NumericWideInt widened = WideIntFromInt64(value) * WideIntFromInt64(factor);
+	if (!WideIntFitsInt64(widened))
+		return false;
+	out = WideIntToInt64Checked(widened, "pg_yaap: numeric compare rescale overflow");
+	return true;
+}
+
+static inline bool
 EvalFilterStep(const FilterStep &step,
+	       const HashJoinFilterInputDesc *inputs,
 	       const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk,
 	       const char *string_consts,
 	       uint8_t *bool_values)
@@ -446,8 +484,32 @@ EvalFilterStep(const FilterStep &step,
 		{
 			if (!filter_chunk.nulls[step.left_idx][0] && !filter_chunk.nulls[step.right_idx][0])
 			{
-				const int64_t l = filter_chunk.get_int64(step.left_idx, 0);
-				const int64_t r = filter_chunk.get_int64(step.right_idx, 0);
+				int64_t l = filter_chunk.get_int64(step.left_idx, 0);
+				int64_t r = filter_chunk.get_int64(step.right_idx, 0);
+				if (inputs != nullptr &&
+					inputs[step.left_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
+					inputs[step.right_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+				{
+					static int numeric_compare_debug_budget = 8;
+					const int64_t orig_l = l;
+					const int64_t orig_r = r;
+					const uint8_t target_scale = std::max(inputs[step.left_idx].numeric_scale,
+						inputs[step.right_idx].numeric_scale);
+					if (!RescaleNumericForCompare(l, inputs[step.left_idx].numeric_scale, target_scale, l) ||
+						!RescaleNumericForCompare(r, inputs[step.right_idx].numeric_scale, target_scale, r))
+						elog(ERROR, "pg_yaap: hash join numeric filter rescale failed");
+					if (pg_yaap_trace_hooks && numeric_compare_debug_budget-- > 0)
+						elog(LOG,
+							 "pg_yaap: hash join numeric compare left=%lld(scale=%u)->%lld right=%lld(scale=%u)->%lld target=%u op=%u",
+							 (long long) orig_l,
+							 (unsigned) inputs[step.left_idx].numeric_scale,
+							 (long long) l,
+							 (long long) orig_r,
+							 (unsigned) inputs[step.right_idx].numeric_scale,
+							 (long long) r,
+							 (unsigned) target_scale,
+							 (unsigned) step.cmp_op);
+				}
 				switch (step.cmp_op)
 				{
 					case QualOp::LE: result = l <= r; break;
@@ -649,7 +711,7 @@ EvaluateJoinFilter(const HashJoinFilterInputDesc *inputs,
 		if (end_step > n_steps)
 			elog(ERROR, "pg_yaap: hash join filter expr step range out of bounds");
 		for (uint16_t step_idx = expr.first_step_idx; step_idx < end_step; ++step_idx)
-			(void) EvalFilterStep(steps[step_idx], filter_chunk, string_consts, bool_values);
+			(void) EvalFilterStep(steps[step_idx], inputs, filter_chunk, string_consts, bool_values);
 		if (expr.output_bool_reg >= required_bool_regs || bool_values[expr.output_bool_reg] == 0)
 			return false;
 	}
@@ -885,10 +947,14 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 			global_row_capacity);
 		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->build_layout,
 			global_row_capacity);
-	state->payload->build_keys_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(global_row_capacity, state->build_key_layout->row_width, key_heap_capacity));
-	state->payload->build_rows_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(global_row_capacity, state->build_layout->row_width, heap_capacity));
+	state->payload->build_keys_dp = TupleDataCollectionAllocate(ctx.dsa,
+		global_row_capacity,
+		state->build_key_layout->row_width,
+		key_heap_capacity);
+	state->payload->build_rows_dp = TupleDataCollectionAllocate(ctx.dsa,
+		global_row_capacity,
+		state->build_layout->row_width,
+		heap_capacity);
 		state->build_keys = ResolveTdc(ctx.dsa, state->payload->build_keys_dp);
 		state->build_rows = ResolveTdc(ctx.dsa, state->payload->build_rows_dp);
 		TupleDataCollectionInit(state->build_keys,
@@ -941,10 +1007,14 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		local_capacity);
 	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->build_layout,
 		local_capacity);
-	state->build_keys_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(local_capacity, state->build_key_layout->row_width, key_heap_capacity));
-	state->build_rows_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(local_capacity, state->build_layout->row_width, heap_capacity));
+	state->build_keys_dp = TupleDataCollectionAllocate(ctx.dsa,
+		local_capacity,
+		state->build_key_layout->row_width,
+		key_heap_capacity);
+	state->build_rows_dp = TupleDataCollectionAllocate(ctx.dsa,
+		local_capacity,
+		state->build_layout->row_width,
+		heap_capacity);
 	state->build_keys = ResolveTdc(ctx.dsa, state->build_keys_dp);
 	state->build_rows = ResolveTdc(ctx.dsa, state->build_rows_dp);
 	TupleDataCollectionInit(state->build_keys,
@@ -1227,6 +1297,13 @@ OperatorResultType
 PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
 {
 	auto &op_state = static_cast<HashJoinOperatorState &>(state);
+	if (pg_yaap_trace_execution_path)
+		elog(LOG,
+			 "pg_yaap hashjoin enter op=%p in_count=%u current_drained=%d join_mode=%u",
+			 static_cast<void *>(this),
+			 in.count,
+			 op_state.current_input_drained ? 1 : 0,
+			 static_cast<unsigned>(desc_ != nullptr ? desc_->body.hash_join.join_mode : join_mode_));
 	if (op_state.current_input_drained)
 	{
 		op_state.current_input_drained = false;
@@ -1241,6 +1318,13 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		elog(ERROR, "pg_yaap: hash join probe ran before build/finalize completed");
 	if (pg_atomic_read_u32(&payload->release_state) != 0)
 		elog(ERROR, "pg_yaap: hash join payload used after release");
+	if (pg_yaap_trace_execution_path)
+		elog(LOG,
+			 "pg_yaap hashjoin payload ready op=%p build_keys_dp=%llu build_rows_dp=%llu finalized=%d",
+			 static_cast<void *>(this),
+			 static_cast<unsigned long long>(payload->build_keys_dp),
+			 static_cast<unsigned long long>(payload->build_rows_dp),
+			 payload->finalized ? 1 : 0);
 	const SchemaDescriptor *left_schema = static_cast<const SchemaDescriptor *>(dsa_get_address(ctx.dsa,
 		DsaPointerIsValid(left_input_schema_dp_) ? left_input_schema_dp_ :
 		(desc_ != nullptr ? desc_->body.hash_join.left_input_schema : InvalidDsaPointer)));
@@ -1292,6 +1376,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		(desc_ != nullptr ? desc_->body.hash_join.n_filter_exprs : 0);
 	const uint16_t n_filter_steps = n_filter_steps_ > 0 ? n_filter_steps_ :
 		(desc_ != nullptr ? desc_->body.hash_join.n_filter_steps : 0);
+	const HashJoinMatchMode join_mode = desc_ != nullptr ? desc_->body.hash_join.join_mode : join_mode_;
 	PgVector<HashJoinOutputColumnDesc> fallback_output_columns;
 	if ((output_columns == nullptr || output_column_count == 0) &&
 		left_schema != nullptr && right_schema != nullptr && output_schema != nullptr)
@@ -1319,8 +1404,9 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	uint16_t matched_probe_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	const uint8_t *matched_build_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>> filter_chunk_holder;
+	DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> filter_chunk_inline;
 	uint8_t filter_bool_values[FILTER_MAX_BOOL_REGS];
-	DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> *filter_chunk = nullptr;
+	DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> *filter_chunk = &filter_chunk_inline;
 	if (n_filter_inputs > 0 && n_filter_exprs > 0 && n_filter_steps > 0)
 	{
 		filter_chunk_holder = std::make_unique<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>();
@@ -1383,13 +1469,29 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 						*filter_chunk,
 						filter_bool_values))
 					continue;
+				if (join_mode == HashJoinMatchMode::ANTI)
+				{
+					matched_rows = static_cast<uint32_t>(matched_rows + 1);
+					batch_count = 0;
+					op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
+					break;
+				}
 				++matched_rows;
 				matched_probe_rows[batch_count] = op_state.probe_row_idx;
 				matched_build_rows[batch_count] = build_row;
 				++batch_count;
-				if (out.count + batch_count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+				if (join_mode == HashJoinMatchMode::SEMI || out.count + batch_count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+				{
+					op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
 					break;
+				}
 			}
+		}
+		if (join_mode == HashJoinMatchMode::ANTI && batch_count == 0 && matched_rows == 0)
+		{
+			matched_probe_rows[0] = op_state.probe_row_idx;
+			matched_build_rows[0] = nullptr;
+			batch_count = 1;
 		}
 		if (batch_count > 0)
 		{
@@ -1404,6 +1506,15 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 				out.count,
 				batch_count);
 			out.count += batch_count;
+		}
+		if (join_mode != HashJoinMatchMode::INNER)
+		{
+			matched_rows = 0;
+			op_state.have_build_cursor = false;
+			++op_state.probe_row_idx;
+			if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+				break;
+			continue;
 		}
 		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 			break;

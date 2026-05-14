@@ -114,6 +114,11 @@ size_t TupleDataCollectionCheckedAllocSize(uint32_t row_capacity,
 	                                         uint32_t row_width,
 	                                         uint32_t heap_capacity = 0);
 
+dsa_pointer TupleDataCollectionAllocate(dsa_area *dsa,
+	                                   uint32_t row_capacity,
+	                                   uint32_t row_width,
+	                                   uint32_t heap_capacity = 0);
+
 inline uint8_t *
 TupleDataCollectionHeap(TupleDataCollection *tdc)
 {

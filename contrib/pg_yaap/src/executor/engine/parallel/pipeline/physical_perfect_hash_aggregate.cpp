@@ -141,8 +141,10 @@ GrowLocalTdc(ExecCtx &ctx, PerfectHashAggLocalSinkState &local)
 	const uint32_t new_capacity = Max(old_tdc->row_capacity * 2u, old_count + 1u);
 	const uint32_t heap_capacity = old_tdc->heap_capacity > 0 ? old_tdc->heap_capacity * 2u :
 		TupleDataCollectionDefaultHeapCapacity(local.layout, new_capacity);
-	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(new_capacity, local.layout->row_width, heap_capacity));
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		new_capacity,
+		local.layout->row_width,
+		heap_capacity);
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc, new_capacity, local.layout->row_width, local.layout_dp, heap_capacity);
 	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
@@ -168,8 +170,10 @@ GrowGlobalTdc(ExecCtx &ctx, PerfectHashAggGlobalSinkState &global)
 	const uint32_t new_capacity = Max(old_tdc->row_capacity * 2u, old_count + 1u);
 	const uint32_t heap_capacity = old_tdc->heap_capacity > 0 ? old_tdc->heap_capacity * 2u :
 		TupleDataCollectionDefaultHeapCapacity(global.layout, new_capacity);
-	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(new_capacity, global.layout->row_width, heap_capacity));
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		new_capacity,
+		global.layout->row_width,
+		heap_capacity);
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc, new_capacity, global.layout->row_width, global.layout_dp, heap_capacity);
 	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
@@ -277,8 +281,10 @@ PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			static_cast<size_t>(state->local_state_slot_count) * sizeof(dsa_pointer));
 		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
 			state->max_groups);
-		state->payload->global_tdc_dp = dsa_allocate0(ctx.dsa,
-			TupleDataCollectionCheckedAllocSize(state->max_groups, state->layout->row_width, heap_capacity));
+		state->payload->global_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+			state->max_groups,
+			state->layout->row_width,
+			heap_capacity);
 		state->global_tdc = ResolveTdc(ctx.dsa, state->payload->global_tdc_dp);
 		TupleDataCollectionInit(state->global_tdc,
 			state->max_groups,
@@ -322,8 +328,10 @@ PhysicalPerfectHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &g
 	state->perfect_row_indices.assign(state->perfect_capacity, TDC_INVALID_ROW_INDEX);
 	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
 		state->max_groups);
-	state->local_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(state->max_groups, state->layout->row_width, heap_capacity));
+	state->local_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		state->max_groups,
+		state->layout->row_width,
+		heap_capacity);
 	state->local_tdc = ResolveTdc(ctx.dsa, state->local_tdc_dp);
 	TupleDataCollectionInit(state->local_tdc,
 		state->max_groups,

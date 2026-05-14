@@ -7,6 +7,7 @@ extern "C" {
 #include "utils/elog.h"
 }
 
+#include <algorithm>
 #include <cstring>
 
 namespace pg_yaap {
@@ -357,6 +358,32 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 				const char *lhs = out.get_string_ptr(ref);
 				const bool eq = lhs != nullptr && ref.len == rhs_len && (rhs_len == 0 || std::memcmp(lhs, rhs, rhs_len) == 0);
 				output[row] = (step.op == ProjectOp::STRING_EQ_VAR_CONST ? eq : !eq) ? 1 : 0;
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::STRING_PREFIX_SLICE:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const VecStringRef *const input = out.string_columns[step.in_a_chunk_slot];
+			VecStringRef *const output = out.string_columns[step.out_chunk_slot];
+			const uint32_t prefix_len = step.in_b_chunk_slot;
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				const VecStringRef &ref = input[row];
+				const char *ptr = out.get_string_ptr(ref);
+				if (ptr == nullptr && ref.len != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = out.store_string_bytes(ptr, std::min<uint32_t>(ref.len, prefix_len));
 				out_nulls[row] = 0;
 			}
 			return;

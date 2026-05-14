@@ -33,6 +33,12 @@ pg_yaap_sources += files(
   'parallel/pipeline/tuple_data_collection.cpp',
   'parallel/pipeline/aggregate_hash_table.cpp',
   'parallel/pipeline/yaap_opt_translator.cpp',
+  'parallel/pipeline/yaap_opt_translator_support.cpp',
+  'parallel/pipeline/yaap_opt_translator_common.cpp',
+  'parallel/pipeline/yaap_opt_translator_filters.cpp',
+  'parallel/pipeline/yaap_opt_translator_exprs.cpp',
+  'parallel/pipeline/yaap_opt_translator_nodes_scan_agg.cpp',
+  'parallel/pipeline/yaap_opt_translator_nodes_join.cpp',
   'core/parallel_dsa_bridge.cpp',
   'core/data_chunk_deform.cpp',
 )

@@ -75,8 +75,10 @@ GrowOrderTdc(ExecCtx &ctx, OrderGlobalState &global, uint32_t required_heap_byte
 		old_tdc,
 		new_capacity,
 		required_heap_bytes);
-	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(new_capacity, old_tdc->row_width, heap_capacity));
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		new_capacity,
+		old_tdc->row_width,
+		heap_capacity);
 	TupleDataCollection *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc,
 		new_capacity,
@@ -194,8 +196,10 @@ PhysicalOrder::GetGlobalSinkState(ExecCtx &ctx)
 		const uint32_t row_width = state->payload_layout != nullptr ? state->payload_layout->row_width : 8;
 		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->payload_layout,
 			state->max_rows);
-		state->shared_payload_dp = dsa_allocate0(ctx.dsa,
-			TupleDataCollectionCheckedAllocSize(state->max_rows, row_width, heap_capacity));
+		state->shared_payload_dp = TupleDataCollectionAllocate(ctx.dsa,
+			state->max_rows,
+			row_width,
+			heap_capacity);
 		state->payload = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, state->shared_payload_dp));
 		TupleDataCollectionInit(state->payload,
 			state->max_rows,

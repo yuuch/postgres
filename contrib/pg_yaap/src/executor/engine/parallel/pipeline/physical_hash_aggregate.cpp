@@ -24,6 +24,8 @@ namespace pipeline {
 
 namespace {
 
+static constexpr int64_t kDenseAggAvgScaleFactor = 1000000000000LL;
+
 static void
 CopyTdcRow(const TupleDataLayout *layout,
 	       const TupleDataCollection *src_tdc,
@@ -271,8 +273,10 @@ GrowTdcForPartition(ExecCtx &ctx,
 		old_tdc,
 		new_capacity,
 		required_heap_bytes);
-	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(new_capacity, layout->row_width, heap_capacity));
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		new_capacity,
+		layout->row_width,
+		heap_capacity);
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc, new_capacity, layout->row_width, layout_dp, heap_capacity);
 
@@ -314,8 +318,10 @@ GrowLocalTdc(ExecCtx &ctx,
 		old_tdc,
 		new_capacity,
 		required_heap_bytes);
-	dsa_pointer new_tdc_dp = dsa_allocate0(ctx.dsa,
-		TupleDataCollectionCheckedAllocSize(new_capacity, local.layout->row_width, heap_capacity));
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		new_capacity,
+		local.layout->row_width,
+		heap_capacity);
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc,
 		new_capacity,
@@ -381,6 +387,82 @@ PartitionNeedsGrowForRow(const TupleDataLayout *layout,
 	return !TupleDataCollectionHasSpaceForAppend(
 		tdc,
 		TupleDataCollectionRequiredHeapBytesForRow(layout, tdc, row_ptr));
+}
+
+static void
+GatherDenseAggregateOutput(const TupleDataLayout *layout,
+	                       const TupleDataCollection *tdc,
+	                       const uint8_t *row_ptr,
+	                       PipelineChunk &chunk,
+	                       uint16_t row_idx)
+{
+	Assert(layout != nullptr);
+	Assert(row_ptr != nullptr);
+
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		const TdcColumnDesc &col = layout->columns[i];
+		switch (col.kind)
+		{
+			case TdcColumnKind::INT32:
+			{
+				int32_t v;
+				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
+				chunk.int32_columns[i][row_idx] = v;
+				break;
+			}
+			case TdcColumnKind::INT64:
+			{
+				int64_t v;
+				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
+				chunk.int64_columns[i][row_idx] = v;
+				break;
+			}
+			case TdcColumnKind::DOUBLE:
+			{
+				double v;
+				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
+				chunk.double_columns[i][row_idx] = v;
+				break;
+			}
+			case TdcColumnKind::STRING_REF:
+			{
+				VecStringRef ref;
+				std::memcpy(&ref, row_ptr + col.offset, sizeof(ref));
+				const char *ptr = VecStringRefDataPtr(
+					ref,
+					tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
+				if (ptr == nullptr && ref.len != 0)
+					elog(ERROR, "pg_yaap: dense hashagg gather missing string backing");
+				chunk.string_columns[i][row_idx] = chunk.store_string_bytes(ptr, ref.len);
+				break;
+			}
+		}
+	}
+
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		int64_t v;
+		std::memcpy(&v, row_ptr + agg.offset, sizeof(v));
+		if (agg.kind == TdcAggKind::AVG_NUMERIC)
+		{
+			int64_t count;
+			std::memcpy(&count, row_ptr + agg.offset + 8, sizeof(count));
+			if (count != 0)
+			{
+				NumericWideInt widened =
+					(WideIntFromInt64(v) * WideIntFromInt64(kDenseAggAvgScaleFactor)) /
+					WideIntFromInt64(count);
+				if (!WideIntFitsInt64(widened))
+					elog(ERROR, "pg_yaap: dense hashagg finalized AVG numeric exceeds int64 range");
+				v = WideIntToInt64Checked(widened, "pg_yaap: dense hashagg finalized AVG numeric");
+			}
+			else
+				v = 0;
+		}
+		chunk.int64_columns[layout->column_count + a][row_idx] = v;
+	}
 }
 
 }  /* namespace */
@@ -487,8 +569,10 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			SpinLockInit(&part.mutex);
 			const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
 				per_partition_groups);
-			part.tdc_dp = dsa_allocate0(ctx.dsa,
-				TupleDataCollectionCheckedAllocSize(per_partition_groups, state->layout->row_width, heap_capacity));
+			part.tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+				per_partition_groups,
+				state->layout->row_width,
+				heap_capacity);
 			auto *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 			TupleDataCollectionInit(tdc,
 				per_partition_groups,
@@ -548,8 +632,10 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		SpinLockInit(&part.mutex);
 		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
 			per_partition_groups);
-		part.tdc_dp = dsa_allocate0(ctx.dsa,
-			TupleDataCollectionCheckedAllocSize(per_partition_groups, state->layout->row_width, heap_capacity));
+		part.tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+			per_partition_groups,
+			state->layout->row_width,
+			heap_capacity);
 		auto *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 		TupleDataCollectionInit(tdc,
 			per_partition_groups,
@@ -575,7 +661,6 @@ SinkResultType
 PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 {
 	auto &local = static_cast<HashAggLocalSinkState &>(input.local_state);
-	(void) ctx;
 	if (local.layout->column_count == 0 && local.layout->aggregate_count > 0)
 		elog(LOG,
 		     "pg_yaap: HashAgg.SinkChunk in_count=%u partitions=%u perfect=%d",
@@ -922,7 +1007,7 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 		}
 
 		const uint8_t *row = TupleDataCollectionGetRowConst(tdc, global.source_cursor++);
-		Gather(global.layout, tdc, row, out, out.count);
+		GatherDenseAggregateOutput(global.layout, tdc, row, out, out.count);
 		++out.count;
 	}
 
