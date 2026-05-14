@@ -72,6 +72,56 @@ public:
 	                 uint16_t n_right_keys,
 	                 uint32_t max_rows = 1024,
 	                 OpDescriptor *desc = nullptr)
+		: PhysicalHashJoin(left_input_schema_dp,
+			right_input_schema_dp,
+			output_schema_dp,
+			left_key_layout_dp,
+			right_key_layout_dp,
+			left_payload_layout_dp,
+			right_payload_layout_dp,
+			output_columns_dp,
+			output_column_count,
+			filter_inputs_dp,
+			filter_exprs_dp,
+			filter_steps_dp,
+			filter_string_consts_dp,
+			n_filter_inputs,
+			n_filter_exprs,
+			n_filter_steps,
+			filter_bool_regs,
+			HashJoinMatchMode::INNER,
+			filter_string_const_bytes,
+			shared_payload_dp,
+			n_left_keys,
+			n_right_keys,
+			max_rows,
+			desc)
+	{}
+
+	PhysicalHashJoin(dsa_pointer left_input_schema_dp,
+	                 dsa_pointer right_input_schema_dp,
+	                 dsa_pointer output_schema_dp,
+	                 dsa_pointer left_key_layout_dp,
+	                 dsa_pointer right_key_layout_dp,
+	                 dsa_pointer left_payload_layout_dp,
+	                 dsa_pointer right_payload_layout_dp,
+	                 dsa_pointer output_columns_dp,
+	                 uint16_t output_column_count,
+	                 dsa_pointer filter_inputs_dp,
+	                 dsa_pointer filter_exprs_dp,
+	                 dsa_pointer filter_steps_dp,
+	                 dsa_pointer filter_string_consts_dp,
+	                 uint16_t n_filter_inputs,
+	                 uint16_t n_filter_exprs,
+	                 uint16_t n_filter_steps,
+	                 uint16_t filter_bool_regs,
+	                 HashJoinMatchMode join_mode,
+	                 uint32_t filter_string_const_bytes,
+	                 dsa_pointer shared_payload_dp,
+	                 uint16_t n_left_keys,
+	                 uint16_t n_right_keys,
+	                 uint32_t max_rows = 1024,
+	                 OpDescriptor *desc = nullptr)
 		: PhysicalOperator(PhysicalOperatorType::HASH_JOIN)
 		, left_input_schema_dp_(left_input_schema_dp)
 		, right_input_schema_dp_(right_input_schema_dp)
@@ -90,6 +140,7 @@ public:
 		, n_filter_exprs_(n_filter_exprs)
 		, n_filter_steps_(n_filter_steps)
 		, filter_bool_regs_(filter_bool_regs)
+		, join_mode_(join_mode)
 		, filter_string_const_bytes_(filter_string_const_bytes)
 		, shared_payload_dp_(shared_payload_dp)
 		, n_left_keys_(n_left_keys)
@@ -132,6 +183,7 @@ public:
 	uint16_t n_filter_exprs() const { return n_filter_exprs_; }
 	uint16_t n_filter_steps() const { return n_filter_steps_; }
 	uint16_t filter_bool_regs() const { return filter_bool_regs_; }
+	HashJoinMatchMode join_mode() const { return join_mode_; }
 	uint32_t filter_string_const_bytes() const { return filter_string_const_bytes_; }
 	dsa_pointer shared_payload_dp() const { return shared_payload_dp_; }
 	uint16_t n_left_keys() const { return n_left_keys_; }
@@ -159,6 +211,7 @@ private:
 	uint16_t     n_filter_exprs_;
 	uint16_t     n_filter_steps_;
 	uint16_t     filter_bool_regs_;
+	HashJoinMatchMode join_mode_;
 	uint32_t     filter_string_const_bytes_;
 	dsa_pointer  shared_payload_dp_;
 	uint16_t     n_left_keys_;

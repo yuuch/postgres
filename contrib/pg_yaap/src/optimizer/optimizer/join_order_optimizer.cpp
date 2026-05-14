@@ -110,21 +110,23 @@ void RecomputeNonReorderableBinaryCardinality(LogicalOperator* plan) {
 				size_t estimated_cardinality = left_stats.cardinality;
 				if (join->join_type == JOIN_MARK) {
 					estimated_cardinality = left_stats.cardinality;
-				} else if (IsSemiOrAntiJoinType(join->join_type)) {
-					if (!join->conditions.empty()) {
-						std::vector<Expression*> conditions;
-						conditions.reserve(join->conditions.size());
-						for (auto& condition : join->conditions) {
-							conditions.push_back(condition.get());
-						}
-						estimated_cardinality = std::min(
-							left_stats.cardinality,
-							statistics_helper.EstimateJoinCardinality(left_stats, right_stats, conditions));
-					} else {
-						estimated_cardinality = std::max<size_t>(
-							1,
-							static_cast<size_t>(std::ceil(
-								static_cast<double>(left_stats.cardinality) *
+        } else if (IsSemiOrAntiJoinType(join->join_type)) {
+            if (!join->conditions.empty()) {
+                std::vector<Expression*> conditions;
+                conditions.reserve(join->conditions.size());
+                for (auto& condition : join->conditions) {
+                    conditions.push_back(condition.get());
+                }
+                estimated_cardinality = join->join_type == JOIN_ANTI
+                    ? statistics_helper.EstimateSemiOrAntiJoinCardinality(left_stats, right_stats, conditions, true)
+                    : std::min(
+                          left_stats.cardinality,
+                          statistics_helper.EstimateJoinCardinality(left_stats, right_stats, conditions));
+            } else {
+                estimated_cardinality = std::max<size_t>(
+                    1,
+                    static_cast<size_t>(std::ceil(
+                        static_cast<double>(left_stats.cardinality) *
 								RelationStatisticsHelper::DEFAULT_SELECTIVITY)));
 					}
 				}

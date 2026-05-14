@@ -4,6 +4,24 @@
 
 namespace pg_yaap::optimizer_translator_detail {
 
+static bool
+BuildOrderedSchemaForRefs(const std::vector<ColumnRef> &refs,
+						  const std::vector<ColumnRef> &available_cols,
+						  const std::vector<ColumnSchema> &available_schema,
+						  std::vector<ColumnSchema> &out_schema)
+{
+	out_schema.clear();
+	out_schema.reserve(refs.size());
+	for (const ColumnRef &ref : refs)
+	{
+		const ColumnSchema *col = nullptr;
+		if (!LookupRawColumn(ref, available_cols, available_schema, col) || col == nullptr)
+			return false;
+		out_schema.push_back(*col);
+	}
+	return true;
+}
+
 static std::string
 ExpressionSemanticKey(const Expression *expression)
 {
@@ -423,13 +441,27 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	TupleDataLayout build_key_layout;
 	TupleDataLayout probe_payload_layout;
 	TupleDataLayout build_payload_layout;
-	const std::vector<ColumnSchema> empty_build_payload_schema;
-	const auto &build_payload_schema =
-		(semi_or_anti_join && residuals.empty()) ? empty_build_payload_schema : build_schema;
+	std::vector<ColumnRef> build_payload_refs;
+	std::vector<ColumnSchema> build_payload_schema_storage;
+	const std::vector<ColumnSchema> *build_payload_schema = &build_schema;
+	if (semi_or_anti_join)
+	{
+		std::vector<ColumnRef> residual_refs;
+		for (Expression *expr : residuals)
+			CollectReferencedColumns(expr, residual_refs);
+		FilterRequestedColumns(build_cols, &residual_refs, build_payload_refs);
+		if (!BuildOrderedSchemaForRefs(build_payload_refs, build_cols, build_schema, build_payload_schema_storage))
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG, "pg_yaap: optimizer hash join rejected: build payload schema derivation failed");
+			return false;
+		}
+		build_payload_schema = &build_payload_schema_storage;
+	}
 	if (!BuildColumnOnlyLayoutForRefs(probe_keys, probe_cols, probe_schema, probe_key_layout) ||
 		!BuildColumnOnlyLayoutForRefs(build_keys, build_cols, build_schema, build_key_layout) ||
 		!BuildColumnOnlyLayout(probe_schema, probe_payload_layout) ||
-		!BuildColumnOnlyLayout(build_payload_schema, build_payload_layout) ||
+		!BuildColumnOnlyLayout(*build_payload_schema, build_payload_layout) ||
 		!BuildHashJoinOutputMappings(requested_output_cols, probe_cols, probe_schema, build_cols, build_schema, output_mappings, output_schema))
 	{
 		if (pg_yaap_trace_hooks)
@@ -467,7 +499,7 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	}
 
 	dsa_pointer left_schema_dp = BuildSchemaDescriptorFromColumns(probe_schema, state->runtime_dsa);
-	dsa_pointer right_schema_dp = BuildSchemaDescriptorFromColumns(build_payload_schema, state->runtime_dsa);
+	dsa_pointer right_schema_dp = BuildSchemaDescriptorFromColumns(*build_payload_schema, state->runtime_dsa);
 	dsa_pointer output_schema_dp = BuildSchemaDescriptorFromColumns(output_schema, state->runtime_dsa);
 	dsa_pointer left_key_layout_dp = SerializeTupleDataLayout(probe_key_layout, state->runtime_dsa);
 	dsa_pointer right_key_layout_dp = SerializeTupleDataLayout(build_key_layout, state->runtime_dsa);

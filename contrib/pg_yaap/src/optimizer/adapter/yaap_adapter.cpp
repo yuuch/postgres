@@ -21,7 +21,11 @@ extern "C" {
 #include "yaap_adapter.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <string>
 #include <sstream>
 #include <set>
@@ -30,6 +34,205 @@ extern "C" {
 namespace yaap {
 
 namespace {
+
+bool TryParsePositiveIntConstant(Expression *expr, int &out_value) {
+    const auto *constant = dynamic_cast<const BoundConstantExpression *>(expr);
+    if (constant == nullptr || constant->is_null) {
+        return false;
+    }
+    char *end = nullptr;
+    errno = 0;
+    long parsed = std::strtol(constant->value.c_str(), &end, 10);
+    if (errno != 0 || end == constant->value.c_str()) {
+        return false;
+    }
+    while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) {
+        ++end;
+    }
+    if (*end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out_value = static_cast<int>(parsed);
+    return true;
+}
+
+const BoundColumnRefExpression *UnwrapPrefixBaseColumn(const Expression *expr) {
+    if (expr == nullptr) {
+        return nullptr;
+    }
+    if (const auto *column = dynamic_cast<const BoundColumnRefExpression *>(expr)) {
+        return column;
+    }
+    const auto *func = dynamic_cast<const BoundFunctionExpression *>(expr);
+    if (func == nullptr || func->children.size() != 1) {
+        return nullptr;
+    }
+    if (func->function_name != "text" &&
+        func->function_name != "varchar" &&
+        func->function_name != "bpchar" &&
+        func->function_name != "char") {
+        return nullptr;
+    }
+    return UnwrapPrefixBaseColumn(func->children[0].get());
+}
+
+bool IsPrefixSliceExpr(const Expression *expr,
+                      const BoundColumnRefExpression *&out_base,
+                      int &out_len) {
+    const auto *func = dynamic_cast<const BoundFunctionExpression *>(expr);
+    if (func == nullptr || func->function_name != "prefix_slice" || func->children.size() != 2) {
+        return false;
+    }
+    out_base = UnwrapPrefixBaseColumn(func->children[0].get());
+    if (out_base == nullptr) {
+        return false;
+    }
+    return TryParsePositiveIntConstant(func->children[1].get(), out_len);
+}
+
+std::unique_ptr<Expression> CloneColumnRef(const BoundColumnRefExpression &column) {
+    return std::make_unique<BoundColumnRefExpression>(column.binding, column.table_name, column.column_name);
+}
+
+std::unique_ptr<Expression> CloneExpression(const Expression &expr) {
+    switch (expr.type) {
+        case ExpressionType::BOUND_COLUMN_REF: {
+            const auto &column = static_cast<const BoundColumnRefExpression &>(expr);
+            return CloneColumnRef(column);
+        }
+        case ExpressionType::BOUND_CONSTANT: {
+            const auto &constant = static_cast<const BoundConstantExpression &>(expr);
+            return std::make_unique<BoundConstantExpression>(constant.value, constant.is_null);
+        }
+        case ExpressionType::BOUND_FUNCTION: {
+            const auto &function = static_cast<const BoundFunctionExpression &>(expr);
+            auto copy = std::make_unique<BoundFunctionExpression>(function.function_name, function.op_oid);
+            for (const auto &child : function.children) {
+                if (child == nullptr) {
+                    return nullptr;
+                }
+                auto child_copy = CloneExpression(*child);
+                if (!child_copy) {
+                    return nullptr;
+                }
+                copy->children.push_back(std::move(child_copy));
+            }
+            return copy;
+        }
+        case ExpressionType::BOUND_CONJUNCTION: {
+            const auto &conjunction = static_cast<const BoundConjunctionExpression &>(expr);
+            auto copy = std::make_unique<BoundConjunctionExpression>(conjunction.bool_expr_type);
+            for (const auto &child : conjunction.children) {
+                if (child == nullptr) {
+                    return nullptr;
+                }
+                auto child_copy = CloneExpression(*child);
+                if (!child_copy) {
+                    return nullptr;
+                }
+                copy->children.push_back(std::move(child_copy));
+            }
+            return copy;
+        }
+        default:
+            return nullptr;
+    }
+}
+
+std::unique_ptr<Expression> BuildPrefixLikePredicate(const BoundColumnRefExpression &column,
+                                                     const std::string &prefix) {
+    auto like = std::make_unique<BoundFunctionExpression>("~~", InvalidOid);
+    like->children.push_back(CloneColumnRef(column));
+    like->children.push_back(std::make_unique<BoundConstantExpression>(prefix + "%", false));
+    return like;
+}
+
+std::unique_ptr<Expression> TryRewriteScalarArrayMembership(bool use_or,
+                                                            Oid compare_opno,
+                                                            const Expression &lhs,
+                                                            const Expression &rhs) {
+    if (compare_opno == InvalidOid) {
+        return nullptr;
+    }
+    char *opname = get_opname(compare_opno);
+    if (opname == nullptr) {
+        return nullptr;
+    }
+
+    const BoundColumnRefExpression *base = nullptr;
+    int prefix_len = 0;
+    const auto *array = dynamic_cast<const BoundFunctionExpression *>(&rhs);
+    if (array == nullptr || array->function_name != "array" || array->children.empty()) {
+        return nullptr;
+    }
+
+    if (use_or && strcmp(opname, "=") == 0 && IsPrefixSliceExpr(&lhs, base, prefix_len)) {
+        auto disjunction = std::make_unique<BoundConjunctionExpression>(OR_EXPR);
+        for (const auto &child : array->children) {
+            const auto *constant = dynamic_cast<const BoundConstantExpression *>(child.get());
+            if (constant == nullptr || constant->is_null) {
+                return nullptr;
+            }
+            if (static_cast<int>(constant->value.size()) != prefix_len) {
+                return nullptr;
+            }
+            disjunction->children.push_back(BuildPrefixLikePredicate(*base, constant->value));
+        }
+        if (disjunction->children.empty()) {
+            return nullptr;
+        }
+        if (disjunction->children.size() == 1) {
+            return std::move(disjunction->children[0]);
+        }
+        return disjunction;
+    }
+
+    auto conjunction = std::make_unique<BoundConjunctionExpression>(use_or ? OR_EXPR : AND_EXPR);
+    for (const auto &child : array->children) {
+        const auto *constant = dynamic_cast<const BoundConstantExpression *>(child.get());
+        if (constant == nullptr || constant->is_null) {
+            return nullptr;
+        }
+
+        auto lhs_copy = CloneExpression(lhs);
+        auto rhs_copy = CloneExpression(*constant);
+        if (!lhs_copy || !rhs_copy) {
+            return nullptr;
+        }
+
+        auto compare = std::make_unique<BoundFunctionExpression>(opname, compare_opno);
+        compare->children.push_back(std::move(lhs_copy));
+        compare->children.push_back(std::move(rhs_copy));
+        conjunction->children.push_back(std::move(compare));
+    }
+    if (conjunction->children.empty()) {
+        return nullptr;
+    }
+    if (conjunction->children.size() == 1) {
+        return std::move(conjunction->children[0]);
+    }
+    return conjunction;
+}
+
+bool IsPrefixSliceFunc(const std::string &function_name, ::List *args) {
+    if (function_name != "substring" && function_name != "substr") {
+        return false;
+    }
+    if (args == nullptr || list_length(args) != 3) {
+        return false;
+    }
+    ::Node *start_arg = (::Node *) list_nth(args, 1);
+    ::Node *len_arg = (::Node *) list_nth(args, 2);
+    if (!IsA(start_arg, Const) || !IsA(len_arg, Const)) {
+        return false;
+    }
+    Const *start_const = (Const *) start_arg;
+    Const *len_const = (Const *) len_arg;
+    if (start_const->constisnull || len_const->constisnull) {
+        return false;
+    }
+    return DatumGetInt32(start_const->constvalue) == 1 && DatumGetInt32(len_const->constvalue) > 0;
+}
 
 int MapPGJoinType(::JoinType join_type) {
     switch (join_type) {
@@ -304,19 +507,6 @@ std::vector<ProducedOutput> CollectProducedOutputs(LogicalOperator* input) {
     }
 
     return outputs;
-}
-
-void AppendUniqueBindings(std::vector<ColumnBinding>& target, const std::vector<ColumnBinding>& source) {
-    std::set<std::pair<size_t, size_t>> seen;
-    for (const auto& binding : target) {
-        seen.insert(std::make_pair(binding.table_index.index, binding.column_index.index));
-    }
-    for (const auto& binding : source) {
-        auto key = std::make_pair(binding.table_index.index, binding.column_index.index);
-        if (seen.insert(key).second) {
-            target.push_back(binding);
-        }
-    }
 }
 
 void CollectCorrelatedColumnsFromPlan(LogicalOperator* op,
@@ -813,13 +1003,15 @@ std::unique_ptr<LogicalOperator> BuildDependentJoin(YaapAdapter& adapter,
     std::set<size_t> left_tables;
     CollectOutputTables(join->children[0].get(), left_tables);
     join->correlated_columns = CollectCorrelatedColumnsFromPlan(join->children[1].get(), left_tables);
-    for (auto& condition : join->conditions) {
-        AppendUniqueBindings(join->correlated_columns, CollectColumnBindings(condition.get(), left_tables));
-    }
     if (!join->correlated_columns.empty()) {
         join->perform_delim = true;
+        join->any_join = (join_type == JOIN_MARK);
+    } else {
+        join->dependent = false;
+        join->perform_delim = false;
+        join->any_join = false;
+        join->type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
     }
-    join->any_join = (join_type == JOIN_MARK);
 
     return join;
 }
@@ -1319,6 +1511,17 @@ std::unique_ptr<Expression> YaapAdapter::TranslateExpression(::Node* pg_expr) {
     if (IsA(pg_expr, FuncExpr)) {
         FuncExpr* func = (FuncExpr*)pg_expr;
         std::string function_name = get_func_name(func->funcid);
+        if (IsPrefixSliceFunc(function_name, func->args)) {
+            auto prefix_expr = std::make_unique<BoundFunctionExpression>("prefix_slice", func->funcid);
+            auto base_expr = TranslateExpression((::Node *) list_nth(func->args, 0));
+            auto len_expr = TranslateExpression((::Node *) list_nth(func->args, 2));
+            if (!base_expr || !len_expr) {
+                throw std::runtime_error("Failed to translate substring prefix arguments");
+            }
+            prefix_expr->children.push_back(std::move(base_expr));
+            prefix_expr->children.push_back(std::move(len_expr));
+            return prefix_expr;
+        }
         std::vector<std::unique_ptr<Expression>> translated_args;
         ListCell* lc;
         foreach(lc, func->args) {
@@ -1408,9 +1611,7 @@ std::unique_ptr<Expression> YaapAdapter::TranslateExpression(::Node* pg_expr) {
 
     if (IsA(pg_expr, ScalarArrayOpExpr)) {
         ScalarArrayOpExpr* saop = (ScalarArrayOpExpr*)pg_expr;
-        auto sa_expr = std::make_unique<BoundFunctionExpression>(
-            saop->useOr ? "any" : "all",
-            saop->opno);
+        std::vector<std::unique_ptr<Expression>> translated_args;
         ListCell* lc;
         foreach(lc, saop->args) {
             ::Node* arg = (::Node*)lfirst(lc);
@@ -1418,7 +1619,22 @@ std::unique_ptr<Expression> YaapAdapter::TranslateExpression(::Node* pg_expr) {
             if (!child_expr) {
                 throw std::runtime_error("Failed to translate ScalarArrayOpExpr argument");
             }
-            sa_expr->children.push_back(std::move(child_expr));
+            translated_args.push_back(std::move(child_expr));
+        }
+        if (translated_args.size() == 2) {
+            auto rewritten = TryRewriteScalarArrayMembership(saop->useOr,
+                                                             saop->opno,
+                                                             *translated_args[0],
+                                                             *translated_args[1]);
+            if (rewritten) {
+                return rewritten;
+            }
+        }
+        auto sa_expr = std::make_unique<BoundFunctionExpression>(
+            saop->useOr ? "any" : "all",
+            saop->opno);
+        for (auto &arg : translated_args) {
+            sa_expr->children.push_back(std::move(arg));
         }
         return sa_expr;
     }

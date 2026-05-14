@@ -422,6 +422,8 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		if (wait_event_id == 0)
 			wait_event_id = WaitEventExtensionNew("pg_yaap leader");
 
+		if (pg_yaap_trace_execution_path)
+			elog(LOG, "pg_yaap pipeline leader: before MetaPipeline::Build");
 		bundle = MetaPipeline::Build(std::unique_ptr<PhysicalOperator>(root));
 		root = nullptr;
 		if (bundle == nullptr)
@@ -435,6 +437,8 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 
 		for (size_t i = 0; i < bundle->pipelines.size(); ++i)
 			Assert(bundle->pipelines[i]->id == static_cast<PipelineId>(i));
+		if (pg_yaap_trace_execution_path)
+			elog(LOG, "pg_yaap pipeline leader: built pipelines=%zu", bundle->pipelines.size());
 
 		phase.mark("T1_build_done");
 
@@ -472,6 +476,10 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 
 		control->pipelines_root = LeaderSerializePipelines(*bundle, dsa);
 		control->num_pipelines = static_cast<int32>(bundle->pipelines.size());
+		if (pg_yaap_trace_execution_path)
+			elog(LOG, "pg_yaap pipeline leader: serialized pipelines root=%llu count=%d",
+				 static_cast<unsigned long long>(control->pipelines_root),
+				 control->num_pipelines);
 
 		phase.mark("T3_descriptor_pub");
 
@@ -496,6 +504,9 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		scheduler.BuildEvents();
 		scheduler.BindRuntime(control, queue, dsa);
 		scheduler.AllocateEventShmStates();
+		if (pg_yaap_trace_execution_path)
+			elog(LOG, "pg_yaap pipeline leader: scheduler initialized events=%u",
+				 scheduler.event_count());
 		PipelineProfileAllocate(control,
 							 dsa,
 							 scheduler.event_count(),

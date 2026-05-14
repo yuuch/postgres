@@ -337,6 +337,54 @@ FindRightColumnBySlotAndKind(const TupleDataLayout *right_layout,
 	return nullptr;
 }
 
+static bool
+ReadPromotedFilterInt64FromProbe(const HashJoinFilterInputDesc &input,
+								 const PipelineChunk &probe_chunk,
+								 uint16_t probe_row_idx,
+								 int64_t &out_value)
+{
+	switch (input.source_decode_kind)
+	{
+		case ColumnDecodeKind::INT32_CHAR:
+		case ColumnDecodeKind::INT32_DATE:
+		case ColumnDecodeKind::INT32_INT4:
+			out_value = static_cast<int64_t>(probe_chunk.get_int32(input.input_chunk_slot, probe_row_idx));
+			return true;
+		case ColumnDecodeKind::INT64_INT8:
+		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+			out_value = probe_chunk.get_int64(input.input_chunk_slot, probe_row_idx);
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+ReadPromotedFilterInt64FromBuild(const HashJoinFilterInputDesc &input,
+								 const TdcColumnDesc *right_col,
+								 const uint8_t *build_row,
+								 int64_t &out_value)
+{
+	switch (input.source_decode_kind)
+	{
+		case ColumnDecodeKind::INT32_CHAR:
+		case ColumnDecodeKind::INT32_DATE:
+		case ColumnDecodeKind::INT32_INT4:
+		{
+			int32_t value = 0;
+			std::memcpy(&value, build_row + right_col->offset, sizeof(value));
+			out_value = static_cast<int64_t>(value);
+			return true;
+		}
+		case ColumnDecodeKind::INT64_INT8:
+		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+			std::memcpy(&out_value, build_row + right_col->offset, sizeof(out_value));
+			return true;
+		default:
+			return false;
+	}
+}
+
 static FilterExprDesc *
 ResolveFilterExprs(dsa_area *dsa, dsa_pointer dp)
 {
@@ -623,7 +671,10 @@ PopulateJoinFilterChunk(const HashJoinFilterInputDesc *inputs,
 					break;
 				case ColumnDecodeKind::INT64_INT8:
 				case ColumnDecodeKind::INT64_NUMERIC_SCALED:
-					filter_chunk.int64_columns[i][0] = probe_chunk.get_int64(input.input_chunk_slot, probe_row_idx);
+					if (!ReadPromotedFilterInt64FromProbe(input, probe_chunk, probe_row_idx, filter_chunk.int64_columns[i][0]))
+						elog(ERROR, "pg_yaap: unsupported LEFT promoted hash join filter decode kind %u->%u",
+							 static_cast<unsigned>(input.source_decode_kind),
+							 static_cast<unsigned>(input.decode_kind));
 					break;
 				case ColumnDecodeKind::DOUBLE_FLOAT8:
 					filter_chunk.double_columns[i][0] = probe_chunk.get_double(input.input_chunk_slot, probe_row_idx);
@@ -643,7 +694,7 @@ PopulateJoinFilterChunk(const HashJoinFilterInputDesc *inputs,
 
 		const TdcColumnDesc *right_col = FindRightColumnBySlotAndKind(build_layout,
 			input.input_chunk_slot,
-			input.decode_kind);
+			input.source_decode_kind);
 		if (right_col == nullptr)
 			elog(ERROR, "pg_yaap: hash join filter mapping missing right payload column");
 		switch (input.decode_kind)
@@ -655,7 +706,10 @@ PopulateJoinFilterChunk(const HashJoinFilterInputDesc *inputs,
 				break;
 			case ColumnDecodeKind::INT64_INT8:
 			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
-				std::memcpy(&filter_chunk.int64_columns[i][0], build_row + right_col->offset, sizeof(int64_t));
+				if (!ReadPromotedFilterInt64FromBuild(input, right_col, build_row, filter_chunk.int64_columns[i][0]))
+					elog(ERROR, "pg_yaap: unsupported RIGHT promoted hash join filter decode kind %u->%u",
+						 static_cast<unsigned>(input.source_decode_kind),
+						 static_cast<unsigned>(input.decode_kind));
 				break;
 			case ColumnDecodeKind::DOUBLE_FLOAT8:
 				std::memcpy(&filter_chunk.double_columns[i][0], build_row + right_col->offset, sizeof(double));

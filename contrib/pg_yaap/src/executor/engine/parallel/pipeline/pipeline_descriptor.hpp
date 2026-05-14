@@ -253,6 +253,7 @@ enum class ProjectOp : uint8_t {
 	BOOL_NOT_VAR = 19,
 	CONST_INT64 = 20,
 	INT32_TO_INT64_VAR = 21,
+	STRING_PREFIX_SLICE = 22,
 };
 
 struct ProjectStep {
@@ -290,7 +291,8 @@ struct HashJoinFilterInputDesc {
 	HashJoinOutputSide side;
 	uint8_t            input_chunk_slot;
 	ColumnDecodeKind   decode_kind;
-	uint8_t            _pad0;
+	ColumnDecodeKind   source_decode_kind;
+	uint8_t            numeric_scale;
 };
 
 struct HashJoinOutputColumnDesc {
@@ -298,6 +300,12 @@ struct HashJoinOutputColumnDesc {
 	uint8_t            input_chunk_slot;
 	ColumnDecodeKind   decode_kind;
 	uint8_t            output_chunk_slot;
+};
+
+enum class HashJoinMatchMode : uint8_t {
+	INNER = 0,
+	SEMI = 1,
+	ANTI = 2,
 };
 
 struct HashJoinOpBody {
@@ -321,7 +329,8 @@ struct HashJoinOpBody {
 	uint16_t    n_filter_exprs;
 	uint16_t    n_filter_steps;
 	uint16_t    filter_bool_regs;
-	uint16_t    _pad0;
+	HashJoinMatchMode join_mode;
+	uint8_t     _pad0[1];
 	uint32_t    filter_string_const_bytes;
 	uint32_t    max_rows;
 };

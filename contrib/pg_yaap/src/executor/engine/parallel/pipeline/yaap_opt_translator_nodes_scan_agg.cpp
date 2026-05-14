@@ -141,6 +141,54 @@ RewriteProjectionAggregateRefs(const Expression *expr,
 }
 
 static bool
+LookupProjectionInputColumn(const BoundColumnRefExpression *expr,
+							const std::vector<ColumnRef> &cols,
+							const std::vector<ColumnSchema> &schema,
+							ColumnRef &out_ref,
+							const ColumnSchema *&out_col)
+{
+	if (expr == nullptr)
+		return false;
+
+	ColumnRef exact_ref{};
+	const ColumnSchema *exact_col = nullptr;
+	const bool exact_found = LookupBindingColumn(expr->binding, cols, schema, exact_ref, exact_col);
+
+	ColumnRef ordinal_ref{};
+	const ColumnSchema *ordinal_col = nullptr;
+	const bool ordinal_found =
+		cols.size() == schema.size() &&
+		expr->binding.column_index.index < schema.size() &&
+		(ordinal_ref = cols[expr->binding.column_index.index], true) &&
+		(ordinal_col = &schema[expr->binding.column_index.index], true);
+
+	if (exact_found &&
+		ordinal_found &&
+		exact_col != nullptr &&
+		ordinal_col != nullptr &&
+		exact_col->decode_kind == ColumnDecodeKind::STRING_REF &&
+		ordinal_col->decode_kind != ColumnDecodeKind::STRING_REF)
+	{
+		out_ref = ordinal_ref;
+		out_col = ordinal_col;
+		return true;
+	}
+	if (exact_found)
+	{
+		out_ref = exact_ref;
+		out_col = exact_col;
+		return true;
+	}
+	if (ordinal_found)
+	{
+		out_ref = ordinal_ref;
+		out_col = ordinal_col;
+		return true;
+	}
+	return false;
+}
+
+static bool
 TryBuildPureProjection(const PhysicalProjection &projection,
 					   const std::vector<Expression *> &select_list,
 					   const std::vector<ColumnRef> *required_output_cols,
@@ -158,7 +206,7 @@ TryBuildPureProjection(const PhysicalProjection &projection,
 			return false;
 		ColumnRef ref{};
 		const ColumnSchema *col = nullptr;
-		if (!LookupExprInputColumn(col_expr->binding, child.cols, child.schema, ref, col) || col == nullptr)
+		if (!LookupProjectionInputColumn(col_expr, child.cols, child.schema, ref, col) || col == nullptr)
 			return false;
 		raw_output_cols.push_back(ColumnRef{
 			static_cast<Index>(projection.table_index.index + 1),
@@ -354,7 +402,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 			ColumnRef ref{};
 			const ColumnSchema *source_col = nullptr;
 			const auto *col_expr = static_cast<const BoundColumnRefExpression *>(expr);
-			if (!LookupExprInputColumn(col_expr->binding, child.cols, child.schema, ref, source_col) ||
+			if (!LookupProjectionInputColumn(col_expr, child.cols, child.schema, ref, source_col) ||
 				source_col == nullptr)
 			{
 				if (pg_yaap_trace_hooks)
@@ -404,7 +452,14 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	if (!DsaPointerIsValid(input_schema_dp) || !DsaPointerIsValid(output_schema_dp))
 	{
 		if (pg_yaap_trace_hooks)
-			elog(LOG, "pg_yaap: optimizer projection rejected: schema DSA publish failed");
+			elog(LOG,
+				 "pg_yaap: optimizer projection rejected: schema DSA publish failed child_schema=%zu out_schema=%zu hidden_passthrough=%zu exprs=%zu input_ok=%d output_ok=%d",
+				 child.schema.size(),
+				 out_schema.size(),
+				 hidden_passthrough.size(),
+				 rewritten_select_list.size(),
+				 DsaPointerIsValid(input_schema_dp) ? 1 : 0,
+				 DsaPointerIsValid(output_schema_dp) ? 1 : 0);
 		return false;
 	}
 

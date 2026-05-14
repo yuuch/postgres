@@ -22,6 +22,7 @@ namespace pipeline {
 namespace translator_detail {
 
 constexpr int8_t kProjectionDivisionScale = 16;
+constexpr int8_t kProjectionConstDivisionScale = 6;
 constexpr int16_t kAvgNumericExtraScale = 12;
 
 Expr *
@@ -611,7 +612,9 @@ LowerNumericBinaryExpr(OpExpr *op,
 		    next_int64_slot >= 16)
 			return false;
 		int64_t factor = 0;
-		out_result_scale = kProjectionDivisionScale;
+		out_result_scale = (lhs_const || rhs_const)
+			? std::max<int8_t>(kProjectionConstDivisionScale, std::max(lhs_scale, rhs_scale))
+			: kProjectionDivisionScale;
 		if (!Pow10Int64(static_cast<int>(out_result_scale) + static_cast<int>(rhs_scale) - static_cast<int>(lhs_scale), factor))
 			return false;
 		out_result_slot = next_int64_slot++;

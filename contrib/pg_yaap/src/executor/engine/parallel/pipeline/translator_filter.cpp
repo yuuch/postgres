@@ -133,13 +133,21 @@ LookupOrAddHashJoinFilterInput(const ColumnRef &ref,
 		return false;
 	desc.input_chunk_slot = out_src->chunk_slot;
 	desc.decode_kind = out_src->decode_kind;
-	desc._pad0 = 0;
+	desc.numeric_scale = 0;
+	if (desc.decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+	{
+		int8_t scale = 0;
+		if (!ColumnNumericScale(*out_src, scale))
+			return false;
+		desc.numeric_scale = static_cast<uint8_t>(std::max<int>(0, scale));
+	}
 	for (uint16_t i = 0; i < inputs.size(); ++i)
 	{
 		const HashJoinFilterInputDesc &existing = inputs[i];
 		if (existing.side == desc.side &&
 			existing.input_chunk_slot == desc.input_chunk_slot &&
-			existing.decode_kind == desc.decode_kind)
+			existing.decode_kind == desc.decode_kind &&
+			existing.numeric_scale == desc.numeric_scale)
 		{
 			out_dst_col = i;
 			return true;

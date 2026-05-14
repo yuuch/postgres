@@ -439,13 +439,25 @@ LookupOrAddScanFilterInput(const ColumnSchema &col,
 
 bool
 LookupOrAddJoinFilterInput(const ColumnRef &ref,
-						   const std::vector<ColumnRef> &left_cols,
-						   const std::vector<ColumnSchema> &left_schema,
-						   const std::vector<ColumnRef> &right_cols,
-						   const std::vector<ColumnSchema> &right_schema,
-						   std::vector<HashJoinFilterInputDesc> &inputs,
-						   uint16_t &out_idx,
-						   const ColumnSchema *&out_col);
+						  const std::vector<ColumnRef> &left_cols,
+						  const std::vector<ColumnSchema> &left_schema,
+						  const std::vector<ColumnRef> &right_cols,
+						  const std::vector<ColumnSchema> &right_schema,
+						  std::vector<HashJoinFilterInputDesc> &inputs,
+						  uint16_t &out_idx,
+						  const ColumnSchema *&out_col);
+
+bool
+LookupOrAddJoinFilterInputAs(const ColumnRef &ref,
+							 const std::vector<ColumnRef> &left_cols,
+							 const std::vector<ColumnSchema> &left_schema,
+							 const std::vector<ColumnRef> &right_cols,
+							 const std::vector<ColumnSchema> &right_schema,
+							 ColumnDecodeKind target_decode_kind,
+							 uint8_t target_numeric_scale,
+							 std::vector<HashJoinFilterInputDesc> &inputs,
+							 uint16_t &out_idx,
+							 const ColumnSchema *&out_col);
 
 bool
 AppendFilterExpr(std::vector<FilterExprDesc> &exprs,

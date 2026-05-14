@@ -729,6 +729,8 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 	const Expression *right_expr = UnwrapTransparentCastExpr(func->children[1].get());
 	const auto *left_col = dynamic_cast<const BoundColumnRefExpression *>(left_expr);
 	const auto *right_col = dynamic_cast<const BoundColumnRefExpression *>(right_expr);
+	const auto *left_const = dynamic_cast<const BoundConstantExpression *>(left_expr);
+	const auto *right_const = dynamic_cast<const BoundConstantExpression *>(right_expr);
 
 	FilterStep step{};
 	step._pad0 = 0;
@@ -786,6 +788,43 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 											 inputs, idx, col);
 		};
 
+		return loose_lookup(left_cols, left_schema) || loose_lookup(right_cols, right_schema);
+	};
+
+	auto resolve_ref = [&](const Expression *side_expr,
+						   const BoundColumnRefExpression *col_expr,
+						   ColumnRef &out_ref,
+						   const ColumnSchema *&out_col) -> bool
+	{
+		if (col_expr == nullptr)
+			return LookupAggregateOutputColumn(side_expr, left_source_op, left_cols, left_schema, out_ref, out_col) ||
+				   LookupAggregateOutputColumn(side_expr, right_source_op, right_cols, right_schema, out_ref, out_col);
+		out_ref = BindingToColumnRef(col_expr->binding);
+		if (LookupRawColumn(out_ref, left_cols, left_schema, out_col) ||
+			LookupRawColumn(out_ref, right_cols, right_schema, out_col))
+			return true;
+		auto loose_lookup = [&](const std::vector<ColumnRef> &side_cols,
+								const std::vector<ColumnSchema> &side_schema) -> bool
+		{
+			if (side_cols.size() != side_schema.size() ||
+				col_expr->binding.column_index.index >= side_schema.size())
+				return false;
+			bool table_match = false;
+			for (const ColumnRef &side_ref : side_cols)
+			{
+				if (side_ref.varno == static_cast<Index>(col_expr->binding.table_index.index) ||
+					side_ref.varno == static_cast<Index>(col_expr->binding.table_index.index + 1))
+				{
+					table_match = true;
+					break;
+				}
+			}
+			if (!table_match)
+				return false;
+			out_ref = side_cols[col_expr->binding.column_index.index];
+			out_col = &side_schema[col_expr->binding.column_index.index];
+			return true;
+		};
 		return loose_lookup(left_cols, left_schema) || loose_lookup(right_cols, right_schema);
 	};
 
@@ -951,11 +990,70 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 	if (!locate(left_expr, left_col, left_source_op, step.left_idx, left_col_schema) ||
 		!locate(right_expr, right_col, right_source_op, step.right_idx, right_col_schema) ||
 		left_col_schema == nullptr || right_col_schema == nullptr ||
-		left_col_schema->decode_kind != right_col_schema->decode_kind ||
 		!MapComparisonNameToQualOp(func->function_name, step.cmp_op))
 	{
 		log_join_compare_failure();
 		return false;
+	}
+	auto is_integral_numeric = [](ColumnDecodeKind kind)
+	{
+		return kind == ColumnDecodeKind::INT32_INT4 || kind == ColumnDecodeKind::INT64_INT8;
+	};
+	auto is_numeric_family = [&](ColumnDecodeKind kind)
+	{
+		return is_integral_numeric(kind) || kind == ColumnDecodeKind::INT64_NUMERIC_SCALED;
+	};
+	if (left_col_schema->decode_kind != right_col_schema->decode_kind)
+	{
+		if (!(is_numeric_family(left_col_schema->decode_kind) && is_numeric_family(right_col_schema->decode_kind)))
+		{
+			log_join_compare_failure();
+			return false;
+		}
+
+		ColumnRef left_ref{};
+		ColumnRef right_ref{};
+		if (!resolve_ref(left_expr, left_col, left_ref, left_col_schema) ||
+			!resolve_ref(right_expr, right_col, right_ref, right_col_schema))
+		{
+			log_join_compare_failure();
+			return false;
+		}
+		if (!(is_numeric_family(left_col_schema->decode_kind) && is_numeric_family(right_col_schema->decode_kind)))
+		{
+			log_join_compare_failure();
+			return false;
+		}
+		if (!(left_col_schema->decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED ||
+			  left_col_schema->decode_kind == ColumnDecodeKind::INT32_INT4 ||
+			  left_col_schema->decode_kind == ColumnDecodeKind::INT64_INT8) ||
+			!(right_col_schema->decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED ||
+			  right_col_schema->decode_kind == ColumnDecodeKind::INT32_INT4 ||
+			  right_col_schema->decode_kind == ColumnDecodeKind::INT64_INT8))
+		{
+			log_join_compare_failure();
+			return false;
+		}
+		if (!LookupOrAddJoinFilterInputAs(left_ref,
+										 left_cols, left_schema,
+										 right_cols, right_schema,
+										 ColumnDecodeKind::INT64_NUMERIC_SCALED,
+										 0,
+										 inputs, step.left_idx, left_col_schema) ||
+			!LookupOrAddJoinFilterInputAs(right_ref,
+										 left_cols, left_schema,
+										 right_cols, right_schema,
+										 ColumnDecodeKind::INT64_NUMERIC_SCALED,
+										 0,
+										 inputs, step.right_idx, right_col_schema))
+		{
+			log_join_compare_failure();
+			return false;
+		}
+		step.op = FilterStepOp::INT64_CMP_VAR;
+		out_bool_reg = step.out_bool_reg;
+		steps.push_back(step);
+		return true;
 	}
 	if (left_col_schema->decode_kind == ColumnDecodeKind::INT32_DATE ||
 		left_col_schema->decode_kind == ColumnDecodeKind::INT32_INT4 ||

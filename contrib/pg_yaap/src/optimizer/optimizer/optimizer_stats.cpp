@@ -95,6 +95,32 @@ bool IsComparisonOperator(const std::string& op_name) {
     return op_name == "=" || op_name == ">" || op_name == ">=" || op_name == "<" || op_name == "<=";
 }
 
+bool IsDynamicComparison(Expression* expression) {
+    if (!expression || expression->type != ExpressionType::BOUND_FUNCTION) {
+        return false;
+    }
+
+    auto* function = static_cast<BoundFunctionExpression*>(expression);
+    if (!IsComparisonOperator(function->function_name) || function->children.size() != 2) {
+        return false;
+    }
+
+    return function->children[0] &&
+           function->children[1] &&
+           function->children[0]->type != ExpressionType::BOUND_CONSTANT &&
+           function->children[1]->type != ExpressionType::BOUND_CONSTANT;
+}
+
+bool IsArrayMembershipPredicate(Expression* expression) {
+    if (!expression || expression->type != ExpressionType::BOUND_FUNCTION) {
+        return false;
+    }
+
+    auto* function = static_cast<BoundFunctionExpression*>(expression);
+    return (function->function_name == "any" || function->function_name == "all") &&
+           !function->children.empty();
+}
+
 bool ParseNumericConstant(const BoundConstantExpression* constant, double& value) {
     if (!constant || constant->is_null) {
         return false;
@@ -1007,6 +1033,10 @@ size_t RelationStatisticsHelper::EstimateSingleFilter(size_t input_cardinality,
         }
     }
 
+    if (IsDynamicComparison(filter) || IsArrayMembershipPredicate(filter)) {
+        return input_cardinality;
+    }
+
     return ClampCardinality(static_cast<double>(input_cardinality) * DEFAULT_SELECTIVITY, input_cardinality);
 }
 
@@ -1048,6 +1078,64 @@ size_t RelationStatisticsHelper::EstimateJoinCardinality(
     }
 
     return ClampCardinality(cardinality, 0);
+}
+
+size_t RelationStatisticsHelper::EstimateSemiOrAntiJoinCardinality(
+    const RelationStats& left_stats,
+    const RelationStats& right_stats,
+    const std::vector<Expression*>& join_conditions,
+    bool anti) const {
+    if (left_stats.cardinality == 0) {
+        return 0;
+    }
+
+    double matched_fraction = -1.0;
+    bool used_stats = false;
+    for (auto* condition : join_conditions) {
+        ColumnBinding left_binding;
+        ColumnBinding right_binding;
+        if (!TryExtractEqualityColumns(condition, left_binding, right_binding)) {
+            continue;
+        }
+
+        auto left_column = LookupColumnStats(left_stats, left_binding);
+        auto right_column = LookupColumnStats(right_stats, right_binding);
+        if (!left_column.has_stats || !right_column.has_stats) {
+            left_column = LookupColumnStats(left_stats, right_binding);
+            right_column = LookupColumnStats(right_stats, left_binding);
+        }
+        if (!left_column.has_stats || !right_column.has_stats ||
+            left_column.distinct.distinct_count == 0 || right_column.distinct.distinct_count == 0) {
+            continue;
+        }
+
+        double coverage = std::min(
+            1.0,
+            static_cast<double>(right_column.distinct.distinct_count) /
+                static_cast<double>(std::max<size_t>(1, left_column.distinct.distinct_count)));
+        matched_fraction = used_stats ? matched_fraction * coverage : coverage;
+        used_stats = true;
+    }
+
+    if (!used_stats) {
+        if (join_conditions.empty()) {
+            matched_fraction = DEFAULT_SELECTIVITY;
+        } else {
+            auto joined = EstimateJoinCardinality(left_stats, right_stats, join_conditions);
+            matched_fraction = std::min(
+                1.0,
+                static_cast<double>(joined) / static_cast<double>(std::max<size_t>(1, left_stats.cardinality)));
+        }
+    }
+
+    matched_fraction = std::max(0.0, std::min(1.0, matched_fraction));
+    size_t matched_rows = ClampCardinality(
+        matched_fraction * static_cast<double>(left_stats.cardinality),
+        left_stats.cardinality);
+    if (!anti) {
+        return matched_rows;
+    }
+    return left_stats.cardinality > matched_rows ? left_stats.cardinality - matched_rows : 0;
 }
 
 RelationStats RelationStatisticsHelper::CombineReorderableStats(

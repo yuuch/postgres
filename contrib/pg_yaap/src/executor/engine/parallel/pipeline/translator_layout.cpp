@@ -1,5 +1,7 @@
 #include "parallel/pipeline/translator_internal.hpp"
 
+#include <limits>
+
 extern "C" {
 #include "access/relation.h"
 #include "access/tupdesc.h"
@@ -170,9 +172,9 @@ ColumnDecodeKindToTdc(ColumnDecodeKind dk, TdcColumnKind &out)
 dsa_pointer
 BuildSchemaDescriptorFromColumns(const std::vector<ColumnSchema> &columns, dsa_area *dsa)
 {
-	const uint16_t n_cols = static_cast<uint16_t>(columns.size());
-	if (n_cols == 0 || n_cols > 16)
+	if (columns.size() > std::numeric_limits<uint16_t>::max())
 		return InvalidDsaPointer;
+	const uint16_t n_cols = static_cast<uint16_t>(columns.size());
 	const Size sz = offsetof(SchemaDescriptor, columns) +
 		static_cast<Size>(n_cols) * sizeof(ColumnSchema);
 	dsa_pointer dp = dsa_allocate0(dsa, sz);

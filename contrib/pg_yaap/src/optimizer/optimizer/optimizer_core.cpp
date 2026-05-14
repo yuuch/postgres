@@ -83,9 +83,11 @@ RelationStats CardinalityEstimator::Rewrite(LogicalOperator& plan) {
                         for (auto& condition : join.conditions) {
                             conditions.push_back(condition.get());
                         }
-                        estimated_cardinality = std::min(
-                            left_stats.cardinality,
-                            statistics_helper_.EstimateJoinCardinality(left_stats, right_stats, conditions));
+                        estimated_cardinality = join.join_type == JOIN_ANTI
+                            ? statistics_helper_.EstimateSemiOrAntiJoinCardinality(left_stats, right_stats, conditions, true)
+                            : std::min(
+                                  left_stats.cardinality,
+                                  statistics_helper_.EstimateJoinCardinality(left_stats, right_stats, conditions));
                     } else {
                         estimated_cardinality = std::max<size_t>(
                             1,
@@ -177,7 +179,7 @@ RelationStats CardinalityEstimator::Rewrite(LogicalOperator& plan) {
     return statistics_helper_.Extract(plan);
 }
 
-std::unique_ptr<Expression> CloneExpressionWithBindingReplacements(
+static std::unique_ptr<Expression> CloneExpressionWithBindingReplacements(
     Expression* expression,
     const std::map<std::pair<size_t, size_t>, ColumnBinding>& replacements) {
     if (!expression) {

@@ -245,6 +245,12 @@ pg_yaap_initialize_plan(QueryDesc *queryDesc, PgYaapQueryState *state_ptr)
 	if (root == nullptr)
 	{
 		pg_yaap::pipeline::DestroyRuntimeDsm(state);
+		if (!saw_optimizer_bundle)
+		{
+			ereport(WARNING,
+					(errmsg("pg_yaap: unsupported plan shape, falling back to standard PostgreSQL executor")));
+			return false;
+		}
 		const char *plan_summary = PlanTreeSummaryCString(queryDesc->plannedstmt->planTree);
 		ereport(ERROR,
 				(errmsg("pg_yaap: executor lowering produced no plan; root=%s plan_nodes=%s",

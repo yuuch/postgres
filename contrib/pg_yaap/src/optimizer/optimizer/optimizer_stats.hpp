@@ -87,6 +87,10 @@ public:
     size_t EstimateJoinCardinality(const RelationStats& left_stats,
                                    const RelationStats& right_stats,
                                    const std::vector<Expression*>& join_conditions) const;
+    size_t EstimateSemiOrAntiJoinCardinality(const RelationStats& left_stats,
+                                             const RelationStats& right_stats,
+                                             const std::vector<Expression*>& join_conditions,
+                                             bool anti) const;
     RelationStats CombineReorderableStats(const RelationStats& left_stats,
                                           const RelationStats& right_stats,
                                           size_t cardinality) const;

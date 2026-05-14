@@ -712,6 +712,7 @@ LookupOrAddJoinFilterInput(const ColumnRef &ref,
 		desc.side = HashJoinOutputSide::LEFT;
 		desc.input_chunk_slot = out_col->chunk_slot;
 		desc.decode_kind = out_col->decode_kind;
+		desc.source_decode_kind = out_col->decode_kind;
 		desc.numeric_scale = 0;
 	}
 	else if (LookupRawColumn(ref, right_cols, right_schema, out_col))
@@ -719,6 +720,7 @@ LookupOrAddJoinFilterInput(const ColumnRef &ref,
 		desc.side = HashJoinOutputSide::RIGHT;
 		desc.input_chunk_slot = out_col->chunk_slot;
 		desc.decode_kind = out_col->decode_kind;
+		desc.source_decode_kind = out_col->decode_kind;
 		desc.numeric_scale = 0;
 	}
 	else
@@ -738,6 +740,60 @@ LookupOrAddJoinFilterInput(const ColumnRef &ref,
 		if (existing.side == desc.side &&
 			existing.input_chunk_slot == desc.input_chunk_slot &&
 			existing.decode_kind == desc.decode_kind &&
+			existing.source_decode_kind == desc.source_decode_kind &&
+			existing.numeric_scale == desc.numeric_scale)
+		{
+			out_idx = static_cast<uint16_t>(i);
+			return true;
+		}
+	}
+	if (inputs.size() >= pg_yaap::pipeline::FILTER_MAX_INPUTS)
+		return false;
+	out_idx = static_cast<uint16_t>(inputs.size());
+	inputs.push_back(desc);
+	return true;
+}
+
+bool
+LookupOrAddJoinFilterInputAs(const ColumnRef &ref,
+							 const std::vector<ColumnRef> &left_cols,
+							 const std::vector<ColumnSchema> &left_schema,
+							 const std::vector<ColumnRef> &right_cols,
+							 const std::vector<ColumnSchema> &right_schema,
+							 ColumnDecodeKind target_decode_kind,
+							 uint8_t target_numeric_scale,
+							 std::vector<HashJoinFilterInputDesc> &inputs,
+							 uint16_t &out_idx,
+							 const ColumnSchema *&out_col)
+{
+	HashJoinFilterInputDesc desc{};
+	if (LookupRawColumn(ref, left_cols, left_schema, out_col))
+		desc.side = HashJoinOutputSide::LEFT;
+	else if (LookupRawColumn(ref, right_cols, right_schema, out_col))
+		desc.side = HashJoinOutputSide::RIGHT;
+	else
+		return false;
+
+	desc.input_chunk_slot = out_col->chunk_slot;
+	desc.decode_kind = target_decode_kind;
+	desc.source_decode_kind = out_col->decode_kind;
+	desc.numeric_scale = target_numeric_scale;
+	if (target_decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
+		desc.source_decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+	{
+		int8_t scale = 0;
+		if (!ColumnNumericScale(*out_col, scale))
+			return false;
+		desc.numeric_scale = static_cast<uint8_t>(std::max<int>(0, scale));
+	}
+
+	for (size_t i = 0; i < inputs.size(); ++i)
+	{
+		const auto &existing = inputs[i];
+		if (existing.side == desc.side &&
+			existing.input_chunk_slot == desc.input_chunk_slot &&
+			existing.decode_kind == desc.decode_kind &&
+			existing.source_decode_kind == desc.source_decode_kind &&
 			existing.numeric_scale == desc.numeric_scale)
 		{
 			out_idx = static_cast<uint16_t>(i);

@@ -1,5 +1,12 @@
 #include "parallel/pipeline/physical_delim_scan.hpp"
 
+extern "C" {
+#include "postgres.h"
+#include "utils/elog.h"
+
+extern bool pg_yaap_trace_execution_path;
+}
+
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
@@ -98,6 +105,13 @@ PhysicalDelimScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput
 	auto &global = static_cast<DelimScanGlobalSourceState &>(input.global_state);
 	(void) input.local_state;
 	out.reset();
+	if (pg_yaap_trace_execution_path)
+		elog(LOG,
+			 "pg_yaap delim scan enter op=%p source_partition=%u partition_count=%u finalized=%d",
+			 static_cast<void *>(this),
+			 global.source_partition,
+			 global.partition_count,
+			 global.payload != nullptr && global.payload->finalized ? 1 : 0);
 
 	if (!global.payload->finalized)
 		return SourceResultType::FINISHED;

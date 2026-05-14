@@ -315,6 +315,13 @@ pg_yaap_planner_hook(Query *parse, const char *query_string,
 	void *optimizer_bundle = NULL;
 	(void) es;
 
+	if (IsParallelWorker())
+	{
+		if (prev_planner_hook)
+			return prev_planner_hook(parse, query_string, cursorOptions, boundParams, es);
+		return standard_planner(parse, query_string, cursorOptions, boundParams, es);
+	}
+
 	if (pg_yaap_enabled && parse != NULL && parse->commandType == CMD_SELECT)
 		(void) pg_yaap_try_build_optimizer_plan(parse, &optimizer_bundle);
 
@@ -341,6 +348,15 @@ pg_yaap_ExplainOneQuery(Query *query,
 						  QueryEnvironment *queryEnv)
 {
 	void *optimizer_bundle = NULL;
+
+	if (IsParallelWorker())
+	{
+		if (prev_ExplainOneQuery)
+			prev_ExplainOneQuery(query, cursorOptions, into, es, queryString, params, queryEnv);
+		else
+			standard_ExplainOneQuery(query, cursorOptions, into, es, queryString, params, queryEnv);
+		return;
+	}
 
 	if (pg_yaap_enabled && query != NULL && query->commandType == CMD_SELECT)
 		(void) pg_yaap_try_build_optimizer_plan(query, &optimizer_bundle);
@@ -513,6 +529,8 @@ pg_yaap_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	else
 	{
 		pg_yaap_close_query_state(state);
+		if (!optimizer_only)
+			return;
 		ereport(ERROR, (errmsg("pg_yaap: optimizer-only plan initialization returned false")));
 	}
 }
@@ -521,6 +539,15 @@ static void
 pg_yaap_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
 	PgYaapQueryState *state = pg_yaap_lookup_state(queryDesc);
+
+	if (IsParallelWorker())
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+		return;
+	}
 
 	if (state != NULL)
 	{
@@ -540,6 +567,15 @@ pg_yaap_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 static void
 pg_yaap_ExecutorFinish(QueryDesc *queryDesc)
 {
+	if (IsParallelWorker())
+	{
+		if (prev_ExecutorFinish)
+			prev_ExecutorFinish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+		return;
+	}
+
 	if (queryDesc != NULL && queryDesc->plannedstmt != NULL &&
 		pg_yaap_lookup_optimizer_plan(queryDesc->plannedstmt) != NULL)
 	{
@@ -558,6 +594,15 @@ pg_yaap_ExecutorEnd(QueryDesc *queryDesc)
 	PgYaapQueryState *state = pg_yaap_lookup_state(queryDesc);
 	bool optimizer_only = queryDesc != NULL && queryDesc->plannedstmt != NULL &&
 		pg_yaap_lookup_optimizer_plan(queryDesc->plannedstmt) != NULL;
+
+	if (IsParallelWorker())
+	{
+		if (prev_ExecutorEnd)
+			prev_ExecutorEnd(queryDesc);
+		else
+			standard_ExecutorEnd(queryDesc);
+		return;
+	}
 
 	if (state != NULL)
 		pg_yaap_close_query_state(state);
