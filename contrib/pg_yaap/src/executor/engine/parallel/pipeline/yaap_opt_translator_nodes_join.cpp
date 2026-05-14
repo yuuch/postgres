@@ -1,6 +1,173 @@
 #include "parallel/pipeline/yaap_opt_translator_internal.hpp"
 
+#include <sstream>
+
 namespace pg_yaap::optimizer_translator_detail {
+
+static std::string
+ExpressionSemanticKey(const Expression *expression)
+{
+	if (expression == nullptr)
+		return "<null>";
+
+	std::stringstream ss;
+	switch (expression->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expression);
+			ss << "col:" << column->binding.table_index.index << "." << column->binding.column_index.index;
+			break;
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expression);
+			ss << "const:" << (constant->is_null ? "NULL" : constant->value);
+			break;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expression);
+			ss << "fn:" << function->function_name << "(";
+			for (size_t i = 0; i < function->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(function->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expression);
+			ss << "agg:" << aggregate->function_name << "(";
+			for (size_t i = 0; i < aggregate->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(aggregate->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expression);
+			ss << "conj:" << conjunction->bool_expr_type << "(";
+			for (size_t i = 0; i < conjunction->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(conjunction->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_SUBQUERY:
+		{
+			const auto *subquery = static_cast<const yaap::BoundSubqueryExpression *>(expression);
+			ss << "subquery:" << subquery->sublink_name << "(";
+			for (size_t i = 0; i < subquery->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(subquery->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		default:
+			ss << "opaque";
+			break;
+	}
+	return ss.str();
+}
+
+static std::unique_ptr<Expression>
+RewriteAggregateExprToProducedColumn(const BoundAggregateExpression *aggregate_expr,
+									 const PhysicalOperator *source_op)
+{
+	if (aggregate_expr == nullptr || source_op == nullptr)
+		return nullptr;
+	if ((source_op->type == PhysicalOperatorType::FILTER ||
+		 source_op->type == PhysicalOperatorType::PROJECTION ||
+		 source_op->type == PhysicalOperatorType::ORDER_BY ||
+		 source_op->type == PhysicalOperatorType::LIMIT) &&
+		source_op->children.size() == 1 &&
+		source_op->children[0] != nullptr)
+		return RewriteAggregateExprToProducedColumn(aggregate_expr, source_op->children[0].get());
+	if (source_op->type != PhysicalOperatorType::HASH_GROUP_BY)
+		return nullptr;
+
+	const auto *aggregate = static_cast<const PhysicalHashAggregate *>(source_op);
+	const std::string fingerprint = ExpressionSemanticKey(aggregate_expr);
+	for (size_t idx = 0; idx < aggregate->expressions.size(); ++idx)
+	{
+		if (ExpressionSemanticKey(aggregate->expressions[idx]) != fingerprint)
+			continue;
+		std::string column_name = idx < aggregate->aggregate_names.size()
+			? aggregate->aggregate_names[idx]
+			: aggregate_expr->function_name;
+		return std::make_unique<BoundColumnRefExpression>(
+			yaap::ColumnBinding{aggregate->aggregate_index, yaap::ProjectionIndex{idx}},
+			"agg",
+			std::move(column_name));
+	}
+	return nullptr;
+}
+
+static std::unique_ptr<Expression>
+RewriteJoinResidualAggregateRefs(const Expression *expr,
+								 const PhysicalOperator *left_source_op,
+								 const PhysicalOperator *right_source_op)
+{
+	if (expr == nullptr)
+		return nullptr;
+	switch (expr->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expr);
+			return std::make_unique<BoundColumnRefExpression>(column->binding, column->table_name, column->column_name);
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expr);
+			return std::make_unique<BoundConstantExpression>(constant->value, constant->is_null);
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			if (auto rewritten = RewriteAggregateExprToProducedColumn(static_cast<const BoundAggregateExpression *>(expr), left_source_op))
+				return rewritten;
+			if (auto rewritten = RewriteAggregateExprToProducedColumn(static_cast<const BoundAggregateExpression *>(expr), right_source_op))
+				return rewritten;
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expr);
+			auto clone = std::make_unique<BoundAggregateExpression>(aggregate->function_name, aggregate->agg_oid, aggregate->is_distinct);
+			for (const auto &child : aggregate->children)
+				clone->children.push_back(RewriteJoinResidualAggregateRefs(child.get(), left_source_op, right_source_op));
+			return clone;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundFunctionExpression>(function->function_name, function->op_oid);
+			for (const auto &child : function->children)
+				clone->children.push_back(RewriteJoinResidualAggregateRefs(child.get(), left_source_op, right_source_op));
+			return clone;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundConjunctionExpression>(conjunction->bool_expr_type);
+			for (const auto &child : conjunction->children)
+				clone->children.push_back(RewriteJoinResidualAggregateRefs(child.get(), left_source_op, right_source_op));
+			return clone;
+		}
+		default:
+			return nullptr;
+	}
+}
 
 static bool
 IsScalarPhysicalNode(const PhysicalOperator *op)
@@ -196,6 +363,8 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	const auto &probe_schema = swap_sides ? right_child.schema : left_child.schema;
 	const auto &build_cols = swap_sides ? left_child.cols : right_child.cols;
 	const auto &build_schema = swap_sides ? left_child.schema : right_child.schema;
+	const PhysicalOperator *probe_source_op = swap_sides ? join.children[1].get() : join.children[0].get();
+	const PhysicalOperator *build_source_op = swap_sides ? join.children[0].get() : join.children[1].get();
 	const auto &probe_keys = swap_sides ? right_keys : left_keys;
 	const auto &build_keys = swap_sides ? left_keys : right_keys;
 
@@ -273,7 +442,19 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	std::vector<FilterStep> filter_steps;
 	std::vector<char> filter_string_consts;
 	uint16_t filter_bool_regs = 0;
-	if (!LowerJoinFilters(residuals,
+	std::vector<std::unique_ptr<Expression>> rewritten_residual_storage;
+	std::vector<Expression *> rewritten_residuals;
+	rewritten_residual_storage.reserve(residuals.size());
+	rewritten_residuals.reserve(residuals.size());
+	for (Expression *expr : residuals)
+	{
+		auto rewritten = RewriteJoinResidualAggregateRefs(expr, probe_source_op, build_source_op);
+		rewritten_residuals.push_back(rewritten != nullptr ? rewritten.get() : expr);
+		rewritten_residual_storage.push_back(std::move(rewritten));
+	}
+	if (!LowerJoinFilters(rewritten_residuals,
+						  probe_source_op,
+						  build_source_op,
 						  probe_cols, probe_schema,
 						  build_cols, build_schema,
 						  filter_inputs, filter_exprs, filter_steps, filter_string_consts, filter_bool_regs))
@@ -462,7 +643,19 @@ TranslateCrossProductNode(const PhysicalCrossProduct &join,
 	std::vector<FilterStep> filter_steps;
 	std::vector<char> filter_string_consts;
 	uint16_t filter_bool_regs = 0;
-	if (!LowerJoinFilters(residuals,
+	std::vector<std::unique_ptr<Expression>> rewritten_residual_storage;
+	std::vector<Expression *> rewritten_residuals;
+	rewritten_residual_storage.reserve(residuals.size());
+	rewritten_residuals.reserve(residuals.size());
+	for (Expression *expr : residuals)
+	{
+		auto rewritten = RewriteJoinResidualAggregateRefs(expr, join.children[0].get(), join.children[1].get());
+		rewritten_residuals.push_back(rewritten != nullptr ? rewritten.get() : expr);
+		rewritten_residual_storage.push_back(std::move(rewritten));
+	}
+	if (!LowerJoinFilters(rewritten_residuals,
+						  join.children[0].get(),
+						  join.children[1].get(),
 						  probe_cols, probe_schema,
 						  build_cols, build_schema,
 						  filter_inputs, filter_exprs, filter_steps, filter_string_consts, filter_bool_regs))

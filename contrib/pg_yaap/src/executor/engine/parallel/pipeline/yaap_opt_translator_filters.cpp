@@ -1,5 +1,7 @@
 #include "parallel/pipeline/yaap_opt_translator_internal.hpp"
 
+#include <sstream>
+
 namespace pg_yaap::optimizer_translator_detail {
 
 static int
@@ -25,6 +27,114 @@ TryParsePositiveIntConstant(const Expression *expr, int &out_value)
 		return false;
 	out_value = static_cast<int>(parsed);
 	return true;
+}
+
+static std::string
+ExpressionSemanticKey(const Expression *expression)
+{
+	if (expression == nullptr)
+		return "<null>";
+
+	std::stringstream ss;
+	switch (expression->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expression);
+			ss << "col:" << column->binding.table_index.index << "." << column->binding.column_index.index;
+			break;
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expression);
+			ss << "const:" << (constant->is_null ? "NULL" : constant->value);
+			break;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expression);
+			ss << "fn:" << function->function_name << "(";
+			for (size_t i = 0; i < function->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(function->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expression);
+			ss << "agg:" << aggregate->function_name << "(";
+			for (size_t i = 0; i < aggregate->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(aggregate->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expression);
+			ss << "conj:" << conjunction->bool_expr_type << "(";
+			for (size_t i = 0; i < conjunction->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(conjunction->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_SUBQUERY:
+		{
+			const auto *subquery = static_cast<const yaap::BoundSubqueryExpression *>(expression);
+			ss << "subquery:" << subquery->sublink_name << "(";
+			for (size_t i = 0; i < subquery->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(subquery->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		default:
+			ss << "opaque";
+			break;
+	}
+	return ss.str();
+}
+
+static bool
+LookupAggregateOutputColumn(const Expression *expr,
+							const PhysicalOperator *source_op,
+							const std::vector<ColumnRef> &cols,
+							const std::vector<ColumnSchema> &schema,
+							ColumnRef &out_ref,
+							const ColumnSchema *&out_col)
+{
+	expr = UnwrapTransparentCastExpr(expr);
+	if (expr == nullptr || expr->type != ExpressionType::BOUND_AGGREGATE || source_op == nullptr)
+		return false;
+	if (source_op->type != PhysicalOperatorType::HASH_GROUP_BY)
+		return false;
+
+	const auto *aggregate = static_cast<const PhysicalHashAggregate *>(source_op);
+	const std::string fingerprint = ExpressionSemanticKey(expr);
+	for (size_t idx = 0; idx < aggregate->expressions.size(); ++idx)
+	{
+		if (ExpressionSemanticKey(aggregate->expressions[idx]) != fingerprint)
+			continue;
+		out_ref = ColumnRef{
+			static_cast<Index>(aggregate->aggregate_index.index + 1),
+			static_cast<AttrNumber>(idx + 1)};
+		return LookupRawColumn(out_ref, cols, schema, out_col);
+	}
+	return false;
 }
 
 static const BoundColumnRefExpression *
@@ -87,6 +197,8 @@ LowerScanFilterBoolExpr(const Expression *expr,
 
 bool
 LowerJoinFilterBoolExpr(const Expression *expr,
+						const PhysicalOperator *left_source_op,
+						const PhysicalOperator *right_source_op,
 						const std::vector<ColumnRef> &left_cols,
 						const std::vector<ColumnSchema> &left_schema,
 						const std::vector<ColumnRef> &right_cols,
@@ -109,8 +221,8 @@ LowerScanFilterCompare(const BoundFunctionExpression *func,
 {
 	if (func == nullptr || func->children.size() != 2 || !IsComparisonName(func->function_name))
 		return false;
-	const auto *left_col = dynamic_cast<const BoundColumnRefExpression *>(func->children[0].get());
-	const auto *right_col = dynamic_cast<const BoundColumnRefExpression *>(func->children[1].get());
+	const auto *left_col = UnwrapTransparentCastColumn(func->children[0].get());
+	const auto *right_col = UnwrapTransparentCastColumn(func->children[1].get());
 	const auto *left_const = dynamic_cast<const BoundConstantExpression *>(func->children[0].get());
 	const auto *right_const = dynamic_cast<const BoundConstantExpression *>(func->children[1].get());
 
@@ -599,6 +711,8 @@ LowerScanFilterBoolExpr(const Expression *expr,
 
 bool
 LowerJoinFilterCompare(const BoundFunctionExpression *func,
+					   const PhysicalOperator *left_source_op,
+					   const PhysicalOperator *right_source_op,
 					   const std::vector<ColumnRef> &left_cols,
 					   const std::vector<ColumnSchema> &left_schema,
 					   const std::vector<ColumnRef> &right_cols,
@@ -611,10 +725,10 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 {
 	if (func == nullptr || func->children.size() != 2 || !IsComparisonName(func->function_name))
 		return false;
-	const auto *left_col = dynamic_cast<const BoundColumnRefExpression *>(func->children[0].get());
-	const auto *right_col = dynamic_cast<const BoundColumnRefExpression *>(func->children[1].get());
-	const auto *left_const = dynamic_cast<const BoundConstantExpression *>(func->children[0].get());
-	const auto *right_const = dynamic_cast<const BoundConstantExpression *>(func->children[1].get());
+	const Expression *left_expr = UnwrapTransparentCastExpr(func->children[0].get());
+	const Expression *right_expr = UnwrapTransparentCastExpr(func->children[1].get());
+	const auto *left_col = dynamic_cast<const BoundColumnRefExpression *>(left_expr);
+	const auto *right_col = dynamic_cast<const BoundColumnRefExpression *>(right_expr);
 
 	FilterStep step{};
 	step._pad0 = 0;
@@ -624,10 +738,23 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 	step.right_idx = 0;
 	step.out_bool_reg = next_bool_reg++;
 
-	auto locate = [&](const BoundColumnRefExpression *col_expr,
+	auto locate = [&](const Expression *side_expr,
+					  const BoundColumnRefExpression *col_expr,
+					  const PhysicalOperator *source_op,
 					  uint16_t &idx,
 					  const ColumnSchema *&col) -> bool
 	{
+		if (col_expr == nullptr)
+		{
+			ColumnRef aggregate_ref{};
+			if (!LookupAggregateOutputColumn(side_expr, source_op, left_cols, left_schema, aggregate_ref, col) &&
+				!LookupAggregateOutputColumn(side_expr, source_op, right_cols, right_schema, aggregate_ref, col))
+				return false;
+			return LookupOrAddJoinFilterInput(aggregate_ref,
+											 left_cols, left_schema,
+											 right_cols, right_schema,
+											 inputs, idx, col);
+		}
 		if (LookupOrAddJoinFilterInput(BindingToColumnRef(col_expr->binding),
 									  left_cols, left_schema,
 									  right_cols, right_schema,
@@ -693,11 +820,13 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 			 rhs_loc_schema != nullptr ? static_cast<int>(rhs_loc_schema->decode_kind) : -1);
 	};
 
-	auto build_const = [&](const BoundColumnRefExpression *col_expr,
+	auto build_const = [&](const Expression *side_expr,
+						   const BoundColumnRefExpression *col_expr,
+						   const PhysicalOperator *source_op,
 						   const BoundConstantExpression *constant) -> bool
 	{
 		const ColumnSchema *col = nullptr;
-		if (!locate(col_expr, step.left_idx, col) || col == nullptr)
+		if (!locate(side_expr, col_expr, source_op, step.left_idx, col) || col == nullptr)
 			return false;
 		if (col->decode_kind == ColumnDecodeKind::INT32_DATE)
 		{
@@ -790,13 +919,13 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 		return false;
 	};
 
-	if (left_col != nullptr && right_const != nullptr && build_const(left_col, right_const))
+	if (left_col != nullptr && right_const != nullptr && build_const(left_expr, left_col, left_source_op, right_const))
 	{
 		out_bool_reg = step.out_bool_reg;
 		steps.push_back(step);
 		return true;
 	}
-	if (right_col != nullptr && left_const != nullptr && build_const(right_col, left_const))
+	if (right_col != nullptr && left_const != nullptr && build_const(right_expr, right_col, right_source_op, left_const))
 	{
 		if (func->function_name == "<")
 			step.cmp_op = QualOp::GT;
@@ -810,7 +939,8 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 		steps.push_back(step);
 		return true;
 	}
-	if (left_col == nullptr || right_col == nullptr)
+	if ((left_col == nullptr && left_expr->type != ExpressionType::BOUND_AGGREGATE) ||
+		(right_col == nullptr && right_expr->type != ExpressionType::BOUND_AGGREGATE))
 	{
 		log_join_compare_failure();
 		return false;
@@ -818,8 +948,8 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 
 	const ColumnSchema *left_col_schema = nullptr;
 	const ColumnSchema *right_col_schema = nullptr;
-	if (!locate(left_col, step.left_idx, left_col_schema) ||
-		!locate(right_col, step.right_idx, right_col_schema) ||
+	if (!locate(left_expr, left_col, left_source_op, step.left_idx, left_col_schema) ||
+		!locate(right_expr, right_col, right_source_op, step.right_idx, right_col_schema) ||
 		left_col_schema == nullptr || right_col_schema == nullptr ||
 		left_col_schema->decode_kind != right_col_schema->decode_kind ||
 		!MapComparisonNameToQualOp(func->function_name, step.cmp_op))
@@ -846,6 +976,8 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 
 bool
 LowerJoinFilterBoolExpr(const Expression *expr,
+						const PhysicalOperator *left_source_op,
+						const PhysicalOperator *right_source_op,
 						const std::vector<ColumnRef> &left_cols,
 						const std::vector<ColumnSchema> &left_schema,
 						const std::vector<ColumnRef> &right_cols,
@@ -860,6 +992,8 @@ LowerJoinFilterBoolExpr(const Expression *expr,
 		return false;
 	if (expr->type == ExpressionType::BOUND_FUNCTION)
 		return LowerJoinFilterCompare(static_cast<const BoundFunctionExpression *>(expr),
+									  left_source_op,
+									  right_source_op,
 									  left_cols, left_schema, right_cols, right_schema,
 									  inputs, steps, string_consts, next_bool_reg, out_bool_reg);
 	if (expr->type != ExpressionType::BOUND_CONJUNCTION)
@@ -873,6 +1007,8 @@ LowerJoinFilterBoolExpr(const Expression *expr,
 			return false;
 		uint16_t child_reg = 0;
 		if (!LowerJoinFilterBoolExpr(conj->children[0].get(),
+									 left_source_op,
+									 right_source_op,
 									 left_cols, left_schema, right_cols, right_schema,
 									 inputs, steps, string_consts, next_bool_reg, child_reg))
 			return false;
@@ -882,6 +1018,8 @@ LowerJoinFilterBoolExpr(const Expression *expr,
 	}
 	uint16_t left_reg = 0;
 	if (!LowerJoinFilterBoolExpr(conj->children[0].get(),
+								 left_source_op,
+								 right_source_op,
 								 left_cols, left_schema, right_cols, right_schema,
 								 inputs, steps, string_consts, next_bool_reg, left_reg))
 		return false;
@@ -891,6 +1029,8 @@ LowerJoinFilterBoolExpr(const Expression *expr,
 			return false;
 		uint16_t right_reg = 0;
 		if (!LowerJoinFilterBoolExpr(conj->children[i].get(),
+									 left_source_op,
+									 right_source_op,
 									 left_cols, left_schema, right_cols, right_schema,
 									 inputs, steps, string_consts, next_bool_reg, right_reg))
 			return false;
@@ -969,6 +1109,8 @@ LowerScanFilters(const std::vector<Expression *> &filters,
 
 bool
 LowerJoinFilters(const std::vector<Expression *> &filters,
+				 const PhysicalOperator *left_source_op,
+				 const PhysicalOperator *right_source_op,
 				 const std::vector<ColumnRef> &left_cols,
 				 const std::vector<ColumnSchema> &left_schema,
 				 const std::vector<ColumnRef> &right_cols,
@@ -987,6 +1129,8 @@ LowerJoinFilters(const std::vector<Expression *> &filters,
 		const size_t first_step_idx = steps.size();
 		uint16_t out_bool_reg = 0;
 		if (!LowerJoinFilterBoolExpr(expr,
+									 left_source_op,
+									 right_source_op,
 									 left_cols, left_schema,
 									 right_cols, right_schema,
 									 inputs, steps, string_consts, next_bool_reg, out_bool_reg) ||

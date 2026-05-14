@@ -124,7 +124,41 @@ using pg_yaap::pipeline::translator_detail::Pow10Int64;
 using pg_yaap::pipeline::translator_detail::RescaleInt64Constant;
 
 constexpr int8_t kProjectionDivisionScale = 16;
+constexpr int8_t kProjectionConstDivisionScale = 6;
 constexpr int16_t kAvgNumericExtraScale = 12;
+
+inline bool
+IsTransparentCastFunctionName(const std::string &function_name)
+{
+	return function_name == "text" ||
+	       function_name == "varchar" ||
+	       function_name == "bpchar" ||
+	       function_name == "char" ||
+	       function_name == "int8" ||
+	       function_name == "int4" ||
+	       function_name == "int2" ||
+	       function_name == "numeric" ||
+	       function_name == "float8" ||
+	       function_name == "float4";
+}
+
+inline const Expression *
+UnwrapTransparentCastExpr(const Expression *expr)
+{
+	while (true)
+	{
+		const auto *func = dynamic_cast<const BoundFunctionExpression *>(expr);
+		if (func == nullptr || func->children.size() != 1 || !IsTransparentCastFunctionName(func->function_name))
+			return expr;
+		expr = func->children[0].get();
+	}
+}
+
+inline const BoundColumnRefExpression *
+UnwrapTransparentCastColumn(const Expression *expr)
+{
+	return dynamic_cast<const BoundColumnRefExpression *>(UnwrapTransparentCastExpr(expr));
+}
 
 struct SupportContext {
 std::vector<std::string> stack;
@@ -463,6 +497,8 @@ LowerScanFilterBoolExpr(const Expression *expr,
 
 bool
 LowerJoinFilterCompare(const BoundFunctionExpression *func,
+					   const PhysicalOperator *left_source_op,
+					   const PhysicalOperator *right_source_op,
 					   const std::vector<ColumnRef> &left_cols,
 					   const std::vector<ColumnSchema> &left_schema,
 					   const std::vector<ColumnRef> &right_cols,
@@ -475,6 +511,8 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 
 bool
 LowerJoinFilterBoolExpr(const Expression *expr,
+						const PhysicalOperator *left_source_op,
+						const PhysicalOperator *right_source_op,
 						const std::vector<ColumnRef> &left_cols,
 						const std::vector<ColumnSchema> &left_schema,
 						const std::vector<ColumnRef> &right_cols,
@@ -496,6 +534,8 @@ LowerScanFilters(const std::vector<Expression *> &filters,
 
 bool
 LowerJoinFilters(const std::vector<Expression *> &filters,
+				 const PhysicalOperator *left_source_op,
+				 const PhysicalOperator *right_source_op,
 				 const std::vector<ColumnRef> &left_cols,
 				 const std::vector<ColumnSchema> &left_schema,
 				 const std::vector<ColumnRef> &right_cols,

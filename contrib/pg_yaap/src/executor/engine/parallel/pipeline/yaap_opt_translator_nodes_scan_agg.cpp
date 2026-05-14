@@ -1,18 +1,157 @@
 #include "parallel/pipeline/yaap_opt_translator_internal.hpp"
 
+#include <sstream>
+
 namespace pg_yaap::optimizer_translator_detail {
 
-bool
+static std::string
+ProjectionExprSemanticKey(const Expression *expression)
+{
+	if (expression == nullptr)
+		return "<null>";
+
+	std::stringstream ss;
+	switch (expression->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expression);
+			ss << "col:" << column->binding.table_index.index << "." << column->binding.column_index.index;
+			break;
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expression);
+			ss << "const:" << (constant->is_null ? "NULL" : constant->value);
+			break;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expression);
+			ss << "fn:" << function->function_name << "(";
+			for (size_t i = 0; i < function->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ProjectionExprSemanticKey(function->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expression);
+			ss << "agg:" << aggregate->function_name << "(";
+			for (size_t i = 0; i < aggregate->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ProjectionExprSemanticKey(aggregate->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		default:
+			ss << "opaque";
+			break;
+	}
+	return ss.str();
+}
+
+static std::unique_ptr<Expression>
+RewriteProjectionAggregateExpr(const BoundAggregateExpression *aggregate_expr,
+							   const PhysicalOperator *source_op)
+{
+	if (aggregate_expr == nullptr || source_op == nullptr)
+		return nullptr;
+	if (source_op->type == PhysicalOperatorType::HASH_GROUP_BY)
+	{
+		const auto *aggregate = static_cast<const PhysicalHashAggregate *>(source_op);
+		const std::string fingerprint = ProjectionExprSemanticKey(aggregate_expr);
+		for (size_t idx = 0; idx < aggregate->expressions.size(); ++idx)
+		{
+			if (ProjectionExprSemanticKey(aggregate->expressions[idx]) != fingerprint)
+				continue;
+			std::string column_name = idx < aggregate->aggregate_names.size()
+				? aggregate->aggregate_names[idx]
+				: aggregate_expr->function_name;
+			return std::make_unique<BoundColumnRefExpression>(
+				yaap::ColumnBinding{aggregate->aggregate_index, yaap::ProjectionIndex{idx}},
+				"agg",
+				std::move(column_name));
+		}
+	}
+	for (const auto &child : source_op->children)
+	{
+		if (child == nullptr)
+			continue;
+		if (auto rewritten = RewriteProjectionAggregateExpr(aggregate_expr, child.get()))
+			return rewritten;
+	}
+	return nullptr;
+}
+
+static std::unique_ptr<Expression>
+RewriteProjectionAggregateRefs(const Expression *expr,
+							   const PhysicalOperator *source_op)
+{
+	if (expr == nullptr)
+		return nullptr;
+	switch (expr->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expr);
+			return std::make_unique<BoundColumnRefExpression>(column->binding, column->table_name, column->column_name);
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expr);
+			return std::make_unique<BoundConstantExpression>(constant->value, constant->is_null);
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			if (auto rewritten = RewriteProjectionAggregateExpr(static_cast<const BoundAggregateExpression *>(expr), source_op))
+				return rewritten;
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expr);
+			auto clone = std::make_unique<BoundAggregateExpression>(aggregate->function_name, aggregate->agg_oid, aggregate->is_distinct);
+			for (const auto &child : aggregate->children)
+				clone->children.push_back(RewriteProjectionAggregateRefs(child.get(), source_op));
+			return clone;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundFunctionExpression>(function->function_name, function->op_oid);
+			for (const auto &child : function->children)
+				clone->children.push_back(RewriteProjectionAggregateRefs(child.get(), source_op));
+			return clone;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundConjunctionExpression>(conjunction->bool_expr_type);
+			for (const auto &child : conjunction->children)
+				clone->children.push_back(RewriteProjectionAggregateRefs(child.get(), source_op));
+			return clone;
+		}
+		default:
+			return nullptr;
+	}
+}
+
+static bool
 TryBuildPureProjection(const PhysicalProjection &projection,
+					   const std::vector<Expression *> &select_list,
 					   const std::vector<ColumnRef> *required_output_cols,
 					   OptimizerNodeTranslation &child,
 					   OptimizerNodeTranslation &out)
 {
 	std::vector<ColumnRef> raw_output_cols;
 	std::vector<ColumnSchema> new_schema;
-	raw_output_cols.reserve(projection.select_list.size());
-	new_schema.reserve(projection.select_list.size());
-	for (Expression *expr : projection.select_list)
+	raw_output_cols.reserve(select_list.size());
+	new_schema.reserve(select_list.size());
+	for (Expression *expr : select_list)
 	{
 		const auto *col_expr = dynamic_cast<const BoundColumnRefExpression *>(expr);
 		if (col_expr == nullptr)
@@ -52,7 +191,17 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	}
 	OptimizerNodeTranslation child;
 	std::vector<ColumnRef> child_required;
+	std::vector<std::unique_ptr<Expression>> rewritten_select_storage;
+	std::vector<Expression *> rewritten_select_list;
+	rewritten_select_storage.reserve(projection.select_list.size());
+	rewritten_select_list.reserve(projection.select_list.size());
 	for (Expression *expr : projection.select_list)
+	{
+		auto rewritten = RewriteProjectionAggregateRefs(expr, projection.children[0].get());
+		rewritten_select_list.push_back(rewritten != nullptr ? rewritten.get() : expr);
+		rewritten_select_storage.push_back(std::move(rewritten));
+	}
+	for (Expression *expr : rewritten_select_list)
 		CollectReferencedColumns(expr, child_required);
 	if (!TranslateOptimizerNode(*projection.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
 	{
@@ -65,7 +214,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		elog(LOG,
 			 "pg_yaap: projection table_index=%zu select_count=%zu child_cols=%zu child_schema=%zu",
 			 projection.table_index.index,
-			 projection.select_list.size(),
+			 rewritten_select_list.size(),
 			 child.cols.size(),
 			 child.schema.size());
 		for (size_t i = 0; i < child.cols.size(); ++i)
@@ -76,13 +225,13 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 				 child.cols[i].attno,
 				 static_cast<int>(child.schema[i].decode_kind),
 				 child.schema[i].chunk_slot);
-		for (size_t i = 0; i < projection.select_list.size(); ++i)
+		for (size_t i = 0; i < rewritten_select_list.size(); ++i)
 		{
-			if (projection.select_list[i] != nullptr &&
-				projection.select_list[i]->type == ExpressionType::BOUND_COLUMN_REF)
+			if (rewritten_select_list[i] != nullptr &&
+				rewritten_select_list[i]->type == ExpressionType::BOUND_COLUMN_REF)
 			{
 				const auto *col_expr =
-					static_cast<const BoundColumnRefExpression *>(projection.select_list[i]);
+					static_cast<const BoundColumnRefExpression *>(rewritten_select_list[i]);
 				elog(LOG,
 					 "pg_yaap: projection select[%zu] binding=(%zu,%zu)",
 					 i,
@@ -113,7 +262,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		}
 	}
 
-	if (hidden_passthrough.empty() && TryBuildPureProjection(projection, required_output_cols, child, out))
+	if (hidden_passthrough.empty() && TryBuildPureProjection(projection, rewritten_select_list, required_output_cols, child, out))
 		return true;
 
 	std::vector<ProjectStep> steps;
@@ -121,7 +270,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	std::vector<ColumnSchema> out_schema;
 	uint8_t next_int64_slot = NextFreeInt64Slot(child.schema);
 	uint8_t next_string_slot = NextFreeStringSlot(child.schema);
-	for (Expression *expr : projection.select_list)
+	for (Expression *expr : rewritten_select_list)
 	{
 		const uint16_t first_step_idx = static_cast<uint16_t>(steps.size());
 		int8_t result_scale = 0;

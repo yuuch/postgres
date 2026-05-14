@@ -73,19 +73,7 @@ LowerOptimizerExpr(const Expression *expr,
 static const BoundColumnRefExpression *
 UnwrapPrefixBaseColumn(const Expression *expr)
 {
-	if (expr == nullptr)
-		return nullptr;
-	if (const auto *column = dynamic_cast<const BoundColumnRefExpression *>(expr))
-		return column;
-	const auto *func = dynamic_cast<const BoundFunctionExpression *>(expr);
-	if (func == nullptr || func->children.size() != 1)
-		return nullptr;
-	if (func->function_name != "text" &&
-		func->function_name != "varchar" &&
-		func->function_name != "bpchar" &&
-		func->function_name != "char")
-		return nullptr;
-	return UnwrapPrefixBaseColumn(func->children[0].get());
+	return UnwrapTransparentCastColumn(expr);
 }
 
 bool
@@ -364,7 +352,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 
 	if (is_div)
 	{
-		if (lhs_const != nullptr || rhs_const != nullptr || next_int64_slot >= 16)
+		if (next_int64_slot >= 16)
 			return false;
 		int8_t lhs_scale = 0;
 		int8_t rhs_scale = 0;
@@ -374,7 +362,9 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 			!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot))
 			return false;
 		int64_t factor = 0;
-		out_scale = kProjectionDivisionScale;
+		out_scale = (lhs_const != nullptr || rhs_const != nullptr)
+			? std::max<int8_t>(kProjectionConstDivisionScale, std::max(lhs_scale, rhs_scale))
+			: kProjectionDivisionScale;
 		if (!Pow10Int64(static_cast<int>(out_scale) + static_cast<int>(rhs_scale) - static_cast<int>(lhs_scale), factor))
 			return false;
 		out_slot = next_int64_slot++;
@@ -579,6 +569,8 @@ LowerOptimizerExpr(const Expression *expr,
 	if (expr->type != ExpressionType::BOUND_FUNCTION)
 		return false;
 	const auto *func = static_cast<const BoundFunctionExpression *>(expr);
+	if (func->children.size() == 1 && IsTransparentCastFunctionName(func->function_name))
+		return LowerOptimizerExpr(func->children[0].get(), steps, next_int64_slot, cols, schema, cache, out_scale, out_slot);
 	if (LowerExtractYearExpr(func, steps, next_int64_slot, cols, schema, out_scale, out_slot) ||
 		LowerCaseExpr(func, steps, next_int64_slot, cols, schema, cache, out_scale, out_slot) ||
 		LowerNumericBinaryExpr(func, steps, next_int64_slot, cols, schema, cache, out_scale, out_slot))
@@ -631,6 +623,8 @@ InferProjectionExprSchema(const Expression *expr,
 	if (expr->type != ExpressionType::BOUND_FUNCTION)
 		return false;
 	const auto *func = static_cast<const BoundFunctionExpression *>(expr);
+	if (func->children.size() == 1 && IsTransparentCastFunctionName(func->function_name))
+		return InferProjectionExprSchema(func->children[0].get(), cols, schema, out_type_oid, out_typmod, out_scale);
 	if (func->function_name == "extract" || func->function_name == "date_part" ||
 		func->function_name == "+" || func->function_name == "-" ||
 		func->function_name == "*" || func->function_name == "/" ||
