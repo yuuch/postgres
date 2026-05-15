@@ -20,20 +20,15 @@ struct OptimizerPlanSupportStatus {
 };
 
 std::unique_ptr<pg_yaap::pipeline::PhysicalOperator>
-TranslateOptimizerPlan(QueryDesc *queryDesc,
-					   pg_yaap::PgYaapQueryState *state,
-					   const OptimizerPlanBundle &bundle);
+BuildPipelineFromOptimizerPlan(QueryDesc *queryDesc,
+							   pg_yaap::PgYaapQueryState *state,
+							   const OptimizerPlanBundle &bundle);
 
 OptimizerPlanSupportStatus
 AnalyzeOptimizerPlanSupport(const OptimizerPlanBundle &bundle);
 
 std::string
 DescribeOptimizerPlan(const OptimizerPlanBundle &bundle);
-
-bool CanExecuteOptimizerPlanSerial(const OptimizerPlanBundle &bundle);
-bool ExecuteOptimizerPlanSerial(QueryDesc *queryDesc,
-								const OptimizerPlanBundle &bundle,
-								const char **failure_reason);
 
 TupleDesc
 BuildOptimizerOutputTupleDesc(const OptimizerPlanBundle &bundle);

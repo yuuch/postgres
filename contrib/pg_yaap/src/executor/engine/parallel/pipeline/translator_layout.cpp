@@ -6,10 +6,15 @@ extern "C" {
 #include "access/relation.h"
 #include "access/tupdesc.h"
 #include "catalog/pg_type_d.h"
+#include "fmgr.h"
 #include "storage/lockdefs.h"
 #include "utils/rel.h"
+#include "utils/fmgroids.h"
+#include "utils/numeric.h"
 
 extern bool pg_yaap_trace_hooks;
+extern Datum numeric_mul(PG_FUNCTION_ARGS);
+extern Datum numeric_int8(PG_FUNCTION_ARGS);
 }
 
 namespace pg_yaap {
@@ -22,6 +27,160 @@ static int32
 MakeNumericTypmod(int precision, int scale)
 {
 	return ((precision << 16) | (scale & 0x7ff)) + kNumericTypmodVarHdrSz;
+}
+
+Expr *
+StripRelabels(Expr *expr)
+{
+	while (expr != nullptr && nodeTag(expr) == T_RelabelType)
+		expr = ((RelabelType *) expr)->arg;
+	return expr;
+}
+
+bool
+Pow10Int64(int exp, int64_t &out)
+{
+	if (exp < 0 || exp > 18)
+		return false;
+	out = 1;
+	for (int i = 0; i < exp; ++i)
+		out *= 10;
+	return true;
+}
+
+bool
+RescaleInt64Constant(int64_t value, int8_t from_scale, int8_t to_scale, int64_t &out)
+{
+	if (to_scale < 0 || from_scale < 0)
+		return false;
+	if (to_scale < from_scale)
+	{
+		int64_t factor = 1;
+		if (!Pow10Int64(static_cast<int>(from_scale - to_scale), factor) || factor == 0)
+			return false;
+		out = value / factor;
+		return true;
+	}
+	int64_t factor = 1;
+	if (!Pow10Int64(static_cast<int>(to_scale - from_scale), factor))
+		return false;
+	out = value * factor;
+	return true;
+}
+
+bool
+LookupRawColumn(const ColumnRef &ref,
+		        const std::vector<ColumnRef> &raw_cols_ref,
+		        const std::vector<ColumnSchema> &raw_cols,
+		        const ColumnSchema *&out_col)
+{
+	if (raw_cols_ref.size() != raw_cols.size())
+	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG,
+				 "pg_yaap: LookupRawColumn mismatched vectors refs=%zu schema=%zu target=(%u,%d)",
+				 raw_cols_ref.size(),
+				 raw_cols.size(),
+				 ref.varno,
+				 ref.attno);
+		return false;
+	}
+	for (size_t i = 0; i < raw_cols_ref.size(); ++i)
+	{
+		if (raw_cols_ref[i] == ref)
+		{
+			out_col = &raw_cols[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+int16_t
+ExtractNumericTypmodScale(int32 typmod)
+{
+	if (typmod < VARHDRSZ)
+		return 0;
+	return static_cast<int16_t>((((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024);
+}
+
+bool
+ColumnNumericScale(const ColumnSchema &col, int8_t &out)
+{
+	switch (col.decode_kind)
+	{
+		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+			out = col.typmod >= VARHDRSZ ? static_cast<int8_t>(ExtractNumericTypmodScale(col.typmod)) : 2;
+			return true;
+		case ColumnDecodeKind::INT64_INT8:
+		case ColumnDecodeKind::INT32_INT4:
+		case ColumnDecodeKind::INT32_CHAR:
+		case ColumnDecodeKind::INT32_DATE:
+		case ColumnDecodeKind::DOUBLE_FLOAT8:
+		case ColumnDecodeKind::STRING_REF:
+			out = 0;
+			return true;
+		case ColumnDecodeKind::NONE:
+			return false;
+	}
+	return false;
+}
+
+bool
+ScaleNumericConstDatumToInt64(Const *c, int8_t &out_scale, int64_t &out_value)
+{
+	if (c == nullptr || c->constisnull || c->consttype != NUMERICOID)
+		return false;
+	out_scale = static_cast<int8_t>(ExtractNumericTypmodScale(c->consttypmod));
+	int64_t factor = 1;
+	if (!Pow10Int64(out_scale, factor))
+		return false;
+	Datum factor_numeric = NumericGetDatum(int64_to_numeric(factor));
+	Datum scaled = DirectFunctionCall2(numeric_mul, c->constvalue, factor_numeric);
+	out_value = DatumGetInt64(DirectFunctionCall1(numeric_int8, scaled));
+	return true;
+}
+
+bool
+ScaleNumericConstDatumToTargetScale(Const *c, int8_t target_scale, int64_t &out_value)
+{
+	if (c == nullptr || c->constisnull || c->consttype != NUMERICOID || target_scale < 0)
+		return false;
+	if (TryFastNumericToScaledInt64(c->constvalue, target_scale, &out_value))
+		return true;
+	int64_t factor = 1;
+	if (!Pow10Int64(target_scale, factor))
+		return false;
+	Datum factor_numeric = NumericGetDatum(int64_to_numeric(factor));
+	Datum scaled = DirectFunctionCall2(numeric_mul, c->constvalue, factor_numeric);
+	out_value = DatumGetInt64(DirectFunctionCall1(numeric_int8, scaled));
+	return true;
+}
+
+bool
+ResolveAggGroupVarToColumnRef(Var *var,
+			      Agg *agg,
+			      const std::vector<ColumnRef> &group_cols,
+			      ColumnRef &out)
+{
+	if (var == nullptr || agg == nullptr || var->varattno <= 0)
+		return false;
+	for (int g = 0; g < agg->numCols; ++g)
+	{
+		if (agg->grpColIdx[g] == var->varattno)
+		{
+			if (static_cast<size_t>(g) >= group_cols.size())
+				return false;
+			out = group_cols[g];
+			return true;
+		}
+	}
+	if (!IS_SPECIAL_VARNO(var->varno))
+	{
+		out = ColumnRef{static_cast<Index>(var->varno), var->varattno};
+		return out.varno > 0 && out.attno > 0;
+	}
+	return false;
 }
 
 bool
@@ -335,6 +494,14 @@ BuildHashGroupLayout(const std::vector<ColumnRef> &group_cols,
 				break;
 			}
 		}
+		if (!found &&
+			group_col.attno != InvalidAttrNumber &&
+			group_col.attno > 0 &&
+			static_cast<size_t>(group_col.attno) <= input_columns.size())
+		{
+			src_idx = static_cast<uint16_t>(group_col.attno - 1);
+			found = true;
+		}
 		if (!found)
 			return false;
 		const ColumnSchema &cs = input_columns[src_idx];
@@ -372,6 +539,8 @@ AppendAggOutputColumn(TdcAggKind kind,
 	switch (kind)
 	{
 		case TdcAggKind::COUNT_STAR:
+		case TdcAggKind::COUNT_NONNULL:
+		case TdcAggKind::COUNT_DISTINCT_NONNULL:
 		case TdcAggKind::SUM_INT64:
 			cs.type_oid = INT8OID;
 			cs.typmod = -1;
@@ -562,6 +731,8 @@ BuildSortLayouts(const std::vector<ColumnRef> &group_cols,
 			switch (agg_kinds[agg_idx])
 			{
 				case TdcAggKind::COUNT_STAR:
+				case TdcAggKind::COUNT_NONNULL:
+				case TdcAggKind::COUNT_DISTINCT_NONNULL:
 				case TdcAggKind::SUM_INT64:
 					type_oid = INT8OID;
 					break;
