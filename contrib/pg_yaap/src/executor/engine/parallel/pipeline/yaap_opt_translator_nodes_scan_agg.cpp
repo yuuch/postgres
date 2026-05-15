@@ -141,6 +141,58 @@ RewriteProjectionAggregateRefs(const Expression *expr,
 }
 
 static bool
+InferNamedColumnDecodeKind(const BoundColumnRefExpression *expr,
+						   ColumnDecodeKind &out)
+{
+	if (expr == nullptr || expr->table_name.empty() || expr->column_name.empty())
+		return false;
+
+	const Oid relid = RelnameGetRelid(expr->table_name.c_str());
+	if (!OidIsValid(relid))
+		return false;
+	const AttrNumber attnum = get_attnum(relid, expr->column_name.c_str());
+	if (attnum == InvalidAttrNumber)
+		return false;
+
+	Oid type_oid = InvalidOid;
+	int32 typmod = -1;
+	Oid collation = InvalidOid;
+	get_atttypetypmodcoll(relid, attnum, &type_oid, &typmod, &collation);
+	switch (type_oid)
+	{
+		case BPCHAROID:
+			out = UseInt32CharDecodeForType(type_oid, typmod) ?
+				ColumnDecodeKind::INT32_CHAR :
+				ColumnDecodeKind::STRING_REF;
+			return true;
+		case CHAROID:
+			out = ColumnDecodeKind::INT32_CHAR;
+			return true;
+		case DATEOID:
+			out = ColumnDecodeKind::INT32_DATE;
+			return true;
+		case INT4OID:
+			out = ColumnDecodeKind::INT32_INT4;
+			return true;
+		case INT8OID:
+			out = ColumnDecodeKind::INT64_INT8;
+			return true;
+		case NUMERICOID:
+			out = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+			return true;
+		case FLOAT8OID:
+			out = ColumnDecodeKind::DOUBLE_FLOAT8;
+			return true;
+		case TEXTOID:
+		case VARCHAROID:
+			out = ColumnDecodeKind::STRING_REF;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
 LookupProjectionInputColumn(const BoundColumnRefExpression *expr,
 							const std::vector<ColumnRef> &cols,
 							const std::vector<ColumnSchema> &schema,
@@ -162,17 +214,28 @@ LookupProjectionInputColumn(const BoundColumnRefExpression *expr,
 		(ordinal_ref = cols[expr->binding.column_index.index], true) &&
 		(ordinal_col = &schema[expr->binding.column_index.index], true);
 
-	if (exact_found &&
-		ordinal_found &&
-		exact_col != nullptr &&
-		ordinal_col != nullptr &&
-		exact_col->decode_kind == ColumnDecodeKind::STRING_REF &&
-		ordinal_col->decode_kind != ColumnDecodeKind::STRING_REF)
+	ColumnDecodeKind expected_decode = ColumnDecodeKind::NONE;
+	if (exact_found && ordinal_found &&
+		exact_col != nullptr && ordinal_col != nullptr &&
+		exact_col->decode_kind != ordinal_col->decode_kind &&
+		InferNamedColumnDecodeKind(expr, expected_decode))
 	{
-		out_ref = ordinal_ref;
-		out_col = ordinal_col;
-		return true;
+		if (ordinal_col->decode_kind == expected_decode &&
+			exact_col->decode_kind != expected_decode)
+		{
+			out_ref = ordinal_ref;
+			out_col = ordinal_col;
+			return true;
+		}
+		if (exact_col->decode_kind == expected_decode &&
+			ordinal_col->decode_kind != expected_decode)
+		{
+			out_ref = exact_ref;
+			out_col = exact_col;
+			return true;
+		}
 	}
+
 	if (exact_found)
 	{
 		out_ref = exact_ref;
@@ -195,18 +258,29 @@ TryBuildPureProjection(const PhysicalProjection &projection,
 					   OptimizerNodeTranslation &child,
 					   OptimizerNodeTranslation &out)
 {
+	if (select_list.size() != child.cols.size() || child.cols.size() != child.schema.size())
+		return false;
+
 	std::vector<ColumnRef> raw_output_cols;
 	std::vector<ColumnSchema> new_schema;
 	raw_output_cols.reserve(select_list.size());
 	new_schema.reserve(select_list.size());
-	for (Expression *expr : select_list)
+	for (size_t idx = 0; idx < select_list.size(); ++idx)
 	{
+		Expression *expr = select_list[idx];
 		const auto *col_expr = dynamic_cast<const BoundColumnRefExpression *>(expr);
 		if (col_expr == nullptr)
 			return false;
 		ColumnRef ref{};
 		const ColumnSchema *col = nullptr;
 		if (!LookupProjectionInputColumn(col_expr, child.cols, child.schema, ref, col) || col == nullptr)
+			return false;
+		if (ref.varno != child.cols[idx].varno ||
+			ref.attno != child.cols[idx].attno ||
+			col->chunk_slot != child.schema[idx].chunk_slot ||
+			col->decode_kind != child.schema[idx].decode_kind ||
+			col->type_oid != child.schema[idx].type_oid ||
+			col->typmod != child.schema[idx].typmod)
 			return false;
 		raw_output_cols.push_back(ColumnRef{
 			static_cast<Index>(projection.table_index.index + 1),
@@ -241,6 +315,8 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	std::vector<ColumnRef> child_required;
 	std::vector<std::unique_ptr<Expression>> rewritten_select_storage;
 	std::vector<Expression *> rewritten_select_list;
+	std::vector<Expression *> selected_select_list;
+	std::vector<size_t> selected_select_indices;
 	rewritten_select_storage.reserve(projection.select_list.size());
 	rewritten_select_list.reserve(projection.select_list.size());
 	for (Expression *expr : projection.select_list)
@@ -249,8 +325,49 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		rewritten_select_list.push_back(rewritten != nullptr ? rewritten.get() : expr);
 		rewritten_select_storage.push_back(std::move(rewritten));
 	}
-	for (Expression *expr : rewritten_select_list)
+	const Index projection_varno = static_cast<Index>(projection.table_index.index + 1);
+	if (required_output_cols == nullptr || required_output_cols->empty())
+	{
+		for (size_t idx = 0; idx < rewritten_select_list.size(); ++idx)
+		{
+			selected_select_indices.push_back(idx);
+			selected_select_list.push_back(rewritten_select_list[idx]);
+		}
+	}
+	else
+	{
+		for (size_t idx = 0; idx < rewritten_select_list.size(); ++idx)
+		{
+			const ColumnRef projected_ref{
+				projection_varno,
+				static_cast<AttrNumber>(idx + 1)};
+			for (const ColumnRef &required : *required_output_cols)
+			{
+				if (SameColumnRef(required, projected_ref))
+				{
+					selected_select_indices.push_back(idx);
+					selected_select_list.push_back(rewritten_select_list[idx]);
+					break;
+				}
+			}
+		}
+	}
+	std::vector<ColumnRef> hidden_passthrough_candidates;
+	if (required_output_cols != nullptr)
+	{
+		for (const ColumnRef &ref : *required_output_cols)
+		{
+			if (ref.varno == projection_varno &&
+				ref.attno > 0 &&
+				ref.attno <= static_cast<AttrNumber>(projection.select_list.size()))
+				continue;
+			AppendUniqueColumnRef(ref, hidden_passthrough_candidates);
+		}
+	}
+	for (Expression *expr : selected_select_list)
 		CollectReferencedColumns(expr, child_required);
+	for (const ColumnRef &ref : hidden_passthrough_candidates)
+		AppendUniqueColumnRef(ref, child_required);
 	if (!TranslateOptimizerNode(*projection.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
 	{
 		if (pg_yaap_trace_hooks)
@@ -262,7 +379,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		elog(LOG,
 			 "pg_yaap: projection table_index=%zu select_count=%zu child_cols=%zu child_schema=%zu",
 			 projection.table_index.index,
-			 rewritten_select_list.size(),
+			 selected_select_list.size(),
 			 child.cols.size(),
 			 child.schema.size());
 		for (size_t i = 0; i < child.cols.size(); ++i)
@@ -273,44 +390,36 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 				 child.cols[i].attno,
 				 static_cast<int>(child.schema[i].decode_kind),
 				 child.schema[i].chunk_slot);
-		for (size_t i = 0; i < rewritten_select_list.size(); ++i)
+		for (size_t i = 0; i < selected_select_list.size(); ++i)
 		{
-			if (rewritten_select_list[i] != nullptr &&
-				rewritten_select_list[i]->type == ExpressionType::BOUND_COLUMN_REF)
+			if (selected_select_list[i] != nullptr &&
+				selected_select_list[i]->type == ExpressionType::BOUND_COLUMN_REF)
 			{
 				const auto *col_expr =
-					static_cast<const BoundColumnRefExpression *>(rewritten_select_list[i]);
+					static_cast<const BoundColumnRefExpression *>(selected_select_list[i]);
 				elog(LOG,
-					 "pg_yaap: projection select[%zu] binding=(%zu,%zu)",
+					 "pg_yaap: projection select[%zu] source_idx=%zu binding=(%zu,%zu)",
 					 i,
+					 selected_select_indices[i],
 					 col_expr->binding.table_index.index,
 					 col_expr->binding.column_index.index);
 			}
 		}
 	}
 	std::vector<ColumnRef> hidden_passthrough;
-	if (required_output_cols != nullptr)
+	if (!hidden_passthrough_candidates.empty())
 	{
-		const Index projection_varno = static_cast<Index>(projection.table_index.index + 1);
-		for (const ColumnRef &ref : *required_output_cols)
+		for (const ColumnRef &ref : hidden_passthrough_candidates)
 		{
-			/*
-			 * Required refs that already target this projection's visible
-			 * output shape are not hidden passthrough columns. Treating them
-			 * as passthrough duplicates the projected outputs and can leave
-			 * downstream operators reading the wrong string slot.
-			 */
-			if (ref.varno == projection_varno &&
-				ref.attno > 0 &&
-				ref.attno <= static_cast<AttrNumber>(projection.select_list.size()))
-				continue;
 			const ColumnSchema *col = nullptr;
 			if (LookupPassthroughColumn(ref, child.cols, child.schema, col) && col != nullptr)
 				AppendUniqueColumnRef(ref, hidden_passthrough);
 		}
 	}
 
-	if (hidden_passthrough.empty() && TryBuildPureProjection(projection, rewritten_select_list, required_output_cols, child, out))
+	if (hidden_passthrough.empty() &&
+		selected_select_list.size() == rewritten_select_list.size() &&
+		TryBuildPureProjection(projection, selected_select_list, required_output_cols, child, out))
 		return true;
 
 	std::vector<ProjectStep> steps;
@@ -318,7 +427,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	std::vector<ColumnSchema> out_schema;
 	uint8_t next_int64_slot = NextFreeInt64Slot(child.schema);
 	uint8_t next_string_slot = NextFreeStringSlot(child.schema);
-	for (Expression *expr : rewritten_select_list)
+	for (Expression *expr : selected_select_list)
 	{
 		const uint16_t first_step_idx = static_cast<uint16_t>(steps.size());
 		int8_t result_scale = 0;
@@ -457,7 +566,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 				 child.schema.size(),
 				 out_schema.size(),
 				 hidden_passthrough.size(),
-				 rewritten_select_list.size(),
+				 selected_select_list.size(),
 				 DsaPointerIsValid(input_schema_dp) ? 1 : 0,
 				 DsaPointerIsValid(output_schema_dp) ? 1 : 0);
 		return false;
@@ -481,11 +590,11 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	out.op = std::move(project_op);
 	out.schema = std::move(out_schema);
 	std::vector<ColumnRef> raw_output_cols;
-	raw_output_cols.reserve(projection.select_list.size() + hidden_passthrough.size());
-	for (size_t i = 0; i < projection.select_list.size(); ++i)
+	raw_output_cols.reserve(selected_select_indices.size() + hidden_passthrough.size());
+	for (size_t idx : selected_select_indices)
 		raw_output_cols.push_back(ColumnRef{
-			static_cast<Index>(projection.table_index.index + 1),
-			static_cast<AttrNumber>(i + 1)});
+			projection_varno,
+			static_cast<AttrNumber>(idx + 1)});
 	for (const ColumnRef &ref : hidden_passthrough)
 		raw_output_cols.push_back(ref);
 	out.cols = BuildParentFacingOutputCols(raw_output_cols, required_output_cols);

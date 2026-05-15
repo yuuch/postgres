@@ -4,6 +4,7 @@ extern "C" {
 #include "postgres.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "datatype/timestamp.h"
 #include "executor/executor.h"

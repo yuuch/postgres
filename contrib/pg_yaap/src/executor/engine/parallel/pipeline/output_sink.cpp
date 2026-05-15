@@ -531,25 +531,26 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 			 (unsigned long long) max_emit_rows_);
 	if (!final_sort_keys_.empty())
 	{
+		const std::vector<SortKeyDesc> sort_keys = final_sort_keys_;
 		if (pg_yaap_trace_hooks)
 		{
-			for (size_t i = 0; i < final_sort_keys_.size(); ++i)
+			for (size_t i = 0; i < sort_keys.size(); ++i)
 				elog(LOG,
 					 "pg_yaap: OutputSink.SortKey idx=%zu col_idx=%u asc=%d nulls_first=%d",
 					 i,
-					 final_sort_keys_[i].col_idx,
-					 final_sort_keys_[i].asc ? 1 : 0,
-					 final_sort_keys_[i].nulls_first ? 1 : 0);
+					 sort_keys[i].col_idx,
+					 sort_keys[i].asc ? 1 : 0,
+					 sort_keys[i].nulls_first ? 1 : 0);
 		}
 		row_order.resize(row_count);
 		for (uint32_t i = 0; i < row_count; ++i)
 			row_order[i] = i;
 		std::sort(row_order.begin(), row_order.end(),
-			[this, layout, tdc](uint32_t lhs, uint32_t rhs)
+			[&sort_keys, layout, tdc](uint32_t lhs, uint32_t rhs)
 		{
 			const uint8_t *row_a = TupleDataCollectionGetRowConst(tdc, lhs);
 			const uint8_t *row_b = TupleDataCollectionGetRowConst(tdc, rhs);
-			for (const SortKeyDesc &key : final_sort_keys_)
+			for (const SortKeyDesc &key : sort_keys)
 			{
 				if (key.col_idx >= layout->column_count)
 					continue;

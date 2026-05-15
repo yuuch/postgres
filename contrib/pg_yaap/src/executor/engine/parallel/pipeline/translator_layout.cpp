@@ -235,6 +235,7 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 	uint8_t next_int32_slot = 0;
 	uint8_t next_int64_slot = 0;
 	uint8_t next_double_slot = 0;
+	uint8_t next_string_slot = 0;
 	out_mappings.clear();
 	out_schema.clear();
 	out_mappings.reserve(output_cols.size());
@@ -276,7 +277,7 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 				out_col.chunk_slot = next_double_slot++;
 				break;
 			case ColumnDecodeKind::STRING_REF:
-				out_col.chunk_slot = next_int32_slot++;
+				out_col.chunk_slot = next_string_slot++;
 				break;
 			case ColumnDecodeKind::NONE:
 				if (pg_yaap_trace_hooks)
