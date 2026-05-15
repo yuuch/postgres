@@ -17,6 +17,25 @@ Yet Another Analytic Processing（简称 YAAP）是一个面向 OLAP 的新型�
 - 集成：YAAP 的执行器尚未完全接入 YAAP 优化器生成的计划，当前执行器多使用来自 PG 的计划作为输入。
 - 限制/已知问题：PostgreSQL 默认优化器在某些场景下效果欠佳；部分算子实现或边界条件仍需完善以覆盖 TPC-H 全集。
 
+TPC-H 10G 最新进展（2026-05-15）
+
+- 本轮已修复并验证：Q2、Q4、Q9、Q20。
+- 关键修复点：
+  - 修正 projection lowering 中 binding / ordinal 冲突时的输入列选择。
+  - 在 projection pruning 中仅保留父节点需要的输出，并补齐必要的 hidden passthrough 列。
+  - 修正 hash join 输出 schema 中 `STRING_REF` 的 slot 分配。
+  - 保留 output sink final sort 的稳定 key 拷贝，避免排序阶段引用失效。
+- 10G、60 秒超时、跳过 Q15/Q19 的 sweep 结果：
+  - 跑通并确认走 `pg_yaap_path: path=pipeline detail=yaap_pipeline`：
+    Q1、Q2、Q3、Q4、Q5、Q6、Q7、Q8、Q9、Q10、Q11、Q12、Q14、Q17、Q20、Q21、Q22
+  - 当前未跑通：
+    - Q13：`optimizer support analysis passed, but lowering returned null`
+    - Q16：`optimizer support analysis passed, but lowering returned null`
+    - Q18：`optimizer support analysis passed, but lowering returned null`
+- Q15 / Q19 仍然不纳入常规 sweep：
+  - Q15 是 fixture / explain 形式问题。
+  - Q19 仍应单独隔离处理，不混入常规批量运行。
+
 核心组件
 
 1. 优化器（optimizer）
