@@ -21,6 +21,14 @@ ColumnHasNulls(const uint8_t *nulls, uint16_t count)
 	return count != 0 && std::memchr(nulls, 1, count) != nullptr;
 }
 
+static inline uint32_t
+TrimBpcharLength(const char *data, uint32_t len)
+{
+	while (len > 0 && data[len - 1] == ' ')
+		--len;
+	return len;
+}
+
 static void
 ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 {
@@ -345,7 +353,8 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
 			const VecStringRef *const input = out.string_columns[step.in_a_chunk_slot];
 			int64_t *const output = out.int64_columns[step.out_chunk_slot];
-			const uint32_t rhs_len = step.in_b_chunk_slot;
+			const bool bpchar_semantics = (step.in_b_chunk_slot & 0x80) != 0;
+			const uint32_t rhs_len = static_cast<uint32_t>(step.in_b_chunk_slot & 0x7f);
 			const char *const rhs = reinterpret_cast<const char *>(&step.const_value);
 			for (uint16_t row = 0; row < count; ++row)
 			{
@@ -356,7 +365,19 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 				}
 				const VecStringRef &ref = input[row];
 				const char *lhs = out.get_string_ptr(ref);
-				const bool eq = lhs != nullptr && ref.len == rhs_len && (rhs_len == 0 || std::memcmp(lhs, rhs, rhs_len) == 0);
+				bool eq = false;
+				if (lhs != nullptr)
+				{
+					if (bpchar_semantics)
+					{
+						const uint32_t lhs_len = TrimBpcharLength(lhs, ref.len);
+						const uint32_t trimmed_rhs_len = TrimBpcharLength(rhs, rhs_len);
+						eq = lhs_len == trimmed_rhs_len &&
+							(lhs_len == 0 || std::memcmp(lhs, rhs, lhs_len) == 0);
+					}
+					else
+						eq = ref.len == rhs_len && (rhs_len == 0 || std::memcmp(lhs, rhs, rhs_len) == 0);
+				}
 				output[row] = (step.op == ProjectOp::STRING_EQ_VAR_CONST ? eq : !eq) ? 1 : 0;
 				out_nulls[row] = 0;
 			}
@@ -480,6 +501,39 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 			}
 			return;
 		}
+
+		case ProjectOp::INT64_LT_VAR_CONST:
+		case ProjectOp::INT64_LE_VAR_CONST:
+		case ProjectOp::INT64_EQ_VAR_CONST:
+		case ProjectOp::INT64_GE_VAR_CONST:
+		case ProjectOp::INT64_GT_VAR_CONST:
+		case ProjectOp::INT64_NE_VAR_CONST:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				const int64_t value = input[row];
+				switch (step.op)
+				{
+					case ProjectOp::INT64_LT_VAR_CONST: output[row] = value < step.const_value; break;
+					case ProjectOp::INT64_LE_VAR_CONST: output[row] = value <= step.const_value; break;
+					case ProjectOp::INT64_EQ_VAR_CONST: output[row] = value == step.const_value; break;
+					case ProjectOp::INT64_GE_VAR_CONST: output[row] = value >= step.const_value; break;
+					case ProjectOp::INT64_GT_VAR_CONST: output[row] = value > step.const_value; break;
+					case ProjectOp::INT64_NE_VAR_CONST: output[row] = value != step.const_value; break;
+					default: break;
+				}
+				out_nulls[row] = 0;
+			}
+			return;
+		}
 	}
 
 	elog(ERROR, "pg_yaap: unsupported projection opcode %u", static_cast<unsigned>(step.op));
@@ -527,7 +581,6 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 		if (expr.output_chunk_slot != steps_[expr.first_step_idx + expr.n_steps - 1].out_chunk_slot)
 			elog(ERROR, "pg_yaap: projection output slot descriptor mismatch");
 	}
-
 	op_state.current_input_drained = out.count > 0;
 	return out.count > 0 ? OperatorResultType::HAVE_MORE_OUTPUT
 	                     : OperatorResultType::NEED_MORE_INPUT;

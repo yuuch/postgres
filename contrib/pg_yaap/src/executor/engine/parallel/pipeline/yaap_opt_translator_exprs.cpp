@@ -52,6 +52,74 @@ AppendScaleProjectStep(uint8_t input_slot,
 	return true;
 }
 
+static bool
+LowerProjectionNumericCompare(const BoundFunctionExpression *func,
+							  std::vector<ProjectStep> &steps,
+							  uint8_t &next_int64_slot,
+							  const std::vector<ColumnRef> &cols,
+							  const std::vector<ColumnSchema> &schema,
+							  uint8_t &out_slot)
+{
+	if (func == nullptr || func->children.size() != 2 || next_int64_slot >= 16)
+		return false;
+	ProjectOp op = ProjectOp::COPY_VAR;
+	if (func->function_name == "<") op = ProjectOp::INT64_LT_VAR_CONST;
+	else if (func->function_name == "<=") op = ProjectOp::INT64_LE_VAR_CONST;
+	else if (func->function_name == "=") op = ProjectOp::INT64_EQ_VAR_CONST;
+	else if (func->function_name == ">=") op = ProjectOp::INT64_GE_VAR_CONST;
+	else if (func->function_name == ">") op = ProjectOp::INT64_GT_VAR_CONST;
+	else if (func->function_name == "<>" || func->function_name == "!=") op = ProjectOp::INT64_NE_VAR_CONST;
+	else return false;
+
+	const auto *lhs = dynamic_cast<const BoundColumnRefExpression *>(func->children[0].get());
+	const auto *rhs = dynamic_cast<const BoundConstantExpression *>(func->children[1].get());
+	if (lhs == nullptr || rhs == nullptr || rhs->is_null)
+		return false;
+
+	ColumnRef ref{};
+	const ColumnSchema *col = nullptr;
+	if (!LookupExprInputColumn(lhs->binding, cols, schema, ref, col) || col == nullptr)
+		return false;
+	if (col->decode_kind != ColumnDecodeKind::INT32_INT4 &&
+		col->decode_kind != ColumnDecodeKind::INT64_INT8 &&
+		col->decode_kind != ColumnDecodeKind::INT64_NUMERIC_SCALED)
+		return false;
+
+	int64_t const_value = 0;
+	if (col->decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+	{
+		int8_t scale = 0;
+		if (!ColumnNumericScale(*col, scale) || !ScaleConstantToTargetScale(rhs, scale, const_value))
+			return false;
+	}
+	else
+	{
+		char *end = nullptr;
+		errno = 0;
+		long long parsed = std::strtoll(rhs->value.c_str(), &end, 10);
+		if (errno != 0 || end == rhs->value.c_str())
+			return false;
+		while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end)))
+			++end;
+		if (*end != '\0')
+			return false;
+		const_value = static_cast<int64_t>(parsed);
+	}
+
+	uint8_t input_slot = col->chunk_slot;
+	if (col->decode_kind == ColumnDecodeKind::INT32_INT4)
+	{
+		if (next_int64_slot >= 16)
+			return false;
+		input_slot = next_int64_slot++;
+		steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, col->chunk_slot, 0, input_slot, 0});
+	}
+
+	out_slot = next_int64_slot++;
+	steps.push_back(ProjectStep{op, input_slot, 0, out_slot, const_value});
+	return true;
+}
+
 bool
 LowerOptimizerBoolExpr(const Expression *expr,
 					   std::vector<ProjectStep> &steps,
@@ -138,11 +206,14 @@ LowerProjectionStringCompare(const BoundFunctionExpression *func,
 	int64_t const_value = 0;
 	if (!TryExtractShortStringConst(rhs, const_len, const_value) || next_int64_slot >= 16)
 		return false;
+	uint8_t encoded_len = const_len;
+	if (col->type_oid == BPCHAROID)
+		encoded_len |= 0x80;
 	out_slot = next_int64_slot++;
 	if (func->function_name == "=")
-		steps.push_back(ProjectStep{ProjectOp::STRING_EQ_VAR_CONST, col->chunk_slot, const_len, out_slot, const_value});
+		steps.push_back(ProjectStep{ProjectOp::STRING_EQ_VAR_CONST, col->chunk_slot, encoded_len, out_slot, const_value});
 	else if (func->function_name == "<>" || func->function_name == "!=")
-		steps.push_back(ProjectStep{ProjectOp::STRING_NE_VAR_CONST, col->chunk_slot, const_len, out_slot, const_value});
+		steps.push_back(ProjectStep{ProjectOp::STRING_NE_VAR_CONST, col->chunk_slot, encoded_len, out_slot, const_value});
 	else
 		return false;
 	return true;
@@ -258,7 +329,8 @@ LowerOptimizerBoolExpr(const Expression *expr,
 	{
 		const auto *func = static_cast<const BoundFunctionExpression *>(expr);
 		if (LowerProjectionStringLike(func, steps, next_int64_slot, cols, schema, out_slot) ||
-			LowerProjectionStringCompare(func, steps, next_int64_slot, cols, schema, out_slot))
+			LowerProjectionStringCompare(func, steps, next_int64_slot, cols, schema, out_slot) ||
+			LowerProjectionNumericCompare(func, steps, next_int64_slot, cols, schema, out_slot))
 			return true;
 	}
 	if (expr->type != ExpressionType::BOUND_CONJUNCTION)
@@ -625,10 +697,58 @@ InferProjectionExprSchema(const Expression *expr,
 	const auto *func = static_cast<const BoundFunctionExpression *>(expr);
 	if (func->children.size() == 1 && IsTransparentCastFunctionName(func->function_name))
 		return InferProjectionExprSchema(func->children[0].get(), cols, schema, out_type_oid, out_typmod, out_scale);
+	if (func->function_name == "case")
+	{
+		if (func->children.size() < 2)
+			return false;
+		size_t when_idx = 0;
+		if (dynamic_cast<const BoundFunctionExpression *>(func->children[0].get()) == nullptr ||
+			static_cast<const BoundFunctionExpression *>(func->children[0].get())->function_name != "when")
+			when_idx = 1;
+		if (when_idx >= func->children.size())
+			return false;
+		const auto *when_func = dynamic_cast<const BoundFunctionExpression *>(func->children[when_idx].get());
+		if (when_func == nullptr || when_func->function_name != "when" || when_func->children.size() != 2)
+			return false;
+		Oid then_type = InvalidOid;
+		Oid else_type = InvalidOid;
+		int32 then_typmod = -1;
+		int32 else_typmod = -1;
+		int8_t then_scale = 0;
+		int8_t else_scale = 0;
+		if (!InferProjectionExprSchema(when_func->children[1].get(), cols, schema,
+									   then_type, then_typmod, then_scale) ||
+			!InferProjectionExprSchema(func->children.back().get(), cols, schema,
+									   else_type, else_typmod, else_scale))
+			return false;
+		const bool then_integral = then_type == BOOLOID || then_type == INT4OID || then_type == INT8OID;
+		const bool else_integral = else_type == BOOLOID || else_type == INT4OID || else_type == INT8OID;
+		if (then_integral && else_integral)
+		{
+			out_type_oid = INT8OID;
+			out_typmod = -1;
+			out_scale = 0;
+			return true;
+		}
+		if (then_type == NUMERICOID || else_type == NUMERICOID)
+		{
+			out_type_oid = NUMERICOID;
+			out_typmod = -1;
+			out_scale = static_cast<int8_t>(Max(then_scale, else_scale));
+			return true;
+		}
+		if (then_type == else_type)
+		{
+			out_type_oid = then_type;
+			out_typmod = then_typmod;
+			out_scale = then_scale;
+			return true;
+		}
+		return false;
+	}
 	if (func->function_name == "extract" || func->function_name == "date_part" ||
 		func->function_name == "+" || func->function_name == "-" ||
-		func->function_name == "*" || func->function_name == "/" ||
-		func->function_name == "case")
+		func->function_name == "*" || func->function_name == "/")
 	{
 		out_type_oid = NUMERICOID;
 		out_typmod = -1;
@@ -686,6 +806,7 @@ NextFreeStringSlot(const std::vector<ColumnSchema> &schema)
 
 bool
 ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
+						   const std::vector<yaap::PhysicalOperator::OutputColumn> *input_outputs,
 						   const std::vector<ColumnRef> &cols,
 						   const std::vector<ColumnSchema> &schema,
 						   std::vector<ProjectStep> &project_steps,
@@ -696,30 +817,130 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 						   TdcAggKind &out_kind,
 						   int16_t &out_numeric_scale)
 {
-	if (agg == nullptr || agg->is_distinct)
+	if (agg == nullptr)
 		return false;
 	out_desc = AggFuncDesc{static_cast<Oid>(agg->agg_oid), InvalidOid, InvalidOid, 0, 0};
 	out_numeric_scale = 0;
 
-	if (pg_strcasecmp(agg->function_name.c_str(), "count") == 0)
+	if (agg->children.empty())
 	{
-		if (!agg->children.empty())
-			return false;
-		out_kind = TdcAggKind::COUNT_STAR;
-		return true;
+		if (pg_strcasecmp(agg->function_name.c_str(), "count") == 0)
+		{
+			out_kind = TdcAggKind::COUNT_STAR;
+			return true;
+		}
+		return false;
 	}
 	if (agg->children.size() != 1)
 		return false;
 
 	const Expression *arg = agg->children[0].get();
+	const auto *bare_arg = UnwrapTransparentCastColumn(arg);
 	ColumnRef bare_ref{};
 	const ColumnSchema *bare_col = nullptr;
 	bool is_bare_ref = false;
-	if (arg != nullptr && arg->type == ExpressionType::BOUND_COLUMN_REF)
-		is_bare_ref = LookupExprInputColumn(static_cast<const BoundColumnRefExpression *>(arg)->binding, cols, schema, bare_ref, bare_col);
+	if (bare_arg != nullptr)
+	{
+		is_bare_ref = LookupNamedExprInputColumn(bare_arg, input_outputs, cols, schema, bare_ref, bare_col);
+		if (pg_yaap_trace_hooks && agg->is_distinct)
+		{
+			elog(LOG,
+				 "pg_yaap: count distinct lookup expr=%s.%s binding=(%zu,%zu) matched=%d decode=%d slot=%u typmod=%d input_outputs=%zu",
+				 bare_arg->table_name.c_str(),
+				 bare_arg->column_name.c_str(),
+				 bare_arg->binding.table_index.index,
+				 bare_arg->binding.column_index.index,
+				 is_bare_ref ? 1 : 0,
+				 bare_col != nullptr ? static_cast<int>(bare_col->decode_kind) : -1,
+				 bare_col != nullptr ? static_cast<unsigned>(bare_col->chunk_slot) : 0,
+				 bare_col != nullptr ? bare_col->typmod : -1,
+				 input_outputs != nullptr ? input_outputs->size() : 0);
+			if (input_outputs != nullptr)
+			{
+				for (size_t i = 0; i < input_outputs->size(); ++i)
+					elog(LOG,
+						 "pg_yaap: count distinct available_output[%zu]=%s.%s binding=(%zu,%zu)",
+						 i,
+						 (*input_outputs)[i].table_name.c_str(),
+						 (*input_outputs)[i].column_name.c_str(),
+						 (*input_outputs)[i].binding.table_index.index,
+						 (*input_outputs)[i].binding.column_index.index);
+			}
+		}
+	}
+
+	if (pg_strcasecmp(agg->function_name.c_str(), "count") == 0)
+	{
+		if (!is_bare_ref || bare_col == nullptr)
+		{
+			if (pg_yaap_trace_hooks && bare_arg != nullptr && agg->is_distinct)
+			{
+				elog(LOG,
+					 "pg_yaap: count distinct classify miss input_outputs=%zu expr=%s.%s binding=(%zu,%zu) cols=%zu schema=%zu",
+					 input_outputs != nullptr ? input_outputs->size() : 0,
+					 bare_arg->table_name.c_str(),
+					 bare_arg->column_name.c_str(),
+					 bare_arg->binding.table_index.index,
+					 bare_arg->binding.column_index.index,
+					 cols.size(),
+					 schema.size());
+				if (input_outputs != nullptr)
+				{
+					for (size_t i = 0; i < input_outputs->size(); ++i)
+						elog(LOG,
+							 "pg_yaap: count distinct input_output[%zu]=%s.%s binding=(%zu,%zu)",
+							 i,
+							 (*input_outputs)[i].table_name.c_str(),
+							 (*input_outputs)[i].column_name.c_str(),
+							 (*input_outputs)[i].binding.table_index.index,
+							 (*input_outputs)[i].binding.column_index.index);
+				}
+			}
+			return false;
+		}
+		if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
+		{
+			if (next_int64_slot >= 16)
+				return false;
+			const uint16_t first = static_cast<uint16_t>(project_steps.size());
+			const uint8_t cast_slot = next_int64_slot++;
+			project_steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, bare_col->chunk_slot, 0, cast_slot, 0});
+			project_exprs.push_back(ProjectExprDesc{first, 1, cast_slot, 0, 0});
+			materialized_exprs.push_back(MaterializedOptExpr{arg, 0, cast_slot});
+			out_desc.input_col_idx = cast_slot;
+		}
+		else if (bare_col->decode_kind == ColumnDecodeKind::INT64_INT8 ||
+				 bare_col->decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+		{
+			out_desc.input_col_idx = bare_col->chunk_slot;
+		}
+		else
+		{
+			if (pg_yaap_trace_hooks && bare_arg != nullptr)
+				elog(LOG,
+					 "pg_yaap: count distinct unsupported decode=%d expr=%s.%s binding=(%zu,%zu) slot=%u typmod=%d",
+					 static_cast<int>(bare_col->decode_kind),
+					 bare_arg->table_name.c_str(),
+					 bare_arg->column_name.c_str(),
+					 bare_arg->binding.table_index.index,
+					 bare_arg->binding.column_index.index,
+					 static_cast<unsigned>(bare_col->chunk_slot),
+					 bare_col->typmod);
+			return false;
+		}
+		out_kind = agg->is_distinct ? TdcAggKind::COUNT_DISTINCT_NONNULL : TdcAggKind::COUNT_NONNULL;
+		return true;
+	}
 
 	if (pg_strcasecmp(agg->function_name.c_str(), "sum") == 0)
 	{
+		Oid arg_type_oid = InvalidOid;
+		int32 arg_typmod = -1;
+		int8_t arg_scale = 0;
+		const bool intlike_expr =
+			InferProjectionExprSchema(arg, cols, schema, arg_type_oid, arg_typmod, arg_scale) &&
+			arg_scale == 0 &&
+			(arg_type_oid == BOOLOID || arg_type_oid == INT4OID || arg_type_oid == INT8OID);
 		if (is_bare_ref && bare_col != nullptr &&
 			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 || bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
 		{
@@ -746,12 +967,19 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 				 bare_col != nullptr ? static_cast<int>(bare_col->decode_kind) : -1,
 				 bare_col != nullptr ? bare_col->typmod : -1,
 				 arg != nullptr ? static_cast<int>(arg->type) : -1);
-		out_kind = TdcAggKind::SUM_NUMERIC;
+		out_kind = intlike_expr ? TdcAggKind::SUM_INT64 : TdcAggKind::SUM_NUMERIC;
 	}
 	else if (pg_strcasecmp(agg->function_name.c_str(), "avg") == 0)
 		out_kind = TdcAggKind::AVG_NUMERIC;
 	else if (pg_strcasecmp(agg->function_name.c_str(), "min") == 0)
 	{
+		Oid arg_type_oid = InvalidOid;
+		int32 arg_typmod = -1;
+		int8_t arg_scale = 0;
+		const bool intlike_expr =
+			InferProjectionExprSchema(arg, cols, schema, arg_type_oid, arg_typmod, arg_scale) &&
+			arg_scale == 0 &&
+			(arg_type_oid == BOOLOID || arg_type_oid == INT4OID || arg_type_oid == INT8OID);
 		if (is_bare_ref && bare_col != nullptr &&
 			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 || bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
 		{
@@ -771,7 +999,7 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 			out_kind = TdcAggKind::MIN_INT64;
 			return true;
 		}
-		out_kind = TdcAggKind::MIN_NUMERIC;
+		out_kind = intlike_expr ? TdcAggKind::MIN_INT64 : TdcAggKind::MIN_NUMERIC;
 	}
 	else
 		return false;
@@ -830,6 +1058,7 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 
 bool
 BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
+						const std::vector<yaap::PhysicalOperator::OutputColumn> *input_outputs,
 						const std::vector<ColumnRef> &input_cols,
 						const std::vector<ColumnSchema> &input_schema,
 						const AggBuildState &agg_state,
@@ -848,7 +1077,7 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 			return false;
 		ColumnRef ref{};
 		const ColumnSchema *src = nullptr;
-		if (!LookupBindingColumn(col_expr->binding, input_cols, input_schema, ref, src) || src == nullptr)
+		if (!LookupNamedExprInputColumn(col_expr, input_outputs, input_cols, input_schema, ref, src) || src == nullptr)
 			return false;
 		ColumnSchema cs = *src;
 		cs.chunk_slot = static_cast<uint8_t>(i);
@@ -868,6 +1097,8 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 		switch (agg_state.agg_kinds[i])
 		{
 			case TdcAggKind::COUNT_STAR:
+			case TdcAggKind::COUNT_NONNULL:
+			case TdcAggKind::COUNT_DISTINCT_NONNULL:
 			case TdcAggKind::SUM_INT64:
 			case TdcAggKind::MIN_INT64:
 				cs.type_oid = INT8OID;
@@ -899,8 +1130,10 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 
 bool
 CollectJoinKeys(const Expression *expr,
+				const std::vector<yaap::PhysicalOperator::OutputColumn> *left_outputs,
 				const std::vector<ColumnRef> &left_cols,
 				const std::vector<ColumnSchema> &left_schema,
+				const std::vector<yaap::PhysicalOperator::OutputColumn> *right_outputs,
 				const std::vector<ColumnRef> &right_cols,
 				const std::vector<ColumnSchema> &right_schema,
 				std::vector<ColumnRef> &left_keys,
@@ -919,7 +1152,16 @@ CollectJoinKeys(const Expression *expr,
 		}
 		for (const auto &child : conj->children)
 		{
-			if (!CollectJoinKeys(child.get(), left_cols, left_schema, right_cols, right_schema, left_keys, right_keys, residuals))
+			if (!CollectJoinKeys(child.get(),
+								 left_outputs,
+								 left_cols,
+								 left_schema,
+								 right_outputs,
+								 right_cols,
+								 right_schema,
+								 left_keys,
+								 right_keys,
+								 residuals))
 				return false;
 		}
 		return true;
@@ -943,46 +1185,50 @@ CollectJoinKeys(const Expression *expr,
 		return true;
 	}
 
-	ColumnRef lhs_ref{};
-	ColumnRef rhs_ref{};
-	const ColumnSchema *lhs_schema = nullptr;
-	const ColumnSchema *rhs_schema = nullptr;
-	const bool lhs_left = LookupBindingColumn(lhs->binding, left_cols, left_schema, lhs_ref, lhs_schema);
-	const bool lhs_right = LookupBindingColumn(lhs->binding, right_cols, right_schema, lhs_ref, lhs_schema);
-	const bool rhs_left = LookupBindingColumn(rhs->binding, left_cols, left_schema, rhs_ref, rhs_schema);
-	const bool rhs_right = LookupBindingColumn(rhs->binding, right_cols, right_schema, rhs_ref, rhs_schema);
-	if (lhs_schema == nullptr || rhs_schema == nullptr || lhs_schema->decode_kind != rhs_schema->decode_kind)
+	ColumnRef lhs_left_ref{};
+	ColumnRef lhs_right_ref{};
+	ColumnRef rhs_left_ref{};
+	ColumnRef rhs_right_ref{};
+	const ColumnSchema *lhs_left_schema = nullptr;
+	const ColumnSchema *lhs_right_schema = nullptr;
+	const ColumnSchema *rhs_left_schema = nullptr;
+	const ColumnSchema *rhs_right_schema = nullptr;
+	const bool lhs_left = LookupNamedExprInputColumn(lhs, left_outputs, left_cols, left_schema, lhs_left_ref, lhs_left_schema);
+	const bool lhs_right = LookupNamedExprInputColumn(lhs, right_outputs, right_cols, right_schema, lhs_right_ref, lhs_right_schema);
+	const bool rhs_left = LookupNamedExprInputColumn(rhs, left_outputs, left_cols, left_schema, rhs_left_ref, rhs_left_schema);
+	const bool rhs_right = LookupNamedExprInputColumn(rhs, right_outputs, right_cols, right_schema, rhs_right_ref, rhs_right_schema);
+	if (lhs_left && rhs_right &&
+		lhs_left_schema != nullptr && rhs_right_schema != nullptr &&
+		lhs_left_schema->decode_kind == rhs_right_schema->decode_kind)
 	{
-		if (pg_yaap_trace_hooks)
-			elog(LOG,
-				 "pg_yaap: collect join keys schema mismatch lhs=(%zu,%zu left=%d right=%d) rhs=(%zu,%zu left=%d right=%d) lhs_schema=%p rhs_schema=%p lhs_decode=%d rhs_decode=%d",
-				 lhs->binding.table_index.index,
-				 lhs->binding.column_index.index,
-				 lhs_left ? 1 : 0,
-				 lhs_right ? 1 : 0,
-				 rhs->binding.table_index.index,
-				 rhs->binding.column_index.index,
-				 rhs_left ? 1 : 0,
-				 rhs_right ? 1 : 0,
-				 lhs_schema,
-				 rhs_schema,
-				 lhs_schema != nullptr ? static_cast<int>(lhs_schema->decode_kind) : -1,
-				 rhs_schema != nullptr ? static_cast<int>(rhs_schema->decode_kind) : -1);
-		residuals.push_back(const_cast<Expression *>(expr));
+		left_keys.push_back(lhs_left_ref);
+		right_keys.push_back(rhs_right_ref);
 		return true;
 	}
-	if (lhs_left && rhs_right)
+	if (lhs_right && rhs_left &&
+		lhs_right_schema != nullptr && rhs_left_schema != nullptr &&
+		lhs_right_schema->decode_kind == rhs_left_schema->decode_kind)
 	{
-		left_keys.push_back(lhs_ref);
-		right_keys.push_back(rhs_ref);
+		left_keys.push_back(rhs_left_ref);
+		right_keys.push_back(lhs_right_ref);
 		return true;
 	}
-	if (lhs_right && rhs_left)
-	{
-		left_keys.push_back(rhs_ref);
-		right_keys.push_back(lhs_ref);
-		return true;
-	}
+	if (pg_yaap_trace_hooks &&
+		((lhs_left || lhs_right) && (rhs_left || rhs_right)))
+		elog(LOG,
+			 "pg_yaap: collect join keys schema mismatch lhs=(%zu,%zu left=%d right=%d) rhs=(%zu,%zu left=%d right=%d) lhs_left_decode=%d lhs_right_decode=%d rhs_left_decode=%d rhs_right_decode=%d",
+			 lhs->binding.table_index.index,
+			 lhs->binding.column_index.index,
+			 lhs_left ? 1 : 0,
+			 lhs_right ? 1 : 0,
+			 rhs->binding.table_index.index,
+			 rhs->binding.column_index.index,
+			 rhs_left ? 1 : 0,
+			 rhs_right ? 1 : 0,
+			 lhs_left_schema != nullptr ? static_cast<int>(lhs_left_schema->decode_kind) : -1,
+			 lhs_right_schema != nullptr ? static_cast<int>(lhs_right_schema->decode_kind) : -1,
+			 rhs_left_schema != nullptr ? static_cast<int>(rhs_left_schema->decode_kind) : -1,
+			 rhs_right_schema != nullptr ? static_cast<int>(rhs_right_schema->decode_kind) : -1);
 	if (pg_yaap_trace_hooks)
 		elog(LOG,
 			 "pg_yaap: collect join keys side miss lhs=(%zu,%zu left=%d right=%d) rhs=(%zu,%zu left=%d right=%d)",
