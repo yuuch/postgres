@@ -30,6 +30,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 
 #include <algorithm>
 #include <cmath>
+#include <string_view>
 
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
@@ -75,6 +76,65 @@ LogSeqScanDeformerJitDecision(const ExecCtx &ctx,
 		 compiled ? "on" : "off",
 		 (reason != nullptr && reason[0] != '\0') ? " reason=" : "",
 		 (reason != nullptr && reason[0] != '\0') ? reason : "");
+}
+
+static bool
+MatchPercentLikePattern(const char *lhs, uint32_t lhs_len,
+						  const char *pattern, uint32_t pattern_len)
+{
+	if (pattern == nullptr)
+		return false;
+	std::string_view text(lhs != nullptr ? lhs : "", lhs_len);
+	std::string_view spec(pattern, pattern_len);
+	if (spec.empty())
+		return text.empty();
+	if (spec == "%")
+		return true;
+
+	size_t text_pos = 0;
+	size_t pat_pos = 0;
+	const bool anchored_start = spec.front() != '%';
+	const bool anchored_end = spec.back() != '%';
+	bool first_token = true;
+
+	while (pat_pos < spec.size())
+	{
+		while (pat_pos < spec.size() && spec[pat_pos] == '%')
+			++pat_pos;
+		if (pat_pos >= spec.size())
+			return true;
+
+		const size_t next_pct = spec.find('%', pat_pos);
+		const std::string_view token = spec.substr(
+			pat_pos,
+			next_pct == std::string_view::npos ? spec.size() - pat_pos : next_pct - pat_pos);
+		if (token.empty())
+		{
+			pat_pos = next_pct;
+			continue;
+		}
+
+		if (first_token && anchored_start)
+		{
+			if (text.size() < token.size() || text.substr(0, token.size()) != token)
+				return false;
+			text_pos = token.size();
+		}
+		else
+		{
+			const size_t found = text.find(token, text_pos);
+			if (found == std::string_view::npos)
+				return false;
+			text_pos = found + token.size();
+		}
+		first_token = false;
+
+		if (next_pct == std::string_view::npos)
+			return !anchored_end || text_pos == text.size();
+		pat_pos = next_pct;
+	}
+
+	return !anchored_end || text_pos == text.size();
 }
 
 static SchemaDescriptor *
@@ -328,6 +388,17 @@ EvalFilterStep(const FilterStep &step,
 							result = false;
 						}
 					}
+				}
+				break;
+			}
+			case FilterStepOp::STRING_SQL_LIKE:
+			{
+				if (!filter_chunk.nulls[step.left_idx][0])
+				{
+					const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+					const char *rhs = ResolveFilterConstPtr(step, string_consts);
+					const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+					result = MatchPercentLikePattern(lhs, ref.len, rhs, step.const_len);
 				}
 				break;
 			}

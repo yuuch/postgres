@@ -18,7 +18,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 | `state.h` | C / C++ | Public C interface for the per-query state HTAB and the `pg_yaap_try_build_query_state` / `pg_yaap_close_query_state` helpers. Forward-declares opaque `PgYaapQueryState`. |
 | `state.c` | C | Defines `struct PgYaapQueryState { MemoryContext context; void *parallel_plan; void *parallel_scheduler; }`, the HTAB, `plan_uses_supported_relations` admission filter, query-state alloc/dispose. |
 | `execute.h` | C / C++ | Declarations for `pg_yaap_initialize_plan`, `pg_yaap_delete_plan`, `pg_yaap_execute_query`. |
-| `execute.cpp` | C++ | Bridge into `pipeline::Translator::Translate(PlannedStmt*)`, owns the resulting `PhysicalOperator*` via `state->parallel_plan` (Option A `void*` ownership), and dispatches `pg_yaap_execute_query` to `pipeline::PgYaapPipelineRun`. |
+| `execute.cpp` | C++ | Bridge from `OptimizerPlanBundle::physical_plan` into runtime lowering/dispatch, owns the resulting pipeline root via `state->parallel_plan`, and dispatches `pg_yaap_execute_query` to `pipeline::PgYaapPipelineRun`. |
 | `AGENTS.md` | doc | This file. |
 
 ## WHERE TO LOOK
@@ -29,7 +29,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 | Admission filter | `state.c::plan_uses_supported_relations` | Recursive walk; rejects when no `RTE_RELATION` user table is touched. SubqueryScan supported via recursion. |
 | Per-query state HTAB | `state.c` (impl), `state.h` (API) | HTAB keyed by `QueryDesc *`; entries hold `PgYaapQueryState *`. |
 | Query state lifecycle | `state.c::pg_yaap_try_build_query_state`, `pg_yaap_close_query_state` | Allocates child `MemoryContext` named `"pg_yaap query context"`. |
-| Plan init / dispatch | `execute.cpp::pg_yaap_initialize_plan`, `pg_yaap_execute_query` | `Translator::Translate` returns `unique_ptr<PhysicalOperator>`. On non-null, ownership is `release()`d into `state->parallel_plan`. `parallel_scheduler` is set to a static char sentinel iff `pg_yaap.parallel=on`. |
+| Plan init / dispatch | `execute.cpp::pg_yaap_initialize_plan`, `pg_yaap_execute_query` | Lowers the optimizer bundle into the YAAP runtime. `parallel_scheduler` is set to a static char sentinel iff `pg_yaap.parallel=on`. |
 | Plan teardown | `execute.cpp::pg_yaap_delete_plan` | `static_cast<PhysicalOperator*>(state->parallel_plan)` → `delete`. Called from `pg_yaap_close_query_state` in `state.c`. |
 | Pipeline dispatch | `execute.cpp::pg_yaap_execute_query` | Calls `pg_yaap::pipeline::PgYaapPipelineRun(queryDesc, state, &failure_reason)`. On failure/unsupported shape it falls through to `standard_ExecutorRun`. |
 
@@ -43,7 +43,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 - **Admission**: `plan_uses_supported_relations` walks the plan tree before init. If it rejects, `pg_yaap_try_build_query_state` returns `NULL`, no state is registered, and `ExecutorRun_hook` finds no entry → fallthrough to standard PG executor.
 - **Plan-init failure**: if `pg_yaap_initialize_plan` returns `false` (Translator returned `nullptr`, or `pg_yaap.parallel=off`, or `parallel_plan==NULL`), the just-allocated state is closed via `pg_yaap_close_query_state` and is never registered — same fallthrough path.
 - **Parallel sentinel**: `state->parallel_plan` holds a real `PhysicalOperator *` cast to `void *`. `state->parallel_scheduler` is set to the address of a static char (`pgyaap_parallel_scheduler_sentinel` in `execute.cpp`) iff `pg_yaap.parallel=on`. Both being non-null gates the dispatch path. The real `TaskScheduler` lives inside `parallel/pipeline/` (not behind this sentinel) and is constructed per-query from `PgYaapPipelineRun`.
-- **`MemoryContextSwitchTo` discipline**: `pg_yaap_initialize_plan` switches into `state->context` before invoking `Translator::Translate` so any palloc-backed allocations the engine makes are anchored to the per-query lifetime.
+- **`MemoryContextSwitchTo` discipline**: `pg_yaap_initialize_plan` switches into `state->context` before invoking optimizer-path lowering so any palloc-backed allocations the engine makes are anchored to the per-query lifetime.
 
 ## GUCs (defined in `pg_yaap.c::_PG_init`)
 
@@ -96,7 +96,7 @@ callback, not a tunable block-range morsel scheduler.
    - `pg_yaap_try_build_query_state(qd, eflags)` → if `NULL`, return.
    - `pg_yaap_initialize_plan(qd, state)`:
      - `MemoryContextSwitchTo(state->context)`.
-     - `pg_yaap::pipeline::Translator::Translate(qd->plannedstmt)` → `unique_ptr<PhysicalOperator>`.
+     - Lower `OptimizerPlanBundle::physical_plan` through the YAAP optimizer-to-executor path.
      - On non-null: `state->parallel_plan = root.release()`; if `pg_yaap_parallel`, `state->parallel_scheduler = &sentinel`.
      - On `parallel_plan==NULL`: emit `WARNING: pg_yaap: unsupported plan shape, falling back to standard PostgreSQL executor` and return `false`.
      - On `pg_yaap_parallel==false`: emit `WARNING: pg_yaap: pg_yaap.parallel=off, falling back to standard PostgreSQL executor` and return `parallel_scheduler != NULL` (i.e. `false`).

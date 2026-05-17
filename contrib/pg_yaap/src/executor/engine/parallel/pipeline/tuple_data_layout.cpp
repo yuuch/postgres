@@ -43,6 +43,8 @@ TupleDataLayoutAggregateWidth(TdcAggKind kind)
 	{
 		case TdcAggKind::SUM_INT64:    return 8;
 		case TdcAggKind::COUNT_STAR:   return 8;
+		case TdcAggKind::COUNT_NONNULL:return 8;
+		case TdcAggKind::COUNT_DISTINCT_NONNULL:return 8;
 		case TdcAggKind::SUM_NUMERIC:  return 8;
 		case TdcAggKind::AVG_NUMERIC:  return 16;
 		case TdcAggKind::MIN_INT64:    return 8;

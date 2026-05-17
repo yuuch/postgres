@@ -194,6 +194,7 @@ InferNamedColumnDecodeKind(const BoundColumnRefExpression *expr,
 
 static bool
 LookupProjectionInputColumn(const BoundColumnRefExpression *expr,
+							const std::vector<yaap::PhysicalOperator::OutputColumn> *outputs,
 							const std::vector<ColumnRef> &cols,
 							const std::vector<ColumnSchema> &schema,
 							ColumnRef &out_ref,
@@ -202,50 +203,74 @@ LookupProjectionInputColumn(const BoundColumnRefExpression *expr,
 	if (expr == nullptr)
 		return false;
 
-	ColumnRef exact_ref{};
-	const ColumnSchema *exact_col = nullptr;
-	const bool exact_found = LookupBindingColumn(expr->binding, cols, schema, exact_ref, exact_col);
+	return LookupNamedExprInputColumn(expr, outputs, cols, schema, out_ref, out_col);
+}
 
-	ColumnRef ordinal_ref{};
-	const ColumnSchema *ordinal_col = nullptr;
-	const bool ordinal_found =
-		cols.size() == schema.size() &&
-		expr->binding.column_index.index < schema.size() &&
-		(ordinal_ref = cols[expr->binding.column_index.index], true) &&
-		(ordinal_col = &schema[expr->binding.column_index.index], true);
-
-	ColumnDecodeKind expected_decode = ColumnDecodeKind::NONE;
-	if (exact_found && ordinal_found &&
-		exact_col != nullptr && ordinal_col != nullptr &&
-		exact_col->decode_kind != ordinal_col->decode_kind &&
-		InferNamedColumnDecodeKind(expr, expected_decode))
+static bool
+LookupProjectionPassthroughColumn(const ColumnRef &ref,
+								  const std::vector<yaap::PhysicalOperator::OutputColumn> &outputs,
+								  const std::vector<ColumnRef> &cols,
+								  const std::vector<ColumnSchema> &schema,
+								  const ColumnSchema *&out_col,
+								  const yaap::PhysicalOperator::OutputColumn *&out_output)
+{
+	out_col = nullptr;
+	out_output = nullptr;
+	for (size_t i = 0; i < cols.size() && i < schema.size(); ++i)
 	{
-		if (ordinal_col->decode_kind == expected_decode &&
-			exact_col->decode_kind != expected_decode)
+		if (SameColumnRef(ref, cols[i]))
 		{
-			out_ref = ordinal_ref;
-			out_col = ordinal_col;
-			return true;
-		}
-		if (exact_col->decode_kind == expected_decode &&
-			ordinal_col->decode_kind != expected_decode)
-		{
-			out_ref = exact_ref;
-			out_col = exact_col;
+			out_col = &schema[i];
+			if (i < outputs.size())
+				out_output = &outputs[i];
 			return true;
 		}
 	}
-
-	if (exact_found)
+	for (size_t i = 0; i < outputs.size() && i < schema.size(); ++i)
 	{
-		out_ref = exact_ref;
-		out_col = exact_col;
+		const ColumnRef output_ref = BindingToColumnRef(outputs[i].binding);
+		if (!SameColumnRef(ref, output_ref))
+			continue;
+		out_col = &schema[i];
+		out_output = &outputs[i];
 		return true;
 	}
-	if (ordinal_found)
+	return false;
+}
+
+static bool
+LookupProjectedOutputOrdinal(const BoundColumnRefExpression *expr,
+							 const PhysicalOperator *source_op,
+							 size_t &out_idx)
+{
+	if (expr == nullptr || source_op == nullptr)
+		return false;
+	if ((source_op->type == PhysicalOperatorType::FILTER ||
+		 source_op->type == PhysicalOperatorType::ORDER_BY ||
+		 source_op->type == PhysicalOperatorType::LIMIT) &&
+		source_op->children.size() == 1 &&
+		source_op->children[0] != nullptr)
+		return LookupProjectedOutputOrdinal(expr, source_op->children[0].get(), out_idx);
+	if (source_op->type != PhysicalOperatorType::PROJECTION)
+		return false;
+	const auto &projection = static_cast<const PhysicalProjection &>(*source_op);
+	for (size_t idx = 0; idx < projection.select_list.size(); ++idx)
 	{
-		out_ref = ordinal_ref;
-		out_col = ordinal_col;
+		const auto *projected_col =
+			dynamic_cast<const BoundColumnRefExpression *>(projection.select_list[idx]);
+		if (projected_col == nullptr)
+			continue;
+		const bool binding_match =
+			projected_col->binding.table_index.index == expr->binding.table_index.index &&
+			projected_col->binding.column_index.index == expr->binding.column_index.index;
+		const bool name_match =
+			!expr->table_name.empty() &&
+			!expr->column_name.empty() &&
+			projected_col->table_name == expr->table_name &&
+			projected_col->column_name == expr->column_name;
+		if (!binding_match && !name_match)
+			continue;
+		out_idx = idx;
 		return true;
 	}
 	return false;
@@ -253,6 +278,7 @@ LookupProjectionInputColumn(const BoundColumnRefExpression *expr,
 
 static bool
 TryBuildPureProjection(const PhysicalProjection &projection,
+					   const PhysicalOperator *source_op,
 					   const std::vector<Expression *> &select_list,
 					   const std::vector<ColumnRef> *required_output_cols,
 					   OptimizerNodeTranslation &child,
@@ -273,7 +299,7 @@ TryBuildPureProjection(const PhysicalProjection &projection,
 			return false;
 		ColumnRef ref{};
 		const ColumnSchema *col = nullptr;
-		if (!LookupProjectionInputColumn(col_expr, child.cols, child.schema, ref, col) || col == nullptr)
+		if (!LookupProjectionInputColumn(col_expr, &child.outputs, child.cols, child.schema, ref, col) || col == nullptr)
 			return false;
 		if (ref.varno != child.cols[idx].varno ||
 			ref.attno != child.cols[idx].attno ||
@@ -290,6 +316,30 @@ TryBuildPureProjection(const PhysicalProjection &projection,
 	out.op = std::move(child.op);
 	out.cols = BuildParentFacingOutputCols(raw_output_cols, required_output_cols);
 	out.schema = std::move(new_schema);
+	out.outputs = projection.outputs;
+	if (pg_yaap_trace_hooks)
+	{
+		elog(LOG,
+			 "pg_yaap: pure projection table_index=%zu required=%zu raw=%zu out=%zu",
+			 projection.table_index.index,
+			 required_output_cols != nullptr ? required_output_cols->size() : 0,
+			 raw_output_cols.size(),
+			 out.cols.size());
+		for (size_t i = 0; i < out.cols.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: pure projection out_col[%zu]=(%u,%d)",
+				 i,
+				 out.cols[i].varno,
+				 out.cols[i].attno);
+	}
+	if (pg_yaap_trace_hooks && out.outputs.size() != out.cols.size())
+		elog(LOG,
+			 "pg_yaap: pure projection output mismatch table_index=%zu out_cols=%zu out_outputs=%zu child_cols=%zu child_outputs=%zu",
+			 projection.table_index.index,
+			 out.cols.size(),
+			 out.outputs.size(),
+			 child.cols.size(),
+			 child.outputs.size());
 	out.final_sort_keys = child.final_sort_keys;
 	out.limit_count = child.limit_count;
 	out.estimated_groups = child.estimated_groups;
@@ -365,10 +415,12 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		}
 	}
 	for (Expression *expr : selected_select_list)
-		CollectReferencedColumns(expr, child_required);
+		CollectReferencedSourceColumns(expr, projection.children[0].get(), child_required);
 	for (const ColumnRef &ref : hidden_passthrough_candidates)
 		AppendUniqueColumnRef(ref, child_required);
-	if (!TranslateOptimizerNode(*projection.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
+	const std::vector<ColumnRef> *child_required_ptr =
+		child_required.empty() ? nullptr : &child_required;
+	if (!TranslateOptimizerNode(*projection.children[0], queryDesc, state, {}, child_required_ptr, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer projection rejected: child translation failed");
@@ -377,11 +429,13 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	if (pg_yaap_trace_hooks)
 	{
 		elog(LOG,
-			 "pg_yaap: projection table_index=%zu select_count=%zu child_cols=%zu child_schema=%zu",
+			 "pg_yaap: projection table_index=%zu child_type=%d select_count=%zu child_cols=%zu child_schema=%zu hidden_candidates=%zu",
 			 projection.table_index.index,
+			 static_cast<int>(projection.children[0]->type),
 			 selected_select_list.size(),
 			 child.cols.size(),
-			 child.schema.size());
+			 child.schema.size(),
+			 hidden_passthrough_candidates.size());
 		for (size_t i = 0; i < child.cols.size(); ++i)
 			elog(LOG,
 				 "pg_yaap: projection child_col[%zu]=(%u,%d) decode=%d slot=%u",
@@ -390,6 +444,14 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 				 child.cols[i].attno,
 				 static_cast<int>(child.schema[i].decode_kind),
 				 child.schema[i].chunk_slot);
+		for (size_t i = 0; i < child.outputs.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: projection child_output[%zu] binding=(%zu,%zu) name=%s.%s",
+				 i,
+				 child.outputs[i].binding.table_index.index,
+				 child.outputs[i].binding.column_index.index,
+				 child.outputs[i].table_name.c_str(),
+				 child.outputs[i].column_name.c_str());
 		for (size_t i = 0; i < selected_select_list.size(); ++i)
 		{
 			if (selected_select_list[i] != nullptr &&
@@ -405,6 +467,12 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 					 col_expr->binding.column_index.index);
 			}
 		}
+		for (size_t i = 0; i < hidden_passthrough_candidates.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: projection hidden_candidate[%zu]=(%u,%d)",
+				 i,
+				 hidden_passthrough_candidates[i].varno,
+				 hidden_passthrough_candidates[i].attno);
 	}
 	std::vector<ColumnRef> hidden_passthrough;
 	if (!hidden_passthrough_candidates.empty())
@@ -412,14 +480,16 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		for (const ColumnRef &ref : hidden_passthrough_candidates)
 		{
 			const ColumnSchema *col = nullptr;
-			if (LookupPassthroughColumn(ref, child.cols, child.schema, col) && col != nullptr)
+			const yaap::PhysicalOperator::OutputColumn *output = nullptr;
+			if (LookupProjectionPassthroughColumn(ref, child.outputs, child.cols, child.schema, col, output) &&
+				col != nullptr)
 				AppendUniqueColumnRef(ref, hidden_passthrough);
 		}
 	}
 
 	if (hidden_passthrough.empty() &&
 		selected_select_list.size() == rewritten_select_list.size() &&
-		TryBuildPureProjection(projection, selected_select_list, required_output_cols, child, out))
+		TryBuildPureProjection(projection, projection.children[0].get(), selected_select_list, required_output_cols, child, out))
 		return true;
 
 	std::vector<ProjectStep> steps;
@@ -511,7 +581,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 			ColumnRef ref{};
 			const ColumnSchema *source_col = nullptr;
 			const auto *col_expr = static_cast<const BoundColumnRefExpression *>(expr);
-			if (!LookupProjectionInputColumn(col_expr, child.cols, child.schema, ref, source_col) ||
+			if (!LookupProjectionInputColumn(col_expr, &child.outputs, child.cols, child.schema, ref, source_col) ||
 				source_col == nullptr)
 			{
 				if (pg_yaap_trace_hooks)
@@ -543,7 +613,9 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	for (const ColumnRef &ref : hidden_passthrough)
 	{
 		const ColumnSchema *col = nullptr;
-		if (!LookupPassthroughColumn(ref, child.cols, child.schema, col) || col == nullptr)
+		const yaap::PhysicalOperator::OutputColumn *output = nullptr;
+		if (!LookupProjectionPassthroughColumn(ref, child.outputs, child.cols, child.schema, col, output) ||
+			col == nullptr)
 			return false;
 		out_schema.push_back(*col);
 		expr_descs.push_back(ProjectExprDesc{
@@ -598,6 +670,32 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	for (const ColumnRef &ref : hidden_passthrough)
 		raw_output_cols.push_back(ref);
 	out.cols = BuildParentFacingOutputCols(raw_output_cols, required_output_cols);
+	out.outputs.clear();
+	out.outputs.reserve(selected_select_indices.size() + hidden_passthrough.size());
+	for (size_t idx : selected_select_indices)
+	{
+		if (idx < projection.outputs.size())
+			out.outputs.push_back(projection.outputs[idx]);
+	}
+	for (const ColumnRef &ref : hidden_passthrough)
+	{
+		const ColumnSchema *col = nullptr;
+		const yaap::PhysicalOperator::OutputColumn *output = nullptr;
+		if (!LookupProjectionPassthroughColumn(ref, child.outputs, child.cols, child.schema, col, output) ||
+			output == nullptr)
+			return false;
+		out.outputs.push_back(*output);
+	}
+	if (pg_yaap_trace_hooks && out.outputs.size() != out.cols.size())
+		elog(LOG,
+			 "pg_yaap: projection output mismatch table_index=%zu out_cols=%zu out_outputs=%zu selected=%zu hidden_passthrough=%zu child_cols=%zu child_outputs=%zu",
+			 projection.table_index.index,
+			 out.cols.size(),
+			 out.outputs.size(),
+			 selected_select_indices.size(),
+			 hidden_passthrough.size(),
+			 child.cols.size(),
+			 child.outputs.size());
 	if (pg_yaap_trace_hooks)
 	{
 		elog(LOG,
@@ -667,7 +765,6 @@ TranslateTableScanNode(const PhysicalTableScan &scan,
 			elog(LOG, "pg_yaap: optimizer scan rejected: BuildOrderedSeqScanColumns failed relid=%u", scan.relid);
 		return false;
 	}
-
 	std::vector<Expression *> filters = scan.filters;
 	filters.insert(filters.end(), pending_filters.begin(), pending_filters.end());
 
@@ -710,6 +807,31 @@ TranslateTableScanNode(const PhysicalTableScan &scan,
 		InvalidDsaPointer);
 	out.cols = std::move(all_cols);
 	out.schema = std::move(ordered_cols);
+	out.outputs.clear();
+	out.outputs.reserve(out.cols.size());
+	const Index scan_varno = static_cast<Index>(scan.table_index.index + 1);
+	for (const ColumnRef &ref : out.cols)
+	{
+		bool matched = false;
+		for (const auto &output : scan.outputs)
+		{
+			if (SameColumnRef(ref, BindingToColumnRef(output.binding)))
+			{
+				out.outputs.push_back(output);
+				matched = true;
+				break;
+			}
+		}
+		if (matched)
+			continue;
+		if (ref.varno != scan_varno || ref.attno <= 0)
+			continue;
+		const char *attname = get_attname(scan.relid, ref.attno, true);
+		out.outputs.push_back(yaap::PhysicalOperator::OutputColumn{
+			yaap::ColumnBinding{scan.table_index, yaap::ProjectionIndex{static_cast<size_t>(ref.attno - 1)}},
+			scan.table_name,
+			attname != nullptr ? std::string(attname) : ("col" + std::to_string(ref.attno))});
+	}
 	out.final_sort_keys.clear();
 	out.limit_count = 0;
 	out.estimated_groups = 0;
@@ -732,11 +854,19 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 	}
 	OptimizerNodeTranslation child;
 	std::vector<ColumnRef> child_required;
+	bool need_full_child_outputs = false;
 	for (Expression *group_expr : agg.groups)
 		CollectReferencedColumns(group_expr, child_required);
 	for (Expression *agg_expr : agg.expressions)
+	{
 		CollectReferencedColumns(agg_expr, child_required);
-	if (!TranslateOptimizerNode(*agg.children[0], queryDesc, state, {}, &child_required, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
+		if (agg_expr != nullptr && agg_expr->type == ExpressionType::BOUND_AGGREGATE &&
+			static_cast<const BoundAggregateExpression *>(agg_expr)->is_distinct)
+			need_full_child_outputs = true;
+	}
+	const std::vector<ColumnRef> *child_required_ptr =
+		need_full_child_outputs ? nullptr : &child_required;
+	if (!TranslateOptimizerNode(*agg.children[0], queryDesc, state, {}, child_required_ptr, delim_outer_child, delim_outer_bindings, child) || child.op == nullptr)
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer agg rejected: child translation failed");
@@ -754,6 +884,7 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 		TdcAggKind kind{};
 		int16_t numeric_scale = 0;
 		if (!ClassifyOptimizerAggregate(bound_agg,
+										&child.outputs,
 										child.cols,
 										child.schema,
 										agg_state.project_steps,
@@ -773,6 +904,15 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 		agg_state.agg_kinds.push_back(kind);
 		agg_state.agg_numeric_scales.push_back(numeric_scale);
 	}
+	for (TdcAggKind kind : agg_state.agg_kinds)
+	{
+		if (kind == TdcAggKind::COUNT_DISTINCT_NONNULL && agg_state.agg_kinds.size() != 1)
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG, "pg_yaap: optimizer agg rejected: mixed distinct aggregates not yet supported");
+			return false;
+		}
+	}
 
 	std::vector<ColumnRef> group_cols;
 	group_cols.reserve(agg.groups.size());
@@ -785,7 +925,68 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 				elog(LOG, "pg_yaap: optimizer agg rejected: non-column group expr");
 			return false;
 		}
-		group_cols.push_back(BindingToColumnRef(group_col->binding));
+		yaap::ColumnBinding resolved_binding = group_col->binding;
+		(void) ResolveOutputBinding(group_col, agg.children[0].get(), resolved_binding);
+		BoundColumnRefExpression resolved_group_col(
+			resolved_binding,
+			group_col->table_name,
+			group_col->column_name);
+		std::unique_ptr<BoundColumnRefExpression> named_group_lookup;
+		const BoundColumnRefExpression *lookup_group_col = &resolved_group_col;
+		const size_t group_idx = group_cols.size();
+		if (resolved_group_col.table_name.empty() &&
+			resolved_group_col.column_name.empty() &&
+			group_idx < agg.outputs.size() &&
+			!agg.outputs[group_idx].table_name.empty() &&
+			!agg.outputs[group_idx].column_name.empty())
+		{
+			named_group_lookup = std::make_unique<BoundColumnRefExpression>(
+				resolved_binding,
+				agg.outputs[group_idx].table_name,
+				agg.outputs[group_idx].column_name);
+			lookup_group_col = named_group_lookup.get();
+		}
+		ColumnRef input_ref{};
+		const ColumnSchema *input_col = nullptr;
+		if (!LookupNamedExprInputColumn(lookup_group_col,
+										&child.outputs,
+										child.cols,
+										child.schema,
+										input_ref,
+										input_col) ||
+			input_col == nullptr)
+		{
+			if (!LookupExprInputColumn(resolved_binding,
+									   child.cols,
+									   child.schema,
+									   input_ref,
+									   input_col) ||
+				input_col == nullptr)
+			{
+			size_t projected_idx = 0;
+				if (LookupProjectedOutputOrdinal(group_col, agg.children[0].get(), projected_idx) &&
+					projected_idx < child.cols.size() &&
+					projected_idx < child.schema.size())
+				{
+					input_ref = child.cols[projected_idx];
+					input_col = &child.schema[projected_idx];
+				}
+			}
+		}
+		if (input_col == nullptr)
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG,
+					 "pg_yaap: optimizer agg rejected: missing translated group column binding=(%zu,%zu) resolved=(%zu,%zu) child_cols=%zu child_outputs=%zu",
+					 group_col->binding.table_index.index,
+					 group_col->binding.column_index.index,
+					 resolved_binding.table_index.index,
+					 resolved_binding.column_index.index,
+					 child.cols.size(),
+					 child.outputs.size());
+			return false;
+		}
+		group_cols.push_back(input_ref);
 	}
 
 	if (!BuildHashGroupLayout(group_cols,
@@ -831,7 +1032,11 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 	for (const ColumnRef &ref : group_cols)
 	{
 		const ColumnSchema *col = nullptr;
-		if (!LookupRawColumn(ref, child.cols, child.schema, col) || col == nullptr)
+		if ((!LookupRawColumn(ref, child.cols, child.schema, col) || col == nullptr) &&
+			!(ref.attno != InvalidAttrNumber &&
+			  ref.attno > 0 &&
+			  static_cast<size_t>(ref.attno) <= child.schema.size() &&
+			  (col = &child.schema[ref.attno - 1], true)))
 		{
 			if (pg_yaap_trace_hooks)
 				elog(LOG, "pg_yaap: optimizer agg rejected: missing group key column");
@@ -868,7 +1073,10 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 	out.final_sort_keys = std::move(child.final_sort_keys);
 	out.limit_count = child.limit_count;
 	out.estimated_groups = static_cast<uint32_t>(std::max<size_t>(1, agg.estimated_cardinality));
-	return BuildOptimizerAggOutput(agg, child.cols, child.schema, agg_state, out.cols, out.schema);
+	if (!BuildOptimizerAggOutput(agg, &child.outputs, child.cols, child.schema, agg_state, out.cols, out.schema))
+		return false;
+	out.outputs = agg.outputs;
+	return true;
 }
 
 bool
@@ -895,21 +1103,91 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 		AppendUniqueColumnRef(BindingToColumnRef(binding), required_cols);
 
 	OptimizerNodeTranslation producer_child;
-	if (!TranslateOptimizerNode(*delim_outer_child,
-			queryDesc,
-			state,
-			{},
-			&required_cols,
-			nullptr,
-			nullptr,
-			producer_child) ||
-		producer_child.op == nullptr)
-		return false;
-	if (producer_child.cols.empty() || producer_child.cols.size() != producer_child.schema.size())
+	std::vector<ColumnRef> selected_cols;
+	std::vector<ColumnSchema> selected_schema;
+	std::vector<yaap::PhysicalOperator::OutputColumn> selected_outputs;
+	auto try_extract_correlated_outputs =
+		[&](const std::vector<ColumnRef> *required_ptr) -> bool
+	{
+		OptimizerNodeTranslation candidate;
+		if (!TranslateOptimizerNode(*delim_outer_child,
+				queryDesc,
+				state,
+				{},
+				required_ptr,
+				nullptr,
+				nullptr,
+				candidate) ||
+			candidate.op == nullptr ||
+			candidate.cols.empty() ||
+			candidate.cols.size() != candidate.schema.size())
+			return false;
+		std::vector<ColumnRef> candidate_cols;
+		std::vector<ColumnSchema> candidate_schema;
+		std::vector<yaap::PhysicalOperator::OutputColumn> candidate_outputs;
+		candidate_cols.reserve(outer_bindings->size());
+		candidate_schema.reserve(outer_bindings->size());
+		candidate_outputs.reserve(outer_bindings->size());
+		for (size_t i = 0; i < outer_bindings->size(); ++i)
+		{
+			const yaap::ColumnBinding &binding = (*outer_bindings)[i];
+			BoundColumnRefExpression bound_expr(
+				binding,
+				i < scan.outputs.size() ? scan.outputs[i].table_name : std::string{},
+				i < scan.outputs.size() ? scan.outputs[i].column_name : std::string{});
+			ColumnRef selected_ref{};
+			const ColumnSchema *selected_col = nullptr;
+			if (!LookupNamedExprInputColumn(&bound_expr,
+											&candidate.outputs,
+											candidate.cols,
+											candidate.schema,
+											selected_ref,
+											selected_col) ||
+				selected_col == nullptr)
+				return false;
+			candidate_cols.push_back(selected_ref);
+			candidate_schema.push_back(*selected_col);
+			if (i < scan.outputs.size())
+				candidate_outputs.push_back(scan.outputs[i]);
+		}
+		if (candidate_cols.empty())
+			return false;
+		producer_child = std::move(candidate);
+		selected_cols = std::move(candidate_cols);
+		selected_schema = std::move(candidate_schema);
+		selected_outputs = std::move(candidate_outputs);
+		if (pg_yaap_trace_hooks)
+		{
+			elog(LOG,
+				 "pg_yaap: delim producer selected via required=%d candidate_cols=%zu candidate_outputs=%zu",
+				 required_ptr != nullptr ? 1 : 0,
+				 producer_child.cols.size(),
+				 producer_child.outputs.size());
+			for (size_t i = 0; i < producer_child.cols.size(); ++i)
+				elog(LOG,
+					 "pg_yaap: delim producer col[%zu]=(%u,%d) decode=%d",
+					 i,
+					 producer_child.cols[i].varno,
+					 producer_child.cols[i].attno,
+					 static_cast<int>(producer_child.schema[i].decode_kind));
+			for (size_t i = 0; i < producer_child.outputs.size(); ++i)
+				elog(LOG,
+					 "pg_yaap: delim producer output[%zu] binding=(%zu,%zu) name=%s.%s",
+					 i,
+					 producer_child.outputs[i].binding.table_index.index,
+					 producer_child.outputs[i].binding.column_index.index,
+					 producer_child.outputs[i].table_name.c_str(),
+					 producer_child.outputs[i].column_name.c_str());
+		}
+		return true;
+	};
+
+	if (!try_extract_correlated_outputs(nullptr) &&
+		!try_extract_correlated_outputs(&required_cols))
 		return false;
 
 	TupleDataLayout group_layout{};
-	if (!BuildHashGroupLayout(producer_child.cols,
+	if (!BuildHashGroupLayout(selected_cols,
 			producer_child.cols,
 			producer_child.schema,
 			{},
@@ -918,7 +1196,7 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 			group_layout))
 		return false;
 
-	const dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(producer_child.schema, state->runtime_dsa);
+	const dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(selected_schema, state->runtime_dsa);
 	const dsa_pointer layout_dp = SerializeTupleDataLayout(group_layout, state->runtime_dsa);
 	const dsa_pointer shared_payload_dp = dsa_allocate0(state->runtime_dsa, sizeof(pipeline::HashAggSharedPayload));
 	if (!DsaPointerIsValid(input_schema_dp) ||
@@ -927,9 +1205,14 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 		return false;
 
 	PgVector<uint16_t> group_keys;
-	group_keys.reserve(producer_child.cols.size());
-	for (uint16_t i = 0; i < producer_child.cols.size(); ++i)
-		group_keys.push_back(i);
+	group_keys.reserve(selected_cols.size());
+	for (const ColumnRef &ref : selected_cols)
+	{
+		const ColumnSchema *selected_col = nullptr;
+		if (!LookupRawColumn(ref, producer_child.cols, producer_child.schema, selected_col) || selected_col == nullptr)
+			return false;
+		group_keys.push_back(selected_col->chunk_slot);
+	}
 
 	auto producer_sink = std::make_unique<PipelineHashAggregate>(
 		layout_dp,
@@ -944,13 +1227,38 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 		shared_payload_dp,
 		std::move(producer_sink));
 	out.cols.clear();
-	for (size_t i = 0; i < producer_child.cols.size(); ++i)
+	for (size_t i = 0; i < selected_schema.size(); ++i)
 	{
 		out.cols.push_back(ColumnRef{
 			static_cast<Index>(scan.table_index.index + 1),
 			static_cast<AttrNumber>(i + 1)});
 	}
-	out.schema = std::move(producer_child.schema);
+	out.schema = std::move(selected_schema);
+	out.outputs = std::move(selected_outputs);
+	if (pg_yaap_trace_hooks)
+	{
+		elog(LOG,
+			 "pg_yaap: delim scan table_index=%zu corr=%zu producer_cols=%zu out_cols=%zu out_outputs=%zu",
+			 scan.table_index.index,
+			 scan.correlated_columns.size(),
+			 producer_child.cols.size(),
+			 out.cols.size(),
+			 out.outputs.size());
+		for (size_t i = 0; i < out.cols.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: delim scan out_col[%zu]=(%u,%d)",
+				 i,
+				 out.cols[i].varno,
+				 out.cols[i].attno);
+		for (size_t i = 0; i < out.outputs.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: delim scan out_output[%zu] binding=(%zu,%zu) name=%s.%s",
+				 i,
+				 out.outputs[i].binding.table_index.index,
+				 out.outputs[i].binding.column_index.index,
+				 out.outputs[i].table_name.c_str(),
+				 out.outputs[i].column_name.c_str());
+	}
 	out.final_sort_keys.clear();
 	out.limit_count = 0;
 	out.estimated_groups = 0;

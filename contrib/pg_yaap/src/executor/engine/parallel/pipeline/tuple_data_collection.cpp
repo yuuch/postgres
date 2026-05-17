@@ -182,6 +182,30 @@ TupleDataCollectionGrowHeapCapacity(const TupleDataLayout *layout,
 	return next_capacity > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(next_capacity);
 }
 
+uint32_t
+TupleDataCollectionClampRowCapacity(uint32_t proposed_row_capacity,
+	                                uint32_t row_width,
+	                                uint32_t required_heap_bytes,
+	                                uint32_t minimum_row_capacity)
+{
+	if (row_width == 0)
+		elog(ERROR, "pg_yaap: TDC clamp received zero row width");
+	if (required_heap_bytes >= kTupleDataCollectionMaxFlatAllocBytes)
+		elog(ERROR, "pg_yaap: TDC required heap exceeds flat allocation limit");
+	const uint64_t max_row_bytes = kTupleDataCollectionMaxFlatAllocBytes -
+		offsetof(TupleDataCollection, rows) -
+		static_cast<uint64_t>(required_heap_bytes);
+	const uint64_t max_rows = max_row_bytes / static_cast<uint64_t>(row_width);
+	if (max_rows < minimum_row_capacity)
+		elog(ERROR,
+			 "pg_yaap: TDC row buffer exceeds flat allocation limit (min_rows=%u row_width=%u required_heap=%u max_rows=%llu)",
+			 minimum_row_capacity,
+			 row_width,
+			 required_heap_bytes,
+			 static_cast<unsigned long long>(max_rows));
+	return proposed_row_capacity > max_rows ? static_cast<uint32_t>(max_rows) : proposed_row_capacity;
+}
+
 bool
 TupleDataCollectionStoreStringBytes(TupleDataCollection *tdc,
 	                                const char *data,

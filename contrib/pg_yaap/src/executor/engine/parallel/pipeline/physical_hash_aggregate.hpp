@@ -65,6 +65,12 @@ public:
 	bool                 use_perfect_hash = false;
 	uint32_t             perfect_capacity = 0;
 	PgVector<uint32_t>   perfect_row_indices;
+	bool                 has_distinct_count = false;
+	uint16_t             distinct_agg_idx = UINT16_MAX;
+	dsa_pointer          distinct_layout_dp = InvalidDsaPointer;
+	const TupleDataLayout *distinct_layout = nullptr;
+	dsa_pointer          distinct_partitions_dp = InvalidDsaPointer;
+	HashAggPartition    *distinct_partitions = nullptr;
 
 };
 

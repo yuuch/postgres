@@ -65,7 +65,8 @@ enum class OpKind : uint8_t {
 	HASH_JOIN      = 4,
 	ORDER          = 5,
 	OUTPUT         = 6,
-	PROJECTION     = 7,
+	FILTER         = 7,
+	PROJECTION     = 8,
 };
 
 /* -------------------------------------------------------------------------
@@ -171,11 +172,12 @@ enum class FilterStepOp : uint8_t {
 	STRING_NE_CONST    = 3,
 	STRING_PREFIX_LIKE = 4,
 	STRING_CONTAINS_LIKE = 5,
-	BOOL_AND           = 6,
-	BOOL_OR            = 7,
-	BOOL_NOT           = 8,
-	INT32_CMP_VAR      = 9,
-	INT64_CMP_VAR      = 10,
+	STRING_SQL_LIKE    = 6,
+	BOOL_AND           = 7,
+	BOOL_OR            = 8,
+	BOOL_NOT           = 9,
+	INT32_CMP_VAR      = 10,
+	INT64_CMP_VAR      = 11,
 };
 
 struct FilterInputDesc {
@@ -190,6 +192,19 @@ struct FilterExprDesc {
 	uint16_t n_steps;
 	uint16_t output_bool_reg;
 	uint16_t _pad0;
+};
+
+struct FilterOpBody {
+	dsa_pointer input_schema;
+	dsa_pointer filter_inputs;
+	dsa_pointer filter_exprs;
+	dsa_pointer filter_steps;
+	dsa_pointer filter_string_consts;
+	uint16_t    n_filter_inputs;
+	uint16_t    n_filter_exprs;
+	uint16_t    n_filter_steps;
+	uint16_t    filter_bool_regs;
+	uint32_t    filter_string_const_bytes;
 };
 
 struct FilterStep {
@@ -254,6 +269,12 @@ enum class ProjectOp : uint8_t {
 	CONST_INT64 = 20,
 	INT32_TO_INT64_VAR = 21,
 	STRING_PREFIX_SLICE = 22,
+	INT64_LT_VAR_CONST = 23,
+	INT64_LE_VAR_CONST = 24,
+	INT64_EQ_VAR_CONST = 25,
+	INT64_GE_VAR_CONST = 26,
+	INT64_GT_VAR_CONST = 27,
+	INT64_NE_VAR_CONST = 28,
 };
 
 struct ProjectStep {
@@ -306,6 +327,7 @@ enum class HashJoinMatchMode : uint8_t {
 	INNER = 0,
 	SEMI = 1,
 	ANTI = 2,
+	LEFT = 3,
 };
 
 struct HashJoinOpBody {
@@ -457,9 +479,12 @@ struct OrderOpBody {
 struct OutputOpBody {
 	dsa_pointer input_schema;        /* SchemaDescriptor */
 	dsa_pointer layout;              /* TupleDataLayout serialized from input_schema */
+	dsa_pointer sort_keys;           /* SortKeyDesc[n_sort_keys] for final top-N pruning */
 	dsa_pointer shared_payload;      /* TupleDataCollection; lazy-init on first GetGlobalSinkState */
+	uint16_t    n_sort_keys;
+	uint16_t    _pad0;
 	uint32_t    tdc_max_rows;        /* row capacity bound (clamp(plan_rows*1.5, 1024, 1<<20)) */
-	uint32_t    _pad0;
+	uint64_t    max_emit_rows;
 };
 
 /* -------------------------------------------------------------------------
@@ -487,6 +512,7 @@ struct OpDescriptor {
 		HashJoinOpBody hash_join;
 		OrderOpBody   order;
 		OutputOpBody  output;
+		FilterOpBody  filter;
 		ProjectOpBody project;
 	} body;
 };

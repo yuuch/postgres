@@ -11,6 +11,7 @@ extern bool pg_yaap_trace_hooks;
 
 #include <algorithm>
 #include <cstring>
+#include <string_view>
 
 #include "core/data_chunk.hpp"
 #include "parallel/pipeline/cancel.hpp"
@@ -94,6 +95,65 @@ EstimateTdcAllocBytes(dsa_area *dsa, dsa_pointer tdc_dp)
 		tdc->heap_capacity));
 }
 
+static bool
+MatchPercentLikePattern(const char *lhs, uint32_t lhs_len,
+						  const char *pattern, uint32_t pattern_len)
+{
+	if (pattern == nullptr)
+		return false;
+	std::string_view text(lhs != nullptr ? lhs : "", lhs_len);
+	std::string_view spec(pattern, pattern_len);
+	if (spec.empty())
+		return text.empty();
+	if (spec == "%")
+		return true;
+
+	size_t text_pos = 0;
+	size_t pat_pos = 0;
+	const bool anchored_start = spec.front() != '%';
+	const bool anchored_end = spec.back() != '%';
+	bool first_token = true;
+
+	while (pat_pos < spec.size())
+	{
+		while (pat_pos < spec.size() && spec[pat_pos] == '%')
+			++pat_pos;
+		if (pat_pos >= spec.size())
+			return true;
+
+		const size_t next_pct = spec.find('%', pat_pos);
+		const std::string_view token = spec.substr(
+			pat_pos,
+			next_pct == std::string_view::npos ? spec.size() - pat_pos : next_pct - pat_pos);
+		if (token.empty())
+		{
+			pat_pos = next_pct;
+			continue;
+		}
+
+		if (first_token && anchored_start)
+		{
+			if (text.size() < token.size() || text.substr(0, token.size()) != token)
+				return false;
+			text_pos = token.size();
+		}
+		else
+		{
+			const size_t found = text.find(token, text_pos);
+			if (found == std::string_view::npos)
+				return false;
+			text_pos = found + token.size();
+		}
+		first_token = false;
+
+		if (next_pct == std::string_view::npos)
+			return !anchored_end || text_pos == text.size();
+		pat_pos = next_pct;
+	}
+
+	return !anchored_end || text_pos == text.size();
+}
+
 static void
 CopyBuildRow(const TupleDataLayout *layout,
 	         const TupleDataCollection *src_tdc,
@@ -156,7 +216,11 @@ GrowJoinTdc(ExecCtx &ctx,
 		elog(ERROR, "pg_yaap: hash join TDC missing during grow");
 
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
-	const uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+		layout->row_width,
+		required_heap_bytes,
+		old_count + 1u);
 	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(layout,
 		old_tdc,
 		new_capacity,
@@ -628,6 +692,17 @@ EvalFilterStep(const FilterStep &step,
 			}
 			break;
 		}
+		case FilterStepOp::STRING_SQL_LIKE:
+		{
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+				result = MatchPercentLikePattern(lhs, ref.len, rhs, step.const_len);
+			}
+			break;
+		}
 		case FilterStepOp::BOOL_AND:
 			result = bool_values[step.left_idx] && bool_values[step.right_idx];
 			break;
@@ -802,13 +877,24 @@ CopyRowsByMappingBatch(const PipelineChunk &left_chunk,
 				{
 					const uint16_t out_row_idx = out_row_base + batch_idx;
 					if (desc.side == HashJoinOutputSide::LEFT)
+					{
 						out.int32_columns[desc.output_chunk_slot][out_row_idx] =
 							left_chunk.get_int32(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk.nulls[desc.input_chunk_slot][left_row_indices[batch_idx]];
+					}
 					else
 					{
+						if (right_rows[batch_idx] == nullptr)
+						{
+							out.int32_columns[desc.output_chunk_slot][out_row_idx] = 0;
+							out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+							continue;
+						}
 						int32_t value;
 						std::memcpy(&value, right_rows[batch_idx] + right_col->offset, sizeof(value));
 						out.int32_columns[desc.output_chunk_slot][out_row_idx] = value;
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 0;
 					}
 				}
 				break;
@@ -818,13 +904,24 @@ CopyRowsByMappingBatch(const PipelineChunk &left_chunk,
 				{
 					const uint16_t out_row_idx = out_row_base + batch_idx;
 					if (desc.side == HashJoinOutputSide::LEFT)
+					{
 						out.int64_columns[desc.output_chunk_slot][out_row_idx] =
 							left_chunk.get_int64(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk.nulls[desc.input_chunk_slot][left_row_indices[batch_idx]];
+					}
 					else
 					{
+						if (right_rows[batch_idx] == nullptr)
+						{
+							out.int64_columns[desc.output_chunk_slot][out_row_idx] = 0;
+							out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+							continue;
+						}
 						int64_t value;
 						std::memcpy(&value, right_rows[batch_idx] + right_col->offset, sizeof(value));
 						out.int64_columns[desc.output_chunk_slot][out_row_idx] = value;
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 0;
 					}
 				}
 				break;
@@ -833,13 +930,24 @@ CopyRowsByMappingBatch(const PipelineChunk &left_chunk,
 				{
 					const uint16_t out_row_idx = out_row_base + batch_idx;
 					if (desc.side == HashJoinOutputSide::LEFT)
+					{
 						out.double_columns[desc.output_chunk_slot][out_row_idx] =
 							left_chunk.get_double(desc.input_chunk_slot, left_row_indices[batch_idx]);
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk.nulls[desc.input_chunk_slot][left_row_indices[batch_idx]];
+					}
 					else
 					{
+						if (right_rows[batch_idx] == nullptr)
+						{
+							out.double_columns[desc.output_chunk_slot][out_row_idx] = 0;
+							out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+							continue;
+						}
 						double value;
 						std::memcpy(&value, right_rows[batch_idx] + right_col->offset, sizeof(value));
 						out.double_columns[desc.output_chunk_slot][out_row_idx] = value;
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 0;
 					}
 				}
 				break;
@@ -854,12 +962,21 @@ CopyRowsByMappingBatch(const PipelineChunk &left_chunk,
 						const VecStringRef src = left_chunk.get_string_ref(desc.input_chunk_slot, left_row_indices[batch_idx]);
 						ptr = left_chunk.get_string_ptr(desc.input_chunk_slot, left_row_indices[batch_idx]);
 						ref = src;
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk.nulls[desc.input_chunk_slot][left_row_indices[batch_idx]];
 					}
 					else
 					{
+						if (right_rows[batch_idx] == nullptr)
+						{
+							out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+							out.string_columns[desc.output_chunk_slot][out_row_idx] = VecStringRef{0, 0, 0};
+							continue;
+						}
 						std::memcpy(&ref, right_rows[batch_idx] + right_col->offset, sizeof(ref));
 						ptr = VecStringRefDataPtr(ref,
 							right_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(right_tdc)) : nullptr);
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 0;
 					}
 					if (ptr == nullptr && ref.len != 0)
 						elog(ERROR, "pg_yaap: hash join output string missing backing storage");
@@ -913,6 +1030,7 @@ public:
 	uint32_t build_row_idx = HASH_JOIN_INVALID_ROW;
 	bool have_build_cursor = false;
 	uint16_t probe_salt = 0;
+	bool probe_matched = false;
 };
 
 } // namespace
@@ -1476,6 +1594,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
 		op_state.have_build_cursor = false;
 		op_state.probe_salt = 0;
+		op_state.probe_matched = false;
 	}
 
 	while (op_state.probe_row_idx < in.count)
@@ -1492,6 +1611,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 			const uint32_t bucket = static_cast<uint32_t>(hash) & (payload->hash_table_capacity - 1u);
 			op_state.build_row_idx = bucket_heads[bucket];
 			op_state.have_build_cursor = true;
+			op_state.probe_matched = false;
 			while (op_state.build_row_idx != HASH_JOIN_INVALID_ROW &&
 				salts[op_state.build_row_idx] != op_state.probe_salt)
 				op_state.build_row_idx = links[op_state.build_row_idx];
@@ -1525,23 +1645,28 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 					continue;
 				if (join_mode == HashJoinMatchMode::ANTI)
 				{
-					matched_rows = static_cast<uint32_t>(matched_rows + 1);
+					op_state.probe_matched = true;
 					batch_count = 0;
 					op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
 					break;
 				}
+				op_state.probe_matched = true;
 				++matched_rows;
 				matched_probe_rows[batch_count] = op_state.probe_row_idx;
 				matched_build_rows[batch_count] = build_row;
 				++batch_count;
-				if (join_mode == HashJoinMatchMode::SEMI || out.count + batch_count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+				if (join_mode == HashJoinMatchMode::SEMI)
 				{
 					op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
 					break;
 				}
+				if (out.count + batch_count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+					break;
 			}
 		}
-		if (join_mode == HashJoinMatchMode::ANTI && batch_count == 0 && matched_rows == 0)
+		const bool probe_complete = (op_state.build_row_idx == HASH_JOIN_INVALID_ROW);
+		if ((join_mode == HashJoinMatchMode::ANTI || join_mode == HashJoinMatchMode::LEFT) &&
+			probe_complete && batch_count == 0 && !op_state.probe_matched)
 		{
 			matched_probe_rows[0] = op_state.probe_row_idx;
 			matched_build_rows[0] = nullptr;
@@ -1561,9 +1686,10 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 				batch_count);
 			out.count += batch_count;
 		}
-		if (join_mode != HashJoinMatchMode::INNER)
+		if (probe_complete)
 		{
 			matched_rows = 0;
+			op_state.probe_matched = false;
 			op_state.have_build_cursor = false;
 			++op_state.probe_row_idx;
 			if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
@@ -1572,8 +1698,6 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		}
 		if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 			break;
-		op_state.have_build_cursor = false;
-		++op_state.probe_row_idx;
 	}
 	if (op_state.probe_row_idx >= in.count)
 	{
@@ -1582,6 +1706,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		op_state.build_row_idx = HASH_JOIN_INVALID_ROW;
 		op_state.have_build_cursor = false;
 		op_state.probe_salt = 0;
+		op_state.probe_matched = false;
 	}
 	if (out.count > 0 && pg_yaap_trace_execution_path)
 		ereport(LOG,

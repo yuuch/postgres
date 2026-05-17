@@ -1,118 +1,125 @@
 # Yet Another Analyze Process (YAAP)
 
-简要概述
+YAAP 是 `contrib/pg_yaap` 下的分析型优化器 + 执行器原型。当前主线已经明确：
 
-Yet Another Analytic Processing（简称 YAAP）是一个面向 OLAP 的新型查询处理引擎，目标是成为一个可替换或增强 PostgreSQL 的分析执行层。项目由两大子系统组成：优化器（optimizer）与执行器（executor）。
+- **只支持 YAAP 自己的 optimizer physical plan。**
+- **不再把 PostgreSQL 的 `PlannedStmt` / executor plan 当成受支持输入。**
+- optimizer 与 executor 通过共享的 `PhysicalOperator` / `ColumnBinding` 语义强绑定，但模块职责仍然分离。
 
-设计目标
+## 当前架构
 
-- 支持 TPC-H 级别的复杂分析查询并对其进行优化执行。
-- 将优化器与执行器解耦，允许逐步替换 PostgreSQL 的planner与executor路径。
-- 第一阶段目标：能正确且稳定地跑通 TPC-H 的 22 条查询。
+端到端主路径：
 
-当前状态（截至本说明）
+```text
+PG Query
+  -> planner_hook / YaapAdapter
+  -> LogicalPlanner
+  -> LogicalOptimizer
+  -> PhysicalPlanner
+  -> OptimizerPlanBundle::physical_plan
+  -> yaap_opt_translator
+  -> pipeline runtime
+  -> OutputSink
+```
 
-- 执行器：能够接受 PostgreSQL 生成的 plan 并对若干典型用例执行（部分 Case 已可跑通）。
-- 优化器：能解析 PostgreSQL 的查询并生成 YAAP 风格的 plan（部分 plan 已生成）。
-- 集成：YAAP 的执行器尚未完全接入 YAAP 优化器生成的计划，当前执行器多使用来自 PG 的计划作为输入。
-- 限制/已知问题：PostgreSQL 默认优化器在某些场景下效果欠佳；部分算子实现或边界条件仍需完善以覆盖 TPC-H 全集。
+当前约束：
 
-TPC-H 10G 最新进展（2026-05-15）
+1. `yaap_opt_translator` 的输入是 **YAAP optimizer 生成的 `PhysicalOperator` 树**，不是 PG plan tree。
+2. optimizer path 上不再应把 `varno/attno` 当作权威列标识；权威键是 `ColumnBinding(table_index, column_index)` 与 operator 输出字典。
+3. translator 尽量只做 lowering；如果 DuckDB 有对应算子/方案，优先补 operator/runtime，而不是在 translator 里硬改 plan shape。
+4. YAAP claim 了 query 之后不应 silent fallback 到 PG 执行。
 
-- 本轮已修复并验证：Q2、Q4、Q9、Q20。
-- 关键修复点：
-  - 修正 projection lowering 中 binding / ordinal 冲突时的输入列选择。
-  - 在 projection pruning 中仅保留父节点需要的输出，并补齐必要的 hidden passthrough 列。
-  - 修正 hash join 输出 schema 中 `STRING_REF` 的 slot 分配。
-  - 保留 output sink final sort 的稳定 key 拷贝，避免排序阶段引用失效。
-- 10G、60 秒超时、跳过 Q15/Q19 的 sweep 结果：
-  - 跑通并确认走 `pg_yaap_path: path=pipeline detail=yaap_pipeline`：
-    Q1、Q2、Q3、Q4、Q5、Q6、Q7、Q8、Q9、Q10、Q11、Q12、Q14、Q17、Q20、Q21、Q22
-  - 当前未跑通：
-    - Q13：`optimizer support analysis passed, but lowering returned null`
-    - Q16：`optimizer support analysis passed, but lowering returned null`
-    - Q18：`optimizer support analysis passed, but lowering returned null`
-- Q15 / Q19 仍然不纳入常规 sweep：
-  - Q15 是 fixture / explain 形式问题。
-  - Q19 仍应单独隔离处理，不混入常规批量运行。
+## 当前进展（TPC-H 10G，2026-05-15）
 
-核心组件
+已在 YAAP optimizer + pipeline 路径上跑通并确认可执行：
 
-1. 优化器（optimizer）
-   - 输入：PostgreSQL 的解析产物 (parse tree/Query)。
-   - 输出：YAAP 的物理计划（自定义 Plan 格式），目前能生成常见的扫描、过滤、连接、分组、聚合等算子组合。
-   - 目标：生成更适合向量化执行器的物理计划（例如批次化扫描、列式传输、向量化 join/agg）。
+- Q1
+- Q2
+- Q3
+- Q4
+- Q5
+- Q6
+- Q7
+- Q8
+- Q9
+- Q10
+- Q11
+- Q12
+- Q14
+- Q17
+- Q20
+- Q21
+- Q22
 
-2. 执行器（executor）
-   - 输入：YAAP Plan（或暂时接受 PG Plan）。
-   - 功能：面向列/向量的算子实现（scan、filter、projection、hash join、merge join、aggregation、sort 等），负责资源/内存管理与批处理控制。
-   - 现状：已有基础算子与执行框架，能跑通部分典型用例。
+当前未跑通：
 
-设计/接口要点
+- Q13：`optimizer support analysis passed, but lowering returned null`
+- Q16：`optimizer support analysis passed, but lowering returned null`
+- Q18：`optimizer support analysis passed, but lowering returned null`
 
-- Plan 格式：建议定义一个清晰且紧凑的 YAAP Plan 结构（JSON 或 protobuf 可选），包括算子类型、输入输出 schema、分区/并行信息与算子参数。
-- PG 兼容层：为尽量少改动 PG，提供一个 PlanAdapter，将 PG 的 Plan 转换为 YAAP Plan（并在优化器就绪后切换为直接使用 YAAP Plan）。
-- 结果交互：定义 slot/tuple 与 YAAP 向量数据结构之间的映射策略，保证执行器能够以最小开销返回 PG 期望的结果。
+备注：
 
-快速上手（开发环境与构建）
+- Q15 / Q19 仍不纳入当前常规 sweep。
+- Q16 当前问题已收敛到 **binding-first 输出元数据在多层 join / projection lowering 中还没有稳定按实际输出顺序传递**。
 
-前置要求：
-- 已 checkout PostgreSQL 源码，并将本仓库放在 contrib/pg_yaap 目录下（当前路径即为本目录）。
-- Meson + Ninja（与 PostgreSQL 的 Meson 构建体系兼容）。
-- C/C++ 编译器、Postgres 开发头文件、LLVM（可选，如果使用 JIT）。
+## 模块职责
 
-示例构建步骤（在仓库根目录运行）：
+### Optimizer
+
+- 输入：PostgreSQL `Query`
+- 输出：YAAP `PhysicalOperator` tree
+- 目标：尽量贴近 DuckDB 的逻辑/物理规划职责划分
+
+当前关键类型：
+
+- `LogicalOperator`
+- `Expression`
+- `ColumnBinding`
+- `PhysicalOperator`
+- `PhysicalOperator::OutputColumn`
+
+其中 `ColumnBinding(table_index, column_index)` 是 optimizer path 上的权威列 identity；`OutputColumn` 是 operator 输出侧的字典，用来把 binding、名字和输出顺序稳定带给 lowering。
+
+### Executor
+
+- 输入：optimizer physical plan
+- 入口：`yaap_opt_translator`
+- 运行时：`parallel/pipeline`
+
+执行器侧要求：
+
+- translator 只做 plan lowering，不承担 optimizer 应承担的 shape 重写。
+- runtime 能力不足时，优先补 runtime/operator，而不是写 query-specific translator hack。
+- optimizer path 上的列解析应优先依赖 binding dictionary / operator outputs，而不是依赖 PG `varno/attno`。
+
+## 开发与验证
+
+构建：
 
 ```bash
-# 在 PostgreSQL 源码根目录
-meson setup build --prefix=/path/to/installed --reconfigure
-meson compile -C build contrib/pg_yaap
+meson compile -C build pg_yaap
 meson install -C build --only-changed
 ```
 
-本地运行与验证：
-- 启动本地 Postgres（使用安装目录的 bin/pg_ctl）并加载扩展（如果以 extension 形式集成）。
-- 使用 psql 运行样例 SQL / TPC-H 查询，观察执行计划与结果。
+运行单条调试：
 
-TPC-H 验证（第一阶段目标）
+```sql
+LOAD 'pg_yaap';
+SET pg_yaap.enabled = on;
+SET pg_yaap.parallel = on;
+SET pg_yaap.trace_hooks = on;
+SET pg_yaap.trace_execution_path = on;
+```
 
-准备：
-- 使用 TPC-H 数据生成工具（dbgen）生成数据并加载到数据库中。
-- 建议先使用 1GB 或 10GB 数据规模进行验收测试。
+TPC-H 验证约束：
 
-运行：
-- 逐条运行 22 条 TPC-H 查询脚本，记录正确性（结果一致性）与性能（执行时间、内存峰值）。
-- 建议先在单线程/禁用 PG 并行执行的环境下运行，以便对比 YAAP 的表现：
-  - SET max_parallel_workers_per_gather = 0;
-  - SET max_parallel_workers = 0;
+- 单条 query，`statement_timeout = '60s'`
+- 失败后继续后续 query
+- 修单条 query 时，先只回归当前 query，再做 sweep
 
-开发注意事项与建议
+## 当前路线
 
-- 边界覆盖：注意 Numeric/Decimal、Timestamp/Date 等类型在向量化路径的处理（是否需要缩放/精度处理）。
-- 内存管理：统一内存上下文/arena，避免频繁分配导致性能波动。
-- 逐步集成：优先实现并验证单表扫描 + agg、单表扫描 + filter、两个表的 hash join 等基础路径，再扩展到更复杂的 join chain 与子查询。
-- 日志与可视化：为每条执行计划增加可选的详细执行日志（按算子逐批输出行数/耗时），便于性能调优。
-
-短期路线图（建议里程碑）
-
-- M1：定义 YAAP Plan 的序列化格式与 PG→YAAP 的适配器（接口契约）。
-- M2：实现基础算子在执行器中的端到端执行（scan/filter/proj/agg/hash-join），通过单元测试验证正确性。
-- M3：实现优化器到执行器的完整链路（优化器输出直接给执行器），并在小型 TPC-H 子集上通过验证。
-- M4：覆盖 TPC-H 22 条查询，完成正确性验证并做性能基线对照。
-
-贡献指南
-
-- 提交前请先在 issue 中描述要实现的内容或 bug，以及复现步骤。
-- Pull Request 要求：包含自测步骤、影响范围说明、必要时的基准脚本与对比数据。尽量把改动限制到最小模块范围。
-
-联系方式
-
-- 在仓库中使用 issue/PR 流程。提交问题时请附带复现用的 SQL、数据规模与期望结果。
-
-致谢
-
-- 本项目基于 PostgreSQL 架构与生态，借鉴了多个向量化执行引擎的设计理念。
-
----
-
-（如果需要，后续可以把本 README 翻译为英文或拆分为多个文档：BUILD.md、DEVELOPMENT.md、ROADMAP.md。）
+1. 继续把 optimizer-to-executor lowering 全面收敛到 **binding-first metadata**。
+2. 清理 translator 中遗留的 PG-plan / `varno/attno` 主键式思路。
+3. 修通 Q16，再处理 Q13 / Q18。
+4. 在 optimizer physical plan 路径稳定后，再继续补 runtime operator 覆盖面。

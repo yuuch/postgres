@@ -70,7 +70,11 @@ GrowOrderTdc(ExecCtx &ctx, OrderGlobalState &global, uint32_t required_heap_byte
 	if (old_tdc == nullptr || global.payload_layout == nullptr)
 		elog(ERROR, "pg_yaap: order TDC missing during grow");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
-	const uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+		old_tdc->row_width,
+		required_heap_bytes,
+		old_count + 1u);
 	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(global.payload_layout,
 		old_tdc,
 		new_capacity,

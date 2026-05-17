@@ -33,6 +33,7 @@ enum class PhysicalOperatorType : uint8_t {
 	HASH_JOIN,
 	ORDER,
 	OUTPUT,
+	FILTER,
 	PROJECTION,
 };
 

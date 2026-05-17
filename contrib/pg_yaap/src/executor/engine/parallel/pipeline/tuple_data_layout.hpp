@@ -70,16 +70,23 @@ enum class TdcColumnKind : uint8_t {
  * SUM_INT64    : accumulator is int64; update reads input col as scaled
  *                int64; combine is dst += src.
  * COUNT_STAR   : accumulator is int64; update is += 1; combine is dst += src.
+ * COUNT_NONNULL: accumulator is int64; update is += 1 for non-null input rows;
+ *                combine is dst += src.
+ * COUNT_DISTINCT_NONNULL:
+ *                accumulator is int64; PhysicalHashAggregate first deduplicates
+ *                distinct keys, then update/combine are the same as COUNT_NONNULL.
  *
  * TODO(Q3+): MIN/MAX (need direction tag), AVG (sum+count pair), STRING_AGG.
  */
 enum class TdcAggKind : uint8_t {
 	SUM_INT64    = 0,
 	COUNT_STAR   = 1,
-	SUM_NUMERIC  = 2,
-	AVG_NUMERIC  = 3,
-	MIN_INT64    = 4,
-	MIN_NUMERIC  = 5,
+	COUNT_NONNULL = 2,
+	COUNT_DISTINCT_NONNULL = 3,
+	SUM_NUMERIC  = 4,
+	AVG_NUMERIC  = 5,
+	MIN_INT64    = 6,
+	MIN_NUMERIC  = 7,
 };
 
 /*

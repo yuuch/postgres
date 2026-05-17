@@ -6,7 +6,7 @@
 
 ## OVERVIEW
 
-DuckDB-faithful `PhysicalOperator` tree (unified `Source/Operator/Sink` base, `physical_operator.hpp`) is built by `Translator::TranslatePlan` from a PG `PlannedStmt`. The tree is sliced at blocking operators (`HashAggregate`, `Order`) into `MetaPipeline` chains via `PhysicalOperator::BuildPipelines`. Each pipeline becomes one or more `Task`s (`PipelineRunEvent`, `PipelineCombineEvent`, `PipelineFinalizeEvent`) and is dispatched onto a DSM-resident MPMC `DsmTaskQueue` (Vyukov bounded queue) by `TaskScheduler::EnqueueTasks`. PostgreSQL parallel bgworkers (and the leader) pop tasks and execute them. Cross-process state lives in DSA, published via `PipelineSharedControl.event_states_root` and `pipelines_root`, addressed by id through `pipeline_descriptor.cpp` Store/LoadSharedPayload + `pipeline_dsm_lookup.hpp`.
+DuckDB-faithful `PhysicalOperator` tree (unified `Source/Operator/Sink` base, `physical_operator.hpp`) is built by the YAAP optimizer, then lowered by `yaap_opt_translator` into the pipeline runtime. The tree is sliced at blocking operators (`HashAggregate`, `Order`) into `MetaPipeline` chains via `PhysicalOperator::BuildPipelines`. Each pipeline becomes one or more `Task`s (`PipelineRunEvent`, `PipelineCombineEvent`, `PipelineFinalizeEvent`) and is dispatched onto a DSM-resident MPMC `DsmTaskQueue` (Vyukov bounded queue) by `TaskScheduler::EnqueueTasks`. PostgreSQL parallel bgworkers (and the leader) pop tasks and execute them. Cross-process state lives in DSA, published via `PipelineSharedControl.event_states_root` and `pipelines_root`, addressed by id through `pipeline_descriptor.cpp` Store/LoadSharedPayload + `pipeline_dsm_lookup.hpp`.
 
 **Status:** runtime end-to-end **plumbed**; SeqScan → HashAgg → Order → OutputSink runs in leader+workers; descriptor publish/load works cross-process; leader drains the global TDC after FINALIZE.
 
@@ -60,7 +60,7 @@ Additional operators used by Q10:
 
 ## EXECUTION FLOW
 
-1. **Bridge** (`bridge/execute.cpp`): `Translator::Translate(plannedstmt)` → `PhysicalOperator*` root (stored as opaque `void*` in query state). On `ExecutorRun`, dispatch to `pipeline::PgYaapPipelineRun(qd, qstate, &reason)`.
+1. **Bridge** (`bridge/execute.cpp`): lower `OptimizerPlanBundle::physical_plan` through `yaap_opt_translator` → pipeline root (stored as opaque `void*` in query state). On `ExecutorRun`, dispatch to `pipeline::PgYaapPipelineRun(qd, qstate, &reason)`.
 2. **Leader** (`pipeline_leader.cpp`):
    - Allocate DSM with `PIPELINE_DSM_MAGIC`; register keys `_CONTROL`, `_DSA`, `_TASK_QUEUE`.
    - Initialize `PipelineSharedControl`; `dsa_create_in_place` at `_DSA`.
@@ -118,7 +118,8 @@ Same invariant for `GetGlobalSourceState`. **Never** read `shared_payload_dp_` d
 
 ## CONVENTIONS
 
- - **Supported shapes:** scan→agg→(optional sort)→output, and join-fed aggregate/sort/output for the validated Q10 slice. Anything else fails admission in `Translator::TranslatePlan` (returns `nullptr`); bridge falls back to PG.
+ - **Supported shapes:** the runtime only needs to support shapes emitted by the YAAP optimizer and admitted by `yaap_opt_translator`. Legacy PG-plan translation is not the supported architecture.
+ - **Column identity:** optimizer-path lowering should treat `ColumnBinding` plus operator output dictionaries as authoritative. `varno/attno` may remain as compatibility metadata, but must not drive semantic resolution on the optimizer path.
 - **Worker indexing**: leader is `LEADER_WORKER_INDEX = -1`. Bgworkers are `0..N-1`. Leader participation gated by `pg_yaap.parallel_leader_participation`.
 - **Chunk size**: `PipelineChunk = DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>` (1024 rows).
 - **DSM keys**: `PIPELINE_DSM_KEY_*` in `0xD8…` range. Always go through `dsm_control.hpp` constants.

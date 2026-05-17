@@ -170,6 +170,12 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 			case TdcAggKind::COUNT_STAR:
 				delta.values[a] += 1;
 				break;
+			case TdcAggKind::COUNT_NONNULL:
+			case TdcAggKind::COUNT_DISTINCT_NONNULL:
+				Assert(agg.src_col_idx < 16);
+				if (chunk.nulls[agg.src_col_idx][row_idx] == 0)
+					delta.values[a] += 1;
+				break;
 			case TdcAggKind::AVG_NUMERIC:
 				Assert(agg.src_col_idx < 16);
 				delta.values[a] += chunk.get_int64(agg.src_col_idx, row_idx);
@@ -200,6 +206,8 @@ ApplyAggDelta(const TupleDataLayout *layout, const AggDelta &delta)
 			case TdcAggKind::SUM_INT64:
 			case TdcAggKind::SUM_NUMERIC:
 			case TdcAggKind::COUNT_STAR:
+			case TdcAggKind::COUNT_NONNULL:
+			case TdcAggKind::COUNT_DISTINCT_NONNULL:
 				AddInt64At(delta.row_ptr, agg.offset, delta.values[a]);
 				break;
 			case TdcAggKind::AVG_NUMERIC:
@@ -1006,6 +1014,12 @@ UpdateAggregates(const TupleDataLayout *layout,
 			case TdcAggKind::COUNT_STAR:
 				AddInt64At(row_ptr, agg.offset, 1);
 				break;
+			case TdcAggKind::COUNT_NONNULL:
+			case TdcAggKind::COUNT_DISTINCT_NONNULL:
+				Assert(agg.src_col_idx < 16);
+				if (chunk.nulls[agg.src_col_idx][row_idx] == 0)
+					AddInt64At(row_ptr, agg.offset, 1);
+				break;
 		case TdcAggKind::AVG_NUMERIC:
 			Assert(agg.src_col_idx < 16);
 			AddInt64At(row_ptr,
@@ -1077,6 +1091,8 @@ CombineAggregates(const TupleDataLayout *layout,
 		{
 			case TdcAggKind::SUM_INT64:
 			case TdcAggKind::COUNT_STAR:
+			case TdcAggKind::COUNT_NONNULL:
+			case TdcAggKind::COUNT_DISTINCT_NONNULL:
 			case TdcAggKind::SUM_NUMERIC:
 				AddInt64At(dst_row, agg.offset, ReadInt64At(src_row, agg.offset));
 				break;

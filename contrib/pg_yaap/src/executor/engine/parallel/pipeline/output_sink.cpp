@@ -265,6 +265,107 @@ CompareOutputKeyColumn(const TupleDataCollection *tdc,
 	return 0;
 }
 
+static int
+CompareStoredOutputRows(const OutputGlobalState &global,
+	                    const uint8_t *row_a,
+	                    const uint8_t *row_b)
+{
+	for (uint16_t i = 0; i < global.n_sort_keys; ++i)
+	{
+		const SortKeyDesc &key = global.sort_keys[i];
+		if (key.col_idx >= global.layout->column_count)
+			continue;
+		const int cmp = CompareOutputKeyColumn(global.global_tdc,
+			global.layout->columns[key.col_idx],
+			row_a,
+			row_b);
+		if (cmp != 0)
+			return key.asc ? cmp : -cmp;
+	}
+	return 0;
+}
+
+static int
+CompareChunkRowToStoredRow(const OutputGlobalState &global,
+	                       const PipelineChunk &chunk,
+	                       uint16_t row_idx,
+	                       const uint8_t *stored_row)
+{
+	for (uint16_t i = 0; i < global.n_sort_keys; ++i)
+	{
+		const SortKeyDesc &key = global.sort_keys[i];
+		if (key.col_idx >= global.layout->column_count ||
+			key.col_idx >= global.input_schema->n_columns)
+			continue;
+
+		const ColumnSchema &schema_col = global.input_schema->columns[key.col_idx];
+		const TdcColumnDesc &layout_col = global.layout->columns[key.col_idx];
+		int cmp = 0;
+		switch (layout_col.kind)
+		{
+			case TdcColumnKind::INT32:
+			{
+				const int32_t lhs = chunk.get_int32(schema_col.chunk_slot, row_idx);
+				int32_t rhs = 0;
+				std::memcpy(&rhs, stored_row + layout_col.offset, sizeof(rhs));
+				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+				break;
+			}
+			case TdcColumnKind::INT64:
+			{
+				const int64_t lhs = chunk.get_int64(schema_col.chunk_slot, row_idx);
+				int64_t rhs = 0;
+				std::memcpy(&rhs, stored_row + layout_col.offset, sizeof(rhs));
+				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+				break;
+			}
+			case TdcColumnKind::DOUBLE:
+			{
+				const double lhs = chunk.get_double(schema_col.chunk_slot, row_idx);
+				double rhs = 0;
+				std::memcpy(&rhs, stored_row + layout_col.offset, sizeof(rhs));
+				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+				break;
+			}
+			case TdcColumnKind::STRING_REF:
+			{
+				const VecStringRef lhs_ref = chunk.get_string_ref(schema_col.chunk_slot, row_idx);
+				const char *lhs_ptr = chunk.get_string_ptr(schema_col.chunk_slot, row_idx);
+				VecStringRef rhs_ref;
+				std::memcpy(&rhs_ref, stored_row + layout_col.offset, sizeof(rhs_ref));
+				const char *rhs_ptr = VecStringRefDataPtr(rhs_ref,
+					reinterpret_cast<const char *>(TupleDataCollectionHeapConst(global.global_tdc)));
+				const uint32_t cmp_len = lhs_ref.len < rhs_ref.len ? lhs_ref.len : rhs_ref.len;
+				cmp = cmp_len > 0 ? std::memcmp(lhs_ptr, rhs_ptr, cmp_len) : 0;
+				if (cmp != 0)
+					cmp = cmp < 0 ? -1 : 1;
+				else
+					cmp = (lhs_ref.len < rhs_ref.len) ? -1 : (lhs_ref.len > rhs_ref.len) ? 1 : 0;
+				break;
+			}
+		}
+		if (cmp != 0)
+			return key.asc ? cmp : -cmp;
+	}
+	return 0;
+}
+
+static uint32_t
+FindWorstTopNRowIndex(const OutputGlobalState &global)
+{
+	const uint32_t row_count = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&global.global_tdc->row_count));
+	uint32_t worst_idx = 0;
+	for (uint32_t row_idx = 1; row_idx < row_count; ++row_idx)
+	{
+		const uint8_t *candidate = TupleDataCollectionGetRowConst(global.global_tdc, row_idx);
+		const uint8_t *worst = TupleDataCollectionGetRowConst(global.global_tdc, worst_idx);
+		if (CompareStoredOutputRows(global, candidate, worst) > 0)
+			worst_idx = row_idx;
+	}
+	return worst_idx;
+}
+
 static void
 CopyTdcRow(const TupleDataLayout *layout,
 	       const TupleDataCollection *src_tdc,
@@ -305,6 +406,16 @@ CopyTdcRow(const TupleDataLayout *layout,
 	}
 }
 
+static inline void
+AppendChunkRowToTdc(const OutputGlobalState &global,
+	                TupleDataCollection *tdc,
+	                uint8_t *row_ptr,
+	                const PipelineChunk &chunk,
+	                uint16_t row_idx)
+{
+	Scatter(global.layout, tdc, row_ptr, chunk, row_idx);
+}
+
 static dsa_pointer
 GrowOutputTdc(ExecCtx &ctx, OutputGlobalState &global, uint32_t required_heap_bytes)
 {
@@ -313,7 +424,11 @@ GrowOutputTdc(ExecCtx &ctx, OutputGlobalState &global, uint32_t required_heap_by
 	if (old_tdc == nullptr || global.layout == nullptr)
 		elog(ERROR, "pg_yaap: output TDC missing during grow");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
-	const uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+		old_tdc->row_width,
+		required_heap_bytes,
+		old_count + 1u);
 	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(global.layout,
 		old_tdc,
 		new_capacity,
@@ -347,6 +462,68 @@ GrowOutputTdc(ExecCtx &ctx, OutputGlobalState &global, uint32_t required_heap_by
 	return new_tdc_dp;
 }
 
+static dsa_pointer
+ReplaceWorstTopNRow(ExecCtx &ctx,
+	                OutputGlobalState &global,
+	                const PipelineChunk &chunk,
+	                uint16_t row_idx,
+	                uint32_t worst_idx)
+{
+	dsa_pointer old_tdc_dp = global.shared_payload_dp;
+	TupleDataCollection *old_tdc = global.global_tdc;
+	if (old_tdc == nullptr || global.layout == nullptr)
+		elog(ERROR, "pg_yaap: top-N output TDC missing during replacement");
+
+	const uint32_t row_capacity = old_tdc->row_capacity;
+	const uint32_t row_count = pg_atomic_read_u32(&old_tdc->row_count);
+	uint64_t heap_needed = TupleDataCollectionRequiredHeapBytesForChunkRow(global.layout, chunk, row_idx);
+	for (uint32_t existing_idx = 0; existing_idx < row_count; ++existing_idx)
+	{
+		if (existing_idx == worst_idx)
+			continue;
+		heap_needed += TupleDataCollectionRequiredHeapBytesForRow(global.layout,
+			old_tdc,
+			TupleDataCollectionGetRowConst(old_tdc, existing_idx));
+	}
+	uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(global.layout, row_capacity);
+	if (heap_needed > heap_capacity)
+		heap_capacity = static_cast<uint32_t>(heap_needed);
+	TupleDataCollectionCheckFlatAllocSize(row_capacity, old_tdc->row_width, heap_capacity);
+
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		row_capacity,
+		old_tdc->row_width,
+		heap_capacity);
+	TupleDataCollection *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
+	TupleDataCollectionInit(new_tdc,
+		row_capacity,
+		old_tdc->row_width,
+		old_tdc->layout_dp,
+		heap_capacity);
+	for (uint32_t existing_idx = 0; existing_idx < row_count; ++existing_idx)
+	{
+		if (existing_idx == worst_idx)
+			continue;
+		uint8_t *dst = nullptr;
+		if (TupleDataCollectionAppendRow(new_tdc, &dst) == TDC_INVALID_ROW_INDEX)
+			elog(ERROR, "pg_yaap: top-N output replacement overflow while copying survivors");
+		CopyTdcRow(global.layout,
+			old_tdc,
+			TupleDataCollectionGetRowConst(old_tdc, existing_idx),
+			new_tdc,
+			dst);
+	}
+	uint8_t *dst = nullptr;
+	if (TupleDataCollectionAppendRow(new_tdc, &dst) == TDC_INVALID_ROW_INDEX)
+		elog(ERROR, "pg_yaap: top-N output replacement overflow while appending new row");
+	AppendChunkRowToTdc(global, new_tdc, dst, chunk, row_idx);
+	global.global_tdc = new_tdc;
+	global.shared_payload_dp = new_tdc_dp;
+	if (DsaPointerIsValid(old_tdc_dp))
+		dsa_free(ctx.dsa, old_tdc_dp);
+	return new_tdc_dp;
+}
+
 }
 
 std::unique_ptr<GlobalSinkState>
@@ -368,6 +545,8 @@ OutputSink::GetGlobalSinkState(ExecCtx &ctx)
 		input_schema_dp_ : (desc_ ? desc_->body.output.input_schema : InvalidDsaPointer);
 	const dsa_pointer layout_dp = DsaPointerIsValid(layout_dp_) ?
 		layout_dp_ : (desc_ ? desc_->body.output.layout : InvalidDsaPointer);
+	const dsa_pointer sort_keys_dp = DsaPointerIsValid(final_sort_keys_dp_) ?
+		final_sort_keys_dp_ : (desc_ ? desc_->body.output.sort_keys : InvalidDsaPointer);
 	dsa_pointer payload_dp = (desc_ && DsaPointerIsValid(desc_->body.output.shared_payload)) ?
 		desc_->body.output.shared_payload : shared_payload_dp_;
 
@@ -379,6 +558,10 @@ OutputSink::GetGlobalSinkState(ExecCtx &ctx)
 	state->input_schema = static_cast<const SchemaDescriptor *>(
 		dsa_get_address(ctx.dsa, schema_dp));
 	state->layout = ResolveLayout(ctx.dsa, layout_dp);
+	state->n_sort_keys = n_final_sort_keys_ > 0 ? n_final_sort_keys_ :
+		(desc_ ? desc_->body.output.n_sort_keys : 0);
+	if (DsaPointerIsValid(sort_keys_dp) && state->n_sort_keys > 0)
+		state->sort_keys = static_cast<const SortKeyDesc *>(dsa_get_address(ctx.dsa, sort_keys_dp));
 	if (state->layout == nullptr)
 		elog(ERROR, "pg_yaap: output sink layout resolve failed");
 
@@ -397,7 +580,8 @@ OutputSink::GetGlobalSinkState(ExecCtx &ctx)
 		elog(ERROR, "pg_yaap: output sink global TDC resolve failed");
 
 	state->shared_payload_dp = payload_dp;
-	state->max_emit_rows = max_emit_rows_;
+	state->max_emit_rows = max_emit_rows_ > 0 ? max_emit_rows_ :
+		(desc_ ? desc_->body.output.max_emit_rows : 0);
 
 	/* Leader-only artifacts: dest/tupdesc/slot are owned in the leader process
 	 * and consumed by EmitGlobalTdcToDest after FINALIZE; workers leave these
@@ -423,7 +607,6 @@ OutputSink::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 SinkResultType
 OutputSink::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 {
-	(void) ctx;
 	auto &global = static_cast<OutputGlobalState &>(input.global_state);
 	auto &local = static_cast<OutputLocalState &>(input.local_state);
 
@@ -432,6 +615,22 @@ OutputSink::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 
 	for (uint16_t row = 0; row < in.count; ++row)
 	{
+		if (global.max_emit_rows > 0 && global.n_sort_keys > 0)
+		{
+			const uint32_t row_count = pg_atomic_read_u32(&global.global_tdc->row_count);
+			if (row_count >= global.max_emit_rows)
+			{
+				const uint32_t worst_idx = FindWorstTopNRowIndex(global);
+				const uint8_t *worst_row = TupleDataCollectionGetRowConst(global.global_tdc, worst_idx);
+				if (CompareChunkRowToStoredRow(global, in, row, worst_row) < 0)
+				{
+					shared_payload_dp_ = ReplaceWorstTopNRow(ctx, global, in, row, worst_idx);
+					StoreSharedPayloadOnDescriptor(this, shared_payload_dp_);
+					++local.emitted_rows;
+				}
+				continue;
+			}
+		}
 		while (!TupleDataCollectionHasSpaceForAppend(global.global_tdc,
 			TupleDataCollectionRequiredHeapBytesForChunkRow(global.layout, in, row)))
 		{
@@ -449,7 +648,7 @@ OutputSink::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 		/* OutputSink layout has columns only (no aggregates); Scatter writes
 		 * exactly layout->columns[0..N-1] from the input chunk slots, matching
 		 * the column-decode metadata in the parallel SchemaDescriptor. */
-		Scatter(global.layout, global.global_tdc, row_ptr, in, row);
+		AppendChunkRowToTdc(global, global.global_tdc, row_ptr, in, row);
 		++local.emitted_rows;
 	}
 

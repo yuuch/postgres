@@ -1075,17 +1075,37 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 		const auto *col_expr = dynamic_cast<const BoundColumnRefExpression *>(agg.groups[i]);
 		if (col_expr == nullptr)
 			return false;
+		std::unique_ptr<BoundColumnRefExpression> named_lookup_expr;
+		const BoundColumnRefExpression *lookup_expr = col_expr;
+		if (col_expr->table_name.empty() &&
+			col_expr->column_name.empty() &&
+			i < agg.outputs.size() &&
+			!agg.outputs[i].table_name.empty() &&
+			!agg.outputs[i].column_name.empty())
+		{
+			named_lookup_expr = std::make_unique<BoundColumnRefExpression>(
+				col_expr->binding,
+				agg.outputs[i].table_name,
+				agg.outputs[i].column_name);
+			lookup_expr = named_lookup_expr.get();
+		}
 		ColumnRef ref{};
 		const ColumnSchema *src = nullptr;
-		if (!LookupNamedExprInputColumn(col_expr, input_outputs, input_cols, input_schema, ref, src) || src == nullptr)
+		if ((!LookupNamedExprInputColumn(lookup_expr, input_outputs, input_cols, input_schema, ref, src) ||
+			 src == nullptr) &&
+			(!LookupExprInputColumn(col_expr->binding, input_cols, input_schema, ref, src) ||
+			 src == nullptr))
 			return false;
 		ColumnSchema cs = *src;
 		cs.chunk_slot = static_cast<uint8_t>(i);
 		cs.src_attno = 0;
 		out_schema.push_back(cs);
-		out_cols.push_back(BindingToColumnRef(yaap::ColumnBinding{
-			agg.group_index,
-			yaap::ProjectionIndex{i}}));
+		if (i < agg.outputs.size())
+			out_cols.push_back(BindingToColumnRef(agg.outputs[i].binding));
+		else
+			out_cols.push_back(BindingToColumnRef(yaap::ColumnBinding{
+				agg.group_index,
+				yaap::ProjectionIndex{i}}));
 	}
 
 	for (size_t i = 0; i < agg_state.agg_kinds.size(); ++i)
@@ -1120,9 +1140,13 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 				return false;
 		}
 		out_schema.push_back(cs);
-		out_cols.push_back(ColumnRef{
-			static_cast<Index>(agg.aggregate_index.index + 1),
-			static_cast<AttrNumber>(i + 1)});
+		const size_t output_idx = agg.groups.size() + i;
+		if (output_idx < agg.outputs.size())
+			out_cols.push_back(BindingToColumnRef(agg.outputs[output_idx].binding));
+		else
+			out_cols.push_back(ColumnRef{
+				static_cast<Index>(agg.aggregate_index.index + 1),
+				static_cast<AttrNumber>(i + 1)});
 	}
 
 	return out_cols.size() == out_schema.size();
@@ -1258,9 +1282,20 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 	dsa_pointer output_layout_dp = SerializeTupleDataLayout(output_layout, state->runtime_dsa);
 	if (!DsaPointerIsValid(output_schema_dp) || !DsaPointerIsValid(output_layout_dp))
 		return nullptr;
-	const uint32_t row_capacity = EstimateInitialResultRows(queryDesc, node.estimated_groups);
+	const bool topn_output =
+		!node.final_sort_keys.empty() &&
+		node.limit_count > 0;
+	uint32_t row_capacity = EstimateInitialResultRows(queryDesc, node.estimated_groups);
+	if (topn_output)
+		row_capacity = static_cast<uint32_t>(std::max<uint64_t>(1, std::min<uint64_t>(row_capacity, node.limit_count)));
 	const dsa_pointer output_payload_dp = BuildOutputTdc(state->runtime_dsa, output_layout_dp, output_layout, row_capacity);
 	if (!DsaPointerIsValid(output_payload_dp))
+		return nullptr;
+	const dsa_pointer final_sort_keys_dp = BuildFilterArray(state->runtime_dsa,
+		node.final_sort_keys.data(),
+		sizeof(SortKeyDesc),
+		node.final_sort_keys.size());
+	if (!node.final_sort_keys.empty() && !DsaPointerIsValid(final_sort_keys_dp))
 		return nullptr;
 
 	auto output_op = std::make_unique<OutputSink>(
@@ -1269,6 +1304,8 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 		static_cast<int>(queryDesc->operation),
 		output_schema_dp,
 		output_layout_dp,
+		final_sort_keys_dp,
+		static_cast<uint16_t>(node.final_sort_keys.size()),
 		output_payload_dp,
 		row_capacity,
 		node.final_sort_keys,

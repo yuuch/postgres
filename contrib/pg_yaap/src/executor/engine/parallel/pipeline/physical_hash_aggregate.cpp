@@ -26,6 +26,24 @@ namespace {
 
 static constexpr int64_t kDenseAggAvgScaleFactor = 1000000000000LL;
 
+static bool
+GetSingleDistinctCountAgg(const TupleDataLayout *layout, uint16_t *out_idx = nullptr)
+{
+	if (layout == nullptr)
+		return false;
+	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
+	{
+		if (layout->aggregates[agg_idx].kind != TdcAggKind::COUNT_DISTINCT_NONNULL)
+			continue;
+		if (layout->aggregate_count != 1)
+			elog(ERROR, "pg_yaap: distinct aggregates currently require a single COUNT(DISTINCT ...) aggregate");
+		if (out_idx != nullptr)
+			*out_idx = agg_idx;
+		return true;
+	}
+	return false;
+}
+
 static void
 CopyTdcRow(const TupleDataLayout *layout,
 	       const TupleDataCollection *src_tdc,
@@ -112,6 +130,19 @@ static void GrowLocalTdc(ExecCtx &ctx,
                          HashAggLocalSinkState &local,
 	                         HashAggPartition &part,
 	                         uint32_t required_heap_bytes);
+
+static uint32_t
+RequiredHeapBytesForChunkRows(const TupleDataLayout *layout,
+							  const PipelineChunk &chunk,
+							  const uint16_t *row_indices,
+							  uint16_t count);
+
+static bool
+PartitionNeedsGrowForChunkBatch(const TupleDataLayout *layout,
+								const TupleDataCollection *tdc,
+								const PipelineChunk &chunk,
+								const uint16_t *row_indices,
+								uint16_t count);
 
 static uint32_t
 PartitionRowCapacity(uint32_t max_groups, uint32_t partition_count)
@@ -268,7 +299,11 @@ GrowTdcForPartition(ExecCtx &ctx,
 		elog(ERROR, "pg_yaap: hash aggregate partition TDC missing");
 
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
-	const uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+		layout->row_width,
+		required_heap_bytes,
+		old_count + 1u);
 	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(layout,
 		old_tdc,
 		new_capacity,
@@ -313,7 +348,11 @@ GrowLocalTdc(ExecCtx &ctx,
 	if (old_tdc == nullptr)
 		elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
-	const uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+		local.layout->row_width,
+		required_heap_bytes,
+		old_count + 1u);
 	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(local.layout,
 		old_tdc,
 		new_capacity,
@@ -348,6 +387,252 @@ GrowLocalTdc(ExecCtx &ctx,
 	part.aht_dp = new_aht_dp;
 	dsa_free(ctx.dsa, old_aht_dp);
 	dsa_free(ctx.dsa, old_tdc_dp);
+}
+
+static void
+GrowLocalTdcForLayout(ExecCtx &ctx,
+					  const TupleDataLayout *layout,
+					  dsa_pointer layout_dp,
+					  HashAggPartition &part,
+					  uint32_t required_heap_bytes)
+{
+	dsa_pointer old_tdc_dp = part.tdc_dp;
+	dsa_pointer old_aht_dp = part.aht_dp;
+	TupleDataCollection *old_tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+	if (old_tdc == nullptr)
+		elog(ERROR, "pg_yaap: local distinct aggregate partition TDC missing");
+	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
+	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
+	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+		layout->row_width,
+		required_heap_bytes,
+		old_count + 1u);
+	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(layout,
+		old_tdc,
+		new_capacity,
+		required_heap_bytes);
+	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+		new_capacity,
+		layout->row_width,
+		heap_capacity);
+	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
+	TupleDataCollectionInit(new_tdc,
+		new_capacity,
+		layout->row_width,
+		layout_dp,
+		heap_capacity);
+	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
+	{
+		uint8_t *dst = nullptr;
+		const uint32_t copied_idx = TupleDataCollectionAppendRow(new_tdc, &dst);
+		if (copied_idx == TDC_INVALID_ROW_INDEX)
+			elog(ERROR, "pg_yaap: local distinct aggregate TDC grow copy overflow");
+		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
+		CopyTdcRow(layout, old_tdc, src, new_tdc, dst);
+	}
+	const uint32_t capacity = AggregateHashTableChooseCapacity(new_capacity);
+	dsa_pointer new_aht_dp = dsa_allocate0(ctx.dsa, AggregateHashTableAllocSize(capacity));
+	AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_aht_dp));
+	AggregateHashTableInit(new_aht, capacity, new_tdc_dp);
+	AggregateHashTableRehash(new_aht, new_tdc, layout);
+	part.tdc_dp = new_tdc_dp;
+	part.aht_dp = new_aht_dp;
+	dsa_free(ctx.dsa, old_aht_dp);
+	dsa_free(ctx.dsa, old_tdc_dp);
+}
+
+static void
+InitDistinctLocalState(ExecCtx &ctx, HashAggLocalSinkState &local, uint32_t per_partition_groups)
+{
+	const TdcAggregateDesc &distinct_agg = local.layout->aggregates[local.distinct_agg_idx];
+	TupleDataLayout distinct_layout{};
+	TupleDataLayoutInit(&distinct_layout);
+	for (uint16_t col_idx = 0; col_idx < local.layout->column_count; ++col_idx)
+	{
+		const TdcColumnDesc &col = local.layout->columns[col_idx];
+		(void) TupleDataLayoutAppendColumn(&distinct_layout,
+			col.kind,
+			col.src_col_idx,
+			col.pg_type_oid,
+			col.numeric_scale);
+	}
+	(void) TupleDataLayoutAppendColumn(&distinct_layout,
+		TdcColumnKind::INT64,
+		distinct_agg.src_col_idx,
+		distinct_agg.numeric_scale != 0 ? NUMERICOID : INT8OID,
+		distinct_agg.numeric_scale);
+	TupleDataLayoutSeal(&distinct_layout);
+	local.distinct_layout_dp = SerializeTupleDataLayout(distinct_layout, ctx.dsa);
+	local.distinct_layout = ResolveLayout(ctx.dsa, local.distinct_layout_dp);
+	if (local.distinct_layout == nullptr)
+		elog(ERROR, "pg_yaap: failed to publish distinct aggregate layout");
+
+	local.distinct_partitions_dp = dsa_allocate0(ctx.dsa,
+		static_cast<size_t>(local.partition_count) * sizeof(HashAggPartition));
+	local.distinct_partitions = static_cast<HashAggPartition *>(
+		dsa_get_address(ctx.dsa, local.distinct_partitions_dp));
+	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
+	{
+		HashAggPartition &part = local.distinct_partitions[part_idx];
+		SpinLockInit(&part.mutex);
+		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(local.distinct_layout,
+			per_partition_groups);
+		part.tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+			per_partition_groups,
+			local.distinct_layout->row_width,
+			heap_capacity);
+		auto *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+		TupleDataCollectionInit(tdc,
+			per_partition_groups,
+			local.distinct_layout->row_width,
+			local.distinct_layout_dp,
+			heap_capacity);
+		AggregateHashTable *aht = nullptr;
+		AllocAhtForTdc(ctx, part.tdc_dp, per_partition_groups, &part.aht_dp, &aht);
+	}
+}
+
+static SinkResultType
+SinkChunkDistinctCount(ExecCtx &ctx, HashAggLocalSinkState &local, PipelineChunk &in)
+{
+	std::array<uint64_t, PIPELINE_DEFAULT_CHUNK_SIZE> group_hashes;
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> partitions;
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> probe_rows;
+	std::array<AggregateHashTableBatchProbeInput, PIPELINE_DEFAULT_CHUNK_SIZE> probe_inputs;
+	std::array<AggregateHashTableBatchProbeResult, PIPELINE_DEFAULT_CHUNK_SIZE> probe_results;
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> main_canonical_rows;
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> distinct_rows;
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> distinct_main_canonical_rows;
+	uint16_t distinct_input_count = 0;
+
+	const TdcAggregateDesc &distinct_agg = local.layout->aggregates[local.distinct_agg_idx];
+	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+	{
+		if (PipelineCancelRequestedEvery(ctx, row_idx))
+			return SinkResultType::FINISHED;
+		group_hashes[row_idx] = HashGroup(local.layout, in, row_idx);
+		partitions[row_idx] = static_cast<uint32_t>(group_hashes[row_idx] >> local.partition_shift) &
+			local.partition_mask;
+	}
+
+	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
+	{
+		uint16_t probe_count = 0;
+		for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+		{
+			if (partitions[row_idx] != part_idx)
+				continue;
+			probe_rows[probe_count++] = row_idx;
+		}
+		if (probe_count == 0)
+			continue;
+
+		HashAggPartition &main_part = local.local_partitions[part_idx];
+		TupleDataCollection *main_tdc = ResolveTdc(ctx.dsa, main_part.tdc_dp);
+		if (main_tdc == nullptr)
+			elog(ERROR, "pg_yaap: local distinct aggregate main TDC missing");
+		while (PartitionNeedsGrowForChunkBatch(local.layout, main_tdc, in, probe_rows.data(), probe_count))
+		{
+			GrowLocalTdc(ctx, local, main_part,
+				RequiredHeapBytesForChunkRows(local.layout, in, probe_rows.data(), probe_count));
+			main_tdc = ResolveTdc(ctx.dsa, main_part.tdc_dp);
+			if (main_tdc == nullptr)
+				elog(ERROR, "pg_yaap: local distinct aggregate main TDC missing after grow");
+		}
+		AggregateHashTable *main_aht = ResolveAht(ctx.dsa, main_part.aht_dp);
+		for (uint16_t i = 0; i < probe_count; ++i)
+		{
+			probe_inputs[i].row_idx = probe_rows[i];
+			probe_inputs[i].hash = group_hashes[probe_rows[i]];
+		}
+		AggregateHashTableFindOrInsertBatch(main_aht,
+			main_tdc,
+			local.layout,
+			in,
+			probe_inputs.data(),
+			probe_count,
+			probe_results.data());
+		if (AggregateHashTableShouldResize(main_aht, main_tdc))
+		{
+			ResizeAhtForTdc(ctx, main_part.tdc_dp, main_tdc, local.layout, &main_part.aht_dp);
+			main_tdc = ResolveTdc(ctx.dsa, main_part.tdc_dp);
+			if (main_tdc == nullptr)
+				elog(ERROR, "pg_yaap: local distinct aggregate main TDC missing after resize");
+		}
+
+		uint16_t distinct_count = 0;
+		for (uint16_t i = 0; i < probe_count; ++i)
+		{
+			main_canonical_rows[i] = probe_results[i].canonical_row_idx;
+			const uint16_t row_idx = probe_results[i].row_idx;
+			if (in.nulls[distinct_agg.src_col_idx][row_idx] != 0)
+				continue;
+			distinct_rows[distinct_count] = row_idx;
+			distinct_main_canonical_rows[distinct_count] = probe_results[i].canonical_row_idx;
+			probe_inputs[distinct_count].row_idx = row_idx;
+			probe_inputs[distinct_count].hash = HashGroup(local.distinct_layout, in, row_idx);
+			++distinct_count;
+		}
+		if (distinct_count == 0)
+			continue;
+
+		HashAggPartition &distinct_part = local.distinct_partitions[part_idx];
+		TupleDataCollection *distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
+		if (distinct_tdc == nullptr)
+			elog(ERROR, "pg_yaap: local distinct aggregate distinct-key TDC missing");
+		while (PartitionNeedsGrowForChunkBatch(local.distinct_layout, distinct_tdc, in, distinct_rows.data(), distinct_count))
+		{
+			GrowLocalTdcForLayout(ctx,
+				local.distinct_layout,
+				local.distinct_layout_dp,
+				distinct_part,
+				RequiredHeapBytesForChunkRows(local.distinct_layout, in, distinct_rows.data(), distinct_count));
+			distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
+			if (distinct_tdc == nullptr)
+				elog(ERROR, "pg_yaap: local distinct aggregate distinct-key TDC missing after grow");
+		}
+		AggregateHashTable *distinct_aht = ResolveAht(ctx.dsa, distinct_part.aht_dp);
+		AggregateHashTableFindOrInsertBatch(distinct_aht,
+			distinct_tdc,
+			local.distinct_layout,
+			in,
+			probe_inputs.data(),
+			distinct_count,
+			probe_results.data());
+		if (AggregateHashTableShouldResize(distinct_aht, distinct_tdc))
+		{
+			ResizeAhtForTdc(ctx,
+				distinct_part.tdc_dp,
+				distinct_tdc,
+				local.distinct_layout,
+				&distinct_part.aht_dp);
+		}
+
+		distinct_input_count = 0;
+		for (uint16_t i = 0; i < distinct_count; ++i)
+		{
+			if (!probe_results[i].inserted)
+				continue;
+			distinct_rows[distinct_input_count] = probe_results[i].row_idx;
+			main_canonical_rows[distinct_input_count] = distinct_main_canonical_rows[i];
+			++distinct_input_count;
+		}
+		if (distinct_input_count > 0)
+		{
+			main_tdc = ResolveTdc(ctx.dsa, main_part.tdc_dp);
+			if (main_tdc == nullptr)
+				elog(ERROR, "pg_yaap: local distinct aggregate main TDC missing before update");
+			UpdateAggregatesGather(local.layout,
+				main_tdc->rows,
+				main_tdc->row_width,
+				main_canonical_rows.data(),
+				in,
+				distinct_rows.data(),
+				distinct_input_count);
+		}
+	}
+
+	return SinkResultType::NEED_MORE_INPUT;
 }
 
 static uint32_t
@@ -470,7 +755,9 @@ GatherDenseAggregateOutput(const TupleDataLayout *layout,
 int
 PhysicalHashAggregate::MaxThreads(ExecCtx &ctx) const
 {
-	(void) ctx;
+	const TupleDataLayout *layout = ResolveLayout(ctx.dsa, DsaPointerIsValid(layout_dp_) ? layout_dp_ : LayoutDpFromDescriptor());
+	if (GetSingleDistinctCountAgg(layout))
+		return 1;
 	return std::max(1, pg_yaap_parallel_max_workers);
 }
 
@@ -612,6 +899,12 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	state->partition_shift = HashAggPartitionShift(state->partition_mask);
 	state->perfect_capacity = global.payload->perfect_hash_capacity;
 	state->use_perfect_hash = state->perfect_capacity > 0;
+	state->has_distinct_count = GetSingleDistinctCountAgg(state->layout, &state->distinct_agg_idx);
+	if (state->has_distinct_count)
+	{
+		state->use_perfect_hash = false;
+		state->perfect_capacity = 0;
+	}
 	if (state->use_perfect_hash)
 	{
 		state->partition_count = 1;
@@ -645,6 +938,8 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		AggregateHashTable *aht = nullptr;
 		AllocAhtForTdc(ctx, part.tdc_dp, per_partition_groups, &part.aht_dp, &aht);
 	}
+	if (state->has_distinct_count)
+		InitDistinctLocalState(ctx, *state, per_partition_groups);
 
 	if (ctx.worker_index >= 0)
 	{
@@ -672,6 +967,8 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		SinkChunkPerfectHash(ctx, local, in);
 		return SinkResultType::NEED_MORE_INPUT;
 	}
+	if (local.has_distinct_count)
+		return SinkChunkDistinctCount(ctx, local, in);
 
 	std::array<uint64_t, PIPELINE_DEFAULT_CHUNK_SIZE> hashes;
 	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> partitions;

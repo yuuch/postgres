@@ -48,9 +48,13 @@ SET pg_yaap.trace_execution_path = on;
 When a query is admitted by the YAAP optimizer path, executor lowering must start from the **optimizer physical plan**, not from PostgreSQL's `PlannedStmt` tree.
 
 - `yaap_opt_translator` must directly lower the optimizer `PhysicalOperator` tree into pipeline executor operators.
+- The PostgreSQL-plan translator is no longer a supported development target for pg_yaap bring-up work. New fixes should assume the optimizer-owned physical plan is the only authoritative execution input.
+- Keep lowering as close as possible to the optimizer-produced plan shape. Do **not** reshape the plan in translator just to force it into an executable form unless there is no viable alternative.
+- If DuckDB has a corresponding physical/operator implementation for the needed plan shape, follow DuckDB's approach and add the matching YAAP operator/runtime support instead of encoding the behavior as translator-side rewrites.
 - Do **not** treat `pipeline::Translator::Translate(queryDesc, state)` as the implementation for optimizer execution; that path lowers PostgreSQL plans and violates the intended architecture.
 - Do **not** debug optimizer-executed queries by assuming PostgreSQL planner/executor shapes are authoritative. The primary object to inspect is the optimizer plan bundle (`OptimizerPlanBundle::physical_plan`) and its lowering into pipeline operators.
 - Failures on the optimizer path should be fixed in optimizer support analysis or optimizer-to-executor lowering, not papered over by falling back to PG translator behavior.
+- On the optimizer path, do not use `varno/attno` as the authoritative column identity. Prefer `ColumnBinding` and operator output dictionaries propagated from the optimizer plan.
 
 ## Repository Constraints
 

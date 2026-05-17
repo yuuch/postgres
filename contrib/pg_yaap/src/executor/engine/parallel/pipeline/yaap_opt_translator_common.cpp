@@ -1,6 +1,190 @@
 #include "parallel/pipeline/yaap_opt_translator_internal.hpp"
 
+#include <sstream>
+
 namespace pg_yaap::optimizer_translator_detail {
+
+namespace {
+
+bool
+BuildGroupOutputSchema(const std::vector<ColumnRef> &refs,
+					   const std::vector<ColumnRef> &input_cols,
+					   const std::vector<ColumnSchema> &input_schema,
+					   std::vector<ColumnSchema> &out_schema)
+{
+	out_schema.clear();
+	out_schema.reserve(refs.size());
+	for (size_t i = 0; i < refs.size(); ++i)
+	{
+		const ColumnSchema *src = nullptr;
+		if (!LookupPassthroughColumn(refs[i], input_cols, input_schema, src) || src == nullptr)
+			return false;
+		ColumnSchema col = *src;
+		col.chunk_slot = static_cast<uint8_t>(i);
+		col.src_attno = 0;
+		out_schema.push_back(col);
+	}
+	return true;
+}
+
+bool
+BuildGroupKeySlots(const std::vector<ColumnRef> &refs,
+				   const std::vector<ColumnRef> &input_cols,
+				   const std::vector<ColumnSchema> &input_schema,
+				   PgVector<uint16_t> &out_group_keys)
+{
+	out_group_keys.clear();
+	for (const ColumnRef &ref : refs)
+	{
+		const ColumnSchema *col = nullptr;
+		if (!LookupPassthroughColumn(ref, input_cols, input_schema, col) || col == nullptr)
+			return false;
+		out_group_keys.push_back(col->chunk_slot);
+	}
+	return true;
+}
+
+std::string
+ExpressionSemanticKey(const Expression *expression)
+{
+	if (expression == nullptr)
+		return "<null>";
+
+	std::stringstream ss;
+	switch (expression->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expression);
+			ss << "col:" << column->binding.table_index.index << "." << column->binding.column_index.index;
+			break;
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expression);
+			ss << "const:" << (constant->is_null ? "NULL" : constant->value);
+			break;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expression);
+			ss << "fn:" << function->function_name << "(";
+			for (size_t i = 0; i < function->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(function->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expression);
+			ss << "agg:" << aggregate->function_name << "(";
+			for (size_t i = 0; i < aggregate->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(aggregate->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expression);
+			ss << "conj:" << conjunction->bool_expr_type << "(";
+			for (size_t i = 0; i < conjunction->children.size(); ++i)
+			{
+				if (i > 0)
+					ss << ",";
+				ss << ExpressionSemanticKey(conjunction->children[i].get());
+			}
+			ss << ")";
+			break;
+		}
+		default:
+			ss << "opaque";
+			break;
+	}
+	return ss.str();
+}
+
+std::unique_ptr<Expression>
+RewriteAggregateExprToProducedColumn(const BoundAggregateExpression *aggregate_expr,
+									 const PhysicalHashAggregate &source_agg)
+{
+	if (aggregate_expr == nullptr)
+		return nullptr;
+
+	const std::string fingerprint = ExpressionSemanticKey(aggregate_expr);
+	for (size_t idx = 0; idx < source_agg.expressions.size(); ++idx)
+	{
+		if (ExpressionSemanticKey(source_agg.expressions[idx]) != fingerprint)
+			continue;
+		std::string column_name = idx < source_agg.aggregate_names.size()
+			? source_agg.aggregate_names[idx]
+			: aggregate_expr->function_name;
+		return std::make_unique<BoundColumnRefExpression>(
+			yaap::ColumnBinding{source_agg.aggregate_index, yaap::ProjectionIndex{idx}},
+			"agg",
+			std::move(column_name));
+	}
+	return nullptr;
+}
+
+std::unique_ptr<Expression>
+RewritePostAggregateFilterExpr(const Expression *expr,
+							  const PhysicalHashAggregate &source_agg)
+{
+	if (expr == nullptr)
+		return nullptr;
+
+	switch (expr->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expr);
+			return std::make_unique<BoundColumnRefExpression>(column->binding, column->table_name, column->column_name);
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expr);
+			return std::make_unique<BoundConstantExpression>(constant->value, constant->is_null);
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expr);
+			if (auto rewritten = RewriteAggregateExprToProducedColumn(aggregate, source_agg))
+				return rewritten;
+			auto clone = std::make_unique<BoundAggregateExpression>(aggregate->function_name, aggregate->agg_oid, aggregate->is_distinct);
+			for (const auto &child : aggregate->children)
+				clone->children.push_back(RewritePostAggregateFilterExpr(child.get(), source_agg));
+			return clone;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundFunctionExpression>(function->function_name, function->op_oid);
+			for (const auto &child : function->children)
+				clone->children.push_back(RewritePostAggregateFilterExpr(child.get(), source_agg));
+			return clone;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundConjunctionExpression>(conjunction->bool_expr_type);
+			for (const auto &child : conjunction->children)
+				clone->children.push_back(RewritePostAggregateFilterExpr(child.get(), source_agg));
+			return clone;
+		}
+		default:
+			return nullptr;
+	}
+}
+
+} // namespace
 
 bool
 UseInt32CharDecodeForType(Oid type_oid, int32 typmod)
@@ -149,6 +333,81 @@ CollectReferencedColumns(const Expression *expr, std::vector<ColumnRef> &out)
 	}
 }
 
+bool
+ResolveOutputBinding(const BoundColumnRefExpression *expr,
+					 const PhysicalOperator *source_op,
+					 yaap::ColumnBinding &out_binding)
+{
+	if (expr == nullptr || source_op == nullptr)
+		return false;
+
+	for (const auto &output : source_op->outputs)
+	{
+		if (output.binding.table_index.index == expr->binding.table_index.index &&
+			output.binding.column_index.index == expr->binding.column_index.index)
+		{
+			out_binding = output.binding;
+			return true;
+		}
+	}
+	if (!expr->table_name.empty() && !expr->column_name.empty())
+	{
+		for (const auto &output : source_op->outputs)
+		{
+			if (output.table_name == expr->table_name &&
+				output.column_name == expr->column_name)
+			{
+				out_binding = output.binding;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void
+CollectReferencedSourceColumns(const Expression *expr,
+							   const PhysicalOperator *source_op,
+							   std::vector<ColumnRef> &out)
+{
+	if (expr == nullptr)
+		return;
+	switch (expr->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expr);
+			yaap::ColumnBinding binding = column->binding;
+			(void) ResolveOutputBinding(column, source_op, binding);
+			AppendUniqueColumnRef(BindingToColumnRef(binding), out);
+			return;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *func = static_cast<const BoundFunctionExpression *>(expr);
+			for (const auto &child : func->children)
+				CollectReferencedSourceColumns(child.get(), source_op, out);
+			return;
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *agg = static_cast<const BoundAggregateExpression *>(expr);
+			for (const auto &child : agg->children)
+				CollectReferencedSourceColumns(child.get(), source_op, out);
+			return;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conj = static_cast<const BoundConjunctionExpression *>(expr);
+			for (const auto &child : conj->children)
+				CollectReferencedSourceColumns(child.get(), source_op, out);
+			return;
+		}
+		default:
+			return;
+	}
+}
+
 void
 FilterRequestedColumns(const std::vector<ColumnRef> &available,
 					   const std::vector<ColumnRef> *required,
@@ -256,6 +515,92 @@ LookupExprInputColumn(const yaap::ColumnBinding &binding,
 	return true;
 }
 
+static bool
+InferNamedColumnDecodeKind(const BoundColumnRefExpression *expr,
+						   ColumnDecodeKind &out)
+{
+	if (expr == nullptr || expr->table_name.empty() || expr->column_name.empty())
+		return false;
+
+	const Oid relid = RelnameGetRelid(expr->table_name.c_str());
+	if (!OidIsValid(relid))
+		return false;
+	const AttrNumber attnum = get_attnum(relid, expr->column_name.c_str());
+	if (attnum <= 0)
+		return false;
+	Oid typid = InvalidOid;
+	int32 typmod = -1;
+	get_atttypetypmodcoll(relid, attnum, &typid, &typmod, nullptr);
+	switch (typid)
+	{
+		case INT4OID:
+			out = ColumnDecodeKind::INT32_INT4;
+			return true;
+		case INT8OID:
+			out = ColumnDecodeKind::INT64_INT8;
+			return true;
+		case NUMERICOID:
+			out = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+			return true;
+		case FLOAT8OID:
+			out = ColumnDecodeKind::DOUBLE_FLOAT8;
+			return true;
+		case TEXTOID:
+		case VARCHAROID:
+			out = ColumnDecodeKind::STRING_REF;
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool
+LookupNamedExprInputColumn(const BoundColumnRefExpression *expr,
+						   const std::vector<yaap::PhysicalOperator::OutputColumn> *outputs,
+						   const std::vector<ColumnRef> &cols,
+						   const std::vector<ColumnSchema> &schema,
+						   ColumnRef &out_ref,
+						   const ColumnSchema *&out_col)
+{
+	if (expr == nullptr)
+		return false;
+
+	if (outputs != nullptr)
+	{
+		const bool has_name =
+			!expr->table_name.empty() &&
+			!expr->column_name.empty();
+		if (has_name)
+		{
+			for (size_t i = 0; i < outputs->size(); ++i)
+			{
+				const auto &output = (*outputs)[i];
+				const bool name_match =
+					output.table_name == expr->table_name &&
+					output.column_name == expr->column_name;
+				if (!name_match || i >= cols.size() || i >= schema.size())
+					continue;
+				out_ref = cols[i];
+				out_col = &schema[i];
+				return true;
+			}
+		}
+		for (size_t i = 0; i < outputs->size(); ++i)
+		{
+			const auto &output = (*outputs)[i];
+			const bool binding_match =
+				output.binding.table_index.index == expr->binding.table_index.index &&
+				output.binding.column_index.index == expr->binding.column_index.index;
+			if (!binding_match || i >= cols.size() || i >= schema.size())
+				continue;
+			out_ref = cols[i];
+			out_col = &schema[i];
+			return true;
+		}
+	}
+	return LookupBindingColumn(expr->binding, cols, schema, out_ref, out_col) && out_col != nullptr;
+}
+
 bool
 LookupPassthroughColumn(const ColumnRef &ref,
 						const std::vector<ColumnRef> &cols,
@@ -272,6 +617,70 @@ LookupPassthroughColumn(const ColumnRef &ref,
 	if (ordinal >= schema.size())
 		return false;
 	out_col = &schema[ordinal];
+	return true;
+}
+
+bool
+ApplyPostAggregateFilters(OptimizerNodeTranslation node,
+						  const PhysicalHashAggregate &source_agg,
+						  const std::vector<Expression *> &pending_filters,
+						  PgYaapQueryState *state,
+						  OptimizerNodeTranslation &out)
+{
+	if (pending_filters.empty())
+	{
+		out = std::move(node);
+		return true;
+	}
+	if (state == nullptr || state->runtime_dsa == nullptr || node.op == nullptr)
+		return false;
+
+	std::vector<ColumnSchema> filter_schema = node.schema;
+	for (ColumnSchema &col : filter_schema)
+	{
+		if (col.src_attno <= 0)
+			col.src_attno = static_cast<int16_t>(col.chunk_slot + 1);
+	}
+
+	std::vector<std::unique_ptr<Expression>> rewritten_storage;
+	std::vector<Expression *> rewritten_filters;
+	rewritten_storage.reserve(pending_filters.size());
+	rewritten_filters.reserve(pending_filters.size());
+	for (Expression *filter_expr : pending_filters)
+	{
+		auto rewritten = RewritePostAggregateFilterExpr(filter_expr, source_agg);
+		if (rewritten == nullptr)
+			return false;
+		rewritten_filters.push_back(rewritten.get());
+		rewritten_storage.push_back(std::move(rewritten));
+	}
+
+	dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(node.schema, state->runtime_dsa);
+	if (!DsaPointerIsValid(input_schema_dp))
+		return false;
+
+	std::vector<FilterInputDesc> filter_inputs;
+	std::vector<FilterExprDesc> filter_exprs;
+	std::vector<FilterStep> filter_steps;
+	std::vector<char> filter_string_consts;
+	if (!LowerScanFilters(rewritten_filters,
+						  node.cols,
+						  filter_schema,
+						  filter_inputs,
+						  filter_exprs,
+						  filter_steps,
+						  filter_string_consts))
+		return false;
+
+	auto filter_op = std::make_unique<PipelineFilter>(
+		input_schema_dp,
+		PgVector<FilterInputDesc>(filter_inputs.begin(), filter_inputs.end()),
+		PgVector<FilterExprDesc>(filter_exprs.begin(), filter_exprs.end()),
+		PgVector<FilterStep>(filter_steps.begin(), filter_steps.end()),
+		PgVector<char>(filter_string_consts.begin(), filter_string_consts.end()));
+	filter_op->AddChild(std::move(node.op));
+	node.op = std::move(filter_op);
+	out = std::move(node);
 	return true;
 }
 

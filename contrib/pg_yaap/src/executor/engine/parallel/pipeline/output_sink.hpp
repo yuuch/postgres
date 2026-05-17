@@ -29,9 +29,11 @@ public:
 
 	const SchemaDescriptor *input_schema = nullptr;
 	const TupleDataLayout  *layout = nullptr;
+	const SortKeyDesc      *sort_keys = nullptr;
 	TupleDataCollection    *global_tdc = nullptr;
 	dsa_pointer             shared_payload_dp = InvalidDsaPointer;
 	bool                    finalized = false;
+	uint16_t                n_sort_keys = 0;
 	uint64                  max_emit_rows = 0;
 };
 
@@ -60,6 +62,8 @@ public:
 	           int operation,
 	           dsa_pointer input_schema_dp,
 	           dsa_pointer layout_dp,
+	           dsa_pointer final_sort_keys_dp,
+	           uint16_t n_final_sort_keys,
 	           dsa_pointer shared_payload_dp,
 	           uint32_t tdc_max_rows,
 	           std::vector<SortKeyDesc> final_sort_keys = {},
@@ -71,6 +75,8 @@ public:
 		, operation_(operation)
 		, input_schema_dp_(input_schema_dp)
 		, layout_dp_(layout_dp)
+		, final_sort_keys_dp_(final_sort_keys_dp)
+		, n_final_sort_keys_(n_final_sort_keys)
 		, shared_payload_dp_(shared_payload_dp)
 		, tdc_max_rows_(tdc_max_rows)
 		, final_sort_keys_(std::move(final_sort_keys))
@@ -82,6 +88,8 @@ public:
 	 * results land in the shared TDC, leader drains via EmitGlobalTdcToDest. */
 	OutputSink(dsa_pointer input_schema_dp,
 	           dsa_pointer layout_dp,
+	           dsa_pointer final_sort_keys_dp,
+	           uint16_t n_final_sort_keys,
 	           dsa_pointer shared_payload_dp,
 	           uint32_t tdc_max_rows,
 	           uint64 max_emit_rows = 0,
@@ -92,6 +100,8 @@ public:
 		, operation_(0)  /* unused on worker (no DestReceiver) */
 		, input_schema_dp_(input_schema_dp)
 		, layout_dp_(layout_dp)
+		, final_sort_keys_dp_(final_sort_keys_dp)
+		, n_final_sort_keys_(n_final_sort_keys)
 		, shared_payload_dp_(shared_payload_dp)
 		, tdc_max_rows_(tdc_max_rows)
 		, final_sort_keys_()
@@ -109,6 +119,8 @@ public:
 	void          AttachDescriptor(OpDescriptor *desc) { desc_ = desc; desc_list_.push_back(desc); }  /* see physical_hash_aggregate.hpp Fix A2 */
 	dsa_pointer   input_schema_dp() const { return input_schema_dp_; }
 	dsa_pointer   layout_dp() const { return layout_dp_; }
+	dsa_pointer   final_sort_keys_dp() const { return final_sort_keys_dp_; }
+	uint16_t      n_final_sort_keys() const { return n_final_sort_keys_; }
 	dsa_pointer   shared_payload_dp() const { return shared_payload_dp_; }
 	uint32_t      tdc_max_rows() const { return tdc_max_rows_; }
 	uint64        max_emit_rows() const { return max_emit_rows_; }
@@ -141,6 +153,8 @@ private:
 	int           operation_;
 	dsa_pointer   input_schema_dp_;
 	dsa_pointer   layout_dp_;
+	dsa_pointer   final_sort_keys_dp_;
+	uint16_t      n_final_sort_keys_;
 	dsa_pointer   shared_payload_dp_;
 	uint32_t      tdc_max_rows_;
 	std::vector<SortKeyDesc> final_sort_keys_;

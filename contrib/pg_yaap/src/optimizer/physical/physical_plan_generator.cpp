@@ -4,6 +4,30 @@
 
 namespace yaap {
 
+namespace {
+
+using OutputColumn = PhysicalOperator::OutputColumn;
+
+std::string ExprTableName(Expression *expr, const std::string &fallback) {
+    auto *col = dynamic_cast<BoundColumnRefExpression *>(expr);
+    return (col != nullptr && !col->table_name.empty()) ? col->table_name : fallback;
+}
+
+std::string ExprColumnName(Expression *expr, const std::string &fallback) {
+    auto *col = dynamic_cast<BoundColumnRefExpression *>(expr);
+    return (col != nullptr && !col->column_name.empty()) ? col->column_name : fallback;
+}
+
+void CopyOutputs(PhysicalOperator &target, const PhysicalOperator &source) {
+    target.outputs = source.outputs;
+}
+
+void AppendOutputs(PhysicalOperator &target, const PhysicalOperator &source) {
+    target.outputs.insert(target.outputs.end(), source.outputs.begin(), source.outputs.end());
+}
+
+} // namespace
+
 std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::Plan(LogicalOperator& op) {
     return CreatePlan(op);
 }
@@ -66,11 +90,21 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalGet& 
         op.projected_columns,
         std::vector<Expression*>{},
         EstimateCardinality(op));
+    for (auto proj_idx : op.projected_columns) {
+        std::string column_name =
+            proj_idx.index < op.output_names.size() ? op.output_names[proj_idx.index]
+                                                    : "col" + std::to_string(proj_idx.index + 1);
+        scan->outputs.push_back(OutputColumn{
+            ColumnBinding{op.table_index, proj_idx},
+            op.table_name,
+            std::move(column_name)});
+    }
     if (op.filters.empty()) {
         return scan;
     }
     auto filter = std::make_unique<PhysicalFilter>(BorrowExpressions(op.filters), EstimateCardinality(op));
     filter->children.push_back(std::move(scan));
+    CopyOutputs(*filter, *filter->children[0]);
     return filter;
 }
 
@@ -82,6 +116,16 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalProje
     auto projection = std::make_unique<PhysicalProjection>(op.table_index,
                                                             BorrowExpressions(op.expressions), op.output_names,
                                                             EstimateCardinality(op));
+    projection->outputs.reserve(op.expressions.size());
+    for (size_t idx = 0; idx < op.expressions.size(); ++idx) {
+        std::string column_name =
+            idx < op.output_names.size() ? op.output_names[idx]
+                                         : ExprColumnName(op.expressions[idx].get(), "col" + std::to_string(idx + 1));
+        projection->outputs.push_back(OutputColumn{
+            ColumnBinding{op.table_index, ProjectionIndex{idx}},
+            ExprTableName(op.expressions[idx].get(), "proj"),
+            std::move(column_name)});
+    }
     projection->children.push_back(std::move(child));
     return projection;
 }
@@ -93,6 +137,7 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalFilte
     auto child = CreatePlan(*op.children[0]);
     auto filter = std::make_unique<PhysicalFilter>(BorrowExpressions(op.expressions), EstimateCardinality(op));
     filter->children.push_back(std::move(child));
+    CopyOutputs(*filter, *filter->children[0]);
     return filter;
 }
 
@@ -103,6 +148,7 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalDisti
     auto child = CreatePlan(*op.children[0]);
     auto distinct = std::make_unique<PhysicalDistinct>(BorrowExpressions(op.expressions), EstimateCardinality(op));
     distinct->children.push_back(std::move(child));
+    CopyOutputs(*distinct, *distinct->children[0]);
     return distinct;
 }
 
@@ -118,6 +164,13 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalSetOp
         op.all,
         op.output_names,
         EstimateCardinality(op));
+    setop->outputs.reserve(op.output_names.size());
+    for (size_t idx = 0; idx < op.output_names.size(); ++idx) {
+        setop->outputs.push_back(OutputColumn{
+            ColumnBinding{op.table_index, ProjectionIndex{idx}},
+            "setop",
+            op.output_names[idx]});
+    }
     setop->children.push_back(std::move(left));
     setop->children.push_back(std::move(right));
     return setop;
@@ -130,6 +183,7 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalLimit
     auto child = CreatePlan(*op.children[0]);
     auto limit = std::make_unique<PhysicalLimit>(op.limit_count.get(), op.limit_offset.get(), EstimateCardinality(op));
     limit->children.push_back(std::move(child));
+    CopyOutputs(*limit, *limit->children[0]);
     return limit;
 }
 
@@ -150,6 +204,17 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalWindo
         BorrowExpressions(op.partitions),
         std::move(orders),
         EstimateCardinality(op));
+    if (child) {
+        CopyOutputs(*window, *child);
+    }
+    for (size_t idx = 0; idx < op.function_names.size(); ++idx) {
+        std::string column_name =
+            idx < op.output_names.size() ? op.output_names[idx] : "window" + std::to_string(idx + 1);
+        window->outputs.push_back(OutputColumn{
+            ColumnBinding{op.table_index, ProjectionIndex{idx}},
+            "window",
+            std::move(column_name)});
+    }
     window->children.push_back(std::move(child));
     return window;
 }
@@ -171,6 +236,17 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalCompa
     hash_join->invert_result = op.invert_result;
     hash_join->children.push_back(std::move(left));
     hash_join->children.push_back(std::move(right));
+    const bool semi_or_anti = op.join_type == JOIN_SEMI || op.join_type == JOIN_ANTI;
+    AppendOutputs(*hash_join, *hash_join->children[0]);
+    if (!semi_or_anti) {
+        AppendOutputs(*hash_join, *hash_join->children[1]);
+    }
+    if (op.has_mark_index) {
+        hash_join->outputs.push_back(OutputColumn{
+            ColumnBinding{op.mark_index, ProjectionIndex{0}},
+            "mark",
+            "mark"});
+    }
     return hash_join;
 }
 
@@ -192,6 +268,15 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalDelim
     auto physical = std::make_unique<PhysicalDelimScan>(op.table_index, EstimateCardinality(op));
     physical->correlated_columns = op.correlated_columns;
     physical->output_names = op.output_names;
+    physical->outputs.reserve(op.correlated_columns.size());
+    for (size_t idx = 0; idx < op.correlated_columns.size(); ++idx) {
+        std::string column_name =
+            idx < op.output_names.size() ? op.output_names[idx] : "delim" + std::to_string(idx + 1);
+        physical->outputs.push_back(OutputColumn{
+            ColumnBinding{op.table_index, ProjectionIndex{idx}},
+            "delim",
+            std::move(column_name)});
+    }
     return physical;
 }
 
@@ -204,6 +289,8 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalCross
     auto cross_product = std::make_unique<PhysicalCrossProduct>(EstimateCardinality(op));
     cross_product->children.push_back(std::move(left));
     cross_product->children.push_back(std::move(right));
+    AppendOutputs(*cross_product, *cross_product->children[0]);
+    AppendOutputs(*cross_product, *cross_product->children[1]);
     return cross_product;
 }
 
@@ -220,6 +307,24 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalAggre
         op.group_names,
         op.aggregate_names,
         EstimateCardinality(op));
+    hash_aggregate->outputs.reserve(op.groups.size() + op.expressions.size());
+    for (size_t idx = 0; idx < op.groups.size(); ++idx) {
+        std::string column_name =
+            idx < op.group_names.size() ? op.group_names[idx]
+                                        : ExprColumnName(op.groups[idx].get(), "group" + std::to_string(idx + 1));
+        hash_aggregate->outputs.push_back(OutputColumn{
+            ColumnBinding{op.group_index, ProjectionIndex{idx}},
+            ExprTableName(op.groups[idx].get(), "group"),
+            std::move(column_name)});
+    }
+    for (size_t idx = 0; idx < op.expressions.size(); ++idx) {
+        std::string column_name =
+            idx < op.aggregate_names.size() ? op.aggregate_names[idx] : "agg" + std::to_string(idx + 1);
+        hash_aggregate->outputs.push_back(OutputColumn{
+            ColumnBinding{op.aggregate_index, ProjectionIndex{idx}},
+            "agg",
+            std::move(column_name)});
+    }
     hash_aggregate->children.push_back(std::move(child));
     return hash_aggregate;
 }
@@ -236,6 +341,7 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalOrder
     }
     auto physical_order = std::make_unique<PhysicalOrderBy>(std::move(orders), EstimateCardinality(op));
     physical_order->children.push_back(std::move(child));
+    CopyOutputs(*physical_order, *physical_order->children[0]);
     return physical_order;
 }
 

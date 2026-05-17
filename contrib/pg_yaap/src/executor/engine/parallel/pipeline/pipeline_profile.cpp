@@ -48,6 +48,7 @@ StageName(PipelineProfileStage stage)
 		case PipelineProfileStage::SOURCE_HASH_AGG: return "source_hashagg_readback";
 		case PipelineProfileStage::SOURCE_PERFECT_HASH_AGG: return "source_perfect_hashagg_readback";
 		case PipelineProfileStage::SOURCE_ORDER: return "source_order_readback";
+		case PipelineProfileStage::OP_FILTER: return "filter_expr";
 		case PipelineProfileStage::OP_PROJECTION: return "project_expr";
 		case PipelineProfileStage::SINK_HASH_AGG_UPDATE: return "agg_update_local";
 		case PipelineProfileStage::SINK_PERFECT_HASH_AGG_UPDATE: return "perfect_agg_update_local";
@@ -376,7 +377,9 @@ PipelineProfileOperatorStage(PhysicalOperatorType type)
 {
 	return type == PhysicalOperatorType::PROJECTION
 		? PipelineProfileStage::OP_PROJECTION
-		: PipelineProfileStage::TASK_RUN_TOTAL;
+		: (type == PhysicalOperatorType::FILTER
+			? PipelineProfileStage::OP_FILTER
+			: PipelineProfileStage::TASK_RUN_TOTAL);
 }
 
 PipelineProfileStage

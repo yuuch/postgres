@@ -182,6 +182,8 @@ bool MatchGroupRow(const TupleDataLayout *layout,
  *                      (input read as int64; NUMERIC carried as scaled int64
  *                      with caller-managed scale).
  *     - COUNT_STAR   : *(int64*)&row[a.offset] += 1.
+ *     - COUNT_NONNULL / COUNT_DISTINCT_NONNULL:
+ *                      *(int64*)&row[a.offset] += 1 for non-null input rows.
  *
  * Aggregate state is plain int64 in v1 (no Wide128 in DSA — out of scope
 	 * per design §3.1). Overflow is undefined for v1; supported queries are
@@ -211,7 +213,8 @@ void UpdateAggregatesGather(const TupleDataLayout *layout,
 /*
  * CombineAggregates:
  *   For each aggregate a:
- *     - SUM_INT64 / COUNT_STAR : *(int64*)&dst_row[a.offset] +=
+ *     - SUM_INT64 / COUNT_STAR / COUNT_NONNULL / COUNT_DISTINCT_NONNULL:
+ *                                *(int64*)&dst_row[a.offset] +=
  *                                *(int64*)&src_row[a.offset].
  *
  * Used by HashAgg.Combine when merging per-thread local AHTs into the

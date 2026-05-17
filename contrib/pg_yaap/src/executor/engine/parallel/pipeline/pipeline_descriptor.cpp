@@ -25,12 +25,14 @@ extern "C" {
 #include "utils/elog.h"
 }
 
+#include <algorithm>
 #include <cstring>
 
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/output_sink.hpp"
 #include "parallel/pipeline/physical_delim_scan.hpp"
+#include "parallel/pipeline/physical_filter.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
@@ -127,6 +129,83 @@ SerializeProjectStepVector(const PgVector<ProjectStep> &values,
 }
 
 static void
+SerializeFilterInputVector(const PgVector<FilterInputDesc> &values,
+					   dsa_area *dsa,
+					   dsa_pointer *out_dp,
+					   uint16_t *out_count)
+{
+	*out_count = static_cast<uint16_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, sizeof(FilterInputDesc) * values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), sizeof(FilterInputDesc) * values.size());
+}
+
+static void
+SerializeFilterExprVector(const PgVector<FilterExprDesc> &values,
+					  dsa_area *dsa,
+					  dsa_pointer *out_dp,
+					  uint16_t *out_count)
+{
+	*out_count = static_cast<uint16_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, sizeof(FilterExprDesc) * values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), sizeof(FilterExprDesc) * values.size());
+}
+
+static void
+SerializeFilterStepVector(const PgVector<FilterStep> &values,
+					  dsa_area *dsa,
+					  dsa_pointer *out_dp,
+					  uint16_t *out_count)
+{
+	*out_count = static_cast<uint16_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, sizeof(FilterStep) * values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), sizeof(FilterStep) * values.size());
+}
+
+static void
+SerializeCharVector(const PgVector<char> &values,
+				dsa_area *dsa,
+				dsa_pointer *out_dp,
+				uint32_t *out_bytes)
+{
+	*out_bytes = static_cast<uint32_t>(values.size());
+	if (values.empty())
+	{
+		*out_dp = InvalidDsaPointer;
+		return;
+	}
+
+	*out_dp = dsa_allocate0(dsa, values.size());
+	std::memcpy(dsa_get_address(dsa, *out_dp), values.data(), values.size());
+}
+
+static uint16_t
+RequiredFilterBoolRegs(const PgVector<FilterExprDesc> &exprs)
+{
+	uint16_t max_reg = 0;
+	for (const FilterExprDesc &expr : exprs)
+		max_reg = std::max<uint16_t>(max_reg, static_cast<uint16_t>(expr.output_bool_reg + 1));
+	return max_reg;
+}
+
+static void
 EmitSeqScan(const PhysicalSeqScan &op, OpDescriptor &out)
 {
 	out.kind = OpKind::SEQ_SCAN;
@@ -198,9 +277,30 @@ EmitOutput(const OutputSink &op, OpDescriptor &out)
 	out.n_children = 0;
 	out.body.output.input_schema = op.input_schema_dp();
 	out.body.output.layout = op.layout_dp();
+	out.body.output.sort_keys = op.final_sort_keys_dp();
+	out.body.output.n_sort_keys = op.n_final_sort_keys();
 	out.body.output.shared_payload = op.shared_payload_dp();
 	out.body.output.tdc_max_rows = op.tdc_max_rows();
 	out.body.output._pad0 = 0;
+	out.body.output.max_emit_rows = op.max_emit_rows();
+}
+
+static void
+EmitFilter(const PhysicalFilter &op, OpDescriptor &out, dsa_area *dsa)
+{
+	out.kind = OpKind::FILTER;
+	out.n_children = 0;
+	out.body.filter.input_schema = op.input_schema_dp();
+	SerializeFilterInputVector(op.filter_inputs(), dsa,
+		&out.body.filter.filter_inputs, &out.body.filter.n_filter_inputs);
+	SerializeFilterExprVector(op.filter_exprs(), dsa,
+		&out.body.filter.filter_exprs, &out.body.filter.n_filter_exprs);
+	SerializeFilterStepVector(op.filter_steps(), dsa,
+		&out.body.filter.filter_steps, &out.body.filter.n_filter_steps);
+	SerializeCharVector(op.filter_string_consts(), dsa,
+		&out.body.filter.filter_string_consts,
+		&out.body.filter.filter_string_const_bytes);
+	out.body.filter.filter_bool_regs = RequiredFilterBoolRegs(op.filter_exprs());
 }
 
 static void
@@ -332,10 +432,55 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 			return std::make_unique<OutputSink>(
 				op.body.output.input_schema,
 				op.body.output.layout,
+				op.body.output.sort_keys,
+				op.body.output.n_sort_keys,
 				op.body.output.shared_payload,
 				op.body.output.tdc_max_rows,
-				0,
+				op.body.output.max_emit_rows,
 				const_cast<OpDescriptor *>(&op));
+
+		case OpKind::FILTER:
+		{
+			PgVector<FilterInputDesc> filter_inputs;
+			if (op.body.filter.n_filter_inputs > 0 && DsaPointerIsValid(op.body.filter.filter_inputs))
+			{
+				auto *inputs = static_cast<FilterInputDesc *>(dsa_get_address(ctx.dsa, op.body.filter.filter_inputs));
+				filter_inputs.assign(inputs, inputs + op.body.filter.n_filter_inputs);
+			}
+
+			PgVector<FilterExprDesc> filter_exprs;
+			if (op.body.filter.n_filter_exprs > 0 && DsaPointerIsValid(op.body.filter.filter_exprs))
+			{
+				auto *exprs = static_cast<FilterExprDesc *>(dsa_get_address(ctx.dsa, op.body.filter.filter_exprs));
+				filter_exprs.assign(exprs, exprs + op.body.filter.n_filter_exprs);
+			}
+
+			PgVector<FilterStep> filter_steps;
+			if (op.body.filter.n_filter_steps > 0 && DsaPointerIsValid(op.body.filter.filter_steps))
+			{
+				auto *steps = static_cast<FilterStep *>(dsa_get_address(ctx.dsa, op.body.filter.filter_steps));
+				filter_steps.assign(steps, steps + op.body.filter.n_filter_steps);
+			}
+
+			PgVector<char> filter_string_consts;
+			if (op.body.filter.filter_string_const_bytes > 0 && DsaPointerIsValid(op.body.filter.filter_string_consts))
+			{
+				auto *bytes = static_cast<char *>(dsa_get_address(ctx.dsa, op.body.filter.filter_string_consts));
+				filter_string_consts.assign(bytes, bytes + op.body.filter.filter_string_const_bytes);
+			}
+
+			return std::make_unique<PhysicalFilter>(
+				op.body.filter.input_schema,
+				std::move(filter_inputs),
+				std::move(filter_exprs),
+				std::move(filter_steps),
+				std::move(filter_string_consts),
+				op.body.filter.filter_inputs,
+				op.body.filter.filter_exprs,
+				op.body.filter.filter_steps,
+				op.body.filter.filter_string_consts,
+				const_cast<OpDescriptor *>(&op));
+		}
 
 		case OpKind::PROJECTION:
 		{
@@ -453,10 +598,13 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 				static_cast<PhysicalOrder &>(*pipeline.source).AttachDescriptor(&ops[idx]);
 				idx++;
 				break;
+			case PhysicalOperatorType::FILTER:
+				EmitFilter(static_cast<const PhysicalFilter &>(*pipeline.source), ops[idx++], dsa);
+				break;
 			case PhysicalOperatorType::PROJECTION:
 				EmitProjection(static_cast<const PhysicalProjection &>(*pipeline.source), ops[idx++], dsa);
 				break;
-		case PhysicalOperatorType::HASH_JOIN:
+			case PhysicalOperatorType::HASH_JOIN:
 				EmitHashJoin(static_cast<const PhysicalHashJoin &>(*pipeline.source), ops[idx]);
 				static_cast<PhysicalHashJoin &>(*pipeline.source).AttachDescriptor(&ops[idx]);
 				idx++;
@@ -474,6 +622,9 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 					EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*mid), ops[idx], dsa);
 					static_cast<PhysicalHashAggregate *>(mid)->AttachDescriptor(&ops[idx]);
 					idx++;
+					break;
+				case PhysicalOperatorType::FILTER:
+					EmitFilter(static_cast<const PhysicalFilter &>(*mid), ops[idx++], dsa);
 					break;
 				case PhysicalOperatorType::PROJECTION:
 					EmitProjection(static_cast<const PhysicalProjection &>(*mid), ops[idx++], dsa);
@@ -633,6 +784,7 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 				join->desc()->body.hash_join.shared_payload = payload_dp;
 			break;
 		}
+		case PhysicalOperatorType::FILTER:
 		case PhysicalOperatorType::PROJECTION:
 			break;
 	}
@@ -688,6 +840,7 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 			OpDescriptor *desc = static_cast<const PhysicalHashJoin *>(op)->desc();
 			return desc != nullptr ? desc->body.hash_join.shared_payload : InvalidDsaPointer;
 		}
+		case PhysicalOperatorType::FILTER:
 		case PhysicalOperatorType::PROJECTION:
 			return InvalidDsaPointer;
 	}

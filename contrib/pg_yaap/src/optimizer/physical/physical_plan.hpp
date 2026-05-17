@@ -24,8 +24,15 @@ enum class PhysicalOperatorType {
 
 class PhysicalOperator {
 public:
+    struct OutputColumn {
+        ColumnBinding binding;
+        std::string table_name;
+        std::string column_name;
+    };
+
     PhysicalOperatorType type;
     size_t estimated_cardinality;
+    std::vector<OutputColumn> outputs;
     std::vector<std::unique_ptr<PhysicalOperator>> children;
 
     virtual ~PhysicalOperator() = default;

@@ -1367,6 +1367,14 @@ std::unique_ptr<LogicalOperator> YaapAdapter::TranslateFromNode(::Node* pg_node)
                 rtref->rtindex,
                 static_cast<unsigned int>(rte->relid),
                 GetRteName(rtref->rtindex));
+            if (rte->eref && rte->eref->colnames) {
+                const size_t column_count = list_length(rte->eref->colnames);
+                get->output_names.reserve(column_count);
+                for (size_t idx = 0; idx < column_count; ++idx) {
+                    Node *column_name = (Node *) list_nth(rte->eref->colnames, idx);
+                    get->output_names.push_back(column_name ? strVal(column_name) : "col" + std::to_string(idx + 1));
+                }
+            }
             get->estimated_cardinality = EstimateBaseCardinality(rte);
             RegisterOutputBindings(rtref->rtindex, rte, get.get());
             return get;

@@ -34,6 +34,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 #include "optimizer_registry.hpp"
 #include "parallel/pipeline/output_sink.hpp"
 #include "parallel/pipeline/physical_delim_scan.hpp"
+#include "parallel/pipeline/physical_filter.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
@@ -95,6 +96,7 @@ template <typename T>
 using PgVector = pg_yaap::PgVector<T>;
 using PipelineOperator = pg_yaap::pipeline::PhysicalOperator;
 using PipelineDelimScan = pg_yaap::pipeline::PhysicalDelimScan;
+using PipelineFilter = pg_yaap::pipeline::PhysicalFilter;
 using PipelineHashAggregate = pg_yaap::pipeline::PhysicalHashAggregate;
 using PipelineHashJoin = pg_yaap::pipeline::PhysicalHashJoin;
 using PipelinePerfectHashAggregate = pg_yaap::pipeline::PhysicalPerfectHashAggregate;
@@ -186,6 +188,7 @@ struct OptimizerNodeTranslation {
 std::unique_ptr<PipelineOperator> op;
 std::vector<ColumnRef> cols;
 std::vector<ColumnSchema> schema;
+std::vector<yaap::PhysicalOperator::OutputColumn> outputs;
 std::vector<SortKeyDesc> final_sort_keys;
 uint64_t limit_count = 0;
 uint32_t estimated_groups = 0;
@@ -332,6 +335,16 @@ AppendUniqueColumnRef(const ColumnRef &ref, std::vector<ColumnRef> &out);
 void
 CollectReferencedColumns(const Expression *expr, std::vector<ColumnRef> &out);
 
+bool
+ResolveOutputBinding(const BoundColumnRefExpression *expr,
+					 const PhysicalOperator *source_op,
+					 yaap::ColumnBinding &out_binding);
+
+void
+CollectReferencedSourceColumns(const Expression *expr,
+							   const PhysicalOperator *source_op,
+							   std::vector<ColumnRef> &out);
+
 void
 FilterRequestedColumns(const std::vector<ColumnRef> &available,
 					   const std::vector<ColumnRef> *required,
@@ -358,6 +371,14 @@ LookupExprInputColumn(const yaap::ColumnBinding &binding,
 					  const std::vector<ColumnSchema> &schema,
 					  ColumnRef &out_ref,
 					  const ColumnSchema *&out_col);
+
+bool
+LookupNamedExprInputColumn(const BoundColumnRefExpression *expr,
+						   const std::vector<yaap::PhysicalOperator::OutputColumn> *outputs,
+						   const std::vector<ColumnRef> &cols,
+						   const std::vector<ColumnSchema> &schema,
+						   ColumnRef &out_ref,
+						   const ColumnSchema *&out_col);
 
 bool
 LookupPassthroughColumn(const ColumnRef &ref,
@@ -478,8 +499,12 @@ LowerScanFilterBoolExpr(const Expression *expr,
 
 bool
 LowerJoinFilterBoolExpr(const Expression *expr,
+						const PhysicalOperator *left_source_op,
+						const PhysicalOperator *right_source_op,
+						const std::vector<yaap::PhysicalOperator::OutputColumn> *left_outputs,
 						const std::vector<ColumnRef> &left_cols,
 						const std::vector<ColumnSchema> &left_schema,
+						const std::vector<yaap::PhysicalOperator::OutputColumn> *right_outputs,
 						const std::vector<ColumnRef> &right_cols,
 						const std::vector<ColumnSchema> &right_schema,
 						std::vector<HashJoinFilterInputDesc> &inputs,
@@ -512,8 +537,10 @@ bool
 LowerJoinFilterCompare(const BoundFunctionExpression *func,
 					   const PhysicalOperator *left_source_op,
 					   const PhysicalOperator *right_source_op,
+					   const std::vector<yaap::PhysicalOperator::OutputColumn> *left_outputs,
 					   const std::vector<ColumnRef> &left_cols,
 					   const std::vector<ColumnSchema> &left_schema,
+					   const std::vector<yaap::PhysicalOperator::OutputColumn> *right_outputs,
 					   const std::vector<ColumnRef> &right_cols,
 					   const std::vector<ColumnSchema> &right_schema,
 					   std::vector<HashJoinFilterInputDesc> &inputs,
@@ -526,8 +553,10 @@ bool
 LowerJoinFilterBoolExpr(const Expression *expr,
 						const PhysicalOperator *left_source_op,
 						const PhysicalOperator *right_source_op,
+						const std::vector<yaap::PhysicalOperator::OutputColumn> *left_outputs,
 						const std::vector<ColumnRef> &left_cols,
 						const std::vector<ColumnSchema> &left_schema,
+						const std::vector<yaap::PhysicalOperator::OutputColumn> *right_outputs,
 						const std::vector<ColumnRef> &right_cols,
 						const std::vector<ColumnSchema> &right_schema,
 						std::vector<HashJoinFilterInputDesc> &inputs,
@@ -549,8 +578,10 @@ bool
 LowerJoinFilters(const std::vector<Expression *> &filters,
 				 const PhysicalOperator *left_source_op,
 				 const PhysicalOperator *right_source_op,
+				 const std::vector<yaap::PhysicalOperator::OutputColumn> *left_outputs,
 				 const std::vector<ColumnRef> &left_cols,
 				 const std::vector<ColumnSchema> &left_schema,
+				 const std::vector<yaap::PhysicalOperator::OutputColumn> *right_outputs,
 				 const std::vector<ColumnRef> &right_cols,
 				 const std::vector<ColumnSchema> &right_schema,
 				 std::vector<HashJoinFilterInputDesc> &inputs,
@@ -590,6 +621,14 @@ LowerOptimizerExpr(const Expression *expr,
 				   const std::vector<MaterializedOptExpr> *cache,
 				   int8_t &out_scale,
 				   uint8_t &out_slot);
+
+bool
+LowerOptimizerBoolExpr(const Expression *expr,
+					   std::vector<ProjectStep> &steps,
+					   uint8_t &next_int64_slot,
+					   const std::vector<ColumnRef> &cols,
+					   const std::vector<ColumnSchema> &schema,
+					   uint8_t &out_slot);
 
 bool
 LowerProjectionConstant(const BoundConstantExpression *constant,
@@ -685,6 +724,7 @@ NextFreeStringSlot(const std::vector<ColumnSchema> &schema);
 
 bool
 ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
+						   const std::vector<yaap::PhysicalOperator::OutputColumn> *input_outputs,
 						   const std::vector<ColumnRef> &cols,
 						   const std::vector<ColumnSchema> &schema,
 						   std::vector<ProjectStep> &project_steps,
@@ -697,6 +737,7 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 
 bool
 BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
+						const std::vector<yaap::PhysicalOperator::OutputColumn> *input_outputs,
 						const std::vector<ColumnRef> &input_cols,
 						const std::vector<ColumnSchema> &input_schema,
 						const AggBuildState &agg_state,
@@ -704,9 +745,18 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 						std::vector<ColumnSchema> &out_schema);
 
 bool
+ApplyPostAggregateFilters(OptimizerNodeTranslation node,
+						  const PhysicalHashAggregate &source_agg,
+						  const std::vector<Expression *> &pending_filters,
+						  PgYaapQueryState *state,
+						  OptimizerNodeTranslation &out);
+
+bool
 CollectJoinKeys(const Expression *expr,
+				const std::vector<yaap::PhysicalOperator::OutputColumn> *left_outputs,
 				const std::vector<ColumnRef> &left_cols,
 				const std::vector<ColumnSchema> &left_schema,
+				const std::vector<yaap::PhysicalOperator::OutputColumn> *right_outputs,
 				const std::vector<ColumnRef> &right_cols,
 				const std::vector<ColumnSchema> &right_schema,
 				std::vector<ColumnRef> &left_keys,

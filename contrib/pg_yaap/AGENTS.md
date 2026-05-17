@@ -8,14 +8,13 @@
 
 pg_yaap is a PostgreSQL extension (loaded via `shared_preload_libraries` or `CREATE EXTENSION`) that hooks into PostgreSQL's planner and executor to intercept `SELECT` queries and run them through its own C++ optimizer and columnar execution engine. The goal is to deliver modern OLAP performance within PostgreSQL without forking the server — it runs in-process, uses PG's storage layer (buffer manager, heap scan), and returns results through standard PG tuple slots.
 
-### Two execution paths coexist
+### Supported execution path
 
 | Path | Optimizer | Executor | Status |
 |------|-----------|----------|--------|
-| **Optimizer → Executor** | YAAP's own `LogicalPlanner` → `LogicalOptimizer` → `PhysicalPlanner` | Serial physical plan execution | Active (simpler shapes first) |
-| **PG Plan → Pipeline** | PostgreSQL's standard planner | YAAP's parallel pipeline runtime (`PgYaapPipelineRun`) | Active (broader plan support) |
+| **Optimizer → Executor** | YAAP's own `LogicalPlanner` → `LogicalOptimizer` → `PhysicalPlanner` | `yaap_opt_translator` → YAAP pipeline runtime | Active |
 
-Both paths are dispatched from `bridge/execute.cpp::pg_yaap_initialize_plan`. The optimizer path takes priority when an `OptimizerPlanBundle` was registered during the planner hook; otherwise the pipeline `Translator` attempts to lower the PG plan tree.
+The supported path is the optimizer-owned `PhysicalOperator` tree registered in `OptimizerPlanBundle`. PostgreSQL plan translation may still exist as legacy code, but it is no longer the intended architecture or a supported target for new fixes.
 
 ---
 
@@ -101,12 +100,12 @@ The only C files in the project live here. This layer is the outer boundary betw
 |------|---------|
 | `pg_yaap.c` | `_PG_init`/`_PG_fini`, 10 GUCs, hook chaining (planner + 4 executor hooks), debug pretty-printer |
 | `state.h` / `state.c` | Per-query state HTAB keyed by `QueryDesc *`, admission filter (`plan_uses_supported_relations`), lifecycle |
-| `execute.h` / `execute.cpp` | C++ shim: `initialize_plan` (Translator or optimizer-to-pipeline), `execute_query` (dispatch), `delete_plan` (teardown) |
+| `execute.h` / `execute.cpp` | C++ shim: initialize from optimizer bundle, dispatch into pipeline runtime, teardown |
 | `optimizer_registry.h` / `.cpp` / `.hpp` | Registers/lookup/discards `OptimizerPlanBundle` mapped to `PlannedStmt *` |
 
 **Hook flow:**
 1. `planner_hook` (before PG plans): Runs YAAP optimizer. On success, registers bundle and forces PG planner GUCs to disable parallel workers (YAAP manages its own parallelism). On failure → `ereport(ERROR)`.
-2. `ExecutorStart_hook` (after PG's `standard_ExecutorStart`): Builds per-query state. Calls `initialize_plan` which either lowers the optimizer bundle or translates the PG plan tree. Worker processes (`IsParallelWorker()`) are bypassed.
+2. `ExecutorStart_hook` (after PG's `standard_ExecutorStart`): Builds per-query state. Calls `initialize_plan` to lower the optimizer bundle. Worker processes (`IsParallelWorker()`) are bypassed.
 3. `ExecutorRun_hook`: Looks up state. If present, calls `execute_query` → `PgYaapPipelineRun`. On success, returns `true` (PG executor is skipped). On failure → `ereport(ERROR)`.
 4. `ExecutorEnd_hook`: Cleans up per-query state and optimizer bundle.
 
@@ -275,7 +274,7 @@ pg_yaap/
 │       ├── yaap_engine.hpp        # Central engine header (includes core + expr)
 │       └── parallel/pipeline/     # Parallel pipeline runtime
 │           ├── physical_operator.hpp/.cpp   # PhysicalOperator base class
-│           ├── translator.hpp/.cpp          # PG Plan → PhysicalOperator
+│           ├── translator.hpp/.cpp          # Legacy PG-plan translator (not the supported path)
 │           ├── translator_shape.cpp         # Shape matching
 │           ├── translator_expr.cpp          # Expression lowering
 │           ├── translator_filter.cpp        # Filter lowering

@@ -297,6 +297,7 @@ public:
     int pg_rtindex;
     unsigned int relid;
     std::string table_name;
+    std::vector<std::string> output_names;
     std::vector<ProjectionIndex> projected_columns;
     std::vector<std::unique_ptr<Expression>> filters;
     LogicalGet(TableIndex table_index, int pg_rtindex, unsigned int relid, std::string table_name)

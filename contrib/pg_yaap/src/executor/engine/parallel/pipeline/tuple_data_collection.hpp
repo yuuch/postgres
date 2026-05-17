@@ -154,6 +154,10 @@ uint32_t TupleDataCollectionGrowHeapCapacity(const TupleDataLayout *layout,
 	                                          const TupleDataCollection *old_tdc,
 	                                          uint32_t new_row_capacity,
 	                                          uint32_t required_heap_bytes);
+uint32_t TupleDataCollectionClampRowCapacity(uint32_t proposed_row_capacity,
+	                                        uint32_t row_width,
+	                                        uint32_t required_heap_bytes,
+	                                        uint32_t minimum_row_capacity);
 
 bool TupleDataCollectionStoreStringBytes(TupleDataCollection *tdc,
 	                                     const char *data,
