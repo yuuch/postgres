@@ -118,6 +118,9 @@ uint64_t HashGroup(const TupleDataLayout *layout,
                    const PipelineChunk &chunk,
                    uint16_t row_idx);
 
+uint64_t HashSingleGroupInt32Value(int32_t value);
+uint64_t HashSingleGroupInt64Value(int64_t value);
+
 /* Row-buffer variant used by HashAgg combine and AHT rehash. Must stay
  * bit-identical to HashGroup for rows produced by ScatterGroupOnly. */
 uint64_t HashGroupRow(const TupleDataLayout *layout,

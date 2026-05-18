@@ -557,6 +557,21 @@ HashGroup(const TupleDataLayout *layout,
 	Assert(layout != nullptr);
 	Assert(row_idx < chunk.count);
 
+	if (layout->column_count == 1)
+	{
+		const TdcColumnDesc &col = layout->columns[0];
+		Assert(col.src_col_idx < 16);
+		switch (col.kind)
+		{
+			case TdcColumnKind::INT32:
+				return HashSingleGroupInt32Value(chunk.get_int32(col.src_col_idx, row_idx));
+			case TdcColumnKind::INT64:
+				return HashSingleGroupInt64Value(chunk.get_int64(col.src_col_idx, row_idx));
+			default:
+				break;
+		}
+	}
+
 	uint64_t h = HashStart();
 
 	for (uint16_t i = 0; i < layout->column_count; ++i)
@@ -603,11 +618,49 @@ HashGroup(const TupleDataLayout *layout,
 }
 
 uint64_t
+HashSingleGroupInt32Value(int32_t value)
+{
+	uint64_t h = HashStart();
+	h = HashCombine(h, static_cast<uint32_t>(value), 0);
+	return Mix64(h ^ 1u);
+}
+
+uint64_t
+HashSingleGroupInt64Value(int64_t value)
+{
+	uint64_t h = HashStart();
+	h = HashCombine(h, static_cast<uint64_t>(value), 0);
+	return Mix64(h ^ 1u);
+}
+
+uint64_t
 HashGroupRow(const TupleDataLayout *layout,
              const TupleDataCollection *tdc,
              const uint8_t *row_ptr)
 {
 	Assert(layout != nullptr && row_ptr != nullptr);
+
+	if (layout->column_count == 1)
+	{
+		const TdcColumnDesc &col = layout->columns[0];
+		switch (col.kind)
+		{
+			case TdcColumnKind::INT32:
+			{
+				int32_t v;
+				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
+				return HashSingleGroupInt32Value(v);
+			}
+			case TdcColumnKind::INT64:
+			{
+				int64_t v;
+				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
+				return HashSingleGroupInt64Value(v);
+			}
+			default:
+				break;
+		}
+	}
 
 	uint64_t h = HashStart();
 	for (uint16_t i = 0; i < layout->column_count; ++i)

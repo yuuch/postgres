@@ -21,6 +21,8 @@ pg_yaap_sources += files(
   'parallel/pipeline/physical_projection.cpp',
   'parallel/pipeline/physical_hash_aggregate.cpp',
   'parallel/pipeline/physical_hash_join.cpp',
+  'parallel/pipeline/physical_hash_join_combine.cpp',
+  'parallel/pipeline/physical_hash_join_fast_probe.cpp',
   'parallel/pipeline/physical_perfect_hash_aggregate.cpp',
   'parallel/pipeline/physical_order.cpp',
   'parallel/pipeline/output_sink.cpp',

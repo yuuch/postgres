@@ -375,6 +375,12 @@ struct SeqScanSharedPayload {
 struct HashJoinLocalBuildRegistryEntry {
 	dsa_pointer build_keys_dp;
 	dsa_pointer build_rows_dp;
+	uint32_t    row_count;
+	uint32_t    key_heap_used;
+	uint32_t    row_heap_used;
+	uint32_t    global_row_offset;
+	uint32_t    global_key_heap_offset;
+	uint32_t    global_row_heap_offset;
 };
 
 struct HashJoinSharedPayload {
@@ -387,6 +393,10 @@ struct HashJoinSharedPayload {
 	bool        finalized;
 	uint8_t     _pad0;
 	pg_atomic_uint32 release_state;       /* 0=live, 1=releasing, 2=released */
+	pg_atomic_uint32 combine_prepare_state; /* 0=pending, 1=preparing, 2=ready */
+	uint32_t    combined_row_count;
+	uint32_t    combined_key_heap_used;
+	uint32_t    combined_row_heap_used;
 	dsa_pointer local_build_registry_dp; /* HashJoinLocalBuildRegistryEntry[local_state_slot_count] */
 	dsa_pointer build_keys_dp;           /* global build-side key row store */
 	dsa_pointer build_rows_dp;           /* future global build-side row store */

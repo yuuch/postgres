@@ -905,6 +905,7 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		state->payload->local_state_slot_count = static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
 		state->payload->perfect_hash_capacity = use_perfect_hash ? perfect_capacity : 0;
 		state->payload->finalized = false;
+		pg_atomic_init_u32(&state->payload->source_partition_next, 0);
 		state->payload->partitions_dp = dsa_allocate0(ctx.dsa,
 			static_cast<size_t>(state->partition_count) * sizeof(HashAggPartition));
 		state->payload->local_partitions_registry_dp = dsa_allocate0(ctx.dsa,

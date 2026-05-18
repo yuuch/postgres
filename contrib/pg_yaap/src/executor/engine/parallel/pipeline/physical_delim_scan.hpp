@@ -20,11 +20,14 @@ public:
 	HashAggPartition     *partitions = nullptr;
 	const TupleDataLayout *layout = nullptr;
 	uint32_t              partition_count = 0;
-	uint32_t              source_partition = 0;
-	uint32_t              source_cursor = 0;
 };
 
 class DelimScanLocalSourceState final : public LocalSourceState {
+public:
+	uint32_t            source_partition = UINT32_MAX;
+	uint32_t            source_cursor = 0;
+	uint32_t            row_count = 0;
+	TupleDataCollection *tdc = nullptr;
 };
 
 class PhysicalDelimScan final : public PhysicalOperator {
@@ -41,6 +44,7 @@ public:
 	{}
 
 	bool IsSource() const override { return true; }
+	bool ParallelSource() const override { return true; }
 	int  MaxThreads(ExecCtx &ctx) const override;
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta) override;
 

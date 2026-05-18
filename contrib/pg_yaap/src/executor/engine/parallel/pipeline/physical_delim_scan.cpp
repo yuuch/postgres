@@ -4,6 +4,7 @@ extern "C" {
 #include "postgres.h"
 #include "utils/elog.h"
 
+extern int pg_yaap_parallel_max_workers;
 extern bool pg_yaap_trace_execution_path;
 }
 
@@ -53,8 +54,14 @@ ResolveLayout(dsa_area *dsa, dsa_pointer layout_dp)
 int
 PhysicalDelimScan::MaxThreads(ExecCtx &ctx) const
 {
-	(void) ctx;
-	return 1;
+	const dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
+		? shared_payload_dp_
+		: LoadSharedPayloadFromDescriptor(this);
+	HashAggSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
+	if (payload == nullptr || payload->partition_count == 0)
+		return 1;
+	return std::max(1, std::min(pg_yaap_parallel_max_workers,
+		static_cast<int>(payload->partition_count)));
 }
 
 void
@@ -103,37 +110,46 @@ SourceResultType
 PhysicalDelimScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &input)
 {
 	auto &global = static_cast<DelimScanGlobalSourceState &>(input.global_state);
-	(void) input.local_state;
+	auto &local = static_cast<DelimScanLocalSourceState &>(input.local_state);
 	out.reset();
 	if (pg_yaap_trace_execution_path)
 		elog(LOG,
 			 "pg_yaap delim scan enter op=%p source_partition=%u partition_count=%u finalized=%d",
 			 static_cast<void *>(this),
-			 global.source_partition,
+			 local.source_partition,
 			 global.partition_count,
 			 global.payload != nullptr && global.payload->finalized ? 1 : 0);
 
+	/* Like DuckDB's delim scan, the producer side must be fully finalized
+	 * before consumer workers start claiming partitions. */
 	if (!global.payload->finalized)
 		return SourceResultType::FINISHED;
 
-	while (global.source_partition < global.partition_count &&
-	       out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
+	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
-		TupleDataCollection *tdc = ResolveTdc(ctx.dsa,
-			global.partitions[global.source_partition].tdc_dp);
-		if (tdc == nullptr || !tdc->finalized)
-			return SourceResultType::FINISHED;
-
-		const uint32_t row_count = pg_atomic_read_u32(&tdc->row_count);
-		if (global.source_cursor >= row_count)
+		if (local.tdc == nullptr || local.source_cursor >= local.row_count)
 		{
-			global.source_partition++;
-			global.source_cursor = 0;
+			const uint32_t claimed = pg_atomic_fetch_add_u32(&global.payload->source_partition_next, 1);
+			if (claimed >= global.partition_count)
+				break;
+			local.source_partition = claimed;
+			local.source_cursor = 0;
+			local.tdc = ResolveTdc(ctx.dsa, global.partitions[claimed].tdc_dp);
+			if (local.tdc == nullptr)
+				elog(ERROR, "pg_yaap: delim scan partition payload missing");
+			if (!local.tdc->finalized)
+				elog(ERROR, "pg_yaap: delim scan partition not finalized before scan");
+			local.row_count = pg_atomic_read_u32(&local.tdc->row_count);
+		}
+
+		if (local.source_cursor >= local.row_count)
+		{
+			local.tdc = nullptr;
 			continue;
 		}
 
-		const uint8_t *row = TupleDataCollectionGetRowConst(tdc, global.source_cursor++);
-		Gather(global.layout, tdc, row, out, out.count);
+		const uint8_t *row = TupleDataCollectionGetRowConst(local.tdc, local.source_cursor++);
+		Gather(global.layout, local.tdc, row, out, out.count);
 		++out.count;
 	}
 

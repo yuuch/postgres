@@ -97,6 +97,7 @@ struct HashAggSharedPayload
 	uint32_t    perfect_hash_capacity;
 	bool        finalized;
 	uint8_t     _pad[3];
+	pg_atomic_uint32 source_partition_next;
 	dsa_pointer partitions_dp;  /* HashAggPartition[partition_count] */
 	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
 };
