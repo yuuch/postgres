@@ -184,6 +184,127 @@ RewritePostAggregateFilterExpr(const Expression *expr,
 	}
 }
 
+std::unique_ptr<Expression>
+RewritePipelineFilterExpr(const Expression *expr,
+						 const PhysicalOperator *source_op)
+{
+	if (expr == nullptr)
+		return nullptr;
+
+	switch (expr->type)
+	{
+		case ExpressionType::BOUND_COLUMN_REF:
+		{
+			const auto *column = static_cast<const BoundColumnRefExpression *>(expr);
+			if (source_op != nullptr)
+			{
+				if ((source_op->type == PhysicalOperatorType::FILTER ||
+					 source_op->type == PhysicalOperatorType::ORDER_BY ||
+					 source_op->type == PhysicalOperatorType::LIMIT) &&
+					source_op->children.size() == 1 &&
+					source_op->children[0] != nullptr)
+					return RewritePipelineFilterExpr(expr, source_op->children[0].get());
+				if (source_op->type == PhysicalOperatorType::PROJECTION)
+				{
+					const auto *projection = static_cast<const PhysicalProjection *>(source_op);
+					for (size_t idx = 0; idx < projection->select_list.size(); ++idx)
+					{
+						const auto *projected_col =
+							dynamic_cast<const BoundColumnRefExpression *>(projection->select_list[idx]);
+						if (projected_col == nullptr)
+							continue;
+						const bool binding_match =
+							projected_col->binding.table_index.index == column->binding.table_index.index &&
+							projected_col->binding.column_index.index == column->binding.column_index.index;
+						const bool name_match =
+							!column->table_name.empty() &&
+							!column->column_name.empty() &&
+							projected_col->table_name == column->table_name &&
+							projected_col->column_name == column->column_name;
+						if (!binding_match && !name_match)
+							continue;
+						if (projection->children.size() == 1 && projection->children[0] != nullptr)
+							return RewritePipelineFilterExpr(projection->select_list[idx], projection->children[0].get());
+						break;
+					}
+					const size_t ordinal = column->binding.column_index.index;
+					if (ordinal < projection->select_list.size() &&
+						projection->children.size() == 1 &&
+						projection->children[0] != nullptr)
+						return RewritePipelineFilterExpr(projection->select_list[ordinal], projection->children[0].get());
+				}
+				yaap::ColumnBinding resolved_binding = column->binding;
+				if (ResolveOutputBinding(column, source_op, resolved_binding))
+					return std::make_unique<BoundColumnRefExpression>(resolved_binding, column->table_name, column->column_name);
+			}
+			return std::make_unique<BoundColumnRefExpression>(column->binding, column->table_name, column->column_name);
+		}
+		case ExpressionType::BOUND_CONSTANT:
+		{
+			const auto *constant = static_cast<const BoundConstantExpression *>(expr);
+			return std::make_unique<BoundConstantExpression>(constant->value, constant->is_null);
+		}
+		case ExpressionType::BOUND_AGGREGATE:
+		{
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expr);
+			const PhysicalOperator *cursor = source_op;
+			while (cursor != nullptr)
+			{
+				if (cursor->type == PhysicalOperatorType::HASH_GROUP_BY)
+				{
+					if (auto rewritten = RewriteAggregateExprToProducedColumn(
+							aggregate,
+							static_cast<const PhysicalHashAggregate &>(*cursor)))
+						return rewritten;
+				}
+				if ((cursor->type == PhysicalOperatorType::FILTER ||
+					 cursor->type == PhysicalOperatorType::PROJECTION ||
+					 cursor->type == PhysicalOperatorType::ORDER_BY ||
+					 cursor->type == PhysicalOperatorType::LIMIT) &&
+					cursor->children.size() == 1 &&
+					cursor->children[0] != nullptr)
+				{
+					cursor = cursor->children[0].get();
+					continue;
+				}
+				break;
+			}
+			if (source_op != nullptr)
+			{
+				for (const auto &child : source_op->children)
+				{
+					if (child == nullptr)
+						continue;
+					if (auto rewritten = RewritePipelineFilterExpr(expr, child.get()))
+						return rewritten;
+				}
+			}
+			auto clone = std::make_unique<BoundAggregateExpression>(aggregate->function_name, aggregate->agg_oid, aggregate->is_distinct);
+			for (const auto &child : aggregate->children)
+				clone->children.push_back(RewritePipelineFilterExpr(child.get(), source_op));
+			return clone;
+		}
+		case ExpressionType::BOUND_FUNCTION:
+		{
+			const auto *function = static_cast<const BoundFunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundFunctionExpression>(function->function_name, function->op_oid);
+			for (const auto &child : function->children)
+				clone->children.push_back(RewritePipelineFilterExpr(child.get(), source_op));
+			return clone;
+		}
+		case ExpressionType::BOUND_CONJUNCTION:
+		{
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expr);
+			auto clone = std::make_unique<BoundConjunctionExpression>(conjunction->bool_expr_type);
+			for (const auto &child : conjunction->children)
+				clone->children.push_back(RewritePipelineFilterExpr(child.get(), source_op));
+			return clone;
+		}
+		default:
+			return nullptr;
+	}
+}
+
 } // namespace
 
 bool
@@ -598,6 +719,15 @@ LookupNamedExprInputColumn(const BoundColumnRefExpression *expr,
 			return true;
 		}
 	}
+	if (expr->binding.table_index.index > 0 &&
+		expr->binding.column_index.index > 0)
+	{
+		out_ref = ColumnRef{
+			static_cast<Index>(expr->binding.table_index.index),
+			static_cast<AttrNumber>(expr->binding.column_index.index)};
+		if (LookupRawColumn(out_ref, cols, schema, out_col) && out_col != nullptr)
+			return true;
+	}
 	return LookupBindingColumn(expr->binding, cols, schema, out_ref, out_col) && out_col != nullptr;
 }
 
@@ -664,6 +794,72 @@ ApplyPostAggregateFilters(OptimizerNodeTranslation node,
 	std::vector<FilterStep> filter_steps;
 	std::vector<char> filter_string_consts;
 	if (!LowerScanFilters(rewritten_filters,
+						  &node.outputs,
+						  node.cols,
+						  filter_schema,
+						  filter_inputs,
+						  filter_exprs,
+						  filter_steps,
+						  filter_string_consts))
+		return false;
+
+	auto filter_op = std::make_unique<PipelineFilter>(
+		input_schema_dp,
+		PgVector<FilterInputDesc>(filter_inputs.begin(), filter_inputs.end()),
+		PgVector<FilterExprDesc>(filter_exprs.begin(), filter_exprs.end()),
+		PgVector<FilterStep>(filter_steps.begin(), filter_steps.end()),
+		PgVector<char>(filter_string_consts.begin(), filter_string_consts.end()));
+	filter_op->AddChild(std::move(node.op));
+	node.op = std::move(filter_op);
+	out = std::move(node);
+	return true;
+}
+
+bool
+ApplyPipelineFilters(OptimizerNodeTranslation node,
+					const PhysicalOperator *source_op,
+					const std::vector<Expression *> &filters,
+					PgYaapQueryState *state,
+					OptimizerNodeTranslation &out)
+{
+	if (filters.empty())
+	{
+		out = std::move(node);
+		return true;
+	}
+	if (state == nullptr || state->runtime_dsa == nullptr || node.op == nullptr)
+		return false;
+
+	std::vector<ColumnSchema> filter_schema = node.schema;
+	for (ColumnSchema &col : filter_schema)
+	{
+		if (col.src_attno <= 0)
+			col.src_attno = static_cast<int16_t>(col.chunk_slot + 1);
+	}
+
+	std::vector<std::unique_ptr<Expression>> rewritten_storage;
+	std::vector<Expression *> rewritten_filters;
+	rewritten_storage.reserve(filters.size());
+	rewritten_filters.reserve(filters.size());
+	for (Expression *filter_expr : filters)
+	{
+		auto rewritten = RewritePipelineFilterExpr(filter_expr, source_op);
+		if (rewritten == nullptr)
+			return false;
+		rewritten_filters.push_back(rewritten.get());
+		rewritten_storage.push_back(std::move(rewritten));
+	}
+
+	dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(node.schema, state->runtime_dsa);
+	if (!DsaPointerIsValid(input_schema_dp))
+		return false;
+
+	std::vector<FilterInputDesc> filter_inputs;
+	std::vector<FilterExprDesc> filter_exprs;
+	std::vector<FilterStep> filter_steps;
+	std::vector<char> filter_string_consts;
+	if (!LowerScanFilters(rewritten_filters,
+						  &node.outputs,
 						  node.cols,
 						  filter_schema,
 						  filter_inputs,
@@ -1088,7 +1284,8 @@ LookupOrAddScanFilterInput(const ColumnSchema &col,
 	for (size_t i = 0; i < inputs.size(); ++i)
 	{
 		if (inputs[i].attno == static_cast<uint16_t>(col.src_attno) &&
-			inputs[i].decode_kind == col.decode_kind)
+			inputs[i].decode_kind == col.decode_kind &&
+			inputs[i].source_decode_kind == col.decode_kind)
 		{
 			out_idx = static_cast<uint16_t>(i);
 			return true;
@@ -1096,12 +1293,66 @@ LookupOrAddScanFilterInput(const ColumnSchema &col,
 	}
 	if (inputs.size() >= pg_yaap::pipeline::FILTER_MAX_INPUTS || col.src_attno <= 0)
 		return false;
+	uint8_t numeric_scale = 0;
+	if (col.decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+	{
+		int8_t scale = 0;
+		if (!ColumnNumericScale(col, scale))
+			return false;
+		numeric_scale = static_cast<uint8_t>(std::max<int>(0, scale));
+	}
 	out_idx = static_cast<uint16_t>(inputs.size());
 	inputs.push_back(FilterInputDesc{
 		static_cast<uint16_t>(col.src_attno),
 		static_cast<uint8_t>(out_idx),
 		col.decode_kind,
+		col.decode_kind,
+		numeric_scale,
 		0});
+	return true;
+}
+
+bool
+LookupOrAddScanFilterInputAs(const ColumnSchema &col,
+							 ColumnDecodeKind target_decode_kind,
+							 uint8_t target_numeric_scale,
+							 std::vector<FilterInputDesc> &inputs,
+							 uint16_t &out_idx)
+{
+	if (col.src_attno <= 0 || inputs.size() >= pg_yaap::pipeline::FILTER_MAX_INPUTS)
+		return false;
+
+	FilterInputDesc desc{
+		static_cast<uint16_t>(col.src_attno),
+		0,
+		target_decode_kind,
+		col.decode_kind,
+		target_numeric_scale,
+		0};
+	if (target_decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
+		col.decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+	{
+		int8_t scale = 0;
+		if (!ColumnNumericScale(col, scale))
+			return false;
+		desc.numeric_scale = static_cast<uint8_t>(std::max<int>(0, scale));
+	}
+
+	for (size_t i = 0; i < inputs.size(); ++i)
+	{
+		const auto &existing = inputs[i];
+		if (existing.attno == desc.attno &&
+			existing.decode_kind == desc.decode_kind &&
+			existing.source_decode_kind == desc.source_decode_kind &&
+			existing.numeric_scale == desc.numeric_scale)
+		{
+			out_idx = static_cast<uint16_t>(i);
+			return true;
+		}
+	}
+	desc.dst_col = static_cast<uint8_t>(inputs.size());
+	out_idx = static_cast<uint16_t>(inputs.size());
+	inputs.push_back(desc);
 	return true;
 }
 

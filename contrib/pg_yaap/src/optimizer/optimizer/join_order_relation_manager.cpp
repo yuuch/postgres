@@ -22,9 +22,7 @@ bool IsReorderableJoinNode(LogicalOperator* op) {
     if (op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
         return true;
     }
-    if (op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-        op->type != LogicalOperatorType::LOGICAL_DEPENDENT_JOIN &&
-        op->type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+    if (op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
         return false;
     }
     auto* join = static_cast<LogicalComparisonJoin*>(op);

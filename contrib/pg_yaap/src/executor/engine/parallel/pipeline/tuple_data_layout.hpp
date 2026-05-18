@@ -76,7 +76,7 @@ enum class TdcColumnKind : uint8_t {
  *                accumulator is int64; PhysicalHashAggregate first deduplicates
  *                distinct keys, then update/combine are the same as COUNT_NONNULL.
  *
- * TODO(Q3+): MIN/MAX (need direction tag), AVG (sum+count pair), STRING_AGG.
+ * TODO(Q3+): AVG (sum+count pair), STRING_AGG.
  */
 enum class TdcAggKind : uint8_t {
 	SUM_INT64    = 0,
@@ -87,6 +87,8 @@ enum class TdcAggKind : uint8_t {
 	AVG_NUMERIC  = 5,
 	MIN_INT64    = 6,
 	MIN_NUMERIC  = 7,
+	MAX_INT64    = 8,
+	MAX_NUMERIC  = 9,
 };
 
 /*

@@ -191,6 +191,16 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 				delta.counts[a] = 1;
 				break;
 			}
+			case TdcAggKind::MAX_INT64:
+			case TdcAggKind::MAX_NUMERIC:
+			{
+				Assert(agg.src_col_idx < 16);
+				const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
+				if (delta.counts[a] == 0 || value > delta.values[a])
+					delta.values[a] = value;
+				delta.counts[a] = 1;
+				break;
+			}
 		}
 	}
 }
@@ -220,6 +230,15 @@ ApplyAggDelta(const TupleDataLayout *layout, const AggDelta &delta)
 				{
 					int64_t current = ReadInt64At(delta.row_ptr, agg.offset);
 					if (current == INT64_MAX || delta.values[a] < current)
+						std::memcpy(delta.row_ptr + agg.offset, &delta.values[a], sizeof(int64_t));
+				}
+				break;
+			case TdcAggKind::MAX_INT64:
+			case TdcAggKind::MAX_NUMERIC:
+				if (delta.counts[a] != 0)
+				{
+					int64_t current = ReadInt64At(delta.row_ptr, agg.offset);
+					if (current == INT64_MIN || delta.values[a] > current)
 						std::memcpy(delta.row_ptr + agg.offset, &delta.values[a], sizeof(int64_t));
 				}
 				break;
@@ -395,6 +414,11 @@ ScatterGroupOnly(const TupleDataLayout *layout,
 		{
 			const int64_t init_min = INT64_MAX;
 			std::memcpy(row_ptr + agg.offset, &init_min, sizeof(int64_t));
+		}
+		else if (agg.kind == TdcAggKind::MAX_INT64 || agg.kind == TdcAggKind::MAX_NUMERIC)
+		{
+			const int64_t init_max = INT64_MIN;
+			std::memcpy(row_ptr + agg.offset, &init_max, sizeof(int64_t));
 		}
 	}
 }
@@ -1037,6 +1061,16 @@ UpdateAggregates(const TupleDataLayout *layout,
 				std::memcpy(row_ptr + agg.offset, &value, sizeof(int64_t));
 			break;
 		}
+		case TdcAggKind::MAX_INT64:
+		case TdcAggKind::MAX_NUMERIC:
+		{
+			Assert(agg.src_col_idx < 16);
+			const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
+			const int64_t current = ReadInt64At(row_ptr, agg.offset);
+			if (current == INT64_MIN || value > current)
+				std::memcpy(row_ptr + agg.offset, &value, sizeof(int64_t));
+			break;
+		}
 	}
 }
 }
@@ -1106,6 +1140,15 @@ CombineAggregates(const TupleDataLayout *layout,
 				const int64_t src = ReadInt64At(src_row, agg.offset);
 				const int64_t dst = ReadInt64At(dst_row, agg.offset);
 				if (dst == INT64_MAX || src < dst)
+					std::memcpy(dst_row + agg.offset, &src, sizeof(int64_t));
+				break;
+			}
+			case TdcAggKind::MAX_INT64:
+			case TdcAggKind::MAX_NUMERIC:
+			{
+				const int64_t src = ReadInt64At(src_row, agg.offset);
+				const int64_t dst = ReadInt64At(dst_row, agg.offset);
+				if (dst == INT64_MIN || src > dst)
 					std::memcpy(dst_row + agg.offset, &src, sizeof(int64_t));
 				break;
 			}

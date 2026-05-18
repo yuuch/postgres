@@ -44,6 +44,15 @@ GetSingleDistinctCountAgg(const TupleDataLayout *layout, uint16_t *out_idx = nul
 	return false;
 }
 
+static bool
+IsSingleStateAggregate(const TupleDataLayout *layout)
+{
+	return layout != nullptr &&
+		layout->column_count == 0 &&
+		layout->aggregate_count > 0 &&
+		!GetSingleDistinctCountAgg(layout);
+}
+
 static void
 CopyTdcRow(const TupleDataLayout *layout,
 	       const TupleDataCollection *src_tdc,
@@ -249,6 +258,57 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 			update_rows.data(),
 			update_count);
 	}
+}
+
+static void
+SinkChunkSingleState(ExecCtx &ctx,
+                     HashAggLocalSinkState &local,
+                     PipelineChunk &in)
+{
+	Assert(IsSingleStateAggregate(local.layout));
+
+	if (in.count == 0)
+		return;
+
+	HashAggPartition &part = local.local_partitions[0];
+	TupleDataCollection *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+	if (tdc == nullptr)
+		elog(ERROR, "pg_yaap: single-state hash aggregate TDC missing");
+
+	const uint32_t row_count = pg_atomic_read_u32(&tdc->row_count);
+	if (row_count > 1)
+		elog(ERROR,
+			 "pg_yaap: single-state hash aggregate produced %u rows",
+			 row_count);
+
+	if (row_count == 0)
+	{
+		uint8_t *row_ptr = nullptr;
+		const uint32_t row_idx = TupleDataCollectionAppendRow(tdc, &row_ptr);
+		if (row_idx == TDC_INVALID_ROW_INDEX || row_ptr == nullptr)
+			elog(ERROR, "pg_yaap: single-state hash aggregate row allocation failed");
+		ScatterGroupOnly(local.layout, tdc, row_ptr, in, 0);
+	}
+
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> canonical_rows{};
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> row_indices;
+	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+	{
+		if (PipelineCancelRequestedEvery(ctx, row_idx))
+			return;
+		row_indices[row_idx] = row_idx;
+	}
+
+	tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+	if (tdc == nullptr)
+		elog(ERROR, "pg_yaap: single-state hash aggregate TDC missing");
+	UpdateAggregatesGather(local.layout,
+		tdc->rows,
+		tdc->row_width,
+		canonical_rows.data(),
+		in,
+		row_indices.data(),
+		in.count);
 }
 
 static void
@@ -827,8 +887,12 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		const uint32_t perfect_capacity = PerfectHashCapacityFromDescriptor();
 		const bool use_perfect_hash = perfect_capacity > 0 &&
 			CanEncodePerfectHashLayout(state->layout);
+		const bool use_single_state = !use_perfect_hash &&
+			IsSingleStateAggregate(state->layout);
 		const uint32_t workers = static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
-		state->partition_count = use_perfect_hash ? 1u :
+		if (use_single_state)
+			state->max_groups = 1;
+		state->partition_count = (use_perfect_hash || use_single_state) ? 1u :
 			HashAggChoosePartitionCount(workers, state->layout->row_width);
 		const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
 
@@ -909,7 +973,7 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	{
 		state->partition_count = 1;
 		state->partition_mask = 0;
-		state->partition_shift = 64;
+		state->partition_shift = 0;
 		state->perfect_row_indices.assign(state->perfect_capacity, TDC_INVALID_ROW_INDEX);
 	}
 	const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
@@ -969,6 +1033,11 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 	}
 	if (local.has_distinct_count)
 		return SinkChunkDistinctCount(ctx, local, in);
+	if (IsSingleStateAggregate(local.layout))
+	{
+		SinkChunkSingleState(ctx, local, in);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 
 	std::array<uint64_t, PIPELINE_DEFAULT_CHUNK_SIZE> hashes;
 	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> partitions;

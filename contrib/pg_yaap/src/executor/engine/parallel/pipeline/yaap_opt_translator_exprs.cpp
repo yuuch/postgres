@@ -842,6 +842,18 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 	if (bare_arg != nullptr)
 	{
 		is_bare_ref = LookupNamedExprInputColumn(bare_arg, input_outputs, cols, schema, bare_ref, bare_col);
+		if (!is_bare_ref && input_outputs != nullptr)
+		{
+			const size_t ordinal = bare_arg->binding.column_index.index;
+			if (ordinal < input_outputs->size() &&
+				ordinal < cols.size() &&
+				ordinal < schema.size())
+			{
+				bare_ref = cols[ordinal];
+				bare_col = &schema[ordinal];
+				is_bare_ref = true;
+			}
+		}
 		if (pg_yaap_trace_hooks && agg->is_distinct)
 		{
 			elog(LOG,
@@ -1001,6 +1013,36 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 		}
 		out_kind = intlike_expr ? TdcAggKind::MIN_INT64 : TdcAggKind::MIN_NUMERIC;
 	}
+	else if (pg_strcasecmp(agg->function_name.c_str(), "max") == 0)
+	{
+		Oid arg_type_oid = InvalidOid;
+		int32 arg_typmod = -1;
+		int8_t arg_scale = 0;
+		const bool intlike_expr =
+			InferProjectionExprSchema(arg, cols, schema, arg_type_oid, arg_typmod, arg_scale) &&
+			arg_scale == 0 &&
+			(arg_type_oid == BOOLOID || arg_type_oid == INT4OID || arg_type_oid == INT8OID);
+		if (is_bare_ref && bare_col != nullptr &&
+			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 || bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
+		{
+			if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
+			{
+				if (next_int64_slot >= 16)
+					return false;
+				const uint16_t first = static_cast<uint16_t>(project_steps.size());
+				const uint8_t cast_slot = next_int64_slot++;
+				project_steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, bare_col->chunk_slot, 0, cast_slot, 0});
+				project_exprs.push_back(ProjectExprDesc{first, 1, cast_slot, 0, 0});
+				materialized_exprs.push_back(MaterializedOptExpr{arg, 0, cast_slot});
+				out_desc.input_col_idx = cast_slot;
+			}
+			else
+				out_desc.input_col_idx = bare_col->chunk_slot;
+			out_kind = TdcAggKind::MAX_INT64;
+			return true;
+		}
+		out_kind = intlike_expr ? TdcAggKind::MAX_INT64 : TdcAggKind::MAX_NUMERIC;
+	}
 	else
 		return false;
 
@@ -1121,6 +1163,7 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 			case TdcAggKind::COUNT_DISTINCT_NONNULL:
 			case TdcAggKind::SUM_INT64:
 			case TdcAggKind::MIN_INT64:
+			case TdcAggKind::MAX_INT64:
 				cs.type_oid = INT8OID;
 				cs.typmod = -1;
 				cs.typlen = 8;
@@ -1130,6 +1173,7 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 			case TdcAggKind::SUM_NUMERIC:
 			case TdcAggKind::AVG_NUMERIC:
 			case TdcAggKind::MIN_NUMERIC:
+			case TdcAggKind::MAX_NUMERIC:
 				cs.type_oid = NUMERICOID;
 				cs.typmod = MakeNumericTypmod(18, agg_state.agg_numeric_scales[i]);
 				cs.typlen = -1;

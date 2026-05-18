@@ -583,7 +583,7 @@ BuildFilterDeformProgram(const FilterInputDesc *inputs,
 			return false;
 
 		DeformDecodeKind kind;
-		switch (input.decode_kind)
+		switch (input.source_decode_kind)
 		{
 			case ColumnDecodeKind::INT32_CHAR: kind = DeformDecodeKind::kBpchar1; break;
 			case ColumnDecodeKind::INT32_DATE: kind = DeformDecodeKind::kDate32; break;
@@ -1112,6 +1112,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			const bool profile_on = PipelineProfileEnabled(ctx);
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(qual_deform_start);
+			local.filter_chunk->reset();
 			local.filter_deformer->deform_tuple_header(tuple.t_data, 0, filter_bindings);
 			if (profile_on)
 			{

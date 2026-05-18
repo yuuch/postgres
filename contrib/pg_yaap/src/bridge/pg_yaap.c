@@ -7,9 +7,11 @@
 #include "executor/executor.h"
 #include "jit/jit.h"
 #include "optimizer/planner.h"
+#include "parser/scansup.h"
 #include "storage/dsm_registry.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "tcop/utility.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
 
@@ -24,6 +26,7 @@
 PG_MODULE_MAGIC;
 
 static planner_hook_type prev_planner_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static ExplainOneQuery_hook_type prev_ExplainOneQuery = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
@@ -48,6 +51,7 @@ bool pg_yaap_parallel_experimental_hash_pipeline = false;
 bool pg_yaap_disable_jit_for_parallel_worker = false;
 bool pg_yaap_profile = false;
 char pg_yaap_bgworker_library_path[MAXPGPATH] = "pg_yaap";
+static int pg_yaap_utility_nesting = 0;
 
 static PlannedStmt *pg_yaap_planner_hook(Query *parse, const char *query_string,
 										 int cursorOptions, ParamListInfo boundParams,
@@ -65,6 +69,28 @@ static void pg_yaap_ExecutorFinish(QueryDesc *queryDesc);
 static void pg_yaap_ExecutorEnd(QueryDesc *queryDesc);
 static PlannedStmt *pg_yaap_build_plannedstmt(Query *parse);
 static void pg_yaap_start_optimizer_executor(QueryDesc *queryDesc, int eflags);
+static void pg_yaap_ProcessUtility(PlannedStmt *pstmt,
+									  const char *queryString,
+									  bool readOnlyTree,
+									  ProcessUtilityContext context,
+									  ParamListInfo params,
+									  QueryEnvironment *queryEnv,
+									  DestReceiver *dest,
+									  QueryCompletion *qc);
+
+static bool
+pg_yaap_optimizer_bundle_has_tupdesc(void *optimizer_bundle)
+{
+	TupleDesc	tupdesc;
+
+	if (optimizer_bundle == NULL)
+		return false;
+	tupdesc = pg_yaap_build_optimizer_tupdesc(optimizer_bundle);
+	if (tupdesc == NULL)
+		return false;
+	FreeTupleDesc(tupdesc);
+	return true;
+}
 
 extern int pg_yaap_runtime_dsa_tranche_id(void);
 extern void pg_yaap_proc_exit_release_jit_contexts(int code, Datum arg);
@@ -111,6 +137,37 @@ pg_yaap_plan_node_name(Plan *plan)
 	if (IsA(plan, Hash))
 		return "Hash";
 	return "Other";
+}
+
+static bool
+pg_yaap_query_string_starts_with(const char *query_string, const char *keyword)
+{
+	size_t		i;
+
+	if (query_string == NULL || keyword == NULL)
+		return false;
+
+	while (*query_string != '\0' && scanner_isspace((unsigned char) *query_string))
+		query_string++;
+
+	for (i = 0; keyword[i] != '\0'; ++i)
+	{
+		if (query_string[i] == '\0')
+			return false;
+		if (pg_ascii_tolower((unsigned char) query_string[i]) !=
+			pg_ascii_tolower((unsigned char) keyword[i]))
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+pg_yaap_skip_optimizer_for_query_string(const char *query_string)
+{
+	return pg_yaap_query_string_starts_with(query_string, "create") ||
+		pg_yaap_query_string_starts_with(query_string, "drop") ||
+		pg_yaap_query_string_starts_with(query_string, "alter");
 }
 
 static void
@@ -279,6 +336,9 @@ _PG_init(void)
 	prev_planner_hook = planner_hook;
 	planner_hook = pg_yaap_planner_hook;
 
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = pg_yaap_ProcessUtility;
+
 	prev_ExplainOneQuery = ExplainOneQuery_hook;
 	ExplainOneQuery_hook = pg_yaap_ExplainOneQuery;
 
@@ -299,6 +359,7 @@ void
 _PG_fini(void)
 {
 	planner_hook = prev_planner_hook;
+	ProcessUtility_hook = prev_ProcessUtility;
 	ExplainOneQuery_hook = prev_ExplainOneQuery;
 	ExecutorStart_hook = prev_ExecutorStart;
 	ExecutorRun_hook = prev_ExecutorRun;
@@ -322,6 +383,20 @@ pg_yaap_planner_hook(Query *parse, const char *query_string,
 		return standard_planner(parse, query_string, cursorOptions, boundParams, es);
 	}
 
+	if (pg_yaap_utility_nesting > 0)
+	{
+		if (prev_planner_hook)
+			return prev_planner_hook(parse, query_string, cursorOptions, boundParams, es);
+		return standard_planner(parse, query_string, cursorOptions, boundParams, es);
+	}
+
+	if (pg_yaap_skip_optimizer_for_query_string(query_string))
+	{
+		if (prev_planner_hook)
+			return prev_planner_hook(parse, query_string, cursorOptions, boundParams, es);
+		return standard_planner(parse, query_string, cursorOptions, boundParams, es);
+	}
+
 	if (pg_yaap_enabled && parse != NULL && parse->commandType == CMD_SELECT)
 		(void) pg_yaap_try_build_optimizer_plan(parse, &optimizer_bundle);
 
@@ -336,6 +411,33 @@ pg_yaap_planner_hook(Query *parse, const char *query_string,
 		return prev_planner_hook(parse, query_string, cursorOptions, boundParams, es);
 	result = standard_planner(parse, query_string, cursorOptions, boundParams, es);
 	return result;
+}
+
+static void
+pg_yaap_ProcessUtility(PlannedStmt *pstmt,
+						 const char *queryString,
+						 bool readOnlyTree,
+						 ProcessUtilityContext context,
+						 ParamListInfo params,
+						 QueryEnvironment *queryEnv,
+						 DestReceiver *dest,
+						 QueryCompletion *qc)
+{
+	pg_yaap_utility_nesting++;
+	PG_TRY();
+	{
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+		pg_yaap_utility_nesting--;
+	}
+	PG_CATCH();
+	{
+		pg_yaap_utility_nesting--;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static void
@@ -487,9 +589,12 @@ static void
 pg_yaap_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	PgYaapQueryState *state;
+	void *optimizer_bundle = queryDesc != NULL && queryDesc->plannedstmt != NULL ?
+		pg_yaap_lookup_optimizer_plan(queryDesc->plannedstmt) : NULL;
 	bool optimizer_only = queryDesc != NULL &&
 		queryDesc->plannedstmt != NULL &&
-		pg_yaap_lookup_optimizer_plan(queryDesc->plannedstmt) != NULL;
+		optimizer_bundle != NULL &&
+		pg_yaap_optimizer_bundle_has_tupdesc(optimizer_bundle);
 	Plan *plan = queryDesc != NULL && queryDesc->plannedstmt != NULL ?
 		queryDesc->plannedstmt->planTree : NULL;
 

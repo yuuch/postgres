@@ -184,7 +184,9 @@ struct FilterInputDesc {
 	uint16_t         attno;
 	uint8_t          dst_col;
 	ColumnDecodeKind decode_kind;
-	uint16_t         _pad0;
+	ColumnDecodeKind source_decode_kind;
+	uint8_t          numeric_scale;
+	uint8_t          _pad0;
 };
 
 struct FilterExprDesc {

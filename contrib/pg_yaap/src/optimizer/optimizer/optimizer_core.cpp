@@ -262,6 +262,7 @@ std::unique_ptr<LogicalOperator> LogicalOptimizer::Optimize(std::unique_ptr<Logi
 
     FilterPushdown filter_pushdown;
     RunOptimizer(OptimizerPass::FILTER_PUSHDOWN, filter_pushdown, plan);
+    RunOptimizer(OptimizerPass::JOIN_PREDICATE_EXTRACTION, join_predicate_extraction, plan);
 
     PredicatePropagation predicate_propagation;
     RunOptimizer(OptimizerPass::PREDICATE_PROPAGATION, predicate_propagation, plan);

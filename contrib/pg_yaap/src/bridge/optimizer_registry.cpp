@@ -86,7 +86,8 @@ pg_yaap_try_build_optimizer_plan(Query *parse, void **out_bundle)
 	catch (const std::exception &e)
 	{
 		const std::string message = e.what() != nullptr ? e.what() : "";
-		if (message.rfind("Unsupported query shape:", 0) == 0)
+		if (message.rfind("Unsupported query shape:", 0) == 0 ||
+			message.rfind("Unsupported ", 0) == 0)
 			return false;
 		ereport(ERROR,
 				(errmsg("pg_yaap: optimizer failed: %s", e.what())));

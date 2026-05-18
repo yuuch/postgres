@@ -203,7 +203,19 @@ LookupProjectionInputColumn(const BoundColumnRefExpression *expr,
 	if (expr == nullptr)
 		return false;
 
-	return LookupNamedExprInputColumn(expr, outputs, cols, schema, out_ref, out_col);
+	if (LookupNamedExprInputColumn(expr, outputs, cols, schema, out_ref, out_col))
+		return true;
+	if (outputs != nullptr)
+	{
+		const size_t ordinal = expr->binding.column_index.index;
+		if (ordinal < outputs->size() && ordinal < cols.size() && ordinal < schema.size())
+		{
+			out_ref = cols[ordinal];
+			out_col = &schema[ordinal];
+			return true;
+		}
+	}
+	return false;
 }
 
 static bool
@@ -768,18 +780,49 @@ TranslateTableScanNode(const PhysicalTableScan &scan,
 	std::vector<Expression *> filters = scan.filters;
 	filters.insert(filters.end(), pending_filters.begin(), pending_filters.end());
 
+	std::vector<ColumnRef> visible_cols = all_cols;
+	std::vector<ColumnSchema> visible_schema = ordered_cols;
+	if (required_output_cols != nullptr && !required_output_cols->empty())
+	{
+		std::vector<ColumnRef> pruned_cols;
+		std::vector<ColumnSchema> pruned_schema;
+		pruned_cols.reserve(required_output_cols->size());
+		pruned_schema.reserve(required_output_cols->size());
+		const Index scan_varno = static_cast<Index>(scan.table_index.index + 1);
+		for (const ColumnRef &required : *required_output_cols)
+		{
+			if (required.varno != scan_varno)
+				continue;
+			for (size_t i = 0; i < all_cols.size() && i < ordered_cols.size(); ++i)
+			{
+				if (!SameColumnRef(required, all_cols[i]))
+					continue;
+				const size_t before = pruned_cols.size();
+				AppendUniqueColumnRef(all_cols[i], pruned_cols);
+				if (pruned_cols.size() != before)
+					pruned_schema.push_back(ordered_cols[i]);
+				break;
+			}
+		}
+		if (!pruned_cols.empty() && pruned_cols.size() == pruned_schema.size())
+		{
+			visible_cols = std::move(pruned_cols);
+			visible_schema = std::move(pruned_schema);
+		}
+	}
+
 	std::vector<FilterInputDesc> filter_inputs;
 	std::vector<FilterExprDesc> filter_exprs;
 	std::vector<FilterStep> filter_steps;
 	std::vector<char> filter_string_consts;
-	if (!LowerScanFilters(filters, all_cols, ordered_cols, filter_inputs, filter_exprs, filter_steps, filter_string_consts))
+	if (!LowerScanFilters(filters, &scan.outputs, all_cols, ordered_cols, filter_inputs, filter_exprs, filter_steps, filter_string_consts))
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer scan rejected: filter lowering failed n_filters=%zu", filters.size());
 		return false;
 	}
 
-	dsa_pointer output_schema_dp = BuildSchemaDescriptorFromColumns(ordered_cols, state->runtime_dsa);
+	dsa_pointer output_schema_dp = BuildSchemaDescriptorFromColumns(visible_schema, state->runtime_dsa);
 	dsa_pointer filter_inputs_dp = BuildFilterArray(state->runtime_dsa, filter_inputs.data(), sizeof(FilterInputDesc), filter_inputs.size());
 	dsa_pointer filter_exprs_dp = BuildFilterArray(state->runtime_dsa, filter_exprs.data(), sizeof(FilterExprDesc), filter_exprs.size());
 	dsa_pointer filter_steps_dp = BuildFilterArray(state->runtime_dsa, filter_steps.data(), sizeof(FilterStep), filter_steps.size());
@@ -805,8 +848,8 @@ TranslateTableScanNode(const PhysicalTableScan &scan,
 		static_cast<uint16_t>(std::min<size_t>(pg_yaap::pipeline::FILTER_MAX_BOOL_REGS, filter_exprs.size() ? filter_steps.back().out_bool_reg + 1 : 0)),
 		static_cast<uint32_t>(filter_string_consts.size()),
 		InvalidDsaPointer);
-	out.cols = std::move(all_cols);
-	out.schema = std::move(ordered_cols);
+	out.cols = std::move(visible_cols);
+	out.schema = std::move(visible_schema);
 	out.outputs.clear();
 	out.outputs.reserve(out.cols.size());
 	const Index scan_varno = static_cast<Index>(scan.table_index.index + 1);

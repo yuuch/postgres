@@ -388,6 +388,8 @@ HashAggPartitionIndex(uint64_t hash, uint32_t partition_mask)
 uint32_t
 HashAggPartitionShift(uint32_t partition_mask)
 {
+	if (partition_mask == 0)
+		return 0;
 	uint32_t bits = 0;
 	uint32_t tmp = partition_mask;
 	while (tmp != 0)
@@ -688,6 +690,11 @@ AggregateHashTableCombineRow(AggregateHashTable *aht,
 					{
 						const int64_t init_min = INT64_MAX;
 						std::memcpy(new_row + agg.offset, &init_min, sizeof(int64_t));
+					}
+					else if (agg.kind == TdcAggKind::MAX_INT64 || agg.kind == TdcAggKind::MAX_NUMERIC)
+					{
+						const int64_t init_max = INT64_MIN;
+						std::memcpy(new_row + agg.offset, &init_max, sizeof(int64_t));
 					}
 				}
 				e.value       = PackEntry(our_salt, new_idx);

@@ -460,6 +460,13 @@ LookupOrAddScanFilterInput(const ColumnSchema &col,
 						   uint16_t &out_idx);
 
 bool
+LookupOrAddScanFilterInputAs(const ColumnSchema &col,
+							 ColumnDecodeKind target_decode_kind,
+							 uint8_t target_numeric_scale,
+							 std::vector<FilterInputDesc> &inputs,
+							 uint16_t &out_idx);
+
+bool
 LookupOrAddJoinFilterInput(const ColumnRef &ref,
 						  const std::vector<ColumnRef> &left_cols,
 						  const std::vector<ColumnSchema> &left_schema,
@@ -515,6 +522,7 @@ LowerJoinFilterBoolExpr(const Expression *expr,
 
 bool
 LowerScanFilterCompare(const BoundFunctionExpression *func,
+					   const std::vector<yaap::PhysicalOperator::OutputColumn> *outputs,
 					   const std::vector<ColumnRef> &cols,
 					   const std::vector<ColumnSchema> &schema,
 					   std::vector<FilterInputDesc> &inputs,
@@ -567,6 +575,7 @@ LowerJoinFilterBoolExpr(const Expression *expr,
 
 bool
 LowerScanFilters(const std::vector<Expression *> &filters,
+				 const std::vector<yaap::PhysicalOperator::OutputColumn> *outputs,
 				 const std::vector<ColumnRef> &cols,
 				 const std::vector<ColumnSchema> &schema,
 				 std::vector<FilterInputDesc> &inputs,
@@ -750,6 +759,13 @@ ApplyPostAggregateFilters(OptimizerNodeTranslation node,
 						  const std::vector<Expression *> &pending_filters,
 						  PgYaapQueryState *state,
 						  OptimizerNodeTranslation &out);
+
+bool
+ApplyPipelineFilters(OptimizerNodeTranslation node,
+					const PhysicalOperator *source_op,
+					const std::vector<Expression *> &filters,
+					PgYaapQueryState *state,
+					OptimizerNodeTranslation &out);
 
 bool
 CollectJoinKeys(const Expression *expr,

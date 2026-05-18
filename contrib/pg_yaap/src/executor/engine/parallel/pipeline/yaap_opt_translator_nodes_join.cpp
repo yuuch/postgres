@@ -243,6 +243,141 @@ RewriteAggregateExprToProducedColumn(const BoundAggregateExpression *aggregate_e
 	return nullptr;
 }
 
+static bool IsScalarPhysicalNode(const PhysicalOperator *op);
+
+static bool
+LookupProjectedOutputOrdinalForJoin(const BoundColumnRefExpression *expr,
+									const PhysicalOperator *source_op,
+									size_t &out_idx)
+{
+	if (expr == nullptr || source_op == nullptr)
+		return false;
+	if ((source_op->type == PhysicalOperatorType::FILTER ||
+		 source_op->type == PhysicalOperatorType::ORDER_BY ||
+		 source_op->type == PhysicalOperatorType::LIMIT) &&
+		source_op->children.size() == 1 &&
+		source_op->children[0] != nullptr)
+		return LookupProjectedOutputOrdinalForJoin(expr, source_op->children[0].get(), out_idx);
+	if (source_op->type != PhysicalOperatorType::PROJECTION)
+		return false;
+
+	const auto &projection = static_cast<const PhysicalProjection &>(*source_op);
+	for (size_t idx = 0; idx < projection.select_list.size(); ++idx)
+	{
+		const auto *projected_col =
+			dynamic_cast<const BoundColumnRefExpression *>(projection.select_list[idx]);
+		if (projected_col == nullptr)
+			continue;
+		const bool binding_match =
+			projected_col->binding.table_index.index == expr->binding.table_index.index &&
+			projected_col->binding.column_index.index == expr->binding.column_index.index;
+		const bool name_match =
+			!expr->table_name.empty() &&
+			!expr->column_name.empty() &&
+			projected_col->table_name == expr->table_name &&
+			projected_col->column_name == expr->column_name;
+		if (!binding_match && !name_match)
+			continue;
+		out_idx = idx;
+		return true;
+	}
+	return false;
+}
+
+static bool
+TryResolveAggregateGroupOutputBinding(const BoundColumnRefExpression *expr,
+									  const PhysicalOperator *source_op,
+									  yaap::ColumnBinding &out_binding,
+									  std::string &out_table_name,
+									  std::string &out_column_name)
+{
+	if (expr == nullptr || source_op == nullptr)
+		return false;
+	if ((source_op->type == PhysicalOperatorType::FILTER ||
+		 source_op->type == PhysicalOperatorType::PROJECTION ||
+		 source_op->type == PhysicalOperatorType::ORDER_BY ||
+		 source_op->type == PhysicalOperatorType::LIMIT) &&
+		source_op->children.size() == 1 &&
+		source_op->children[0] != nullptr)
+		return TryResolveAggregateGroupOutputBinding(expr,
+													 source_op->children[0].get(),
+													 out_binding,
+													 out_table_name,
+													 out_column_name);
+	if (source_op->type != PhysicalOperatorType::HASH_GROUP_BY)
+		return false;
+
+	const auto *aggregate = static_cast<const PhysicalHashAggregate *>(source_op);
+	for (size_t idx = 0; idx < aggregate->groups.size() && idx < aggregate->outputs.size(); ++idx)
+	{
+		const auto *group_col = dynamic_cast<const BoundColumnRefExpression *>(aggregate->groups[idx]);
+		if (group_col == nullptr)
+			continue;
+		const bool binding_match =
+			group_col->binding.table_index.index == expr->binding.table_index.index &&
+			group_col->binding.column_index.index == expr->binding.column_index.index;
+		const bool name_match =
+			!expr->table_name.empty() &&
+			!expr->column_name.empty() &&
+			group_col->table_name == expr->table_name &&
+			group_col->column_name == expr->column_name;
+		if (!binding_match && !name_match)
+			continue;
+		out_binding = aggregate->outputs[idx].binding;
+		out_table_name = aggregate->outputs[idx].table_name;
+		out_column_name = aggregate->outputs[idx].column_name;
+		return true;
+	}
+	if (source_op->children.size() == 1 && source_op->children[0] != nullptr)
+	{
+		size_t projected_idx = 0;
+		if (LookupProjectedOutputOrdinalForJoin(expr, source_op->children[0].get(), projected_idx) &&
+			projected_idx < aggregate->groups.size() &&
+			projected_idx < aggregate->outputs.size())
+		{
+			out_binding = aggregate->outputs[projected_idx].binding;
+			out_table_name = aggregate->outputs[projected_idx].table_name;
+			out_column_name = aggregate->outputs[projected_idx].column_name;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+TryResolveOutputOrdinalBinding(const BoundColumnRefExpression *expr,
+							   const PhysicalOperator *source_op,
+							   yaap::ColumnBinding &out_binding,
+							   std::string &out_table_name,
+							   std::string &out_column_name)
+{
+	if (expr == nullptr || source_op == nullptr)
+		return false;
+	if ((source_op->type == PhysicalOperatorType::FILTER ||
+		 source_op->type == PhysicalOperatorType::PROJECTION ||
+		 source_op->type == PhysicalOperatorType::ORDER_BY ||
+		 source_op->type == PhysicalOperatorType::LIMIT) &&
+		source_op->children.size() == 1 &&
+		source_op->children[0] != nullptr)
+		return TryResolveOutputOrdinalBinding(expr,
+											 source_op->children[0].get(),
+											 out_binding,
+											 out_table_name,
+											 out_column_name);
+	if (source_op->type != PhysicalOperatorType::HASH_GROUP_BY &&
+		source_op->type != PhysicalOperatorType::PROJECTION &&
+		source_op->type != PhysicalOperatorType::WINDOW &&
+		source_op->type != PhysicalOperatorType::SET_OPERATION)
+		return false;
+	const size_t ordinal = expr->binding.column_index.index;
+	if (ordinal >= source_op->outputs.size())
+		return false;
+	out_binding = source_op->outputs[ordinal].binding;
+	out_table_name = source_op->outputs[ordinal].table_name;
+	out_column_name = source_op->outputs[ordinal].column_name;
+	return true;
+}
+
 static std::unique_ptr<Expression>
 RewriteJoinResidualAggregateRefs(const Expression *expr,
 								 const PhysicalOperator *left_source_op,
@@ -256,12 +391,40 @@ RewriteJoinResidualAggregateRefs(const Expression *expr,
 		{
 			const auto *column = static_cast<const BoundColumnRefExpression *>(expr);
 			yaap::ColumnBinding resolved_binding = column->binding;
+			std::string resolved_table_name = column->table_name;
+			std::string resolved_column_name = column->column_name;
 			if (!ResolveOutputBinding(column, left_source_op, resolved_binding))
-				(void) ResolveOutputBinding(column, right_source_op, resolved_binding);
+			{
+				if (!ResolveOutputBinding(column, right_source_op, resolved_binding))
+				{
+					if (!TryResolveAggregateGroupOutputBinding(column,
+															  left_source_op,
+															  resolved_binding,
+															  resolved_table_name,
+															  resolved_column_name) &&
+						!TryResolveAggregateGroupOutputBinding(column,
+															   right_source_op,
+															   resolved_binding,
+															   resolved_table_name,
+															   resolved_column_name))
+					{
+						if (!TryResolveOutputOrdinalBinding(column,
+															left_source_op,
+															resolved_binding,
+															resolved_table_name,
+															resolved_column_name))
+							(void) TryResolveOutputOrdinalBinding(column,
+																 right_source_op,
+																 resolved_binding,
+																 resolved_table_name,
+																 resolved_column_name);
+					}
+				}
+			}
 			return std::make_unique<BoundColumnRefExpression>(
 				resolved_binding,
-				column->table_name,
-				column->column_name);
+				std::move(resolved_table_name),
+				std::move(resolved_column_name));
 		}
 		case ExpressionType::BOUND_CONSTANT:
 		{
@@ -475,6 +638,20 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		for (const ColumnRef &ref : *required_output_cols)
 			AppendUniqueColumnRef(ref, output_required_cols);
 	}
+	if (!semi_or_anti_join && required_output_cols == nullptr)
+	{
+		for (const auto &output : join.children[0]->outputs)
+			AppendUniqueColumnRef(BindingToColumnRef(output.binding), left_required_cols);
+		for (const auto &output : join.children[1]->outputs)
+			AppendUniqueColumnRef(BindingToColumnRef(output.binding), right_required_cols);
+	}
+	const bool left_child_scalar = join.children[0] != nullptr && IsScalarPhysicalNode(join.children[0].get());
+	const bool right_child_scalar = join.children[1] != nullptr && IsScalarPhysicalNode(join.children[1].get());
+	if (left_child_scalar || right_child_scalar)
+	{
+		left_required_cols.clear();
+		right_required_cols.clear();
+	}
 
 	auto translate_children = [&](const std::vector<Expression *> &left_filters,
 								  const std::vector<Expression *> &right_filters,
@@ -665,7 +842,13 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		right_keys.empty() &&
 		!residuals.empty() &&
 		(left_rows == 1 || right_rows == 1 || left_scalar || right_scalar);
-	if ((!scalar_residual_join && left_keys.empty()) || left_keys.size() != right_keys.size())
+	const bool scalar_zero_key_join =
+		(join.join_type == yaap::JOIN_INNER || scalar_delim_join) &&
+		left_keys.empty() &&
+		right_keys.empty() &&
+		residuals.empty() &&
+		(left_rows == 1 || right_rows == 1 || left_scalar || right_scalar);
+	if ((!scalar_residual_join && !scalar_zero_key_join && left_keys.empty()) || left_keys.size() != right_keys.size())
 	{
 		if (pg_yaap_trace_hooks)
 		{
@@ -717,6 +900,13 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 			 left_scalar ? 1 : 0,
 			 right_scalar ? 1 : 0,
 			 residuals.size());
+	if (pg_yaap_trace_hooks && scalar_zero_key_join)
+		elog(LOG,
+			 "pg_yaap: optimizer hash join using zero-key scalar join fallback left_rows=%zu right_rows=%zu left_scalar=%d right_scalar=%d",
+			 left_rows,
+			 right_rows,
+			 left_scalar ? 1 : 0,
+			 right_scalar ? 1 : 0);
 
 	const bool swap_sides = semi_or_anti_join ? right_output_semi_or_anti :
 		(left_outer_join ? false :
@@ -873,6 +1063,31 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		rewritten_residuals.push_back(rewritten != nullptr ? rewritten.get() : expr);
 		rewritten_residual_storage.push_back(std::move(rewritten));
 	}
+	if (pg_yaap_trace_hooks && scalar_residual_join)
+	{
+		for (size_t i = 0; i < rewritten_residuals.size(); ++i)
+		{
+			const auto *func = dynamic_cast<const BoundFunctionExpression *>(rewritten_residuals[i]);
+			if (func == nullptr || func->children.size() != 2)
+				continue;
+			const auto *lhs = dynamic_cast<const BoundColumnRefExpression *>(func->children[0].get());
+			const auto *rhs = dynamic_cast<const BoundColumnRefExpression *>(func->children[1].get());
+			if (lhs == nullptr || rhs == nullptr)
+				continue;
+			elog(LOG,
+				 "pg_yaap: scalar residual[%zu] fn=%s lhs=(%zu,%zu %s.%s) rhs=(%zu,%zu %s.%s)",
+				 i,
+				 func->function_name.c_str(),
+				 lhs->binding.table_index.index,
+				 lhs->binding.column_index.index,
+				 lhs->table_name.c_str(),
+				 lhs->column_name.c_str(),
+				 rhs->binding.table_index.index,
+				 rhs->binding.column_index.index,
+				 rhs->table_name.c_str(),
+				 rhs->column_name.c_str());
+		}
+	}
 	if (!LowerJoinFilters(rewritten_residuals,
 						  probe_source_op,
 						  build_source_op,
@@ -911,6 +1126,14 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		}
 		return false;
 	}
+	if (pg_yaap_trace_hooks && scalar_residual_join)
+		elog(LOG,
+			 "pg_yaap: scalar residual filter counts inputs=%zu exprs=%zu steps=%zu bool_regs=%u residuals=%zu",
+			 filter_inputs.size(),
+			 filter_exprs.size(),
+			 filter_steps.size(),
+			 filter_bool_regs,
+			 rewritten_residuals.size());
 
 	dsa_pointer left_schema_dp = BuildSchemaDescriptorFromColumns(probe_schema, state->runtime_dsa);
 	dsa_pointer right_schema_dp = BuildSchemaDescriptorFromColumns(*build_payload_schema, state->runtime_dsa);
@@ -1025,11 +1248,50 @@ TranslateCrossProductNode(const PhysicalCrossProduct &join,
 			elog(LOG, "pg_yaap: optimizer cross product rejected: child translation failed");
 		return false;
 	}
+	if (pg_yaap_trace_hooks)
+	{
+		for (size_t i = 0; i < left_child.cols.size() && i < left_child.schema.size(); ++i)
+		{
+			const auto *output = i < left_child.outputs.size() ? &left_child.outputs[i] : nullptr;
+			elog(LOG,
+				 "pg_yaap: cross product left output[%zu] col=(%u,%d) binding=(%zu,%zu) name=%s.%s",
+				 i,
+				 left_child.cols[i].varno,
+				 left_child.cols[i].attno,
+				 output != nullptr ? output->binding.table_index.index : 0,
+				 output != nullptr ? output->binding.column_index.index : 0,
+				 output != nullptr ? output->table_name.c_str() : "<none>",
+				 output != nullptr ? output->column_name.c_str() : "<none>");
+		}
+		for (size_t i = 0; i < right_child.cols.size() && i < right_child.schema.size(); ++i)
+		{
+			const auto *output = i < right_child.outputs.size() ? &right_child.outputs[i] : nullptr;
+			elog(LOG,
+				 "pg_yaap: cross product right output[%zu] col=(%u,%d) binding=(%zu,%zu) name=%s.%s",
+				 i,
+				 right_child.cols[i].varno,
+				 right_child.cols[i].attno,
+				 output != nullptr ? output->binding.table_index.index : 0,
+				 output != nullptr ? output->binding.column_index.index : 0,
+				 output != nullptr ? output->table_name.c_str() : "<none>",
+				 output != nullptr ? output->column_name.c_str() : "<none>");
+		}
+	}
 
 	std::vector<ColumnRef> left_keys;
 	std::vector<ColumnRef> right_keys;
 	std::vector<Expression *> residuals;
+	std::vector<std::unique_ptr<Expression>> rewritten_filter_storage;
+	std::vector<Expression *> rewritten_pending_filters;
+	rewritten_filter_storage.reserve(pending_filters.size());
+	rewritten_pending_filters.reserve(pending_filters.size());
 	for (Expression *expr : pending_filters)
+	{
+		auto rewritten = RewriteJoinResidualAggregateRefs(expr, join.children[0].get(), join.children[1].get());
+		rewritten_pending_filters.push_back(rewritten != nullptr ? rewritten.get() : expr);
+		rewritten_filter_storage.push_back(std::move(rewritten));
+	}
+	for (Expression *expr : rewritten_pending_filters)
 	{
 		if (!CollectJoinKeys(expr,
 							 &left_child.outputs,
@@ -1056,6 +1318,17 @@ TranslateCrossProductNode(const PhysicalCrossProduct &join,
 				 right_keys.size(),
 				 residuals.size());
 		return false;
+	}
+	if (pg_yaap_trace_hooks)
+	{
+		for (size_t i = 0; i < left_keys.size() && i < right_keys.size(); ++i)
+			elog(LOG,
+				 "pg_yaap: cross product join key[%zu] left=(%u,%d) right=(%u,%d)",
+				 i,
+				 left_keys[i].varno,
+				 left_keys[i].attno,
+				 right_keys[i].varno,
+				 right_keys[i].attno);
 	}
 
 	const size_t left_rows = join.children[0] != nullptr ? join.children[0]->estimated_cardinality : 0;
@@ -1340,7 +1613,25 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 				return false;
 			std::vector<Expression *> next_filters = pending_filters;
 			next_filters.insert(next_filters.end(), filter.expressions.begin(), filter.expressions.end());
-			return TranslateOptimizerNode(*filter.children[0], queryDesc, state, next_filters, required_output_cols, delim_outer_child, delim_outer_bindings, out);
+			if (filter.children[0]->type == PhysicalOperatorType::TABLE_SCAN ||
+				filter.children[0]->type == PhysicalOperatorType::HASH_GROUP_BY)
+				return TranslateOptimizerNode(*filter.children[0], queryDesc, state, next_filters, required_output_cols, delim_outer_child, delim_outer_bindings, out);
+
+			std::vector<ColumnRef> child_required;
+			if (required_output_cols != nullptr)
+			{
+				for (const ColumnRef &ref : *required_output_cols)
+					AppendUniqueColumnRef(ref, child_required);
+			}
+			for (Expression *expr : next_filters)
+				CollectReferencedColumns(expr, child_required);
+
+			OptimizerNodeTranslation child;
+			const std::vector<ColumnRef> *child_required_ptr =
+				child_required.empty() ? required_output_cols : &child_required;
+			if (!TranslateOptimizerNode(*filter.children[0], queryDesc, state, {}, child_required_ptr, delim_outer_child, delim_outer_bindings, child))
+				return false;
+			return ApplyPipelineFilters(std::move(child), filter.children[0].get(), next_filters, state, out);
 		}
 
 		case PhysicalOperatorType::PROJECTION:

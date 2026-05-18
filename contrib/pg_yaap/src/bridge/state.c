@@ -1,19 +1,30 @@
 #include "postgres.h"
-#include "catalog/catalog.h"
 #include "utils/hsearch.h"
 #include "state.h"
 #include "execute.h"
 #include "optimizer_registry.h"
-#include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
 #include "utils/dsa.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
 struct dsm_segment;
 
 extern bool pg_yaap_trace_hooks;
+
+static bool
+pg_yaap_optimizer_bundle_has_tupdesc(void *optimizer_bundle)
+{
+	TupleDesc	tupdesc;
+
+	if (optimizer_bundle == NULL)
+		return false;
+	tupdesc = pg_yaap_build_optimizer_tupdesc(optimizer_bundle);
+	if (tupdesc == NULL)
+		return false;
+	FreeTupleDesc(tupdesc);
+	return true;
+}
 
 /* Layout MUST match query_state.hpp PgYaapQueryState (C++ mirror). */
 struct PgYaapQueryState
@@ -87,42 +98,6 @@ pg_yaap_close_query_state(PgYaapQueryState *state)
 	pfree(state);
 }
 
-/* 
- * RELAXED VERSION: Support Agg and SeqScan.
- */
-static bool
-plan_uses_supported_relations(Plan *plan, PlannedStmt *plannedstmt)
-{
-	if (plan == NULL)
-		return false;
-
-	if (IsA(plan, SeqScan))
-	{
-		SeqScan *scan = (SeqScan *) plan;
-		RangeTblEntry *rte;
-
-		if (plannedstmt == NULL ||
-			scan->scan.scanrelid <= 0 ||
-			scan->scan.scanrelid > list_length(plannedstmt->rtable))
-			return false;
-		rte = rt_fetch(scan->scan.scanrelid, plannedstmt->rtable);
-		if (rte == NULL || rte->rtekind != RTE_RELATION)
-			return false;
-		if (rte->relid == InvalidOid ||
-			IsCatalogRelationOid(rte->relid) ||
-			IsCatalogNamespace(get_rel_namespace(rte->relid)))
-			return false;
-		return true;
-	}
-
-	if (IsA(plan, SubqueryScan))
-		return ((SubqueryScan *) plan)->subplan != NULL &&
-			   plan_uses_supported_relations(((SubqueryScan *) plan)->subplan, plannedstmt);
-
-	return plan_uses_supported_relations(plan->lefttree, plannedstmt) &&
-		   (plan->righttree == NULL || plan_uses_supported_relations(plan->righttree, plannedstmt));
-}
-
 PgYaapQueryState *
 pg_yaap_try_build_query_state(QueryDesc *queryDesc, int eflags)
 {
@@ -131,14 +106,14 @@ pg_yaap_try_build_query_state(QueryDesc *queryDesc, int eflags)
 	void *optimizer_bundle = pg_yaap_lookup_optimizer_plan(queryDesc->plannedstmt);
 	(void) eflags;
 
-	/*
-	 * Admission here is intentionally broad: PostgreSQL owns planning, and
-	 * pg_yaap decides exact shape support later during VecPlan / parallel
-	 * lowering. At this stage we only fence out plans that never touch
-	 * supported user relations.
-	 */
 	if (optimizer_bundle != NULL)
 	{
+		if (!pg_yaap_optimizer_bundle_has_tupdesc(optimizer_bundle))
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG, "pg_yaap: query state admission rejected because optimizer bundle has no output tuple descriptor");
+			return NULL;
+		}
 		state = (PgYaapQueryState *) palloc0(sizeof(PgYaapQueryState));
 		state->context = AllocSetContextCreate(CurrentMemoryContext,
 											   "pg_yaap query context",
@@ -150,29 +125,9 @@ pg_yaap_try_build_query_state(QueryDesc *queryDesc, int eflags)
 		return state;
 	}
 
-	if (plan == NULL)
-	{
-		if (pg_yaap_trace_hooks)
-			elog(LOG, "pg_yaap: query state admission rejected because root plan is NULL");
-		return NULL;
-	}
-	if (!plan_uses_supported_relations(plan, queryDesc->plannedstmt))
-	{
-		if (pg_yaap_trace_hooks)
-			elog(LOG,
-				 "pg_yaap: query state admission rejected because plan does not touch supported user relations (nodeTag=%d)",
-				 (int) nodeTag(plan));
-		return NULL;
-	}
-
-	state = (PgYaapQueryState *) palloc0(sizeof(PgYaapQueryState));
-	state->context = AllocSetContextCreate(CurrentMemoryContext,
-										   "pg_yaap query context",
-										   ALLOCSET_DEFAULT_SIZES);
 	if (pg_yaap_trace_hooks)
 		elog(LOG,
-			 "pg_yaap: query state admitted (nodeTag=%d context=%p)",
-			 (int) nodeTag(plan),
-			 (void *) state->context);
-	return state;
+			 "pg_yaap: query state admission rejected because query has no optimizer bundle (nodeTag=%d)",
+			 plan != NULL ? (int) nodeTag(plan) : -1);
+	return NULL;
 }

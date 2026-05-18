@@ -7,6 +7,8 @@ namespace yaap {
 
 namespace {
 
+constexpr int kPgAndExpr = 0;
+
 bool IsProjectionExpressionPushdownSafe(Expression* expression) {
     if (!expression) {
         return false;
@@ -21,21 +23,33 @@ bool IsProjectionExpressionPushdownSafe(Expression* expression) {
     }
 }
 
+void AppendConjuncts(std::unique_ptr<Expression> expression,
+                     std::vector<std::unique_ptr<Expression>>& output) {
+    if (!expression) {
+        return;
+    }
+    if (expression->type != ExpressionType::BOUND_CONJUNCTION) {
+        output.push_back(std::move(expression));
+        return;
+    }
+
+    auto* conjunction = static_cast<BoundConjunctionExpression*>(expression.get());
+    if (conjunction->bool_expr_type != kPgAndExpr) {
+        output.push_back(std::move(expression));
+        return;
+    }
+
+    for (auto& child : conjunction->children) {
+        AppendConjuncts(std::move(child), output);
+    }
+}
+
 } // namespace
 
 void SplitConjunctionList(std::vector<std::unique_ptr<Expression>>& expressions) {
     std::vector<std::unique_ptr<Expression>> split;
     for (auto& expression : expressions) {
-        if (expression->type == ExpressionType::BOUND_CONJUNCTION) {
-            auto* conjunction = static_cast<BoundConjunctionExpression*>(expression.get());
-            if (conjunction->bool_expr_type == 0) {
-                for (auto& child : conjunction->children) {
-                    split.push_back(std::move(child));
-                }
-                continue;
-            }
-        }
-        split.push_back(std::move(expression));
+        AppendConjuncts(std::move(expression), split);
     }
     expressions = std::move(split);
 }

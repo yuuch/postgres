@@ -281,8 +281,34 @@ PopulateFilterChunk(const PgVector<FilterInputDesc> &inputs,
 					filter_chunk.int32_columns[dst_slot][row] = in.get_int32(src_slot, row);
 					break;
 				case ColumnDecodeKind::INT64_INT8:
+					if (input.source_decode_kind == ColumnDecodeKind::INT32_INT4 ||
+						input.source_decode_kind == ColumnDecodeKind::INT32_CHAR ||
+						input.source_decode_kind == ColumnDecodeKind::INT32_DATE)
+						filter_chunk.int64_columns[dst_slot][row] = static_cast<int64_t>(in.get_int32(src_slot, row));
+					else
+						filter_chunk.int64_columns[dst_slot][row] = in.get_int64(src_slot, row);
+					break;
 				case ColumnDecodeKind::INT64_NUMERIC_SCALED:
-					filter_chunk.int64_columns[dst_slot][row] = in.get_int64(src_slot, row);
+					if (input.source_decode_kind == ColumnDecodeKind::INT32_INT4 ||
+						input.source_decode_kind == ColumnDecodeKind::INT32_CHAR ||
+						input.source_decode_kind == ColumnDecodeKind::INT32_DATE)
+					{
+						int64_t factor = 1;
+						for (uint8_t i = 0; i < input.numeric_scale; ++i)
+							factor *= 10;
+						filter_chunk.int64_columns[dst_slot][row] =
+							static_cast<int64_t>(in.get_int32(src_slot, row)) * factor;
+					}
+					else if (input.source_decode_kind == ColumnDecodeKind::INT64_INT8)
+					{
+						int64_t factor = 1;
+						for (uint8_t i = 0; i < input.numeric_scale; ++i)
+							factor *= 10;
+						filter_chunk.int64_columns[dst_slot][row] =
+							in.get_int64(src_slot, row) * factor;
+					}
+					else
+						filter_chunk.int64_columns[dst_slot][row] = in.get_int64(src_slot, row);
 					break;
 				case ColumnDecodeKind::STRING_REF:
 				{

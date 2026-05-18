@@ -1,8 +1,185 @@
 #include "optimizer_core.hpp"
 
+#include "../logical/filter_rewrite_utils.hpp"
 #include "../logical/logical_utils.hpp"
 
+#include <map>
+#include <sstream>
+
 namespace yaap {
+
+namespace {
+
+constexpr int kPgAndExpr = 0;
+constexpr int kPgOrExpr = 1;
+
+std::string ExpressionFingerprint(Expression* expression) {
+    if (!expression) {
+        return "<null>";
+    }
+
+    std::stringstream ss;
+    switch (expression->type) {
+        case ExpressionType::BOUND_COLUMN_REF: {
+            auto* column = static_cast<BoundColumnRefExpression*>(expression);
+            ss << "col:" << column->binding.table_index.index << "."
+               << column->binding.column_index.index;
+            break;
+        }
+        case ExpressionType::BOUND_CONSTANT: {
+            auto* constant = static_cast<BoundConstantExpression*>(expression);
+            ss << "const:" << (constant->is_null ? "NULL" : constant->value);
+            break;
+        }
+        case ExpressionType::BOUND_FUNCTION: {
+            auto* function = static_cast<BoundFunctionExpression*>(expression);
+            ss << "fn:" << function->function_name << "(";
+            for (size_t i = 0; i < function->children.size(); ++i) {
+                if (i > 0) {
+                    ss << ",";
+                }
+                ss << ExpressionFingerprint(function->children[i].get());
+            }
+            ss << ")";
+            break;
+        }
+        case ExpressionType::BOUND_CONJUNCTION: {
+            auto* conjunction = static_cast<BoundConjunctionExpression*>(expression);
+            ss << "conj:" << conjunction->bool_expr_type << "(";
+            for (size_t i = 0; i < conjunction->children.size(); ++i) {
+                if (i > 0) {
+                    ss << ",";
+                }
+                ss << ExpressionFingerprint(conjunction->children[i].get());
+            }
+            ss << ")";
+            break;
+        }
+        default:
+            ss << "opaque";
+            break;
+    }
+    return ss.str();
+}
+
+void ExtractAndConjuncts(std::unique_ptr<Expression> expression,
+                         std::vector<std::unique_ptr<Expression>>& conjuncts) {
+    if (!expression) {
+        return;
+    }
+    if (expression->type != ExpressionType::BOUND_CONJUNCTION) {
+        conjuncts.push_back(std::move(expression));
+        return;
+    }
+
+    auto* conjunction = static_cast<BoundConjunctionExpression*>(expression.get());
+    if (conjunction->bool_expr_type != kPgAndExpr) {
+        conjuncts.push_back(std::move(expression));
+        return;
+    }
+
+    for (auto& child : conjunction->children) {
+        ExtractAndConjuncts(std::move(child), conjuncts);
+    }
+}
+
+std::unique_ptr<Expression> MakeConjunction(int bool_expr_type,
+                                            std::vector<std::unique_ptr<Expression>> expressions) {
+    if (expressions.empty()) {
+        return nullptr;
+    }
+    if (expressions.size() == 1) {
+        return std::move(expressions[0]);
+    }
+
+    auto conjunction = std::make_unique<BoundConjunctionExpression>(bool_expr_type);
+    conjunction->children = std::move(expressions);
+    return conjunction;
+}
+
+std::unique_ptr<Expression> FactorCommonDisjunctConjuncts(std::unique_ptr<Expression> expression) {
+    if (!expression || expression->type != ExpressionType::BOUND_CONJUNCTION) {
+        return expression;
+    }
+
+    auto* conjunction = static_cast<BoundConjunctionExpression*>(expression.get());
+    for (auto& child : conjunction->children) {
+        child = FactorCommonDisjunctConjuncts(std::move(child));
+    }
+
+    if (conjunction->bool_expr_type != kPgOrExpr || conjunction->children.size() < 2) {
+        return expression;
+    }
+
+    std::vector<std::vector<std::unique_ptr<Expression>>> branch_conjuncts;
+    branch_conjuncts.reserve(conjunction->children.size());
+    for (auto& child : conjunction->children) {
+        std::vector<std::unique_ptr<Expression>> conjuncts;
+        ExtractAndConjuncts(std::move(child), conjuncts);
+        if (conjuncts.empty()) {
+            return expression;
+        }
+        branch_conjuncts.push_back(std::move(conjuncts));
+    }
+
+    std::map<std::string, size_t> candidate_counts;
+    for (const auto& conjunct : branch_conjuncts[0]) {
+        candidate_counts.emplace(ExpressionFingerprint(conjunct.get()), 1);
+    }
+
+    for (size_t branch_idx = 1; branch_idx < branch_conjuncts.size(); ++branch_idx) {
+        std::set<std::string> branch_fingerprints;
+        for (const auto& conjunct : branch_conjuncts[branch_idx]) {
+            branch_fingerprints.insert(ExpressionFingerprint(conjunct.get()));
+        }
+        for (auto it = candidate_counts.begin(); it != candidate_counts.end();) {
+            if (branch_fingerprints.find(it->first) == branch_fingerprints.end()) {
+                it = candidate_counts.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    if (candidate_counts.empty()) {
+        std::vector<std::unique_ptr<Expression>> rebuilt_children;
+        rebuilt_children.reserve(branch_conjuncts.size());
+        for (auto& conjuncts : branch_conjuncts) {
+            rebuilt_children.push_back(MakeConjunction(kPgAndExpr, std::move(conjuncts)));
+        }
+        return MakeConjunction(kPgOrExpr, std::move(rebuilt_children));
+    }
+
+    std::vector<std::unique_ptr<Expression>> common_conjuncts;
+    for (auto& branch : branch_conjuncts) {
+        std::vector<std::unique_ptr<Expression>> remaining;
+        for (auto& conjunct : branch) {
+            auto fingerprint = ExpressionFingerprint(conjunct.get());
+            if (candidate_counts.find(fingerprint) != candidate_counts.end()) {
+                if (common_conjuncts.size() < candidate_counts.size()) {
+                    common_conjuncts.push_back(std::move(conjunct));
+                }
+                continue;
+            }
+            remaining.push_back(std::move(conjunct));
+        }
+        branch = std::move(remaining);
+        if (branch.empty()) {
+            return MakeConjunction(kPgAndExpr, std::move(common_conjuncts));
+        }
+    }
+
+    std::vector<std::unique_ptr<Expression>> rebuilt_or_children;
+    rebuilt_or_children.reserve(branch_conjuncts.size());
+    for (auto& branch : branch_conjuncts) {
+        rebuilt_or_children.push_back(MakeConjunction(kPgAndExpr, std::move(branch)));
+    }
+
+    common_conjuncts.push_back(MakeConjunction(kPgOrExpr, std::move(rebuilt_or_children)));
+    return MakeConjunction(kPgAndExpr, std::move(common_conjuncts));
+}
+
+} // namespace
 
 OptimizerPass JoinPredicateExtraction::Pass() const {
     return OptimizerPass::JOIN_PREDICATE_EXTRACTION;
@@ -46,6 +223,11 @@ std::unique_ptr<LogicalOperator> JoinPredicateExtraction::ExtractFromFilter(std:
 
     std::vector<std::unique_ptr<Expression>> join_conditions;
     std::vector<std::unique_ptr<Expression>> remaining_filters;
+
+    for (auto& expression : filter->expressions) {
+        expression = FactorCommonDisjunctConjuncts(std::move(expression));
+    }
+    SplitConjunctionList(filter->expressions);
 
     for (auto& expression : filter->expressions) {
         if (IsEquiJoinPredicate(expression.get(), left_tables, right_tables)) {
