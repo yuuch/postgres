@@ -729,7 +729,7 @@ PopulateJoinFilterChunk(const HashJoinFilterInputDesc *inputs,
 			       const uint8_t *build_row,
 			       DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk)
 {
-	filter_chunk.reset();
+	filter_chunk.reset_lightweight();
 	filter_chunk.count = 1;
 	for (uint16_t i = 0; i < n_inputs; ++i)
 	{

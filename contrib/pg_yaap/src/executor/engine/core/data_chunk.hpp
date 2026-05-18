@@ -87,22 +87,31 @@ struct alignas(16) DataChunk {
 		  string_arena(PgMemoryContextAllocator<char>(CurrentMemoryContext))
 	{
 		memset(nulls, 0, sizeof(nulls));
-		memset(double_dict, 0, sizeof(double_dict));
-		memset(int64_dict, 0, sizeof(int64_dict));
-		memset(int32_dict, 0, sizeof(int32_dict));
-		memset(string_dict, 0, sizeof(string_dict));
+		clear_dictionaries();
 	}
 
-	void reset() {
+	void clear_dictionaries()
+	{
+		for (uint8_t slot = 0; slot < 16; ++slot)
+		{
+			double_dict[slot] = VecDictionaryDesc{false, 0, 0};
+			int64_dict[slot] = VecDictionaryDesc{false, 0, 0};
+			int32_dict[slot] = VecDictionaryDesc{false, 0, 0};
+			string_dict[slot] = VecDictionaryDesc{false, 0, 0};
+		}
+	}
+
+	void reset_lightweight() {
 		count = 0;
 		sel.clear();
 		has_selection = false;
-		memset(nulls, 0, sizeof(nulls));
-		memset(double_dict, 0, sizeof(double_dict));
-		memset(int64_dict, 0, sizeof(int64_dict));
-		memset(int32_dict, 0, sizeof(int32_dict));
-		memset(string_dict, 0, sizeof(string_dict));
+		clear_dictionaries();
 		string_arena.clear();
+	}
+
+	void reset() {
+		reset_lightweight();
+		memset(nulls, 0, sizeof(nulls));
 	}
 
 	bool has_any_dictionary() const

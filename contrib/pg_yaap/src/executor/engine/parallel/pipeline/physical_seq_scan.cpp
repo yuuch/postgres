@@ -418,6 +418,176 @@ EvalFilterStep(const FilterStep &step,
 	return result;
 }
 
+static inline bool
+IsSimpleFilterStep(const FilterExprDesc *exprs,
+		   uint16_t n_exprs,
+		   const FilterStep *steps,
+		   uint16_t n_steps,
+		   const FilterStep **simple_step)
+{
+	if (simple_step != nullptr)
+		*simple_step = nullptr;
+	if (exprs == nullptr || steps == nullptr || n_exprs != 1)
+		return false;
+	const FilterExprDesc &expr = exprs[0];
+	if (expr.n_steps != 1 || expr.first_step_idx >= n_steps)
+		return false;
+	const FilterStep &step = steps[expr.first_step_idx];
+	if (expr.output_bool_reg != step.out_bool_reg)
+		return false;
+	switch (step.op)
+	{
+		case FilterStepOp::INT32_CMP_CONST:
+		case FilterStepOp::INT64_CMP_CONST:
+		case FilterStepOp::INT32_CMP_VAR:
+		case FilterStepOp::INT64_CMP_VAR:
+		case FilterStepOp::STRING_EQ_CONST:
+		case FilterStepOp::STRING_NE_CONST:
+		case FilterStepOp::STRING_PREFIX_LIKE:
+		case FilterStepOp::STRING_CONTAINS_LIKE:
+		case FilterStepOp::STRING_SQL_LIKE:
+			if (simple_step != nullptr)
+				*simple_step = &step;
+			return true;
+		case FilterStepOp::BOOL_AND:
+		case FilterStepOp::BOOL_OR:
+		case FilterStepOp::BOOL_NOT:
+			return false;
+	}
+	return false;
+}
+
+static inline bool
+EvalSimpleFilterStep(const FilterStep &step,
+		     const DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE> &filter_chunk,
+		     const char *string_consts)
+{
+	switch (step.op)
+	{
+		case FilterStepOp::INT32_CMP_CONST:
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const int32_t l = filter_chunk.get_int32(step.left_idx, 0);
+				const int32_t r = static_cast<int32_t>(step.const_value);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: return l <= r;
+					case QualOp::LT: return l < r;
+					case QualOp::EQ: return l == r;
+					case QualOp::GE: return l >= r;
+					case QualOp::GT: return l > r;
+					case QualOp::NE: return l != r;
+				}
+			}
+			return false;
+		case FilterStepOp::INT64_CMP_CONST:
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const int64_t l = filter_chunk.get_int64(step.left_idx, 0);
+				const int64_t r = static_cast<int64_t>(step.const_value);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: return l <= r;
+					case QualOp::LT: return l < r;
+					case QualOp::EQ: return l == r;
+					case QualOp::GE: return l >= r;
+					case QualOp::GT: return l > r;
+					case QualOp::NE: return l != r;
+				}
+			}
+			return false;
+		case FilterStepOp::INT32_CMP_VAR:
+			if (!filter_chunk.nulls[step.left_idx][0] && !filter_chunk.nulls[step.right_idx][0])
+			{
+				const int32_t l = filter_chunk.get_int32(step.left_idx, 0);
+				const int32_t r = filter_chunk.get_int32(step.right_idx, 0);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: return l <= r;
+					case QualOp::LT: return l < r;
+					case QualOp::EQ: return l == r;
+					case QualOp::GE: return l >= r;
+					case QualOp::GT: return l > r;
+					case QualOp::NE: return l != r;
+				}
+			}
+			return false;
+		case FilterStepOp::INT64_CMP_VAR:
+			if (!filter_chunk.nulls[step.left_idx][0] && !filter_chunk.nulls[step.right_idx][0])
+			{
+				const int64_t l = filter_chunk.get_int64(step.left_idx, 0);
+				const int64_t r = filter_chunk.get_int64(step.right_idx, 0);
+				switch (step.cmp_op)
+				{
+					case QualOp::LE: return l <= r;
+					case QualOp::LT: return l < r;
+					case QualOp::EQ: return l == r;
+					case QualOp::GE: return l >= r;
+					case QualOp::GT: return l > r;
+					case QualOp::NE: return l != r;
+				}
+			}
+			return false;
+		case FilterStepOp::STRING_EQ_CONST:
+		case FilterStepOp::STRING_NE_CONST:
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+				const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				const bool eq = (lhs != nullptr || ref.len == 0) && rhs != nullptr &&
+					ref.len == step.const_len &&
+					(step.const_len == 0 || std::memcmp(lhs, rhs, step.const_len) == 0);
+				return step.op == FilterStepOp::STRING_EQ_CONST ? eq : !eq;
+			}
+			return false;
+		case FilterStepOp::STRING_PREFIX_LIKE:
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				if (rhs == nullptr || ref.len < step.const_len)
+					return false;
+				if (step.const_len == 0)
+					return true;
+				if (step.const_len <= sizeof(ref.prefix))
+					return std::memcmp(&ref.prefix, rhs, step.const_len) == 0;
+				const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+				return lhs != nullptr && std::memcmp(lhs, rhs, step.const_len) == 0;
+			}
+			return false;
+		case FilterStepOp::STRING_CONTAINS_LIKE:
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+				if (rhs == nullptr || lhs == nullptr || step.const_len > ref.len)
+					return false;
+				for (uint32_t start = 0; start + step.const_len <= ref.len; ++start)
+				{
+					if (std::memcmp(lhs + start, rhs, step.const_len) == 0)
+						return true;
+				}
+			}
+			return false;
+		case FilterStepOp::STRING_SQL_LIKE:
+			if (!filter_chunk.nulls[step.left_idx][0])
+			{
+				const VecStringRef ref = filter_chunk.get_string_ref(step.left_idx, 0);
+				const char *rhs = ResolveFilterConstPtr(step, string_consts);
+				const char *lhs = filter_chunk.get_string_ptr(step.left_idx, 0);
+				return MatchPercentLikePattern(lhs, ref.len, rhs, step.const_len);
+			}
+			return false;
+		case FilterStepOp::BOOL_AND:
+		case FilterStepOp::BOOL_OR:
+		case FilterStepOp::BOOL_NOT:
+			break;
+	}
+	return false;
+}
+
 /*
  * Map planner-published per-column decode kind onto the deformer's
  * physical decode kind. The two enums are intentionally distinct:
@@ -929,6 +1099,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		: nullptr;
 	const uint16_t required_bool_regs = filter_exprs != nullptr ?
 		RequiredFilterBoolRegs(filter_exprs, n_filter_exprs_) : 0;
+	const FilterStep *simple_filter_step = nullptr;
 	if (n_filter_inputs_ > 0 && filter_inputs == nullptr)
 		elog(ERROR, "pg_yaap: PhysicalSeqScan filter_inputs_dp not published");
 	if (n_filter_exprs_ > 0 && filter_exprs == nullptr)
@@ -1058,6 +1229,9 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				      local.filter_chunk != nullptr);
 	if (has_filter)
 		BuildFilterDeformBindings(filter_inputs, n_filter_inputs_, *local.filter_chunk, filter_bindings);
+	const bool use_simple_filter =
+		has_filter && IsSimpleFilterStep(filter_exprs, n_filter_exprs_, filter_steps, n_filter_steps_, &simple_filter_step);
+	const bool profile_on = PipelineProfileEnabled(ctx);
 
 	uint32_t tuple_checks = 0;
 	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
@@ -1074,8 +1248,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		}
 
 		instr_time tuple_iter_start;
-		const bool tuple_profile_on = PipelineProfileEnabled(ctx);
-		if (tuple_profile_on)
+		if (profile_on)
 			INSTR_TIME_SET_CURRENT(tuple_iter_start);
 
 		OffsetNumber offnum = local.scan_desc->rs_vistuples[local.page_visible_index++];
@@ -1087,7 +1260,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		tuple.t_tableOid = RelationGetRelid(local.scan_desc->rs_base.rs_rd);
 		ItemPointerSet(&(tuple.t_self), local.scan_desc->rs_cblock, offnum);
 
-		if (tuple_profile_on)
+		if (profile_on)
 		{
 			instr_time tuple_iter_end;
 			INSTR_TIME_SET_CURRENT(tuple_iter_end);
@@ -1109,10 +1282,9 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		if (has_filter)
 		{
 			instr_time qual_deform_start;
-			const bool profile_on = PipelineProfileEnabled(ctx);
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(qual_deform_start);
-			local.filter_chunk->reset();
+			local.filter_chunk->reset_lightweight();
 			local.filter_deformer->deform_tuple_header(tuple.t_data, 0, filter_bindings);
 			if (profile_on)
 			{
@@ -1128,25 +1300,35 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			instr_time filter_start;
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(filter_start);
-			bool pass = true;
-			if (required_bool_regs > 0)
-				std::memset(local.filter_bool_values, 0, required_bool_regs * sizeof(local.filter_bool_values[0]));
-			for (uint16_t expr_idx = 0; expr_idx < n_filter_exprs_; ++expr_idx)
+			bool pass;
+			if (use_simple_filter)
 			{
-				const FilterExprDesc &expr = filter_exprs[expr_idx];
-				const uint16_t expr_end = expr.first_step_idx + expr.n_steps;
-				if (expr_end > n_filter_steps_)
-					elog(ERROR, "pg_yaap: filter expression step range overflow");
-				for (uint16_t step_idx = expr.first_step_idx; step_idx < expr_end; ++step_idx)
-					EvalFilterStep(filter_steps[step_idx],
-						*local.filter_chunk,
-						filter_string_consts,
-						local.filter_bool_values);
-				if (expr.output_bool_reg >= filter_bool_regs_ ||
-				    !local.filter_bool_values[expr.output_bool_reg])
+				pass = EvalSimpleFilterStep(*simple_filter_step,
+					*local.filter_chunk,
+					filter_string_consts);
+			}
+			else
+			{
+				pass = true;
+				if (required_bool_regs > 0)
+					std::memset(local.filter_bool_values, 0, required_bool_regs * sizeof(local.filter_bool_values[0]));
+				for (uint16_t expr_idx = 0; expr_idx < n_filter_exprs_; ++expr_idx)
 				{
-					pass = false;
-					break;
+					const FilterExprDesc &expr = filter_exprs[expr_idx];
+					const uint16_t expr_end = expr.first_step_idx + expr.n_steps;
+					if (expr_end > n_filter_steps_)
+						elog(ERROR, "pg_yaap: filter expression step range overflow");
+					for (uint16_t step_idx = expr.first_step_idx; step_idx < expr_end; ++step_idx)
+						EvalFilterStep(filter_steps[step_idx],
+							*local.filter_chunk,
+							filter_string_consts,
+							local.filter_bool_values);
+					if (expr.output_bool_reg >= filter_bool_regs_ ||
+					    !local.filter_bool_values[expr.output_bool_reg])
+					{
+						pass = false;
+						break;
+					}
 				}
 			}
 			if (profile_on)
@@ -1163,7 +1345,6 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				continue;
 		}
 		instr_time proj_start;
-		const bool profile_on = PipelineProfileEnabled(ctx);
 		if (profile_on)
 			INSTR_TIME_SET_CURRENT(proj_start);
 		AppendProjectedTupleViaDeformer(out, &tuple, out_schema, local);
