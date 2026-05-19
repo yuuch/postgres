@@ -46,11 +46,19 @@ public:
 	Relation        rel = nullptr;
 	HeapScanDesc    scan_desc = nullptr;
 	ReadStream     *read_stream = nullptr;
-	ParallelBlockTableScanWorkerData parallel_scan_worker{};
 	TupleDesc       scan_tupdesc = nullptr;
 	uint32          page_visible_index = 0;
+	bool            check_serializable = false;
 	bool            exhausted = false;
 	bool            diag_first_call_logged = false;
+	bool            descriptor_cache_ready = false;
+	SchemaDescriptor *out_schema_cache = nullptr;
+	FilterInputDesc *filter_inputs_cache = nullptr;
+	FilterExprDesc  *filter_exprs_cache = nullptr;
+	FilterStep      *filter_steps_cache = nullptr;
+	const char      *filter_string_consts_cache = nullptr;
+	uint16_t         required_bool_regs_cache = 0;
+	const FilterStep *simple_filter_step_cache = nullptr;
 
 	/* M-Q1-PERF B.1: split deform into qual-side (1-row scratch chunk, written
 	 * at row 0 every tuple, evaluated inline) + projection-side (written at
@@ -71,6 +79,7 @@ public:
 	 * during build and then reuse them for every tuple. */
 	std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>> filter_chunk;
 	uint8_t                                filter_bool_values[FILTER_MAX_BOOL_REGS]{};
+	bool                                   filter_uses_string_arena = false;
 	JitContext                            *proj_jit_context = nullptr;
 	JitDeformFunc                          proj_jit_func = nullptr;
 	JitContext                            *filter_jit_context = nullptr;

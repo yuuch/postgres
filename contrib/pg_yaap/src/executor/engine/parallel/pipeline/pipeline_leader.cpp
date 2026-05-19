@@ -12,9 +12,11 @@ extern "C" {
 #include "utils/dsa.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 }
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -50,6 +52,7 @@ namespace pipeline {
 namespace {
 
 static constexpr uint32_t kTaskQueueCapacity = 64;
+static constexpr int kPipelineWorkerLaunchSoftCap = 6;
 
 /* B.2 startup-tax probe: one-shot phase timer to localize the ~2700 ms cold-
  * cache fixed cost in PgYaapPipelineRun. Toggle via env PG_YAAP_PHASE=1.
@@ -67,9 +70,11 @@ struct PhaseTimer {
 	void mark(const char *tag) {
 		if (!on) return;
 		instr_time now; INSTR_TIME_SET_CURRENT(now);
+		const TimestampTz abs_now = GetCurrentTimestamp();
 		instr_time d_total = now; INSTR_TIME_SUBTRACT(d_total, t0);
 		instr_time d_step  = now; INSTR_TIME_SUBTRACT(d_step,  prev);
-		fprintf(stderr, "PG_YAAP_PHASE pid=%d tag=%-22s step=%6.1f ms total=%7.1f ms\n",
+		fprintf(stderr, "PG_YAAP_PHASE abs=%s pid=%d tag=%-22s step=%6.1f ms total=%7.1f ms\n",
+		        timestamptz_to_str(abs_now),
 		        MyProcPid, tag,
 		        INSTR_TIME_GET_MILLISEC(d_step),
 		        INSTR_TIME_GET_MILLISEC(d_total));
@@ -442,6 +447,13 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 
 		phase.mark("T1_build_done");
 
+		const int bgworker_count = std::min(pg_yaap_parallel_max_workers,
+											kPipelineWorkerLaunchSoftCap);
+		if (bgworker_count <= 0)
+		{
+			return FailEarly(failure_reason, "pg_yaap: pg_yaap.parallel_max_workers must be >= 1", cleanup, state);
+		}
+
 		if (state->runtime_dsm == nullptr || state->runtime_dsa == nullptr)
 		{
 			const char *err = nullptr;
@@ -473,6 +485,7 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		Assert(queue != nullptr);
 		Assert(control->magic == PIPELINE_DSM_MAGIC);
 		Assert(control->leader_pid == MyProcPid);
+		control->num_workers = bgworker_count;
 
 		control->pipelines_root = LeaderSerializePipelines(*bundle, dsa);
 		control->num_pipelines = static_cast<int32>(bundle->pipelines.size());
@@ -490,12 +503,6 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		/* Per-current scheduler/task-descriptor contract, leader participation
 		 * remains disabled until a dedicated LEADER_WORKER_INDEX task slot is
 		 * published. */
-
-		const int bgworker_count = pg_yaap_parallel_max_workers;
-		if (bgworker_count <= 0)
-		{
-			return FailEarly(failure_reason, "pg_yaap: pg_yaap.parallel_max_workers must be >= 1", cleanup, state);
-		}
 
 		TaskScheduler scheduler(leader_mcxt,
 						std::move(bundle),

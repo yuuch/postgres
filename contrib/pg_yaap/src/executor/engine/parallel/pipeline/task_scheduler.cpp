@@ -33,6 +33,7 @@ extern "C" {
 #include "parallel/pipeline/dsm_task_queue.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
+#include "parallel/pipeline/output_sink.hpp"
 #include "parallel/pipeline/pipeline_combine_event.hpp"
 #include "parallel/pipeline/pipeline_finalize_event.hpp"
 #include "parallel/pipeline/pipeline_run_event.hpp"
@@ -280,6 +281,8 @@ TaskScheduler::EnqueueTasks(Event &event)
 	Assert(pid != INVALID_PIPELINE_ID);
 	Pipeline *pipeline = pipelines_.Resolve(static_cast<uint32_t>(pid));
 	Assert(pipeline != nullptr);
+	auto *sink = pipeline->sink;
+	Assert(sink != nullptr);
 
 	/* Resolve the EventId scheduler-side. BuildEvents publishes 3 events
 	 * per pipeline in the deterministic order (Run, Combine, Finalize)
@@ -298,6 +301,13 @@ TaskScheduler::EnqueueTasks(Event &event)
 			break;
 		case TaskKind::COMBINE:
 			event_id   = base_id + 1;
+			if (sink->CombineIsTrivial())
+			{
+				EventShmState &shm = event_shm_[event_id];
+				pg_atomic_write_u32(&shm.tasks_remaining, 0);
+				event.FinishEvent();
+				return;
+			}
 			if (pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
 			{
 				auto *hash_agg = static_cast<PhysicalHashAggregate *>(pipeline->sink);
@@ -324,6 +334,25 @@ TaskScheduler::EnqueueTasks(Event &event)
 			break;
 		case TaskKind::FINALIZE:
 			event_id   = base_id + 2;
+			if (sink->FinalizeIsTrivial())
+			{
+				EventShmState &shm = event_shm_[event_id];
+				pg_atomic_write_u32(&shm.tasks_remaining, 0);
+				{
+					ExecCtx leader_ctx{mcxt_, dsa_, LEADER_WORKER_INDEX, control_, event_id};
+					auto &ps = state_.GetOrCreate(pid);
+					if (ps.global_sink == nullptr)
+						ps.global_sink = sink->GetGlobalSinkState(leader_ctx);
+					if (ps.global_sink != nullptr)
+					{
+						SinkFinalizeType fres = sink->Finalize(leader_ctx, *ps.global_sink);
+						if (fres != SinkFinalizeType::READY)
+							elog(ERROR, "pg_yaap: trivial finalize did not finish");
+					}
+				}
+				event.FinishEvent();
+				return;
+			}
 			/* Finalize is leader-only (Sink::Finalize is a leader op). The
 			 * leader's worker_index is LEADER_WORKER_INDEX; C7's event loop
 			 * runs Finalize inline rather than dispatching to the DSM

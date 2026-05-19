@@ -3,12 +3,17 @@
 extern "C" {
 #include "utils/dsa.h"
 #include "utils/elog.h"
+#include "utils/lsyscache.h"
+#include "utils/timestamp.h"
 }
 
 #include <algorithm>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/types.hpp"
 
@@ -22,6 +27,7 @@ namespace pipeline {
 namespace {
 
 static constexpr uint32 kStageCount = static_cast<uint32>(PipelineProfileStage::COUNT);
+static constexpr uint64 kEventReportMinNs = UINT64CONST(1000000);
 
 struct StageTotals {
 	uint64 elapsed_ns = 0;
@@ -50,12 +56,14 @@ StageName(PipelineProfileStage stage)
 		case PipelineProfileStage::SOURCE_ORDER: return "source_order_readback";
 		case PipelineProfileStage::OP_FILTER: return "filter_expr";
 		case PipelineProfileStage::OP_PROJECTION: return "project_expr";
+		case PipelineProfileStage::OP_HASH_JOIN: return "hash_join_probe";
 		case PipelineProfileStage::SINK_HASH_AGG_UPDATE: return "agg_update_local";
 		case PipelineProfileStage::SINK_PERFECT_HASH_AGG_UPDATE: return "perfect_agg_update_local";
 		case PipelineProfileStage::SINK_ORDER_APPEND: return "order_sink_append";
 		case PipelineProfileStage::SINK_OUTPUT_APPEND: return "output_sink_append";
 		case PipelineProfileStage::COMBINE_HASH_AGG: return "agg_combine_global";
 		case PipelineProfileStage::COMBINE_PERFECT_HASH_AGG: return "perfect_agg_combine_global";
+		case PipelineProfileStage::FINALIZE_HASH_JOIN: return "hash_join_finalize_global";
 		case PipelineProfileStage::FINALIZE_HASH_AGG: return "agg_finalize_global";
 		case PipelineProfileStage::FINALIZE_PERFECT_HASH_AGG: return "perfect_agg_finalize_global";
 		case PipelineProfileStage::FINALIZE_ORDER: return "order_finalize_sort";
@@ -134,6 +142,111 @@ AccumulateStageTotals(StageTotals *totals,
 	totals[stage_idx].elapsed_ns += record.elapsed_ns;
 	totals[stage_idx].calls += record.calls;
 	totals[stage_idx].rows += record.rows;
+}
+
+const char *
+OpKindName(OpKind kind)
+{
+	switch (kind)
+	{
+		case OpKind::SEQ_SCAN: return "SEQ_SCAN";
+		case OpKind::DELIM_SCAN: return "DELIM_SCAN";
+		case OpKind::HASH_AGGREGATE: return "HASH_AGGREGATE";
+		case OpKind::PERFECT_HASH_AGGREGATE: return "PERFECT_HASH_AGGREGATE";
+		case OpKind::HASH_JOIN: return "HASH_JOIN";
+		case OpKind::ORDER: return "ORDER";
+		case OpKind::OUTPUT: return "OUTPUT";
+		case OpKind::FILTER: return "FILTER";
+		case OpKind::PROJECTION: return "PROJECTION";
+	}
+	return "UNKNOWN";
+}
+
+const char *
+HashJoinModeName(HashJoinMatchMode mode)
+{
+	switch (mode)
+	{
+		case HashJoinMatchMode::INNER: return "INNER";
+		case HashJoinMatchMode::SEMI: return "SEMI";
+		case HashJoinMatchMode::ANTI: return "ANTI";
+		case HashJoinMatchMode::LEFT: return "LEFT";
+	}
+	return "UNKNOWN";
+}
+
+const char *
+EventKindName(uint32 event_id)
+{
+	switch (event_id % 3u)
+	{
+		case 0: return "run";
+		case 1: return "combine";
+		case 2: return "finalize";
+	}
+	return "unknown";
+}
+
+std::string
+DescribeOp(const OpDescriptor &op)
+{
+	switch (op.kind)
+	{
+		case OpKind::SEQ_SCAN:
+		{
+			std::string desc = "SEQ_SCAN";
+			char *relname = get_rel_name(op.body.seq_scan.relid);
+			if (relname != nullptr)
+			{
+				desc += "(";
+				desc += relname;
+				desc += ")";
+				pfree(relname);
+			}
+			return desc;
+		}
+		case OpKind::HASH_JOIN:
+		{
+			std::string desc = "HASH_JOIN(";
+			desc += HashJoinModeName(op.body.hash_join.join_mode);
+			desc += ")";
+			return desc;
+		}
+		default:
+			return OpKindName(op.kind);
+	}
+}
+
+std::string
+DescribeEvent(PipelineSharedControl *control, dsa_area *dsa, uint32 event_id)
+{
+	const uint32 pipeline_id = event_id / 3u;
+	if (control == nullptr || dsa == nullptr ||
+		!DsaPointerIsValid(control->pipelines_root) ||
+		pipeline_id >= static_cast<uint32>(control->num_pipelines))
+	{
+		return "pipeline=? kind=" + std::string(EventKindName(event_id));
+	}
+
+	auto *root = static_cast<PipelineDescriptor *>(dsa_get_address(dsa, control->pipelines_root));
+	if (root == nullptr)
+		return "pipeline=? kind=" + std::string(EventKindName(event_id));
+	const PipelineDescriptor &pd = root[pipeline_id];
+	if (!DsaPointerIsValid(pd.ops) || pd.op_count <= 0)
+		return "pipeline=" + std::to_string(pipeline_id) + " kind=" + EventKindName(event_id);
+
+	auto *ops = static_cast<OpDescriptor *>(dsa_get_address(dsa, pd.ops));
+	if (ops == nullptr)
+		return "pipeline=" + std::to_string(pipeline_id) + " kind=" + EventKindName(event_id);
+
+	std::string desc = "pipeline=" + std::to_string(pipeline_id);
+	desc += " kind=";
+	desc += EventKindName(event_id);
+	desc += " source=";
+	desc += DescribeOp(ops[0]);
+	desc += " sink=";
+	desc += DescribeOp(ops[pd.op_count - 1]);
+	return desc;
 }
 
 }  /* namespace */
@@ -256,8 +369,11 @@ PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 	if (records == nullptr)
 		return;
 
+	const TimestampTz report_ts = GetCurrentTimestamp();
+
 	elog(NOTICE,
-		 "pg_yaap[timing] workers=%u worker_slots=%u events=%u stages=%u",
+		 "pg_yaap[timing] report_at=%s workers=%u worker_slots=%u events=%u stages=%u",
+		 timestamptz_to_str(report_ts),
 		 control->profile_worker_slots > 0 ? control->profile_worker_slots - 1 : 0,
 		 control->profile_worker_slots,
 		 control->profile_event_count,
@@ -282,6 +398,30 @@ PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 	}
 
 	StageTotals grand_totals[kStageCount] = {};
+	std::vector<StageTotals> event_totals(static_cast<size_t>(control->profile_event_count) * kStageCount);
+	std::vector<std::string> event_labels(control->profile_event_count);
+
+	for (uint32 event_id = 0; event_id < control->profile_event_count; ++event_id)
+		event_labels[event_id] = DescribeEvent(control, dsa, event_id);
+
+	for (uint32 slot = 0; slot < control->profile_worker_slots; ++slot)
+	{
+		for (uint32 event_id = 0; event_id < control->profile_event_count; ++event_id)
+		{
+			for (uint32 stage_idx = 0; stage_idx < kStageCount; ++stage_idx)
+			{
+				const uint64 idx =
+					((uint64) slot * control->profile_event_count + event_id) * kStageCount + stage_idx;
+				const PipelineProfileRecord &record = records[idx];
+				if (record.calls == 0 && record.elapsed_ns == 0)
+					continue;
+				StageTotals &total = event_totals[static_cast<size_t>(event_id) * kStageCount + stage_idx];
+				total.elapsed_ns += record.elapsed_ns;
+				total.calls += record.calls;
+				total.rows += record.rows;
+			}
+		}
+	}
 
 	for (uint32 stage_idx = 0; stage_idx < kStageCount; ++stage_idx)
 	{
@@ -357,6 +497,26 @@ PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 			 total.calls,
 			 total.rows);
 	}
+
+	for (uint32 event_id = 0; event_id < control->profile_event_count; ++event_id)
+	{
+		for (uint32 stage_idx = 0; stage_idx < kStageCount; ++stage_idx)
+		{
+			const StageTotals &total =
+				event_totals[static_cast<size_t>(event_id) * kStageCount + stage_idx];
+			if ((total.calls == 0 && total.elapsed_ns == 0) || total.elapsed_ns < kEventReportMinNs)
+				continue;
+
+			elog(NOTICE,
+				 "pg_yaap[timing] event=%u %s stage=%s total_ms=%.3f calls=" UINT64_FORMAT " rows=" UINT64_FORMAT,
+				 event_id,
+				 event_labels[event_id].c_str(),
+				 StageName(static_cast<PipelineProfileStage>(stage_idx)),
+				 (double) total.elapsed_ns / 1000000.0,
+				 total.calls,
+				 total.rows);
+		}
+	}
 }
 
 PipelineProfileStage
@@ -375,11 +535,17 @@ PipelineProfileSourceStage(PhysicalOperatorType type)
 PipelineProfileStage
 PipelineProfileOperatorStage(PhysicalOperatorType type)
 {
-	return type == PhysicalOperatorType::PROJECTION
-		? PipelineProfileStage::OP_PROJECTION
-		: (type == PhysicalOperatorType::FILTER
-			? PipelineProfileStage::OP_FILTER
-			: PipelineProfileStage::TASK_RUN_TOTAL);
+	switch (type)
+	{
+		case PhysicalOperatorType::PROJECTION:
+			return PipelineProfileStage::OP_PROJECTION;
+		case PhysicalOperatorType::FILTER:
+			return PipelineProfileStage::OP_FILTER;
+		case PhysicalOperatorType::HASH_JOIN:
+			return PipelineProfileStage::OP_HASH_JOIN;
+		default:
+			return PipelineProfileStage::TASK_RUN_TOTAL;
+	}
 }
 
 PipelineProfileStage
@@ -411,6 +577,7 @@ PipelineProfileFinalizeStage(PhysicalOperatorType type)
 	{
 		switch (type)
 		{
+			case PhysicalOperatorType::HASH_JOIN: return PipelineProfileStage::FINALIZE_HASH_JOIN;
 			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_HASH_AGG;
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_PERFECT_HASH_AGG;
 			case PhysicalOperatorType::ORDER: return PipelineProfileStage::FINALIZE_ORDER;

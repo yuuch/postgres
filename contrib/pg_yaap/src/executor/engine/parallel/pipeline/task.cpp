@@ -52,6 +52,17 @@ EnsureRunLocalStates(ProcessPipelineExecState &ps, Pipeline &pipeline, ExecCtx &
 	ps.run_initialized = true;
 }
 
+void
+EnsureRunChunks(ProcessPipelineExecState &ps)
+{
+	if (ps.run_src_chunk == nullptr)
+		ps.run_src_chunk = std::make_unique<PipelineChunk>();
+	if (ps.run_scratch_a == nullptr)
+		ps.run_scratch_a = std::make_unique<PipelineChunk>();
+	if (ps.run_scratch_b == nullptr)
+		ps.run_scratch_b = std::make_unique<PipelineChunk>();
+}
+
 class TaskProfileEventGuard
 {
 public:
@@ -166,12 +177,14 @@ PipelineRunTask::Execute()
 
 	EnsureGlobalStates(ps, *pipeline_, ctx);
 	EnsureRunLocalStates(ps, *pipeline_, ctx);
+	EnsureRunChunks(ps);
 
 	const uint32_t chunk_budget = 32;
 	uint32_t chunks_done = 0;
 
-	PipelineChunk src_chunk;
-	PipelineChunk scratch_a, scratch_b;
+	PipelineChunk &src_chunk = *ps.run_src_chunk;
+	PipelineChunk &scratch_a = *ps.run_scratch_a;
+	PipelineChunk &scratch_b = *ps.run_scratch_b;
 
 	for (;;)
 	{

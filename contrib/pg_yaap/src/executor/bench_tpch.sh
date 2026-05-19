@@ -81,8 +81,10 @@ trap 'rm -f "$TMP_SQL"' EXIT
 	printf '\\timing on\n'
 	printf '\\o /dev/null\n'
 	for ((i = 1; i <= RUNS; ++i)); do
+		printf '\\echo __PG_YAAP_BENCH_RUN_BEGIN__ %d\n' "$i"
 		cat "$SQL_FILE"
 		printf '\n'
+		printf '\\echo __PG_YAAP_BENCH_RUN_END__ %d\n' "$i"
 	done
 } > "$TMP_SQL"
 
@@ -90,12 +92,30 @@ printf 'benchmarking q%s (%s), runs=%s, workers=%s, timeout=%s, trace_hooks=%s, 
 	"$QNUM" "$SQL_FILE" "$RUNS" "$WORKERS" "$TIMEOUT" "$TRACE_HOOKS" "$TRACE_EXECUTION_PATH"
 "$PSQL" -X -P pager=off -h "$HOST" -p "$PORT" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$TMP_SQL" 2>&1 |
 	awk '
+		/^__PG_YAAP_BENCH_RUN_BEGIN__ [0-9]+$/ {
+			run = $2
+			in_run = 1
+			run_sum = 0
+			next
+		}
 		/^Time:/ {
+			if (!in_run)
+				next
+			run_sum += $2
+			next
+		}
+		/^__PG_YAAP_BENCH_RUN_END__ [0-9]+$/ {
+			if (!in_run || $2 != run)
+				next
 			++n
-			printf("run%d: %s %s\n", n, $2, $3)
-			sum += $2
-			if (min == 0 || $2 < min) min = $2
-			if ($2 > max) max = $2
+			printf("run%d: %.3f ms\n", run, run_sum)
+			sum += run_sum
+			if (min == 0 || run_sum < min) min = run_sum
+			if (run_sum > max) max = run_sum
+			in_run = 0
+			run = 0
+			run_sum = 0
+			next
 		}
 		END {
 			if (n == 0) {

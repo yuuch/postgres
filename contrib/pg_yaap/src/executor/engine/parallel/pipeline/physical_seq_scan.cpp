@@ -34,6 +34,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
+#include "parallel/pipeline/physical_seq_scan_page_prepare.hpp"
 #ifdef USE_LLVM
 #include "llvmjit_deform_datachunk.h"
 #endif
@@ -176,48 +177,16 @@ ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared)
 		return 1;
 
 	uint32 want = (uint32) std::min<uint64>(shared->total_blocks, (uint64) UINT32_MAX);
-	return (uint32) std::max(1, std::min(pg_yaap_parallel_max_workers, (int) want));
-}
-
-struct SeqScanBlockStreamState {
-	Relation rel = nullptr;
-	SeqScanSharedPayload *shared = nullptr;
-	ParallelBlockTableScanWorker worker = nullptr;
-	BlockNumber startblock = InvalidBlockNumber;
-	int worker_index = LEADER_WORKER_INDEX;
-};
-
-static BlockNumber
-SeqScanReadStreamNextBlock(ReadStream *stream,
-                           void *callback_private_data,
-                           void *per_buffer_data)
-{
-	(void) stream;
-	(void) per_buffer_data;
-	auto *state = static_cast<SeqScanBlockStreamState *>(callback_private_data);
-	if (state == nullptr || state->rel == nullptr || state->shared == nullptr ||
-		state->worker == nullptr)
-		return InvalidBlockNumber;
-
-	if (unlikely(state->worker->phsw_chunk_size == 0))
-		table_block_parallelscan_startblock_init(state->rel,
-			state->worker,
-			&state->shared->pbscan,
-			state->startblock,
-			InvalidBlockNumber);
-
-	BlockNumber block = table_block_parallelscan_nextpage(state->rel,
-		state->worker,
-		&state->shared->pbscan);
-	if (pg_yaap_trace_execution_path)
-		ereport(LOG,
-			(errmsg("pg_yaap scan prefetch worker=%d startblock=%u nextblock=%u total_blocks=%u chunk_size=%u",
-				state->worker_index,
-				state->startblock,
-				block,
-				state->shared != nullptr ? state->shared->total_blocks : 0,
-				state->worker->phsw_chunk_size)));
-	return block;
+	/*
+	 * Treat pg_yaap.parallel_max_workers as a ceiling, not a target. On Q10's
+	 * large heap scans, using all 12 local workers oversubscribes the shared
+	 * buffer/read_stream path and loses to 4-8 workers. PostgreSQL's planner
+	 * likewise picks fewer workers than max_parallel_workers_per_gather for the
+	 * same query on this dataset.
+	 */
+	static constexpr int kSeqScanWorkerSoftCap = 6;
+	const int worker_cap = std::min(pg_yaap_parallel_max_workers, kSeqScanWorkerSoftCap);
+	return (uint32) std::max(1, std::min(worker_cap, (int) want));
 }
 
 /*
@@ -647,12 +616,20 @@ BuildDeformBindings(const SchemaDescriptor *out_schema,
                     DeformBindings &bindings)
 {
 	const uint16_t n = out_schema->n_columns;
+	if (n > kMaxDeformTargets)
+		elog(ERROR, "pg_yaap: SeqScan projection schema has too many columns (%u)",
+		     static_cast<unsigned>(n));
 	bindings.ncolumns = n;
 	bindings.owner_chunk = &out;
 	for (uint16_t s = 0; s < n; ++s)
 	{
 		const ColumnSchema &col = out_schema->columns[s];
 		const uint8_t       slot_idx = col.chunk_slot;
+		if (slot_idx >= 16)
+			elog(ERROR,
+			     "pg_yaap: SeqScan projection column %u has invalid chunk slot %u",
+			     static_cast<unsigned>(s),
+			     static_cast<unsigned>(slot_idx));
 		void *data_head;
 		switch (col.decode_kind)
 		{
@@ -691,15 +668,17 @@ BuildDeformBindings(const SchemaDescriptor *out_schema,
  */
 static inline void
 AppendProjectedTupleViaDeformer(PipelineChunk &out,
-                                 HeapTuple tuple,
-                                 const SchemaDescriptor *out_schema,
-                                 SeqScanLocalState &local)
+                                  HeapTuple tuple,
+                                  const DeformBindings &bindings,
+                                  SeqScanLocalState &local)
 {
+	if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
+		elog(ERROR, "pg_yaap: SeqScan output chunk overflow before append");
 	uint16_t row = out.count++;
 
-	DeformBindings bindings;
-	BuildDeformBindings(out_schema, out, bindings);
 	local.proj_deformer->deform_tuple_header(tuple->t_data, row, bindings);
+	if (out.count > PIPELINE_DEFAULT_CHUNK_SIZE)
+		elog(ERROR, "pg_yaap: SeqScan output chunk overflow after append");
 }
 
 /*
@@ -838,9 +817,7 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 		Page page;
 		int lines;
 		bool all_visible;
-		bool check_serializable;
-		int ntup = 0;
-		BatchMVCCState batchmvcc;
+		const bool check_serializable = local.check_serializable;
 
 		/*
 		 * pg_yaap AP/Q1 path only needs page-at-a-time visibility state
@@ -854,66 +831,46 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 		page = BufferGetPage(buffer);
 		lines = PageGetMaxOffsetNumber(page);
 		all_visible = PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
-		check_serializable =
-			CheckForSerializableConflictOutNeeded(scan->rs_base.rs_rd, snapshot);
-
-		for (OffsetNumber lineoff = FirstOffsetNumber;
-			 lineoff <= lines;
-			 lineoff++)
+		if (likely(all_visible))
 		{
-			ItemId lpp = PageGetItemId(page, lineoff);
-			HeapTuple tup;
-
-			if (unlikely(!ItemIdIsNormal(lpp)))
-				continue;
-
-			if (!all_visible || check_serializable)
-			{
-				tup = &batchmvcc.tuples[ntup];
-				tup->t_data = (HeapTupleHeader) PageGetItem(page, lpp);
-				tup->t_len = ItemIdGetLength(lpp);
-				tup->t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
-				ItemPointerSet(&(tup->t_self), scan->rs_cblock, lineoff);
-			}
-
-			if (all_visible)
-			{
-				if (check_serializable)
-					batchmvcc.visible[ntup] = true;
-				scan->rs_vistuples[ntup] = lineoff;
-			}
-
-			ntup++;
+			if (likely(!check_serializable))
+				scan->rs_ntuples = PgYaapCollectPageTuples<true, false>(scan,
+																	 snapshot,
+																	 page,
+																	 buffer,
+																	 scan->rs_cblock,
+																	 lines);
+			else
+				scan->rs_ntuples = PgYaapCollectPageTuples<true, true>(scan,
+																	snapshot,
+																	page,
+																	buffer,
+																	scan->rs_cblock,
+																	lines);
 		}
-
-		Assert(ntup <= MaxHeapTuplesPerPage);
-
-		if (all_visible)
-			scan->rs_ntuples = ntup;
 		else
-			scan->rs_ntuples = HeapTupleSatisfiesMVCCBatch(snapshot,
-										   buffer,
-										   ntup,
-										   &batchmvcc,
-										   scan->rs_vistuples);
-
-		if (check_serializable)
 		{
-			for (int i = 0; i < ntup; i++)
-			{
-				HeapCheckForSerializableConflictOut(batchmvcc.visible[i],
-									   scan->rs_base.rs_rd,
-									   &batchmvcc.tuples[i],
-									   buffer,
-									   snapshot);
-			}
+			if (likely(!check_serializable))
+				scan->rs_ntuples = PgYaapCollectPageTuples<false, false>(scan,
+																  snapshot,
+																  page,
+																  buffer,
+																  scan->rs_cblock,
+																  lines);
+			else
+				scan->rs_ntuples = PgYaapCollectPageTuples<false, true>(scan,
+																 snapshot,
+																 page,
+																 buffer,
+																 scan->rs_cblock,
+																 lines);
 		}
 	if (SeqScanTraceEnabled(ctx))
 		ereport(LOG,
 			(errmsg("pg_yaap scan load_page worker=%d block=%u visible=%u all_visible=%d serializable=%d",
 				ctx.worker_index,
 					local.scan_desc->rs_cblock,
-					ntup,
+					local.scan_desc->rs_ntuples,
 					all_visible ? 1 : 0,
 					check_serializable ? 1 : 0)));
 
@@ -1012,13 +969,13 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 	{
 		Relation rel = relation_open(relid_, AccessShareLock);
 		BlockNumber total = RelationGetNumberOfBlocks(rel);
-		relation_close(rel, AccessShareLock);
 
 		state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(SeqScanSharedPayload));
 		auto *payload = static_cast<SeqScanSharedPayload *>(
 			dsa_get_address(ctx.dsa, state->shared_payload_dp));
 		table_block_parallelscan_initialize(rel, (ParallelTableScanDesc) &payload->pbscan);
 		payload->total_blocks = total;
+		relation_close(rel, AccessShareLock);
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
 	}
 
@@ -1041,33 +998,19 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 		GetActiveSnapshot(),
 		0,
 		nullptr,
-		nullptr,
+		global.shared != nullptr ? (ParallelTableScanDesc) &global.shared->pbscan : nullptr,
 		SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
-	if (local->scan_desc->rs_read_stream != nullptr)
-	{
-		read_stream_end(local->scan_desc->rs_read_stream);
-		local->scan_desc->rs_read_stream = nullptr;
-	}
-	auto *stream_state = static_cast<SeqScanBlockStreamState *>(palloc0(sizeof(SeqScanBlockStreamState)));
-	stream_state->rel = local->rel;
-	stream_state->shared = global.shared;
-	stream_state->worker = &local->parallel_scan_worker;
-	stream_state->startblock = local->scan_desc->rs_startblock;
-	stream_state->worker_index = ctx.worker_index;
 	if (SeqScanTraceEnabled(ctx))
 		ereport(LOG,
 			(errmsg("pg_yaap scan read_stream worker=%d startblock=%u total_blocks=%u",
 				ctx.worker_index,
-				stream_state->startblock,
+				local->scan_desc->rs_startblock,
 				global.shared != nullptr ? global.shared->total_blocks : 0)));
-	local->read_stream = read_stream_begin_relation(READ_STREAM_SEQUENTIAL |
-	                                                READ_STREAM_USE_BATCHING,
-	                                                local->scan_desc->rs_strategy,
-	                                                local->rel,
-	                                                MAIN_FORKNUM,
-	                                                SeqScanReadStreamNextBlock,
-	                                                stream_state,
-	                                                0);
+	local->read_stream = local->scan_desc->rs_read_stream;
+	if (local->read_stream == nullptr)
+		elog(ERROR, "pg_yaap: SeqScan failed to initialize read stream");
+	local->check_serializable =
+		CheckForSerializableConflictOutNeeded(local->rel, GetActiveSnapshot());
 	local->exhausted = (global.shared == nullptr || global.shared->total_blocks == 0);
 
 	return std::unique_ptr<LocalSourceState>(std::move(local));
@@ -1083,32 +1026,53 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	if (first_call)
 		local.diag_first_call_logged = true;
 
-	out.reset();
+	out.reset_lightweight();
 
 	if (local.exhausted || global.shared == nullptr)
 		return SourceResultType::FINISHED;
 
-	SchemaDescriptor *out_schema = ResolveSchemaDescriptor(global.dsa, output_schema_dp_);
-	if (out_schema == nullptr)
-		elog(ERROR, "pg_yaap: PhysicalSeqScan output_schema_dp not published");
-	FilterInputDesc *filter_inputs = ResolveFilterInputs(global.dsa, filter_inputs_dp_);
-	FilterExprDesc *filter_exprs = ResolveFilterExprs(global.dsa, filter_exprs_dp_);
-	FilterStep *filter_steps = ResolveFilterSteps(global.dsa, filter_steps_dp_);
-	const char *filter_string_consts = DsaPointerIsValid(filter_string_consts_dp_)
-		? static_cast<const char *>(dsa_get_address(global.dsa, filter_string_consts_dp_))
-		: nullptr;
-	const uint16_t required_bool_regs = filter_exprs != nullptr ?
-		RequiredFilterBoolRegs(filter_exprs, n_filter_exprs_) : 0;
-	const FilterStep *simple_filter_step = nullptr;
-	if (n_filter_inputs_ > 0 && filter_inputs == nullptr)
-		elog(ERROR, "pg_yaap: PhysicalSeqScan filter_inputs_dp not published");
-	if (n_filter_exprs_ > 0 && filter_exprs == nullptr)
-		elog(ERROR, "pg_yaap: PhysicalSeqScan filter_exprs_dp not published");
-	if (n_filter_steps_ > 0 && filter_steps == nullptr)
-		elog(ERROR, "pg_yaap: PhysicalSeqScan filter_steps_dp not published");
-	if (filter_bool_regs_ > FILTER_MAX_BOOL_REGS)
-		elog(ERROR, "pg_yaap: PhysicalSeqScan filter bool register overflow (%u)",
-		     static_cast<unsigned>(filter_bool_regs_));
+	if (!local.descriptor_cache_ready)
+	{
+		local.out_schema_cache = ResolveSchemaDescriptor(global.dsa, output_schema_dp_);
+		if (local.out_schema_cache == nullptr)
+			elog(ERROR, "pg_yaap: PhysicalSeqScan output_schema_dp not published");
+		local.filter_inputs_cache = ResolveFilterInputs(global.dsa, filter_inputs_dp_);
+		local.filter_exprs_cache = ResolveFilterExprs(global.dsa, filter_exprs_dp_);
+		local.filter_steps_cache = ResolveFilterSteps(global.dsa, filter_steps_dp_);
+		local.filter_string_consts_cache = DsaPointerIsValid(filter_string_consts_dp_)
+			? static_cast<const char *>(dsa_get_address(global.dsa, filter_string_consts_dp_))
+			: nullptr;
+		local.required_bool_regs_cache = local.filter_exprs_cache != nullptr ?
+			RequiredFilterBoolRegs(local.filter_exprs_cache, n_filter_exprs_) : 0;
+		if (n_filter_inputs_ > 0 && local.filter_inputs_cache == nullptr)
+			elog(ERROR, "pg_yaap: PhysicalSeqScan filter_inputs_dp not published");
+		if (n_filter_exprs_ > 0 && local.filter_exprs_cache == nullptr)
+			elog(ERROR, "pg_yaap: PhysicalSeqScan filter_exprs_dp not published");
+		if (n_filter_steps_ > 0 && local.filter_steps_cache == nullptr)
+			elog(ERROR, "pg_yaap: PhysicalSeqScan filter_steps_dp not published");
+		if (filter_bool_regs_ > FILTER_MAX_BOOL_REGS)
+			elog(ERROR, "pg_yaap: PhysicalSeqScan filter bool register overflow (%u)",
+			     static_cast<unsigned>(filter_bool_regs_));
+		local.simple_filter_step_cache = nullptr;
+		if (n_filter_exprs_ > 0 && local.filter_exprs_cache != nullptr &&
+			local.filter_steps_cache != nullptr)
+		{
+			IsSimpleFilterStep(local.filter_exprs_cache,
+			                   n_filter_exprs_,
+			                   local.filter_steps_cache,
+			                   n_filter_steps_,
+			                   &local.simple_filter_step_cache);
+		}
+		local.descriptor_cache_ready = true;
+	}
+
+	SchemaDescriptor *out_schema = local.out_schema_cache;
+	FilterInputDesc *filter_inputs = local.filter_inputs_cache;
+	FilterExprDesc *filter_exprs = local.filter_exprs_cache;
+	FilterStep *filter_steps = local.filter_steps_cache;
+	const char *filter_string_consts = local.filter_string_consts_cache;
+	const uint16_t required_bool_regs = local.required_bool_regs_cache;
+	const FilterStep *simple_filter_step = local.simple_filter_step_cache;
 
 	(void) ctx;
 
@@ -1131,9 +1095,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			bool proj_jit_compiled = false;
 			const char *proj_jit_reason = nullptr;
 #ifdef USE_LLVM
-			if (pg_yaap_jit_deform &&
-			    !(ctx.worker_index != LEADER_WORKER_INDEX &&
-			      pg_yaap_disable_jit_for_parallel_worker))
+			const bool allow_proj_worker_jit =
+				!pg_yaap_disable_jit_for_parallel_worker ||
+				ctx.worker_index == LEADER_WORKER_INDEX;
+			if (pg_yaap_jit_deform && allow_proj_worker_jit)
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1176,6 +1141,15 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 					local.filter_deform_program))
 				ereport(ERROR,
 				        (errmsg("pg_yaap: failed to build SeqScan filter deformer")));
+			local.filter_uses_string_arena = false;
+			for (int target_idx = 0; target_idx < local.filter_deform_program.ntargets; ++target_idx)
+			{
+				if (local.filter_deform_program.targets[target_idx].decode_kind == DeformDecodeKind::kStringRef)
+				{
+					local.filter_uses_string_arena = true;
+					break;
+				}
+			}
 			local.filter_chunk = std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>>(
 				new DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>());
 			local.filter_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
@@ -1183,9 +1157,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			bool filter_jit_compiled = false;
 			const char *filter_jit_reason = nullptr;
 #ifdef USE_LLVM
-			if (pg_yaap_jit_deform &&
-			    !(ctx.worker_index != LEADER_WORKER_INDEX &&
-			      pg_yaap_disable_jit_for_parallel_worker))
+			const bool allow_filter_worker_jit =
+				!pg_yaap_disable_jit_for_parallel_worker ||
+				ctx.worker_index == LEADER_WORKER_INDEX;
+			if (pg_yaap_jit_deform && allow_filter_worker_jit)
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1229,14 +1204,15 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 				      local.filter_chunk != nullptr);
 	if (has_filter)
 		BuildFilterDeformBindings(filter_inputs, n_filter_inputs_, *local.filter_chunk, filter_bindings);
-	const bool use_simple_filter =
-		has_filter && IsSimpleFilterStep(filter_exprs, n_filter_exprs_, filter_steps, n_filter_steps_, &simple_filter_step);
+	DeformBindings proj_bindings;
+	BuildDeformBindings(out_schema, out, proj_bindings);
+	const bool use_simple_filter = has_filter && simple_filter_step != nullptr;
 	const bool profile_on = PipelineProfileEnabled(ctx);
 
 	uint32_t tuple_checks = 0;
 	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
-		if (PipelineCancelRequestedEvery(ctx, tuple_checks++))
+		if (PipelineCancelRequestedEvery(ctx, tuple_checks++, 1023u))
 		{
 			ReleaseSeqScanPage(local);
 			break;
@@ -1284,7 +1260,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			instr_time qual_deform_start;
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(qual_deform_start);
-			local.filter_chunk->reset_lightweight();
+			if (local.filter_uses_string_arena)
+				local.filter_chunk->string_arena.clear();
 			local.filter_deformer->deform_tuple_header(tuple.t_data, 0, filter_bindings);
 			if (profile_on)
 			{
@@ -1347,7 +1324,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		instr_time proj_start;
 		if (profile_on)
 			INSTR_TIME_SET_CURRENT(proj_start);
-		AppendProjectedTupleViaDeformer(out, &tuple, out_schema, local);
+		AppendProjectedTupleViaDeformer(out, &tuple, proj_bindings, local);
 		if (profile_on)
 		{
 			instr_time proj_end;
@@ -1362,18 +1339,20 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 
 	if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
-		if (first_call)
+		if (first_call && pg_yaap_trace_execution_path)
+		{
 			elog(LOG,
 			     "pg_yaap: SeqScan.GetData first_call full_chunk=%u exhausted=%d has_filter=%d total_blocks=%u",
 			     out.count,
 			     local.exhausted ? 1 : 0,
 			     has_filter ? 1 : 0,
 			     global.shared != nullptr ? global.shared->total_blocks : 0);
+		}
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
 
 	ReleaseSeqScanPage(local);
-	if (first_call)
+	if (first_call && pg_yaap_trace_execution_path)
 		elog(LOG,
 		     "pg_yaap: SeqScan.GetData first_call out_count=%u exhausted=%d has_filter=%d total_blocks=%u",
 		     out.count,

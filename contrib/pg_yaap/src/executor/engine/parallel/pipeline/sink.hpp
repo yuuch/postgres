@@ -63,6 +63,8 @@ public:
 	Finalize(ExecCtx &ctx, GlobalSinkState &gstate) = 0;
 
 	virtual bool ParallelSink() const { return true; }
+	virtual bool CombineIsTrivial() const { return false; }
+	virtual bool FinalizeIsTrivial() const { return false; }
 };
 
 }  /* namespace pipeline */

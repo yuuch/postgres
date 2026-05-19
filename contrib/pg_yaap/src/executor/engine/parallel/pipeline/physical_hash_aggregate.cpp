@@ -16,6 +16,7 @@ extern bool pg_yaap_trace_hooks;
 
 #include "core/data_chunk.hpp"
 #include "parallel/pipeline/cancel.hpp"
+#include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 #include "parallel/pipeline/types.hpp"
 
@@ -117,6 +118,14 @@ ResolvePartitions(dsa_area *dsa, HashAggSharedPayload *payload)
 	if (payload == nullptr || !DsaPointerIsValid(payload->partitions_dp))
 		return nullptr;
 	return static_cast<HashAggPartition *>(dsa_get_address(dsa, payload->partitions_dp));
+}
+
+static uint32_t
+EffectiveWorkerCount(const ExecCtx &ctx)
+{
+	if (ctx.control != nullptr && ctx.control->num_workers > 0)
+		return static_cast<uint32_t>(ctx.control->num_workers);
+	return static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
 }
 
 static dsa_pointer *
@@ -889,7 +898,7 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			CanEncodePerfectHashLayout(state->layout);
 		const bool use_single_state = !use_perfect_hash &&
 			IsSingleStateAggregate(state->layout);
-		const uint32_t workers = static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
+		const uint32_t workers = EffectiveWorkerCount(ctx);
 		if (use_single_state)
 			state->max_groups = 1;
 		state->partition_count = (use_perfect_hash || use_single_state) ? 1u :
@@ -902,7 +911,7 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		state->payload->partition_count = state->partition_count;
 		state->payload->partition_mask = state->partition_count - 1u;
 		state->payload->max_groups = state->max_groups;
-		state->payload->local_state_slot_count = static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
+		state->payload->local_state_slot_count = workers;
 		state->payload->perfect_hash_capacity = use_perfect_hash ? perfect_capacity : 0;
 		state->payload->finalized = false;
 		pg_atomic_init_u32(&state->payload->source_partition_next, 0);

@@ -130,6 +130,8 @@ public:
 	SinkResultType                   SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
 	SinkCombineResultType            Combine(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
 	SinkFinalizeType                 Finalize(ExecCtx &ctx, GlobalSinkState &gstate) override;
+	bool                             CombineIsTrivial() const override { return true; }
+	bool                             FinalizeIsTrivial() const override { return true; }
 
 	/* Leader-only post-FINALIZE drain. Walks shared TDC → encodes columns
 	 * via input_schema → forwards to dest_. No-op when dest_ is nullptr. */

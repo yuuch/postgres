@@ -39,6 +39,7 @@ PipelineRunEvent::Schedule()
 	leader_ctx.mcxt         = scheduler_->mcxt();
 	leader_ctx.dsa          = scheduler_->dsa();
 	leader_ctx.worker_index = LEADER_WORKER_INDEX;
+	leader_ctx.control      = scheduler_->control();
 
 	if (pipeline_->source != nullptr)
 		(void) pipeline_->source->GetGlobalSourceState(leader_ctx);

@@ -33,6 +33,7 @@ extern "C" {
 }
 
 #include "core/memory.hpp"
+#include "core/data_chunk.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
 #include "parallel/pipeline/operator.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
@@ -55,6 +56,9 @@ struct ProcessPipelineExecState {
 	std::unique_ptr<LocalSourceState> local_source;
 	std::unique_ptr<LocalSinkState> local_sink;
 	PgVector<std::unique_ptr<OperatorState>> local_ops;
+	std::unique_ptr<PipelineChunk> run_src_chunk;
+	std::unique_ptr<PipelineChunk> run_scratch_a;
+	std::unique_ptr<PipelineChunk> run_scratch_b;
 	bool run_initialized = false;
 	bool combine_done = false;
 	bool leader_partial_pending = false;

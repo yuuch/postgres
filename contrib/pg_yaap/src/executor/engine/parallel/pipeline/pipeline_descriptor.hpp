@@ -390,8 +390,10 @@ struct HashJoinSharedPayload {
 	uint32_t    hash_table_capacity;
 	uint8_t     radix_bits;
 	bool        combined;
+	bool        build_rows_shared_local;
+	bool        build_rows_use_keys;
 	bool        finalized;
-	uint8_t     _pad0;
+	uint8_t     _pad0[2];
 	pg_atomic_uint32 release_state;       /* 0=live, 1=releasing, 2=released */
 	pg_atomic_uint32 combine_prepare_state; /* 0=pending, 1=preparing, 2=ready */
 	uint32_t    combined_row_count;
@@ -400,7 +402,10 @@ struct HashJoinSharedPayload {
 	dsa_pointer local_build_registry_dp; /* HashJoinLocalBuildRegistryEntry[local_state_slot_count] */
 	dsa_pointer build_keys_dp;           /* global build-side key row store */
 	dsa_pointer build_rows_dp;           /* future global build-side row store */
+	dsa_pointer build_row_slots_dp;      /* uint32_t[combined_row_count] -> registry slot */
+	dsa_pointer build_row_local_idxs_dp; /* uint32_t[combined_row_count] -> row index within slot-local payload TDC */
 	dsa_pointer hash_table_dp;           /* uint32_t[hash_table_capacity] bucket heads */
+	dsa_pointer hash_buckets_dp;         /* uint32_t[build_rows.row_count] cached bucket indices */
 	dsa_pointer hash_links_dp;           /* uint32_t[build_rows.row_count] next indices */
 	dsa_pointer hash_salts_dp;           /* uint16_t[build_rows.row_count] high-hash salts */
 };

@@ -52,7 +52,7 @@ void InitializeHashJoinFastProbeState(HashJoinFastProbeState &state,
 
 void CopyRowsByResolvedMappingBatch(const PipelineChunk &left_chunk,
 				    const uint16_t *left_row_indices,
-				    const TupleDataCollection *right_tdc,
+				    const TupleDataCollection *const *right_tdcs,
 				    const uint8_t *const *right_rows,
 				    const HashJoinResolvedOutputColumn *resolved_columns,
 				    uint16_t output_column_count,

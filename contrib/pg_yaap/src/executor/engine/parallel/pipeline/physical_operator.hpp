@@ -103,6 +103,8 @@ public:
 		(void) ctx; (void) gstate;
 		return SinkFinalizeType::READY;
 	}
+	virtual bool CombineIsTrivial() const { return false; }
+	virtual bool FinalizeIsTrivial() const { return false; }
 
 	/* Worker count hint for the scheduler. Single-threaded ops return 1. */
 	virtual int MaxThreads(ExecCtx &ctx) const {

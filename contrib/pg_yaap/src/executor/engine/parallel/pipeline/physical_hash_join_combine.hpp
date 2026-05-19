@@ -8,6 +8,9 @@ namespace pipeline {
 SinkCombineResultType ExecuteHashJoinCombine(ExecCtx &ctx,
                                              HashJoinGlobalSinkState &global,
                                              HashJoinLocalSinkState &local);
+SinkCombineResultType ExecuteHashJoinSharedPayloadCombine(ExecCtx &ctx,
+                                                          HashJoinGlobalSinkState &global,
+                                                          HashJoinLocalSinkState &local);
 void PublishHashJoinCombinedRows(HashJoinGlobalSinkState &global);
 
 }  /* namespace pipeline */

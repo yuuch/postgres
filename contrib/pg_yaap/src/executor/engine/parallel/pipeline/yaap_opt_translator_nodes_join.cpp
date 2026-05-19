@@ -23,6 +23,42 @@ BuildOrderedSchemaForRefs(const std::vector<ColumnRef> &refs,
 }
 
 static bool
+AddRightFilterPayloadRefs(const std::vector<HashJoinFilterInputDesc> &filter_inputs,
+						  const std::vector<ColumnRef> &build_cols,
+						  const std::vector<ColumnSchema> &build_schema,
+						  std::vector<ColumnRef> &build_payload_refs)
+{
+	for (const HashJoinFilterInputDesc &input : filter_inputs)
+	{
+		if (input.side != HashJoinOutputSide::RIGHT)
+			continue;
+		bool found = false;
+		for (size_t i = 0; i < build_cols.size() && i < build_schema.size(); ++i)
+		{
+			if (build_schema[i].chunk_slot != input.input_chunk_slot ||
+				build_schema[i].decode_kind != input.source_decode_kind)
+				continue;
+			found = true;
+			bool exists = false;
+			for (const ColumnRef &existing : build_payload_refs)
+			{
+				if (SameColumnRef(existing, build_cols[i]))
+				{
+					exists = true;
+					break;
+				}
+			}
+			if (!exists)
+				build_payload_refs.push_back(build_cols[i]);
+			break;
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+static bool
 OutputBindingsMatch(const std::vector<yaap::PhysicalOperator::OutputColumn> &lhs,
 					  const std::vector<yaap::PhysicalOperator::OutputColumn> &rhs)
 {
@@ -986,44 +1022,9 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	std::vector<ColumnRef> build_payload_refs;
 	std::vector<ColumnSchema> build_payload_schema_storage;
 	const std::vector<ColumnSchema> *build_payload_schema = &build_schema;
-	{
-		{
-			const bool keep_all_build_payload =
-				!residuals.empty();
-			for (const ColumnRef &candidate : build_cols)
-			{
-				bool needed = keep_all_build_payload;
-				for (const ColumnRef &requested_ref : requested_output_cols)
-				{
-					if (SameColumnRef(candidate, requested_ref))
-					{
-						needed = true;
-						break;
-					}
-				}
-				if (needed)
-					build_payload_refs.push_back(candidate);
-			}
-		}
-		if (build_payload_refs.empty())
-		{
-			if (!build_keys.empty())
-				build_payload_refs.push_back(build_keys.front());
-			else if (!build_cols.empty())
-				build_payload_refs.push_back(build_cols.front());
-		}
-		if (!BuildOrderedSchemaForRefs(build_payload_refs, build_cols, build_schema, build_payload_schema_storage))
-		{
-			if (pg_yaap_trace_hooks)
-				elog(LOG, "pg_yaap: optimizer hash join rejected: build payload schema derivation failed");
-			return false;
-		}
-		build_payload_schema = &build_payload_schema_storage;
-	}
 	if (!BuildColumnOnlyLayoutForRefs(probe_keys, probe_cols, probe_schema, probe_key_layout) ||
 		!BuildColumnOnlyLayoutForRefs(build_keys, build_cols, build_schema, build_key_layout) ||
 		!BuildColumnOnlyLayout(probe_schema, probe_payload_layout) ||
-		!BuildColumnOnlyLayout(*build_payload_schema, build_payload_layout) ||
 		!BuildHashJoinOutputMappings(requested_output_cols, probe_cols, probe_schema, build_cols, build_schema, output_mappings, output_schema))
 	{
 		if (pg_yaap_trace_hooks)
@@ -1134,6 +1135,39 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 			 filter_steps.size(),
 			 filter_bool_regs,
 			 rewritten_residuals.size());
+
+	for (const ColumnRef &candidate : build_cols)
+	{
+		for (const ColumnRef &requested_ref : requested_output_cols)
+		{
+			if (SameColumnRef(candidate, requested_ref))
+			{
+				build_payload_refs.push_back(candidate);
+				break;
+			}
+		}
+	}
+	if (!AddRightFilterPayloadRefs(filter_inputs, build_cols, build_schema, build_payload_refs))
+	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG, "pg_yaap: optimizer hash join rejected: residual payload column derivation failed");
+		return false;
+	}
+	if (build_payload_refs.empty())
+	{
+		if (!build_keys.empty())
+			build_payload_refs.push_back(build_keys.front());
+		else if (!build_cols.empty())
+			build_payload_refs.push_back(build_cols.front());
+	}
+	if (!BuildOrderedSchemaForRefs(build_payload_refs, build_cols, build_schema, build_payload_schema_storage) ||
+		!BuildColumnOnlyLayout(build_payload_schema_storage, build_payload_layout))
+	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG, "pg_yaap: optimizer hash join rejected: build payload schema derivation failed");
+		return false;
+	}
+	build_payload_schema = &build_payload_schema_storage;
 
 	dsa_pointer left_schema_dp = BuildSchemaDescriptorFromColumns(probe_schema, state->runtime_dsa);
 	dsa_pointer right_schema_dp = BuildSchemaDescriptorFromColumns(*build_payload_schema, state->runtime_dsa);
