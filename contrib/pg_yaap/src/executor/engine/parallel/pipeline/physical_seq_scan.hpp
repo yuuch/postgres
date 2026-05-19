@@ -16,6 +16,7 @@ extern "C" {
 
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
+#include "parallel/pipeline/physical_seq_scan_read_stream.hpp"
 #include "core/data_chunk.hpp"
 #include "core/data_chunk_deform.hpp"
 #include "expr/expr.hpp"  /* pg_yaap_release_llvm_jit_context */
@@ -59,6 +60,7 @@ public:
 	const char      *filter_string_consts_cache = nullptr;
 	uint16_t         required_bool_regs_cache = 0;
 	const FilterStep *simple_filter_step_cache = nullptr;
+	SeqScanReadStreamState read_stream_state{};
 
 	/* M-Q1-PERF B.1: split deform into qual-side (1-row scratch chunk, written
 	 * at row 0 every tuple, evaluated inline) + projection-side (written at

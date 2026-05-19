@@ -199,6 +199,8 @@ private:
 	/* Internal helper: derive the per-Run/Combine task fan-out count for
 	 * a pipeline. Currently bounded by source->MaxThreads(). */
 	uint32_t DeriveRunTaskCount(Pipeline &pipeline) const;
+	void RememberRunTaskCount(PipelineId pid, uint32_t task_count);
+	uint32_t RememberedRunTaskCount(PipelineId pid) const;
 
 	MemoryContext                                  mcxt_;
 	std::unique_ptr<MetaPipelineBundle>            bundle_;
@@ -208,6 +210,7 @@ private:
 	PipelineDsmLookup<Event>                       events_;
 
 	PgVector<std::shared_ptr<Event>>               events_owned_;
+	PgVector<uint32_t>                             run_task_counts_;
 	uint32_t                                       next_event_id_ = 0;
 
 	/* C1 NEW: shared runtime pointers (bound by BindRuntime; not owned). */

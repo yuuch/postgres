@@ -1706,19 +1706,87 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 			return BuildFinalSortKeys(order, queryDesc, &out.outputs, out.cols, out.schema, out.final_sort_keys);
 		}
 
-		case PhysicalOperatorType::LIMIT:
-		{
-			if (!pending_filters.empty())
-				return false;
-			const auto &limit = static_cast<const PhysicalLimit &>(op);
-			if (limit.children.size() != 1 || limit.children[0] == nullptr)
-				return false;
-			uint64_t limit_count = 0;
-			if (!TryParseLimitExpression(limit.limit_count, limit_count))
-				return false;
-			OptimizerNodeTranslation child;
-			if (!TranslateOptimizerNode(*limit.children[0], queryDesc, state, {}, required_output_cols, delim_outer_child, delim_outer_bindings, child))
-				return false;
+			case PhysicalOperatorType::LIMIT:
+			{
+				if (!pending_filters.empty())
+					return false;
+				const auto &limit = static_cast<const PhysicalLimit &>(op);
+				if (limit.children.size() != 1 || limit.children[0] == nullptr)
+					return false;
+				uint64_t limit_count = 0;
+				if (!TryParseLimitExpression(limit.limit_count, limit_count))
+					return false;
+				if (limit_count == 0)
+					return false;
+				if (IsTopNNode(op))
+				{
+					const auto &order = static_cast<const PhysicalOrderBy &>(*limit.children[0]);
+					OptimizerNodeTranslation child;
+					if (!TranslateOptimizerNode(*order.children[0],
+							queryDesc,
+							state,
+							{},
+							required_output_cols,
+							delim_outer_child,
+							delim_outer_bindings,
+							child))
+						return false;
+					if (!BuildFinalSortKeys(order,
+							queryDesc,
+							&child.outputs,
+							child.cols,
+							child.schema,
+							child.final_sort_keys))
+						return false;
+					TupleDataLayout payload_layout;
+					if (!BuildColumnOnlyLayout(child.schema, payload_layout))
+						return false;
+					const dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(child.schema, state->runtime_dsa);
+					const dsa_pointer layout_dp = SerializeTupleDataLayout(payload_layout, state->runtime_dsa);
+					const dsa_pointer sort_keys_dp = BuildFilterArray(state->runtime_dsa,
+						child.final_sort_keys.data(),
+						sizeof(SortKeyDesc),
+						child.final_sort_keys.size());
+					const dsa_pointer shared_payload_dp = dsa_allocate0(state->runtime_dsa,
+						sizeof(pipeline::TopNSharedPayload));
+					if (!DsaPointerIsValid(input_schema_dp) ||
+						!DsaPointerIsValid(layout_dp) ||
+						!DsaPointerIsValid(sort_keys_dp) ||
+						!DsaPointerIsValid(shared_payload_dp))
+						return false;
+					auto *shared_payload = static_cast<pipeline::TopNSharedPayload *>(
+						dsa_get_address(state->runtime_dsa, shared_payload_dp));
+					SpinLockInit(&shared_payload->mutex);
+					shared_payload->sort_indices_dp = InvalidDsaPointer;
+					shared_payload->finalized = false;
+					shared_payload->tdc_dp = pipeline::TupleDataCollectionAllocate(state->runtime_dsa,
+						static_cast<uint32_t>(limit_count),
+						payload_layout.row_width,
+						TupleDataCollectionDefaultHeapCapacity(&payload_layout, static_cast<uint32_t>(limit_count)));
+					auto *global_tdc = static_cast<TupleDataCollection *>(
+						dsa_get_address(state->runtime_dsa, shared_payload->tdc_dp));
+					TupleDataCollectionInit(global_tdc,
+						static_cast<uint32_t>(limit_count),
+						payload_layout.row_width,
+						layout_dp,
+						TupleDataCollectionDefaultHeapCapacity(&payload_layout, static_cast<uint32_t>(limit_count)));
+					auto topn = std::make_unique<PipelineTopN>(
+						input_schema_dp,
+						layout_dp,
+						sort_keys_dp,
+						static_cast<uint16_t>(child.final_sort_keys.size()),
+						shared_payload_dp,
+						static_cast<uint32_t>(limit_count));
+					topn->AddChild(std::move(child.op));
+					child.op = std::move(topn);
+					child.final_sort_keys.clear();
+					child.limit_count = 0;
+					out = std::move(child);
+					return true;
+				}
+				OptimizerNodeTranslation child;
+				if (!TranslateOptimizerNode(*limit.children[0], queryDesc, state, {}, required_output_cols, delim_outer_child, delim_outer_bindings, child))
+					return false;
 			out = std::move(child);
 			out.limit_count = limit_count;
 			return true;

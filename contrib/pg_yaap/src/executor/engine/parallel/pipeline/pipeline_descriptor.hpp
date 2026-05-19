@@ -64,9 +64,10 @@ enum class OpKind : uint8_t {
 	PERFECT_HASH_AGGREGATE = 3,
 	HASH_JOIN      = 4,
 	ORDER          = 5,
-	OUTPUT         = 6,
-	FILTER         = 7,
-	PROJECTION     = 8,
+	TOP_N          = 6,
+	OUTPUT         = 7,
+	FILTER         = 8,
+	PROJECTION     = 9,
 };
 
 /* -------------------------------------------------------------------------
@@ -493,6 +494,17 @@ struct OrderOpBody {
 	uint32_t    max_rows;
 };
 
+struct TopNOpBody {
+	dsa_pointer input_schema;        /* SchemaDescriptor */
+	dsa_pointer layout;              /* TupleDataLayout for payload storage */
+	dsa_pointer sort_keys;           /* SortKeyDesc[n_sort_keys] */
+	dsa_pointer shared_payload;      /* TopNSharedPayload */
+	dsa_pointer sort_indices;        /* OrderSortIndices; populated in Finalize */
+	uint16_t    n_sort_keys;
+	uint16_t    _pad0;
+	uint32_t    max_rows;
+};
+
 struct OutputOpBody {
 	dsa_pointer input_schema;        /* SchemaDescriptor */
 	dsa_pointer layout;              /* TupleDataLayout serialized from input_schema */
@@ -526,11 +538,12 @@ struct OpDescriptor {
 		DelimScanOpBody delim_scan;
 		HashAggOpBody hash_agg;
 		HashAggOpBody perfect_hash_agg;
-		HashJoinOpBody hash_join;
-		OrderOpBody   order;
-		OutputOpBody  output;
-		FilterOpBody  filter;
-		ProjectOpBody project;
+			HashJoinOpBody hash_join;
+			OrderOpBody   order;
+			TopNOpBody    top_n;
+			OutputOpBody  output;
+			FilterOpBody  filter;
+			ProjectOpBody project;
 	} body;
 };
 

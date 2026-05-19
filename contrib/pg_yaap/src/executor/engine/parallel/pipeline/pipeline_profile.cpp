@@ -155,6 +155,7 @@ OpKindName(OpKind kind)
 		case OpKind::PERFECT_HASH_AGGREGATE: return "PERFECT_HASH_AGGREGATE";
 		case OpKind::HASH_JOIN: return "HASH_JOIN";
 		case OpKind::ORDER: return "ORDER";
+		case OpKind::TOP_N: return "TOP_N";
 		case OpKind::OUTPUT: return "OUTPUT";
 		case OpKind::FILTER: return "FILTER";
 		case OpKind::PROJECTION: return "PROJECTION";
@@ -528,6 +529,7 @@ PipelineProfileSourceStage(PhysicalOperatorType type)
 			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SOURCE_HASH_AGG;
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::SOURCE_PERFECT_HASH_AGG;
 			case PhysicalOperatorType::ORDER: return PipelineProfileStage::SOURCE_ORDER;
+			case PhysicalOperatorType::TOP_N: return PipelineProfileStage::SOURCE_ORDER;
 		default: return PipelineProfileStage::TASK_RUN_TOTAL;
 	}
 }
@@ -556,6 +558,7 @@ PipelineProfileSinkStage(PhysicalOperatorType type)
 			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SINK_HASH_AGG_UPDATE;
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::SINK_PERFECT_HASH_AGG_UPDATE;
 			case PhysicalOperatorType::ORDER: return PipelineProfileStage::SINK_ORDER_APPEND;
+			case PhysicalOperatorType::TOP_N: return PipelineProfileStage::SINK_ORDER_APPEND;
 		case PhysicalOperatorType::OUTPUT: return PipelineProfileStage::SINK_OUTPUT_APPEND;
 		default: return PipelineProfileStage::TASK_RUN_TOTAL;
 	}
@@ -564,12 +567,11 @@ PipelineProfileSinkStage(PhysicalOperatorType type)
 PipelineProfileStage
 PipelineProfileCombineStage(PhysicalOperatorType type)
 {
-	return (type == PhysicalOperatorType::HASH_AGGREGATE ||
-		type == PhysicalOperatorType::PERFECT_HASH_AGGREGATE)
-		? (type == PhysicalOperatorType::PERFECT_HASH_AGGREGATE
-			? PipelineProfileStage::COMBINE_PERFECT_HASH_AGG
-			: PipelineProfileStage::COMBINE_HASH_AGG)
-		: PipelineProfileStage::TASK_COMBINE_TOTAL;
+	if (type == PhysicalOperatorType::HASH_AGGREGATE)
+		return PipelineProfileStage::COMBINE_HASH_AGG;
+	if (type == PhysicalOperatorType::PERFECT_HASH_AGGREGATE)
+		return PipelineProfileStage::COMBINE_PERFECT_HASH_AGG;
+	return PipelineProfileStage::TASK_COMBINE_TOTAL;
 }
 
 PipelineProfileStage
@@ -581,6 +583,7 @@ PipelineProfileFinalizeStage(PhysicalOperatorType type)
 			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_HASH_AGG;
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_PERFECT_HASH_AGG;
 			case PhysicalOperatorType::ORDER: return PipelineProfileStage::FINALIZE_ORDER;
+			case PhysicalOperatorType::TOP_N: return PipelineProfileStage::FINALIZE_ORDER;
 		case PhysicalOperatorType::OUTPUT: return PipelineProfileStage::FINALIZE_OUTPUT;
 		default: return PipelineProfileStage::TASK_FINALIZE_TOTAL;
 	}

@@ -40,6 +40,7 @@ extern "C" {
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_projection.hpp"
 #include "parallel/pipeline/physical_seq_scan.hpp"
+#include "parallel/pipeline/physical_top_n.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 
@@ -271,6 +272,21 @@ EmitOrder(const PhysicalOrder &op, OpDescriptor &out, dsa_area *dsa)
 }
 
 static void
+EmitTopN(const PhysicalTopN &op, OpDescriptor &out)
+{
+	out.kind = OpKind::TOP_N;
+	out.n_children = 0;
+	out.body.top_n.input_schema = op.input_schema_dp();
+	out.body.top_n.layout = op.layout_dp();
+	out.body.top_n.sort_keys = op.sort_keys_dp();
+	out.body.top_n.shared_payload = op.shared_payload_dp();
+	out.body.top_n.sort_indices = InvalidDsaPointer;
+	out.body.top_n.n_sort_keys = op.n_sort_keys();
+	out.body.top_n._pad0 = 0;
+	out.body.top_n.max_rows = op.max_rows();
+}
+
+static void
 EmitOutput(const OutputSink &op, OpDescriptor &out)
 {
 	out.kind = OpKind::OUTPUT;
@@ -418,18 +434,28 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				const_cast<OpDescriptor *>(&op));
 		}
 
-		case OpKind::ORDER:
-			return std::make_unique<PhysicalOrder>(
-				op.body.order.sort_keys,
-				op.body.order.n_sort_keys,
-				op.body.order.key_layout,
-				op.body.order.payload_layout,
-				op.body.order.shared_payload,
-				op.body.order.max_rows,
-				const_cast<OpDescriptor *>(&op));
+			case OpKind::ORDER:
+				return std::make_unique<PhysicalOrder>(
+					op.body.order.sort_keys,
+					op.body.order.n_sort_keys,
+					op.body.order.key_layout,
+					op.body.order.payload_layout,
+					op.body.order.shared_payload,
+					op.body.order.max_rows,
+					const_cast<OpDescriptor *>(&op));
 
-		case OpKind::OUTPUT:
-			return std::make_unique<OutputSink>(
+			case OpKind::TOP_N:
+				return std::make_unique<PhysicalTopN>(
+					op.body.top_n.input_schema,
+					op.body.top_n.layout,
+					op.body.top_n.sort_keys,
+					op.body.top_n.n_sort_keys,
+					op.body.top_n.shared_payload,
+					op.body.top_n.max_rows,
+					const_cast<OpDescriptor *>(&op));
+
+			case OpKind::OUTPUT:
+				return std::make_unique<OutputSink>(
 				op.body.output.input_schema,
 				op.body.output.layout,
 				op.body.output.sort_keys,
@@ -598,6 +624,11 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 				static_cast<PhysicalOrder &>(*pipeline.source).AttachDescriptor(&ops[idx]);
 				idx++;
 				break;
+			case PhysicalOperatorType::TOP_N:
+				EmitTopN(static_cast<const PhysicalTopN &>(*pipeline.source), ops[idx]);
+				static_cast<PhysicalTopN &>(*pipeline.source).AttachDescriptor(&ops[idx]);
+				idx++;
+				break;
 			case PhysicalOperatorType::FILTER:
 				EmitFilter(static_cast<const PhysicalFilter &>(*pipeline.source), ops[idx++], dsa);
 				break;
@@ -649,6 +680,10 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 			case PhysicalOperatorType::ORDER:
 				EmitOrder(static_cast<const PhysicalOrder &>(*pipeline.sink), ops[idx], dsa);
 				static_cast<PhysicalOrder &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
+				break;
+			case PhysicalOperatorType::TOP_N:
+				EmitTopN(static_cast<const PhysicalTopN &>(*pipeline.sink), ops[idx]);
+				static_cast<PhysicalTopN &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
 				break;
 			case PhysicalOperatorType::OUTPUT:
 				EmitOutput(static_cast<const OutputSink &>(*pipeline.sink), ops[idx]);
@@ -756,6 +791,20 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 				order->desc()->body.order.shared_payload = payload_dp;
 			break;
 		}
+		case PhysicalOperatorType::TOP_N:
+		{
+			const auto *topn = static_cast<const PhysicalTopN *>(op);
+			bool stored = false;
+			for (OpDescriptor *desc : topn->descs())
+				if (desc != nullptr)
+				{
+					desc->body.top_n.shared_payload = payload_dp;
+					stored = true;
+				}
+			if (!stored && topn->desc() != nullptr)
+				topn->desc()->body.top_n.shared_payload = payload_dp;
+			break;
+		}
 		case PhysicalOperatorType::OUTPUT:
 		{
 			const auto *output = static_cast<const OutputSink *>(op);
@@ -829,6 +878,11 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 		{
 			OpDescriptor *desc = static_cast<const PhysicalOrder *>(op)->desc();
 			return desc != nullptr ? desc->body.order.shared_payload : InvalidDsaPointer;
+		}
+		case PhysicalOperatorType::TOP_N:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalTopN *>(op)->desc();
+			return desc != nullptr ? desc->body.top_n.shared_payload : InvalidDsaPointer;
 		}
 		case PhysicalOperatorType::OUTPUT:
 		{

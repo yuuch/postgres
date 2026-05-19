@@ -32,6 +32,7 @@ enum class PhysicalOperatorType : uint8_t {
 	PERFECT_HASH_AGGREGATE,
 	HASH_JOIN,
 	ORDER,
+	TOP_N,
 	OUTPUT,
 	FILTER,
 	PROJECTION,

@@ -1367,14 +1367,6 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 			return SourceResultType::FINISHED;
 
 		const uint32_t row_count = pg_atomic_read_u32(&tdc->row_count);
-		if (pg_yaap_trace_hooks)
-			elog(LOG,
-			     "pg_yaap: HashAgg.GetData part=%u row_count=%u cursor=%u out_count=%u finalized=%d",
-			     global.source_partition,
-			     row_count,
-			     global.source_cursor,
-			     out.count,
-			     tdc->finalized ? 1 : 0);
 		if (global.source_cursor >= row_count)
 		{
 			global.source_partition++;

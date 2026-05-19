@@ -40,6 +40,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_projection.hpp"
 #include "parallel/pipeline/physical_seq_scan.hpp"
+#include "parallel/pipeline/physical_top_n.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/translator_internal.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
@@ -102,6 +103,7 @@ using PipelineHashJoin = pg_yaap::pipeline::PhysicalHashJoin;
 using PipelinePerfectHashAggregate = pg_yaap::pipeline::PhysicalPerfectHashAggregate;
 using PipelineProjection = pg_yaap::pipeline::PhysicalProjection;
 using PipelineSeqScan = pg_yaap::pipeline::PhysicalSeqScan;
+using PipelineTopN = pg_yaap::pipeline::PhysicalTopN;
 using pg_yaap::pipeline::ProjectExprDesc;
 using pg_yaap::pipeline::ProjectOp;
 using pg_yaap::pipeline::ProjectStep;

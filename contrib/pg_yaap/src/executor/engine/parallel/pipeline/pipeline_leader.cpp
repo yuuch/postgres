@@ -52,7 +52,6 @@ namespace pipeline {
 namespace {
 
 static constexpr uint32_t kTaskQueueCapacity = 64;
-static constexpr int kPipelineWorkerLaunchSoftCap = 6;
 
 /* B.2 startup-tax probe: one-shot phase timer to localize the ~2700 ms cold-
  * cache fixed cost in PgYaapPipelineRun. Toggle via env PG_YAAP_PHASE=1.
@@ -447,8 +446,7 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 
 		phase.mark("T1_build_done");
 
-		const int bgworker_count = std::min(pg_yaap_parallel_max_workers,
-											kPipelineWorkerLaunchSoftCap);
+		const int bgworker_count = pg_yaap_parallel_max_workers;
 		if (bgworker_count <= 0)
 		{
 			return FailEarly(failure_reason, "pg_yaap: pg_yaap.parallel_max_workers must be >= 1", cleanup, state);

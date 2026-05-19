@@ -35,6 +35,7 @@ extern Datum numeric_int8(PG_FUNCTION_ARGS);
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/physical_seq_scan_page_prepare.hpp"
+#include "parallel/pipeline/physical_seq_scan_read_stream.hpp"
 #ifdef USE_LLVM
 #include "llvmjit_deform_datachunk.h"
 #endif
@@ -177,16 +178,7 @@ ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared)
 		return 1;
 
 	uint32 want = (uint32) std::min<uint64>(shared->total_blocks, (uint64) UINT32_MAX);
-	/*
-	 * Treat pg_yaap.parallel_max_workers as a ceiling, not a target. On Q10's
-	 * large heap scans, using all 12 local workers oversubscribes the shared
-	 * buffer/read_stream path and loses to 4-8 workers. PostgreSQL's planner
-	 * likewise picks fewer workers than max_parallel_workers_per_gather for the
-	 * same query on this dataset.
-	 */
-	static constexpr int kSeqScanWorkerSoftCap = 6;
-	const int worker_cap = std::min(pg_yaap_parallel_max_workers, kSeqScanWorkerSoftCap);
-	return (uint32) std::max(1, std::min(worker_cap, (int) want));
+	return (uint32) std::max(1, std::min(pg_yaap_parallel_max_workers, (int) want));
 }
 
 /*
@@ -865,15 +857,6 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 																 scan->rs_cblock,
 																 lines);
 		}
-	if (SeqScanTraceEnabled(ctx))
-		ereport(LOG,
-			(errmsg("pg_yaap scan load_page worker=%d block=%u visible=%u all_visible=%d serializable=%d",
-				ctx.worker_index,
-					local.scan_desc->rs_cblock,
-					local.scan_desc->rs_ntuples,
-					all_visible ? 1 : 0,
-					check_serializable ? 1 : 0)));
-
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	}
 	if (profile_on)
@@ -1000,12 +983,12 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 		nullptr,
 		global.shared != nullptr ? (ParallelTableScanDesc) &global.shared->pbscan : nullptr,
 		SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
-	if (SeqScanTraceEnabled(ctx))
-		ereport(LOG,
-			(errmsg("pg_yaap scan read_stream worker=%d startblock=%u total_blocks=%u",
-				ctx.worker_index,
-				local->scan_desc->rs_startblock,
-				global.shared != nullptr ? global.shared->total_blocks : 0)));
+	if (local->scan_desc->rs_base.rs_parallel != nullptr)
+		InstallAggressiveParallelSeqScanReadStream(local->scan_desc,
+		                                           local->rel,
+		                                           local->read_stream_state,
+		                                           ctx.worker_index,
+		                                           SeqScanTraceEnabled(ctx));
 	local->read_stream = local->scan_desc->rs_read_stream;
 	if (local->read_stream == nullptr)
 		elog(ERROR, "pg_yaap: SeqScan failed to initialize read stream");

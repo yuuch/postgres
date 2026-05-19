@@ -1,14 +1,15 @@
 # Yet Another Analyze Process (YAAP)
 
-YAAP 是 `contrib/pg_yaap` 下的分析型优化器 + 执行器原型。当前主线已经明确：
+`contrib/pg_yaap` is a PostgreSQL extension that runs OLAP queries through a YAAP-owned optimizer and a C++ columnar executor. The supported execution path is now the optimizer-produced `PhysicalOperator` tree; PostgreSQL `PlannedStmt` lowering remains legacy code and is not the target for new work.
 
-- **只支持 YAAP 自己的 optimizer physical plan。**
-- **不再把 PostgreSQL 的 `PlannedStmt` / executor plan 当成受支持输入。**
-- optimizer 与 executor 通过共享的 `PhysicalOperator` / `ColumnBinding` 语义强绑定，但模块职责仍然分离。
+## What this plugin does
 
-## 当前架构
+- Hooks PostgreSQL planner/executor entry points.
+- Lowers `SELECT` queries into YAAP logical/physical plans.
+- Executes supported plans in a parallel pipeline runtime with columnar batches, JIT deform/expression support, and DSA/DSM-backed shared state.
+- Falls back only when the query was never claimed by YAAP; once admitted, the query runs fully on YAAP or fails loudly.
 
-端到端主路径：
+## Architecture
 
 ```text
 PG Query
@@ -22,45 +23,62 @@ PG Query
   -> OutputSink
 ```
 
-当前约束：
+### Layering
 
-1. `yaap_opt_translator` 的输入是 **YAAP optimizer 生成的 `PhysicalOperator` 树**，不是 PG plan tree。
-2. optimizer path 上不再应把 `varno/attno` 当作权威列标识；权威键是 `ColumnBinding(table_index, column_index)` 与 operator 输出字典。
-3. translator 尽量只做 lowering；如果 DuckDB 有对应算子/方案，优先补 operator/runtime，而不是在 translator 里硬改 plan shape。
-4. YAAP claim 了 query 之后不应 silent fallback 到 PG 执行。
+| Layer | Responsibility |
+|------|----------------|
+| `src/bridge/` | PostgreSQL hook boundary, admission, query state, bundle registry, runtime dispatch |
+| `src/optimizer/` | Logical planning, rewrite rules, join ordering, physical plan generation |
+| `src/executor/engine/parallel/pipeline/` | Physical operators, lowering, task scheduling, pipeline execution |
 
-## 当前进展（TPC-H 10G，2026-05-15）
+### Current rules
 
-已在 YAAP optimizer + pipeline 路径上跑通并确认可执行：
+1. `yaap_opt_translator` consumes the YAAP optimizer's `PhysicalOperator` tree, not PostgreSQL plan trees.
+2. `ColumnBinding(table_index, column_index)` is the authoritative column identity on the optimizer path.
+3. The translator should lower plans, not repair them; when possible, missing behavior belongs in the optimizer or runtime operator implementation.
+4. Supported queries should not silently fall back to PostgreSQL once YAAP has claimed them.
 
-- Q1
-- Q2
-- Q3
-- Q4
-- Q5
-- Q6
-- Q7
-- Q8
-- Q9
-- Q10
-- Q11
-- Q12
-- Q14
-- Q17
-- Q20
-- Q21
-- Q22
+## TPC-H coverage
 
-当前未跑通：
+The current bring-up target is Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10/Q14/Q18/Q21 on the optimizer-to-executor path, with adjacent queries used as regression checks during bring-up.
 
-- Q13：`optimizer support analysis passed, but lowering returned null`
-- Q16：`optimizer support analysis passed, but lowering returned null`
-- Q18：`optimizer support analysis passed, but lowering returned null`
+## Benchmark snapshot
 
-备注：
+Methodology:
 
-- Q15 / Q19 仍不纳入当前常规 sweep。
-- Q16 当前问题已收敛到 **binding-first 输出元数据在多层 join / projection lowering 中还没有稳定按实际输出顺序传递**。
+- Native PG and YAAP were both run against `contrib/pg_carbon/tests/tpch/*.sql`
+- `statement_timeout = '60s'`
+- 3 runs per query, median reported below
+- YAAP ran with `pg_yaap.enabled = on`, `pg_yaap.parallel = on`, `pg_yaap.parallel_max_workers = 12`
+- Queries skipped from the final sweep: `q2`, `q17`, `q20` (timeout), `q22` (result mismatch)
+- `q16` matched by row set but differs in output order
+
+| Query | PG median ms | YAAP median ms | Speedup |
+|---|---:|---:|---:|
+| q1 | 3048.955 | 926.826 | 3.290x |
+| q3 | 1319.368 | 1073.424 | 1.229x |
+| q4 | 1648.182 | 1274.599 | 1.293x |
+| q5 | 3278.014 | 1026.755 | 3.193x |
+| q6 | 607.870 | 603.361 | 1.007x |
+| q7 | 1244.085 | 1152.389 | 1.080x |
+| q8 | 3814.888 | 1167.318 | 3.268x |
+| q9 | 7638.830 | 1802.195 | 4.239x |
+| q10 | 1915.644 | 3675.870 | 0.521x |
+| q11 | 291.658 | 313.135 | 0.931x |
+| q12 | 1827.045 | 860.676 | 2.123x |
+| q13 | 3141.475 | 1003.922 | 3.129x |
+| q14 | 706.327 | 590.051 | 1.197x |
+| q15 | 2049.022 | 1142.078 | 1.794x |
+| q16 | 3475.077 | 1165.177 | 2.982x |
+| q18 | 18125.647 | 11216.419 | 1.616x |
+| q19 | 1383.606 | 787.833 | 1.756x |
+| q21 | 5840.204 | 7130.993 | 0.819x |
+
+## Current status
+
+- YAAP now lowers and executes the optimizer-owned physical plan directly.
+- The bridge/optimizer/executor split is stable enough for top-N, joins, scans, and aggregate paths to be debugged independently.
+- Remaining work is centered on correctness and performance gaps in the optimizer-to-executor lowering and pipeline runtime.
 
 ## 模块职责
 
@@ -117,9 +135,8 @@ TPC-H 验证约束：
 - 失败后继续后续 query
 - 修单条 query 时，先只回归当前 query，再做 sweep
 
-## 当前路线
+## Current route
 
-1. 继续把 optimizer-to-executor lowering 全面收敛到 **binding-first metadata**。
-2. 清理 translator 中遗留的 PG-plan / `varno/attno` 主键式思路。
-3. 修通 Q16，再处理 Q13 / Q18。
-4. 在 optimizer physical plan 路径稳定后，再继续补 runtime operator 覆盖面。
+1. Keep converging optimizer-to-executor lowering on **binding-first metadata**.
+2. Remove the remaining PG-plan / `varno/attno` assumptions from translator code.
+3. Keep extending runtime coverage for the optimizer plan shapes already admitted.

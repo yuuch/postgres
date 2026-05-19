@@ -32,6 +32,7 @@ extern "C" {
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
+#include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 #include "parallel/pipeline/output_sink.hpp"
 #include "parallel/pipeline/pipeline_combine_event.hpp"
@@ -101,6 +102,7 @@ TaskScheduler::TaskScheduler(MemoryContext              mcxt,
     , pipelines_(mcxt)
     , events_(mcxt)
     , events_owned_(PgMemoryContextAllocator<std::shared_ptr<Event>>(mcxt))
+    , run_task_counts_(PgMemoryContextAllocator<uint32_t>(mcxt))
     , state_(mcxt, sizing.worker_count)
 {
 	Assert(mcxt_ != nullptr);
@@ -267,6 +269,26 @@ TaskScheduler::DeriveRunTaskCount(Pipeline &pipeline) const
 }
 
 void
+TaskScheduler::RememberRunTaskCount(PipelineId pid, uint32_t task_count)
+{
+	Assert(pid != INVALID_PIPELINE_ID);
+	const size_t idx = static_cast<size_t>(pid);
+	if (run_task_counts_.size() <= idx)
+		run_task_counts_.resize(idx + 1);
+	run_task_counts_[idx] = std::max<uint32_t>(1u, task_count);
+}
+
+uint32_t
+TaskScheduler::RememberedRunTaskCount(PipelineId pid) const
+{
+	Assert(pid != INVALID_PIPELINE_ID);
+	const size_t idx = static_cast<size_t>(pid);
+	if (idx < run_task_counts_.size() && run_task_counts_[idx] != 0)
+		return run_task_counts_[idx];
+	return 1u;
+}
+
+void
 TaskScheduler::EnqueueTasks(Event &event)
 {
 	/* Preconditions: BindRuntime + AllocateEventShmStates already called by
@@ -298,6 +320,7 @@ TaskScheduler::EnqueueTasks(Event &event)
 		case TaskKind::RUN:
 			event_id   = base_id + 0;
 			task_count = DeriveRunTaskCount(*pipeline);
+			RememberRunTaskCount(pid, task_count);
 			break;
 		case TaskKind::COMBINE:
 			event_id   = base_id + 1;
@@ -325,11 +348,19 @@ TaskScheduler::EnqueueTasks(Event &event)
 					elog(ERROR, "pg_yaap: perfect hash aggregate payload missing during COMBINE scheduling");
 				task_count = 1;
 			}
+			else if (pipeline->sink->type() == PhysicalOperatorType::HASH_JOIN)
+			{
+				auto *hash_join = static_cast<PhysicalHashJoin *>(pipeline->sink);
+				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(hash_join);
+				if (!DsaPointerIsValid(payload_dp))
+					elog(ERROR, "pg_yaap: hash join payload missing during COMBINE scheduling");
+				task_count = RememberedRunTaskCount(pid);
+			}
 			else
 			{
 				/* One combine task per worker that participated in Run; matches
 				 * the Run fan-out for non-partition-owner sinks. */
-				task_count = DeriveRunTaskCount(*pipeline);
+				task_count = RememberedRunTaskCount(pid);
 			}
 			break;
 		case TaskKind::FINALIZE:
