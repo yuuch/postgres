@@ -756,6 +756,12 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 						std::vector<ColumnSchema> &out_schema);
 
 bool
+BuildOrderedOutputBindingsForRefs(const std::vector<ColumnRef> &requested_refs,
+								  const std::vector<ColumnRef> &raw_refs,
+								  const std::vector<yaap::PhysicalOperator::OutputColumn> &raw_outputs,
+								  std::vector<yaap::PhysicalOperator::OutputColumn> &out_bindings);
+
+bool
 ApplyPostAggregateFilters(OptimizerNodeTranslation node,
 						  const PhysicalHashAggregate &source_agg,
 						  const std::vector<Expression *> &pending_filters,

@@ -1118,7 +1118,12 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 	out.estimated_groups = static_cast<uint32_t>(std::max<size_t>(1, agg.estimated_cardinality));
 	if (!BuildOptimizerAggOutput(agg, &child.outputs, child.cols, child.schema, agg_state, out.cols, out.schema))
 		return false;
-	out.outputs = agg.outputs;
+	std::vector<ColumnRef> raw_output_cols;
+	raw_output_cols.reserve(agg.outputs.size());
+	for (const auto &output : agg.outputs)
+		raw_output_cols.push_back(BindingToColumnRef(output.binding));
+	if (!BuildOrderedOutputBindingsForRefs(out.cols, raw_output_cols, agg.outputs, out.outputs))
+		return false;
 	return true;
 }
 

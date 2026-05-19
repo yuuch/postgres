@@ -1142,12 +1142,9 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 		cs.chunk_slot = static_cast<uint8_t>(i);
 		cs.src_attno = 0;
 		out_schema.push_back(cs);
-		if (i < agg.outputs.size())
-			out_cols.push_back(BindingToColumnRef(agg.outputs[i].binding));
-		else
-			out_cols.push_back(BindingToColumnRef(yaap::ColumnBinding{
-				agg.group_index,
-				yaap::ProjectionIndex{i}}));
+		out_cols.push_back(BindingToColumnRef(yaap::ColumnBinding{
+			agg.group_index,
+			yaap::ProjectionIndex{i}}));
 	}
 
 	for (size_t i = 0; i < agg_state.agg_kinds.size(); ++i)
@@ -1184,13 +1181,9 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 				return false;
 		}
 		out_schema.push_back(cs);
-		const size_t output_idx = agg.groups.size() + i;
-		if (output_idx < agg.outputs.size())
-			out_cols.push_back(BindingToColumnRef(agg.outputs[output_idx].binding));
-		else
-			out_cols.push_back(ColumnRef{
-				static_cast<Index>(agg.aggregate_index.index + 1),
-				static_cast<AttrNumber>(i + 1)});
+		out_cols.push_back(ColumnRef{
+			static_cast<Index>(agg.aggregate_index.index + 1),
+			static_cast<AttrNumber>(i + 1)});
 	}
 
 	return out_cols.size() == out_schema.size();

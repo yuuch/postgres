@@ -73,78 +73,6 @@ OutputBindingsMatch(const std::vector<yaap::PhysicalOperator::OutputColumn> &lhs
 	return true;
 }
 
-static bool
-BuildOrderedOutputBindingsForRefs(const std::vector<ColumnRef> &requested_refs,
-								  const std::vector<ColumnRef> &raw_refs,
-								  const std::vector<yaap::PhysicalOperator::OutputColumn> &raw_outputs,
-								  std::vector<yaap::PhysicalOperator::OutputColumn> &out_bindings)
-{
-	if (raw_refs.size() != raw_outputs.size())
-	{
-		if (pg_yaap_trace_hooks)
-			elog(LOG,
-				 "pg_yaap: output binding alignment size mismatch requested=%zu raw_refs=%zu raw_outputs=%zu",
-				 requested_refs.size(),
-				 raw_refs.size(),
-				 raw_outputs.size());
-		return false;
-	}
-
-	if (requested_refs.size() == raw_refs.size())
-	{
-		bool identical = true;
-		for (size_t i = 0; i < requested_refs.size(); ++i)
-		{
-			if (!SameColumnRef(requested_refs[i], raw_refs[i]))
-			{
-				if (pg_yaap_trace_hooks)
-					elog(LOG,
-						 "pg_yaap: output binding alignment order mismatch idx=%zu requested=(%u,%d) raw=(%u,%d)",
-						 i,
-						 requested_refs[i].varno,
-						 requested_refs[i].attno,
-						 raw_refs[i].varno,
-						 raw_refs[i].attno);
-				identical = false;
-				break;
-			}
-		}
-		if (identical)
-		{
-			out_bindings = raw_outputs;
-			return true;
-		}
-	}
-
-	out_bindings.clear();
-	out_bindings.reserve(requested_refs.size());
-	std::vector<bool> used(raw_refs.size(), false);
-	for (const ColumnRef &ref : requested_refs)
-	{
-		bool matched = false;
-		for (size_t i = 0; i < raw_refs.size(); ++i)
-		{
-			if (used[i] || !SameColumnRef(ref, raw_refs[i]))
-				continue;
-			out_bindings.push_back(raw_outputs[i]);
-			used[i] = true;
-			matched = true;
-			break;
-		}
-		if (!matched)
-		{
-			if (pg_yaap_trace_hooks)
-				elog(LOG,
-					 "pg_yaap: output binding alignment missing requested=(%u,%d) raw_refs=%zu",
-					 ref.varno,
-					 ref.attno,
-					 raw_refs.size());
-			return false;
-		}
-	}
-	return true;
-}
-
 static size_t
 CountSourceOutputMatches(const PhysicalOperator *source_op,
 						 const std::vector<ColumnRef> *required_refs)
@@ -1551,11 +1479,36 @@ BuildFinalSortKeys(const PhysicalOrderBy &order,
 		}
 		const ColumnSchema *col = nullptr;
 		ColumnRef ref{};
-		if (outputs != nullptr)
+		if (queryDesc != nullptr &&
+			queryDesc->tupDesc != nullptr &&
+			!col_expr->column_name.empty())
 		{
-			for (size_t col_idx = 0; col_idx < outputs->size() && col_idx < schema.size(); ++col_idx)
+			int matched_attno = -1;
+			for (int attno = 0; attno < queryDesc->tupDesc->natts &&
+							 static_cast<size_t>(attno) < schema.size();
+				 ++attno)
 			{
-				const auto &output = (*outputs)[col_idx];
+				const char *attname = NameStr(TupleDescAttr(queryDesc->tupDesc, attno)->attname);
+				if (attname == nullptr || col_expr->column_name != attname)
+					continue;
+				if (matched_attno >= 0)
+				{
+					matched_attno = -1;
+					break;
+				}
+				matched_attno = attno;
+			}
+			if (matched_attno >= 0)
+			{
+				output_col_idx = static_cast<uint16_t>(matched_attno);
+				col = &schema[output_col_idx];
+			}
+		}
+		if (output_col_idx == UINT16_MAX && outputs != nullptr)
+		{
+			for (size_t out_idx = 0; out_idx < outputs->size(); ++out_idx)
+			{
+				const auto &output = (*outputs)[out_idx];
 				const bool binding_match =
 					output.binding.table_index.index == col_expr->binding.table_index.index &&
 					output.binding.column_index.index == col_expr->binding.column_index.index;
@@ -1566,9 +1519,17 @@ BuildFinalSortKeys(const PhysicalOrderBy &order,
 					output.column_name == col_expr->column_name;
 				if (!binding_match && !name_match)
 					continue;
-				col = &schema[col_idx];
-				output_col_idx = static_cast<uint16_t>(col_idx);
-				break;
+				const ColumnRef output_ref = BindingToColumnRef(output.binding);
+				for (size_t col_idx = 0; col_idx < cols.size() && col_idx < schema.size(); ++col_idx)
+				{
+					if (!SameColumnRef(cols[col_idx], output_ref))
+						continue;
+					col = &schema[col_idx];
+					output_col_idx = static_cast<uint16_t>(col_idx);
+					break;
+				}
+				if (col != nullptr && output_col_idx != UINT16_MAX)
+					break;
 			}
 		}
 		if ((col == nullptr || output_col_idx == UINT16_MAX) &&

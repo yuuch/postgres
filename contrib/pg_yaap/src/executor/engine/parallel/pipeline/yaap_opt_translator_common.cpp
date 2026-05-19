@@ -44,6 +44,82 @@ BuildGroupKeySlots(const std::vector<ColumnRef> &refs,
 	return true;
 }
 
+}  // namespace
+
+bool
+BuildOrderedOutputBindingsForRefs(const std::vector<ColumnRef> &requested_refs,
+								  const std::vector<ColumnRef> &raw_refs,
+								  const std::vector<yaap::PhysicalOperator::OutputColumn> &raw_outputs,
+								  std::vector<yaap::PhysicalOperator::OutputColumn> &out_bindings)
+{
+	if (raw_refs.size() != raw_outputs.size())
+	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG,
+				 "pg_yaap: output binding alignment size mismatch requested=%zu raw_refs=%zu raw_outputs=%zu",
+				 requested_refs.size(),
+				 raw_refs.size(),
+				 raw_outputs.size());
+		return false;
+	}
+
+	if (requested_refs.size() == raw_refs.size())
+	{
+		bool identical = true;
+		for (size_t i = 0; i < requested_refs.size(); ++i)
+		{
+			if (!SameColumnRef(requested_refs[i], raw_refs[i]))
+			{
+				if (pg_yaap_trace_hooks)
+					elog(LOG,
+						 "pg_yaap: output binding alignment order mismatch idx=%zu requested=(%u,%d) raw=(%u,%d)",
+						 i,
+						 requested_refs[i].varno,
+						 requested_refs[i].attno,
+						 raw_refs[i].varno,
+						 raw_refs[i].attno);
+				identical = false;
+				break;
+			}
+		}
+		if (identical)
+		{
+			out_bindings = raw_outputs;
+			return true;
+		}
+	}
+
+	out_bindings.clear();
+	out_bindings.reserve(requested_refs.size());
+	std::vector<bool> used(raw_refs.size(), false);
+	for (const ColumnRef &ref : requested_refs)
+	{
+		bool matched = false;
+		for (size_t i = 0; i < raw_refs.size(); ++i)
+		{
+			if (used[i] || !SameColumnRef(ref, raw_refs[i]))
+				continue;
+			out_bindings.push_back(raw_outputs[i]);
+			used[i] = true;
+			matched = true;
+			break;
+		}
+		if (!matched)
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG,
+					 "pg_yaap: output binding alignment missing requested=(%u,%d) raw_refs=%zu",
+					 ref.varno,
+					 ref.attno,
+					 raw_refs.size());
+			return false;
+		}
+	}
+	return true;
+}
+
+namespace {
+
 std::string
 ExpressionSemanticKey(const Expression *expression)
 {
