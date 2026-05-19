@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="774" viewBox="0 0 1040 774">
+<style>text{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;fill:#222}.small{font-size:12px}.label{font-size:13px;font-weight:600}.title{font-size:20px;font-weight:700}.axis{font-size:11px;fill:#555}.pg{fill:#4f81bd}.yaap{fill:#f28e2b}.timeout{fill:#c0c0c0}.grid{stroke:#e6e6e6;stroke-width:1}.base{stroke:#999;stroke-width:1}</style>
+<text x="20" y="30" class="title">TPC-H median runtime: native PG vs YAAP</text>
+<text x="20" y="50" class="small">PG: 4 runs, 180s timeout, max_parallel_workers(_per_gather)=12. YAAP: 4 runs, max workers 12; all queries completed within 120s.</text>
+<line x1="170.0" y1="60" x2="170.0" y2="734" class="grid"/>
+<text x="170.0" y="72" text-anchor="middle" class="axis">250 ms</text>
+<line x1="293.1" y1="60" x2="293.1" y2="734" class="grid"/>
+<text x="293.1" y="72" text-anchor="middle" class="axis">500 ms</text>
+<line x1="416.2" y1="60" x2="416.2" y2="734" class="grid"/>
+<text x="416.2" y="72" text-anchor="middle" class="axis">1000 ms</text>
+<line x1="539.3" y1="60" x2="539.3" y2="734" class="grid"/>
+<text x="539.3" y="72" text-anchor="middle" class="axis">2000 ms</text>
+<line x1="702.0" y1="60" x2="702.0" y2="734" class="grid"/>
+<text x="702.0" y="72" text-anchor="middle" class="axis">5000 ms</text>
+<line x1="825.1" y1="60" x2="825.1" y2="734" class="grid"/>
+<text x="825.1" y="72" text-anchor="middle" class="axis">10000 ms</text>
+<line x1="948.2" y1="60" x2="948.2" y2="734" class="grid"/>
+<text x="948.2" y="72" text-anchor="middle" class="axis">20000 ms</text>
+<text x="20" y="88" class="label">q1</text>
+<line x1="170" y1="92" x2="990" y2="92" class="base" opacity="0.12"/>
+<rect x="170" y="76" width="444.5" height="8" class="pg" rx="3"/>
+<rect x="170" y="87" width="234.0" height="8" class="yaap" rx="3"/>
+<text x="1000" y="84" text-anchor="end" class="axis">PG 3054.146</text>
+<text x="1000" y="96" text-anchor="end" class="axis">YAAP 933.576 · 3.271x</text>
+<text x="20" y="116" class="label">q2</text>
+<line x1="170" y1="120" x2="990" y2="120" class="base" opacity="0.12"/>
+<rect x="170" y="104" width="120" height="8" class="timeout" rx="3"/>
+<text x="298" y="112" class="axis">timeout</text>
+<rect x="170" y="115" width="61.9" height="8" class="yaap" rx="3"/>
+<text x="1000" y="112" text-anchor="end" class="axis">PG timeout</text>
+<text x="1000" y="124" text-anchor="end" class="axis">YAAP 354.199</text>
+<text x="20" y="144" class="label">q3</text>
+<line x1="170" y1="148" x2="990" y2="148" class="base" opacity="0.12"/>
+<rect x="170" y="132" width="360.4" height="8" class="pg" rx="3"/>
+<rect x="170" y="143" width="252.9" height="8" class="yaap" rx="3"/>
+<text x="1000" y="140" text-anchor="end" class="axis">PG 1902.705</text>
+<text x="1000" y="152" text-anchor="end" class="axis">YAAP 1038.548 · 1.832x</text>
+<text x="20" y="172" class="label">q4</text>
+<line x1="170" y1="176" x2="990" y2="176" class="base" opacity="0.12"/>
+<rect x="170" y="160" width="396.8" height="8" class="pg" rx="3"/>
+<rect x="170" y="171" width="280.5" height="8" class="yaap" rx="3"/>
+<text x="1000" y="168" text-anchor="end" class="axis">PG 2335.004</text>
+<text x="1000" y="180" text-anchor="end" class="axis">YAAP 1212.921 · 1.925x</text>
+<text x="20" y="200" class="label">q5</text>
+<line x1="170" y1="204" x2="990" y2="204" class="base" opacity="0.12"/>
+<rect x="170" y="188" width="446.0" height="8" class="pg" rx="3"/>
+<rect x="170" y="199" width="239.6" height="8" class="yaap" rx="3"/>
+<text x="1000" y="196" text-anchor="end" class="axis">PG 3080.473</text>
+<text x="1000" y="208" text-anchor="end" class="axis">YAAP 963.481 · 3.197x</text>
+<text x="20" y="228" class="label">q6</text>
+<line x1="170" y1="232" x2="990" y2="232" class="base" opacity="0.12"/>
+<rect x="170" y="216" width="253.5" height="8" class="pg" rx="3"/>
+<rect x="170" y="227" width="121.3" height="8" class="yaap" rx="3"/>
+<text x="1000" y="224" text-anchor="end" class="axis">PG 1042.336</text>
+<text x="1000" y="236" text-anchor="end" class="axis">YAAP 495.106 · 2.105x</text>
+<text x="20" y="256" class="label">q7</text>
+<line x1="170" y1="260" x2="990" y2="260" class="base" opacity="0.12"/>
+<rect x="170" y="244" width="325.2" height="8" class="pg" rx="3"/>
+<rect x="170" y="255" width="263.2" height="8" class="yaap" rx="3"/>
+<text x="1000" y="252" text-anchor="end" class="axis">PG 1560.009</text>
+<text x="1000" y="264" text-anchor="end" class="axis">YAAP 1100.774 · 1.417x</text>
+<text x="20" y="284" class="label">q8</text>
+<line x1="170" y1="288" x2="990" y2="288" class="base" opacity="0.12"/>
+<rect x="170" y="272" width="475.5" height="8" class="pg" rx="3"/>
+<rect x="170" y="283" width="253.3" height="8" class="yaap" rx="3"/>
+<text x="1000" y="280" text-anchor="end" class="axis">PG 3637.530</text>
+<text x="1000" y="292" text-anchor="end" class="axis">YAAP 1040.793 · 3.495x</text>
+<text x="20" y="312" class="label">q9</text>
+<line x1="170" y1="316" x2="990" y2="316" class="base" opacity="0.12"/>
+<rect x="170" y="300" width="595.5" height="8" class="pg" rx="3"/>
+<rect x="170" y="311" width="344.4" height="8" class="yaap" rx="3"/>
+<text x="1000" y="308" text-anchor="end" class="axis">PG 7149.423</text>
+<text x="1000" y="320" text-anchor="end" class="axis">YAAP 1738.643 · 4.112x</text>
+<text x="20" y="340" class="label">q10</text>
+<line x1="170" y1="344" x2="990" y2="344" class="base" opacity="0.12"/>
+<rect x="170" y="328" width="371.2" height="8" class="pg" rx="3"/>
+<rect x="170" y="339" width="459.0" height="8" class="yaap" rx="3"/>
+<text x="1000" y="336" text-anchor="end" class="axis">PG 2022.361</text>
+<text x="1000" y="348" text-anchor="end" class="axis">YAAP 3314.089 · 0.610x</text>
+<text x="20" y="368" class="label">q11</text>
+<line x1="170" y1="372" x2="990" y2="372" class="base" opacity="0.12"/>
+<rect x="170" y="356" width="59.7" height="8" class="pg" rx="3"/>
+<rect x="170" y="367" width="47.0" height="8" class="yaap" rx="3"/>
+<text x="1000" y="364" text-anchor="end" class="axis">PG 349.885</text>
+<text x="1000" y="376" text-anchor="end" class="axis">YAAP 325.832 · 1.074x</text>
+<text x="20" y="396" class="label">q12</text>
+<line x1="170" y1="400" x2="990" y2="400" class="base" opacity="0.12"/>
+<rect x="170" y="384" width="376.4" height="8" class="pg" rx="3"/>
+<rect x="170" y="395" width="278.7" height="8" class="yaap" rx="3"/>
+<text x="1000" y="392" text-anchor="end" class="axis">PG 2081.627</text>
+<text x="1000" y="404" text-anchor="end" class="axis">YAAP 1200.723 · 1.734x</text>
+<text x="20" y="424" class="label">q13</text>
+<line x1="170" y1="428" x2="990" y2="428" class="base" opacity="0.12"/>
+<rect x="170" y="412" width="437.9" height="8" class="pg" rx="3"/>
+<rect x="170" y="423" width="248.8" height="8" class="yaap" rx="3"/>
+<text x="1000" y="420" text-anchor="end" class="axis">PG 2942.782</text>
+<text x="1000" y="432" text-anchor="end" class="axis">YAAP 1015.136 · 2.899x</text>
+<text x="20" y="452" class="label">q14</text>
+<line x1="170" y1="456" x2="990" y2="456" class="base" opacity="0.12"/>
+<rect x="170" y="440" width="270.0" height="8" class="pg" rx="3"/>
+<rect x="170" y="451" width="213.2" height="8" class="yaap" rx="3"/>
+<text x="1000" y="448" text-anchor="end" class="axis">PG 1143.271</text>
+<text x="1000" y="460" text-anchor="end" class="axis">YAAP 830.311 · 1.377x</text>
+<text x="20" y="480" class="label">q15</text>
+<line x1="170" y1="484" x2="990" y2="484" class="base" opacity="0.12"/>
+<rect x="170" y="468" width="425.2" height="8" class="pg" rx="3"/>
+<rect x="170" y="479" width="280.9" height="8" class="yaap" rx="3"/>
+<text x="1000" y="476" text-anchor="end" class="axis">PG 2740.381</text>
+<text x="1000" y="488" text-anchor="end" class="axis">YAAP 1216.157 · 2.253x</text>
+<text x="20" y="508" class="label">q16</text>
+<line x1="170" y1="512" x2="990" y2="512" class="base" opacity="0.12"/>
+<rect x="170" y="496" width="464.1" height="8" class="pg" rx="3"/>
+<rect x="170" y="507" width="269.9" height="8" class="yaap" rx="3"/>
+<text x="1000" y="504" text-anchor="end" class="axis">PG 3412.140</text>
+<text x="1000" y="516" text-anchor="end" class="axis">YAAP 1143.208 · 2.985x</text>
+<text x="20" y="536" class="label">q17</text>
+<line x1="170" y1="540" x2="990" y2="540" class="base" opacity="0.12"/>
+<rect x="170" y="524" width="120" height="8" class="timeout" rx="3"/>
+<text x="298" y="532" class="axis">timeout</text>
+<rect x="170" y="535" width="376.0" height="8" class="yaap" rx="3"/>
+<text x="1000" y="532" text-anchor="end" class="axis">PG timeout</text>
+<text x="1000" y="544" text-anchor="end" class="axis">YAAP 2077.160</text>
+<text x="20" y="564" class="label">q18</text>
+<line x1="170" y1="568" x2="990" y2="568" class="base" opacity="0.12"/>
+<rect x="170" y="552" width="811.3" height="8" class="pg" rx="3"/>
+<rect x="170" y="563" width="660.8" height="8" class="yaap" rx="3"/>
+<text x="1000" y="560" text-anchor="end" class="axis">PG 24106.389</text>
+<text x="1000" y="572" text-anchor="end" class="axis">YAAP 10325.809 · 2.335x</text>
+<text x="20" y="592" class="label">q19</text>
+<line x1="170" y1="596" x2="990" y2="596" class="base" opacity="0.12"/>
+<rect x="170" y="580" width="415.0" height="8" class="pg" rx="3"/>
+<rect x="170" y="591" width="192.6" height="8" class="yaap" rx="3"/>
+<text x="1000" y="588" text-anchor="end" class="axis">PG 2586.662</text>
+<text x="1000" y="600" text-anchor="end" class="axis">YAAP 739.592 · 3.497x</text>
+<text x="20" y="620" class="label">q20</text>
+<line x1="170" y1="624" x2="990" y2="624" class="base" opacity="0.12"/>
+<rect x="170" y="608" width="120" height="8" class="timeout" rx="3"/>
+<text x="298" y="616" class="axis">timeout</text>
+<rect x="170" y="619" width="222.5" height="8" class="yaap" rx="3"/>
+<text x="1000" y="616" text-anchor="end" class="axis">PG timeout</text>
+<text x="1000" y="628" text-anchor="end" class="axis">YAAP 874.922</text>
+<text x="20" y="648" class="label">q21</text>
+<line x1="170" y1="652" x2="990" y2="652" class="base" opacity="0.12"/>
+<rect x="170" y="636" width="605.9" height="8" class="pg" rx="3"/>
+<rect x="170" y="647" width="579.6" height="8" class="yaap" rx="3"/>
+<text x="1000" y="644" text-anchor="end" class="axis">PG 7581.361</text>
+<text x="1000" y="656" text-anchor="end" class="axis">YAAP 6539.170 · 1.159x</text>
+<text x="20" y="676" class="label">q22</text>
+<line x1="170" y1="680" x2="990" y2="680" class="base" opacity="0.12"/>
+<rect x="170" y="664" width="265.1" height="8" class="pg" rx="3"/>
+<rect x="170" y="675" width="87.8" height="8" class="yaap" rx="3"/>
+<text x="1000" y="672" text-anchor="end" class="axis">PG 1112.471</text>
+<text x="1000" y="684" text-anchor="end" class="axis">YAAP 409.804 · 2.715x</text>
+<rect x="20" y="742" width="12" height="12" class="pg" rx="2"/><text x="38" y="752" class="small">native PG</text>
+<rect x="130" y="742" width="12" height="12" class="yaap" rx="2"/><text x="148" y="752" class="small">YAAP</text>
+<rect x="220" y="742" width="12" height="12" class="timeout" rx="2"/><text x="238" y="752" class="small">PG timeout</text>
+</svg>

@@ -47,32 +47,39 @@ The current bring-up target is Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10/Q14/Q18/Q21 on the optim
 Methodology:
 
 - Native PG and YAAP were both run against `contrib/pg_carbon/tests/tpch/*.sql`
-- `statement_timeout = '60s'`
-- 3 runs per query, median reported below
-- YAAP ran with `pg_yaap.enabled = on`, `pg_yaap.parallel = on`, `pg_yaap.parallel_max_workers = 12`
-- Queries skipped from the final sweep: `q2`, `q17`, `q20` (timeout), `q22` (result mismatch)
-- `q16` matched by row set but differs in output order
+- Native PG used 4 runs per query, `statement_timeout = '180s'`, `max_parallel_workers_per_gather = 12`, and `max_parallel_workers = 12`
+- YAAP used 4 runs per query, `pg_yaap.parallel_max_workers = 12`; every query finished within the 120s YAAP sweep timeout
+- Medians are reported below
+- Native PG timed out on `q2`, `q17`, and `q20`
+- `q22` still has a known YAAP correctness mismatch versus native PostgreSQL, so its timing is shown but not correctness-qualified
+- Excluding `q22`, YAAP is faster on 17 of the 18 queries where both sides completed with matching results; `q10` is the current regression
 
-| Query | PG median ms | YAAP median ms | Speedup |
-|---|---:|---:|---:|
-| q1 | 3048.955 | 926.826 | 3.290x |
-| q3 | 1319.368 | 1073.424 | 1.229x |
-| q4 | 1648.182 | 1274.599 | 1.293x |
-| q5 | 3278.014 | 1026.755 | 3.193x |
-| q6 | 607.870 | 603.361 | 1.007x |
-| q7 | 1244.085 | 1152.389 | 1.080x |
-| q8 | 3814.888 | 1167.318 | 3.268x |
-| q9 | 7638.830 | 1802.195 | 4.239x |
-| q10 | 1915.644 | 3675.870 | 0.521x |
-| q11 | 291.658 | 313.135 | 0.931x |
-| q12 | 1827.045 | 860.676 | 2.123x |
-| q13 | 3141.475 | 1003.922 | 3.129x |
-| q14 | 706.327 | 590.051 | 1.197x |
-| q15 | 2049.022 | 1142.078 | 1.794x |
-| q16 | 3475.077 | 1165.177 | 2.982x |
-| q18 | 18125.647 | 11216.419 | 1.616x |
-| q19 | 1383.606 | 787.833 | 1.756x |
-| q21 | 5840.204 | 7130.993 | 0.819x |
+![TPC-H median runtime chart](tpch_pg_vs_yaap.svg)
+
+| Query | PG median ms | YAAP median ms | Speedup (PG/YAAP) | Notes |
+|---|---:|---:|---:|---|
+| q1 | 3054.146 | 933.576 | 3.271x | - |
+| q2 | timeout | 354.199 | - | PG timed out in all 4 runs |
+| q3 | 1902.705 | 1038.548 | 1.832x | - |
+| q4 | 2335.004 | 1212.921 | 1.925x | - |
+| q5 | 3080.473 | 963.481 | 3.197x | - |
+| q6 | 1042.336 | 495.106 | 2.105x | - |
+| q7 | 1560.009 | 1100.774 | 1.417x | - |
+| q8 | 3637.530 | 1040.793 | 3.495x | - |
+| q9 | 7149.423 | 1738.643 | 4.112x | - |
+| q10 | 2022.361 | 3314.089 | 0.610x | PG faster |
+| q11 | 349.885 | 325.832 | 1.074x | - |
+| q12 | 2081.627 | 1200.723 | 1.734x | - |
+| q13 | 2942.782 | 1015.136 | 2.899x | - |
+| q14 | 1143.271 | 830.311 | 1.377x | - |
+| q15 | 2740.381 | 1216.157 | 2.253x | - |
+| q16 | 3412.140 | 1143.208 | 2.985x | - |
+| q17 | timeout | 2077.160 | - | PG timed out in all 4 runs |
+| q18 | 24106.389 | 10325.809 | 2.335x | - |
+| q19 | 2586.662 | 739.592 | 3.497x | - |
+| q20 | timeout | 874.922 | - | PG timed out in all 4 runs |
+| q21 | 7581.361 | 6539.170 | 1.159x | - |
+| q22 | 1112.471 | 409.804 | 2.715x | Known YAAP result mismatch vs PG |
 
 ## Current status
 
