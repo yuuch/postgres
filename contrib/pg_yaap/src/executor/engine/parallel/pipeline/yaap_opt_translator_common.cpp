@@ -302,9 +302,12 @@ RewritePipelineFilterExpr(const Expression *expr,
 						if (projection->children.size() == 1 && projection->children[0] != nullptr)
 							return RewritePipelineFilterExpr(projection->select_list[idx], projection->children[0].get());
 						break;
-					}
+				}
+					const bool refers_to_projection_output =
+						column->binding.table_index.index == projection->table_index.index;
 					const size_t ordinal = column->binding.column_index.index;
-					if (ordinal < projection->select_list.size() &&
+					if (refers_to_projection_output &&
+						ordinal < projection->select_list.size() &&
 						projection->children.size() == 1 &&
 						projection->children[0] != nullptr)
 						return RewritePipelineFilterExpr(projection->select_list[ordinal], projection->children[0].get());

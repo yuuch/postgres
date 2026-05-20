@@ -34,6 +34,40 @@ RequiredFilterBoolRegs(const PgVector<FilterExprDesc> &exprs)
 	return max_reg;
 }
 
+static inline bool
+Pow10Int64Local(uint8_t exp, int64_t &out)
+{
+	int64_t value = 1;
+	for (uint8_t i = 0; i < exp; ++i)
+	{
+		if (value > PG_INT64_MAX / 10)
+			return false;
+		value *= 10;
+	}
+	out = value;
+	return true;
+}
+
+static inline bool
+RescaleNumericForCompare(int64_t value, uint8_t from_scale, uint8_t to_scale, int64_t &out)
+{
+	if (from_scale == to_scale)
+	{
+		out = value;
+		return true;
+	}
+	if (from_scale > to_scale)
+		return false;
+	int64_t factor = 0;
+	if (!Pow10Int64Local(static_cast<uint8_t>(to_scale - from_scale), factor))
+		return false;
+	NumericWideInt widened = WideIntFromInt64(value) * WideIntFromInt64(factor);
+	if (!WideIntFitsInt64(widened))
+		return false;
+	out = WideIntToInt64Checked(widened, "pg_yaap: filter numeric compare rescale overflow");
+	return true;
+}
+
 static bool
 MatchPercentLikePattern(const char *lhs, uint32_t lhs_len,
 						  const char *pattern, uint32_t pattern_len)
@@ -92,6 +126,7 @@ MatchPercentLikePattern(const char *lhs, uint32_t lhs_len,
 
 static inline bool
 EvalFilterStepAtRow(const FilterStep &step,
+					const PgVector<FilterInputDesc> &inputs,
 					const PipelineChunk &filter_chunk,
 					const char *string_consts,
 					uint8_t *bool_values,
@@ -158,8 +193,20 @@ EvalFilterStepAtRow(const FilterStep &step,
 		{
 			if (!filter_chunk.nulls[step.left_idx][row_idx] && !filter_chunk.nulls[step.right_idx][row_idx])
 			{
-				const int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
-				const int64_t r = filter_chunk.get_int64(step.right_idx, row_idx);
+				int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
+				int64_t r = filter_chunk.get_int64(step.right_idx, row_idx);
+				if (step.left_idx < inputs.size() &&
+					step.right_idx < inputs.size() &&
+					inputs[step.left_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
+					inputs[step.right_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+				{
+					const uint8_t target_scale =
+						std::max(inputs[step.left_idx].numeric_scale,
+								 inputs[step.right_idx].numeric_scale);
+					if (!RescaleNumericForCompare(l, inputs[step.left_idx].numeric_scale, target_scale, l) ||
+						!RescaleNumericForCompare(r, inputs[step.right_idx].numeric_scale, target_scale, r))
+						elog(ERROR, "pg_yaap: filter numeric compare rescale failed");
+				}
 				switch (step.cmp_op)
 				{
 					case QualOp::LE: result = l <= r; break;
@@ -296,6 +343,7 @@ IsSimpleFilterStep(const PgVector<FilterExprDesc> &exprs,
 
 static inline bool
 EvalSimpleFilterStepAtRow(const FilterStep &step,
+			  const PgVector<FilterInputDesc> &inputs,
 			  const PipelineChunk &filter_chunk,
 			  const char *string_consts,
 			  uint16_t row_idx)
@@ -353,8 +401,20 @@ EvalSimpleFilterStepAtRow(const FilterStep &step,
 		case FilterStepOp::INT64_CMP_VAR:
 			if (!filter_chunk.nulls[step.left_idx][row_idx] && !filter_chunk.nulls[step.right_idx][row_idx])
 			{
-				const int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
-				const int64_t r = filter_chunk.get_int64(step.right_idx, row_idx);
+				int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
+				int64_t r = filter_chunk.get_int64(step.right_idx, row_idx);
+				if (step.left_idx < inputs.size() &&
+					step.right_idx < inputs.size() &&
+					inputs[step.left_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
+					inputs[step.right_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
+				{
+					const uint8_t target_scale =
+						std::max(inputs[step.left_idx].numeric_scale,
+								 inputs[step.right_idx].numeric_scale);
+					if (!RescaleNumericForCompare(l, inputs[step.left_idx].numeric_scale, target_scale, l) ||
+						!RescaleNumericForCompare(r, inputs[step.right_idx].numeric_scale, target_scale, r))
+						elog(ERROR, "pg_yaap: filter numeric compare rescale failed");
+				}
 				switch (step.cmp_op)
 				{
 					case QualOp::LE: return l <= r;
@@ -562,6 +622,7 @@ PhysicalFilter::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, Ope
 		if (use_simple_filter)
 		{
 			pass = EvalSimpleFilterStepAtRow(*simple_filter_step,
+				filter_inputs_,
 				*op_state.filter_chunk,
 				filter_string_consts,
 				row);
@@ -577,7 +638,7 @@ PhysicalFilter::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, Ope
 				if (expr_end > filter_steps_.size())
 					elog(ERROR, "pg_yaap: filter expression step range overflow");
 				for (uint16_t step_idx = expr.first_step_idx; step_idx < expr_end; ++step_idx)
-					EvalFilterStepAtRow(filter_steps_[step_idx], *op_state.filter_chunk, filter_string_consts, op_state.bool_values, row);
+					EvalFilterStepAtRow(filter_steps_[step_idx], filter_inputs_, *op_state.filter_chunk, filter_string_consts, op_state.bool_values, row);
 				if (expr.output_bool_reg >= FILTER_MAX_BOOL_REGS || !op_state.bool_values[expr.output_bool_reg])
 				{
 					pass = false;

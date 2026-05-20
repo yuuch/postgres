@@ -47,44 +47,47 @@ The current bring-up target is Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10/Q14/Q18/Q21 on the optim
 Methodology:
 
 - Native PG and YAAP were both run against `contrib/pg_carbon/tests/tpch/*.sql`
-- Native PG used 4 runs per query, `statement_timeout = '180s'`, `max_parallel_workers_per_gather = 12`, and `max_parallel_workers = 12`
-- YAAP used 4 runs per query, `pg_yaap.parallel_max_workers = 12`; every query finished within the 120s YAAP sweep timeout
+- Native PG medians below reuse the earlier 4-run baseline with `statement_timeout = '180s'`, `max_parallel_workers_per_gather = 12`, and `max_parallel_workers = 12`
+- YAAP medians below were rerun on the current tree with 4 runs/query, `statement_timeout = '120s'`, and `pg_yaap.parallel_max_workers = 12`
 - Medians are reported below
 - Native PG timed out on `q2`, `q17`, and `q20`
-- `q22` still has a known YAAP correctness mismatch versus native PostgreSQL, so its timing is shown but not correctness-qualified
-- Excluding `q22`, YAAP is faster on 17 of the 18 queries where both sides completed with matching results; `q10` is the current regression
+- All 22 queries completed in the current YAAP rerun
+- `q22` now matches native PostgreSQL row-for-row
+- On the 19 queries where both sides completed in the current comparison, YAAP is faster on 17; PG is faster on `q10` and `q21`
 
 ![TPC-H median runtime chart](tpch_pg_vs_yaap.svg)
 
 | Query | PG median ms | YAAP median ms | Speedup (PG/YAAP) | Notes |
 |---|---:|---:|---:|---|
-| q1 | 3054.146 | 933.576 | 3.271x | - |
-| q2 | timeout | 354.199 | - | PG timed out in all 4 runs |
-| q3 | 1902.705 | 1038.548 | 1.832x | - |
-| q4 | 2335.004 | 1212.921 | 1.925x | - |
-| q5 | 3080.473 | 963.481 | 3.197x | - |
-| q6 | 1042.336 | 495.106 | 2.105x | - |
-| q7 | 1560.009 | 1100.774 | 1.417x | - |
-| q8 | 3637.530 | 1040.793 | 3.495x | - |
-| q9 | 7149.423 | 1738.643 | 4.112x | - |
-| q10 | 2022.361 | 3314.089 | 0.610x | PG faster |
-| q11 | 349.885 | 325.832 | 1.074x | - |
-| q12 | 2081.627 | 1200.723 | 1.734x | - |
-| q13 | 2942.782 | 1015.136 | 2.899x | - |
-| q14 | 1143.271 | 830.311 | 1.377x | - |
-| q15 | 2740.381 | 1216.157 | 2.253x | - |
-| q16 | 3412.140 | 1143.208 | 2.985x | - |
-| q17 | timeout | 2077.160 | - | PG timed out in all 4 runs |
-| q18 | 24106.389 | 10325.809 | 2.335x | - |
-| q19 | 2586.662 | 739.592 | 3.497x | - |
-| q20 | timeout | 874.922 | - | PG timed out in all 4 runs |
-| q21 | 7581.361 | 6539.170 | 1.159x | - |
-| q22 | 1112.471 | 409.804 | 2.715x | Known YAAP result mismatch vs PG |
+| q1 | 3054.146 | 1587.421 | 1.924x | - |
+| q2 | timeout | 340.668 | - | PG timed out in all 4 runs |
+| q3 | 1902.705 | 1661.728 | 1.145x | - |
+| q4 | 2335.004 | 1779.976 | 1.312x | - |
+| q5 | 3080.473 | 1317.652 | 2.338x | - |
+| q6 | 1042.336 | 834.930 | 1.248x | - |
+| q7 | 1560.009 | 1299.847 | 1.200x | - |
+| q8 | 3637.530 | 1335.647 | 2.723x | - |
+| q9 | 7149.423 | 2085.194 | 3.429x | - |
+| q10 | 2022.361 | 4116.180 | 0.491x | PG faster |
+| q11 | 349.885 | 327.222 | 1.069x | - |
+| q12 | 2081.627 | 1285.939 | 1.619x | - |
+| q13 | 2942.782 | 978.851 | 3.006x | - |
+| q14 | 1143.271 | 1106.063 | 1.034x | - |
+| q15 | 2740.381 | 1730.280 | 1.584x | - |
+| q16 | 3412.140 | 1241.010 | 2.749x | - |
+| q17 | timeout | 2087.735 | - | PG timed out in all 4 runs |
+| q18 | 24106.389 | 13075.440 | 1.844x | - |
+| q19 | 2586.662 | 824.784 | 3.136x | - |
+| q20 | timeout | 1067.146 | - | PG timed out in all 4 runs |
+| q21 | 7581.361 | 9421.150 | 0.805x | PG faster |
+| q22 | 1112.471 | 486.221 | 2.288x | Matches PG row-for-row |
 
 ## Current status
 
 - YAAP now lowers and executes the optimizer-owned physical plan directly.
+- `q22`'s old correctness mismatch is fixed on the current tree.
 - The bridge/optimizer/executor split is stable enough for top-N, joins, scans, and aggregate paths to be debugged independently.
+- The latest full benchmark rerun completes all 22 TPC-H queries under YAAP within the 120s/query sweep timeout.
 - Remaining work is centered on correctness and performance gaps in the optimizer-to-executor lowering and pipeline runtime.
 
 ## 模块职责
